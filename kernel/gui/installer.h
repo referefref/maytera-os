@@ -217,6 +217,12 @@ typedef struct {
 } inst_target_t;
 _Static_assert(sizeof(inst_target_t) == 16, "inst_target_t must match rustkern/instdisk.rs InstTarget");
 
+// #404 disk-mgr: per-kind sector dispatch, de-static'd from installer.c so
+// rustkern/blkmgr.rs routes raw sector I/O through the same proven ata/ahci/
+// usb_msc calls the verified installer clone uses. LBA u32, count u8 (<=255).
+int inst_kind_read(uint8_t kind, uint8_t index, uint32_t lba, uint8_t cnt, void *buf);
+int inst_kind_write(uint8_t kind, uint8_t index, uint32_t lba, uint8_t cnt, const void *buf);
+
 int inst_enumerate_targets(inst_target_t *out, int max);
 int inst_target_installable(const inst_target_t *t, uint64_t min_sectors);
 

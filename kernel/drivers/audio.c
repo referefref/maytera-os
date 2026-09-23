@@ -1048,25 +1048,43 @@ int audio_resume(audio_stream_t *stream) {
 // give the driver a real drained predicate (hda_avail() maxes out at
 // (HDA_NUM_BDL-1) buffers, reachable only in a one-buffer-wide window per ring
 // revolution, so a naive `avail >= max` samples badly), decide what drain means
-// for a stalled sink, and only then wire hda_space_wq(). Left as-is: a
-// bounded, BKL-releasing, non-spinning loop that is currently a no-op is the
-// safest thing in the tree today. Tracked as #514.
+// for a stalled sink, and only then is this more than a no-op. What THIS change
+// did (audioyield, 2026-09-11): stop the proc_sleep(1) poll and park on the
+// active sink's armed wake instead, bounded by wait_event_timeout so no stalled
+// sink can hang. The remaining buffer_size/predicate work stays open as #514.
+#define AUDIO_DRAIN_BUDGET_MS 1000u   // was 1000 x proc_sleep(1)
 int audio_drain(audio_stream_t *stream) {
     if (!stream || !stream->active) {
         return AUDIO_ERR_INVALID_PARAM;
     }
 
-    // Wait for buffer to empty (simplified - just stop)
     stream->state = AUDIO_STATE_DRAINING;
 
-    // Simple busy wait with timeout
-    for (int i = 0; i < 1000; i++) {
-        if (audio_avail(stream) >= (int)stream->config.buffer_size - 1) {
-            break;
+    // #514/#426: park on the active sink's real completion wake instead of a
+    // proc_sleep(1) poll. The drained predicate is unchanged, so this stays the
+    // documented no-op for every current caller (all pass buffer_size==0, so
+    // the test is `audio_avail() >= -1`, already true at entry): both waits
+    // below re-check the predicate FIRST and return without ever sleeping. What
+    // changes is the mechanism for the day a real drained predicate lands: it
+    // then parks on an armed wake rather than busy-polling a core, and it is
+    // wait_event_TIMEOUT, so a stalled sink that never drains gives up at the
+    // bound instead of hanging (the #514 objection to an UNTIMED conversion).
+    if (audio_state.device_type == AUDIO_DEVICE_HDA) {
+        // hda_space_wq() is woken from BOTH the BCIS MSI ISR AND the 10ms
+        // hda_poll_worker, so no wake is lost for more than one 10ms service
+        // pass: the wait cannot hang on a missing interrupt.
+        wait_event_timeout(hda_space_wq(),
+                           audio_avail(stream) >= (int)stream->config.buffer_size - 1,
+                           wq_ms_to_ticks(AUDIO_DRAIN_BUDGET_MS));
+    } else {
+        // AC97, SB16 and USB-audio sinks have no drain-completion wait queue to
+        // park on. Do NOT wait_event on hda_space_wq() here: that waker is not
+        // armed for these sinks, so it would hide a broken wake behind a full
+        // timeout. A single bounded yielding sleep is the safe floor: it never
+        // busy-spins and it is not a poll loop.
+        if (audio_avail(stream) < (int)stream->config.buffer_size - 1) {
+            proc_sleep(AUDIO_DRAIN_BUDGET_MS);
         }
-        // #347: yield to the scheduler instead of busy-spinning (never hold the
-        // BKL spinning) while the sink drains.
-        proc_sleep(1);
     }
 
     audio_stop(stream);
@@ -1473,7 +1491,7 @@ int audio_play_file(const char *path) {
     // and one shared wr_slot, each reprogramming the stream format under the
     // other.
     //
-    // MEASURED, 2026-08-26, VM <vmid> (golden byte copy, QEMU -audiodev wav): the
+    // MEASURED, 2026-08-26, VM 2760 (golden byte copy, QEMU -audiodev wav): the
     // 18.6 s boot chime was still playing when a DOS guest's /APPS/FMSYNTH
     // opened its stream. From that point hda_avail() returned 0 to the PCM pump
     // for as long as it was asked, because the chime kept every slot the

@@ -99,6 +99,13 @@ int64_t sys_sock_shutdown(int fd, int how);
 // net_lock context (only touches a wait_queue_head's own spinlock).
 void socket_net_wake(void);
 
+struct wait_queue_head;
+// #httpsddl: the shared net RX wait queue (g_net_rx_wq), woken by
+// socket_net_wake() on every delivered IP frame. Exported so the in-kernel
+// HTTPS/TLS recv path (net/https.c) can park on the SAME queue this layer's
+// blocking recv uses, instead of busy-polling.
+struct wait_queue_head *net_rx_waitq(void);
+
 // Deliver an inbound UDP datagram to a bound BSD DGRAM socket, if any. Called
 // from udp_handle() (which runs under net_lock). dest_port is host order.
 // Returns 1 if a BSD socket consumed it, 0 otherwise.

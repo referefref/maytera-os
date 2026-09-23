@@ -1,0 +1,48 @@
+--- /dev/null
++++ b/lib/expat_config.h
+@@ -0,0 +1,45 @@
++/* SPDX-License-Identifier: MIT */
++/* MayteraOS expat_config.h for the mports expat port (userland/ports/expat).
++ *
++ * First-party MayteraOS file added to the upstream tree by patch, the same way
++ * musl-regex adds gnuregex.h: expat's sources #include "expat_config.h"
++ * unconditionally (lib/xmlparse.c), and upstream's own generated copy assumes a
++ * full Linux userland (getrandom, arc4random_buf, mmap, dlfcn) that this
++ * freestanding userland does not provide. This is the honest MayteraOS config.
++ *
++ * Copyright (c) 2026 MayteraOS. Licensed MIT, matching the port's libc.
++ */
++#ifndef EXPAT_CONFIG_H
++#define EXPAT_CONFIG_H 1
++
++/* Little-endian x86-64. */
++#define BYTEORDER 1234
++
++/* Headers this userland provides (gate #includes inside expat only). */
++#define HAVE_STDINT_H 1
++#define HAVE_STRING_H 1
++#define HAVE_STRINGS_H 1
++#define HAVE_STDLIB_H 1
++#define HAVE_STDIO_H 1
++#define HAVE_UNISTD_H 1
++#define HAVE_SYS_TYPES_H 1
++
++/* HASH-SALT ENTROPY. MayteraOS userland libc exposes no getrandom(),
++ * arc4random_buf() or /dev/urandom, and the kernel entropy source (#654) is
++ * not yet surfaced to Ring 3. expat's hash secret salt is a hash-flooding
++ * MITIGATION, not a cryptographic key; with XML_POOR_ENTROPY defined, expat
++ * derives it from clock() ^ getpid() (both present in libc). This is the
++ * documented upstream fallback and is appropriate for parsing trusted on-device
++ * XML (config, manifests). It is NOT a general-purpose RNG and must not be
++ * treated as one. When a userland entropy accessor lands, define HAVE_GETRANDOM
++ * here and drop XML_POOR_ENTROPY. */
++#define XML_POOR_ENTROPY 1
++
++#define PACKAGE "expat"
++#define PACKAGE_NAME "expat"
++#define PACKAGE_STRING "expat 2.7.1"
++#define PACKAGE_TARNAME "expat"
++#define PACKAGE_VERSION "2.7.1"
++#define VERSION "2.7.1"
++
++#endif /* EXPAT_CONFIG_H */

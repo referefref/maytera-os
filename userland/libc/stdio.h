@@ -25,6 +25,8 @@ int snprintf(char *str, size_t size, const char *format, ...) __attribute__((for
 int vprintf(const char *format, va_list ap);
 int vsprintf(char *str, const char *format, va_list ap);
 int vsnprintf(char *str, size_t size, const char *format, va_list ap);
+int asprintf(char **strp, const char *format, ...) __attribute__((format(printf, 2, 3)));  // #745
+int vasprintf(char **strp, const char *format, va_list ap);  // #745
 
 // Input functions (basic)
 int getchar(void);
@@ -110,5 +112,10 @@ int vfscanf(FILE *f, const char *fmt, va_list ap);
 #define _IONBF 2
 
 void __stdio_init(void);
+
+// Large-file positioning, added for the libedit port (#745). off_t is
+// signed long here, so these are exact aliases of fseek/ftell.
+int   fseeko(FILE *fp, long long off, int whence);
+long long ftello(FILE *fp);
 
 #endif // LIBC_STDIO_H

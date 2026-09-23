@@ -158,3 +158,28 @@ day when Computer/Browser/Recycle Bin were reverted per user preference (see
 the original custom hand-drawn trash can, not third-party. See
 `../../ATTRIBUTION.md` for the full source table of every currently-shipped
 icon, third-party or original.
+
+## Packing step (2026-09-07): `tools/icons/pack_icn.py`
+
+The "pack g.png (RGBA) -> MICO" step above was prose with no script behind
+it. `tools/icons/pack_icn.py IN.png OUT.ICN --expect 64x64` is that step:
+stdlib only (it decodes the 8-bit RGBA/RGB PNG `rsvg-convert` emits itself,
+so it runs in the build container without Pillow), writes magic `MICO` +
+u32 LE width + u32 LE height + BGRA pixels, straight alpha, and refuses
+anything it cannot represent exactly. Full recipe for a new icon:
+
+```
+rsvg-convert -w 64 -h 64 --background-color=none assets/icons/svg/NAME.svg -o NAME.png
+tools/icons/pack_icn.py NAME.png NAME.ICN --expect 64x64
+# then write NAME.ICN into BOTH copies of record: the maytera-assets LFS repo
+# ICONS/ and the b850 asset base image's ext2 /ICONS/, and add its sha256 to
+# build/asset-manifest.sha256 (FREEWARE tier).
+```
+
+## Office suite family (WRITER, SHEETS, SLIDES, OFFICE)
+
+Original artwork; the SVGs in this directory are symlinks to the masters in
+`assets/office-icons/apps/`, whose `README.md` documents the family rules
+(white 4px sheet outline, mountain-M suite cue, colour on content only so
+the dock's luminance-tint path keeps the outline at full weight) and the
+exact compositor wiring the launcher entries need.

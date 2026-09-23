@@ -142,4 +142,8 @@ int rsa_sign_pkcs1_sha256(const rsa_private_key_t *key,
 // Get key size in bytes
 size_t rsa_key_size(const rsa_public_key_t *key);
 
+// secroad2: RSA PKCS#1 v1.5 SHA-256 signature-verify known-answer self-test
+// (accept + forgery-reject). Returns 0 on PASS, nonzero = failure count.
+int rsa_verify_selftest(void);
+
 #endif // RSA_H

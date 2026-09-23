@@ -1,0 +1,130 @@
+# mports recipe: moon-buggy 1.0.51. Tier 3 item #17 of
+# docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md ("myman, ninvaders,
+# moon-buggy ... near-zero individual cost once ncurses lands. Useful
+# specifically as VOLUME PROOF that the recipe system works"). GPL-2.0-or-
+# later, dependency closure 1 (ncurses). The third and last of the three
+# named ncurses terminal games, after myman and ninvaders.
+#
+# WHAT THIS PORT SHIPS. moon-buggy is Jochen Voss's ncurses side-scroller
+# (https://www.seehuhn.de/pages/moon-buggy): drive a moon buggy across a
+# lunar landscape, jump craters, and shoot meteors. 26 small translation
+# units, no image/audio data files (the buggy sprite is text baked into a
+# header at build time, see below), self-contained ASCII-art rendering via
+# ncurses only.
+#
+# WHY build=script, NOT build=objects. Upstream is autoconf, and its build
+# GENERATES three headers a static `sources=` list cannot express:
+#   * config.h  - normally emitted by ./configure; this recipe writes a small,
+#     honest one directly (see build.sh) recording the MayteraOS platform
+#     facts (hardware-float C on the freestanding libc + ported ncurses).
+#   * copying.h - the GPL text baked into a C string array, created by
+#     upstream's own `sed -f text2c.sed COPYING` (a BUILT_SOURCES rule in
+#     Makefile.am). pager.c #includes it for the in-game `c' copyright screen.
+#   * buggy.h   - the buggy/crash/meteor sprites baked into a C array, created
+#     by upstream's own `sed -n -f img.sed car.img` (also BUILT_SOURCES).
+#     buggy.c #includes it; without it the game has no buggy to draw.
+# build.sh runs upstream's two seds verbatim, so the sprites and licence text
+# are exactly upstream's, not a frozen copy in our patch series.
+#
+# THREE REAL ADAPTATIONS, each a documented patch (see patches/ and
+# CHANGELOG.md), all measured against this tree's libc/ncurses, not assumed:
+#   0001 - queue.c drives its main loop off select(2) on stdin with a timeval
+#          deadline. MayteraOS's select() is network-oriented (libc
+#          sys/socket.c -> SYS_SOCK_SELECT blocks on the net RX wait queue), so
+#          it does not wake on a Terminal-pty keypress and a NULL timeout would
+#          hang the title screen. Rewritten onto ncurses' own
+#          wtimeout()+wgetch() wait (a key is pushed back with ungetch() so the
+#          existing read_key() still consumes it once) - the same idiom the
+#          ninvaders port used to replace setitimer/SIGALRM, and the one
+#          docs/MPORTS.md points at. No busy-wait introduced (the wait blocks
+#          in ncurses).
+#   0002 - highscore.c fatal()s if its fcntl(F_SETLKW) advisory lock fails.
+#          MayteraOS carries the lock constants for source compatibility only
+#          (the kernel returns -1/ENOSYS, libc fcntl.h) and runs a single
+#          writer, so the lock is made best-effort, matching every other
+#          caller of these constants in the tree (angband).
+#   0003 - terminal.c fchmod()s the tty for the -m "mesg n" feature and toggles
+#          IXON via termios. Neither is needed under the single-user Terminal
+#          (ncurses raw mode already governs C-s), and fchmod() is not in this
+#          libc (only chmod() is), so the "mesg n" path would fail to LINK even
+#          though it is off by default. Reduced to the isatty() guard; the
+#          termios block already compiles out (HAVE_TERMIOS_H unset).
+# Load-bearing together: the `symbols` list below is defined across queue.c
+# (main_loop), buggy.c (jump), terminal.c is not in it only because it exports
+# no game symbol, but a patch that stopped applying would fail `patch -F0`
+# before the build, not ship silently.
+
+name=moonbuggy
+version=1.0.51
+class=C
+homepage=https://www.seehuhn.de/pages/moon-buggy
+
+# The upstream release tarball from the author's site. The sha256 below is of
+# THIS file, MEASURED on the build container with sha256sum, not copied from a web page:
+#   wget -O moon-buggy-1.0.51.tar.gz \
+#     https://www.seehuhn.de/media/programs/moon-buggy-1.0.51.tar.gz
+#   sha256sum moon-buggy-1.0.51.tar.gz
+#   -> 352dc16ccae4c66f1e87ab071e6a4ebeb94ff4e4f744ce1b12a769d02fe5d23f (263,572 bytes)
+source_url=https://www.seehuhn.de/media/programs/moon-buggy-1.0.51.tar.gz
+tarball=moon-buggy-1.0.51.tar.gz
+sha256=352dc16ccae4c66f1e87ab071e6a4ebeb94ff4e4f744ce1b12a769d02fe5d23f
+srcdir=moon-buggy-1.0.51
+
+# GPL. HONEST BASIS FOR "or later": the source files carry only a bare
+# "Copyright <year> Jochen Voss" header (no per-file "version 2 or any later
+# version" grant, unlike ninvaders), and README/moon-buggy.texi say generically
+# "under the terms of the GNU General Public License". The ship's COPYING is the
+# GPLv2 text, and its recommended notice reads "version 2 of the License, or (at
+# your option) any later version"; Debian has recorded moon-buggy as GPL-2+ for
+# its whole life. We record it as GPL-2.0-or-later on that basis. Either
+# reading (v2-only or v2+) is inside the allowed set here (only CC-BY-SA is
+# banned) and neither creates a conflict, since ncurses and libc are permissive.
+# COPYING is reproduced in ATTRIBUTION.md, copied out of THIS tarball.
+licence=GPL-2.0-or-later
+licence_files=COPYING
+copyleft=combined
+copyleft_note=Statically combined into one binary (/APPS/MOONBUGY) with permissively-licensed ncurses and userland/libc; the combined binary as a whole must be offered under GPL-2.0-or-later (same shape as the NINVADERS and VI precedents: the more restrictive licence governs the combined work). ncurses and userland/libc are not thereby made GPL; each remains available under its own permissive terms and neither is modified by this port. Corresponding source is the pinned moon-buggy-1.0.51.tar.gz, the three patches in patches/, and this repository's own ncurses/libc source.
+
+# ncurses supplies the whole screen/input model (initscr, colours, wgetch, and
+# the wtimeout()-driven timing this port switches the main loop to). libc is the
+# shared platform library, not a port.
+
+# THE ADOPTION TEST (owner rule 2): does this want to USE a platform layer, or
+# to BE one? moon-buggy USES. It is an ordinary Ring-3 program driven entirely
+# by ncurses screen/input calls plus the ordinary libc surface (malloc/free,
+# str/mem, stdio incl. the fopen/fscanf family for the score file, getopt_long,
+# getpwuid, gettimeofday, time/localtime, srand/rand). Measured: the 26 objects
+# link against the built libncurses.a + userland/libc/libc.a (crt0.o +
+# user-pie.ld) with ZERO undefined symbols. It owns its own game/screen state
+# and event queue but never the process or an event loop the rest of the system
+# must adopt; it calls wgetch() itself from its own main loop in queue.c.
+adoption=USES. Measured: the 26 compiled objects link against the built libncurses.a + userland/libc/libc.a (crt0.o + user-pie.ld) with zero undefined symbols. moon-buggy owns its own game/screen state and internal event queue but never the process or an event loop the rest of the system must adopt; it calls wgetch() itself from its main loop in queue.c.
+needs=libc ncurses
+
+# No pre-configure file copies: build.sh writes config.h and runs upstream's
+# two BUILT_SOURCES seds itself (see the header comment for why).
+prepare=none
+
+patches=0001-queue-ncurses-timeout-instead-of-select.patch 0002-highscore-advisory-lock-best-effort.patch 0003-terminal-drop-mesg-fchmod.patch
+
+# build=script: writes config.h, generates copying.h + buggy.h via upstream's
+# seds, compiles the 26 translation units into libmoonbugy.a. See build.sh and
+# the header comment. An APP (main() included, in main.c) expressed as an
+# archive here, matching the darkhttpd/myman/ninvaders precedent (a library
+# carrying main() is fine when there is exactly one intended consumer,
+# userland/apps/moonbuggy).
+build=script
+
+# A program installs no public header (see darkhttpd's headers=none literal).
+headers=none
+
+lib=libmoonbugy.a
+
+# THE ANTI-NO-OP CHECK. Ten non-static symbols proven DEFINED in the archive
+# with `nm`, spanning ten different translation units, so a build that compiled
+# the wrong source list or lost a file to a bad patch cannot define them all:
+# main (main.c), main_loop (queue.c, the loop this port rewrote), jump
+# (buggy.c), fire_laser (laser.c), setup_game_mode (game.c), install_keys
+# (keyboard.c), vclock (vclock.c), init_rnd (random.c), print_ground
+# (ground.c), show_highscores (highscore.c).
+symbols=main main_loop jump fire_laser setup_game_mode install_keys vclock init_rnd print_ground show_highscores

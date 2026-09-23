@@ -474,3 +474,10 @@ int icmp_get_ping_reply(uint32_t *src_ip, uint16_t *seq, uint16_t *time_ms) {
     ping_reply_received = 0;
     return 1;
 }
+
+// #netpolls: non-consuming peek of the echo-reply flag, for a wait_event
+// condition. Pure BSS read (no NIC), safe on any CR3. icmp_get_ping_reply()
+// stays the consuming reader that hands back the rtt/src/seq.
+int icmp_ping_reply_pending(void) {
+    return ping_reply_received;
+}

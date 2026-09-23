@@ -1,0 +1,25 @@
+status.h: map the sig* setjmp variants to plain setjmp/longjmp on MayteraOS.
+
+A TARGET ADAPTATION, not a bug fix. bc-gh uses sigsetjmp(sjb, 0) / siglongjmp /
+sigjmp_buf for its exception-handling non-local jumps. The MayteraOS freestanding
+libc <setjmp.h> provides only setjmp/longjmp (there are no per-thread signal
+masks to save). Because bc always passes savesigs = 0, sigsetjmp is exactly
+equivalent to setjmp and siglongjmp to longjmp, so this mapping is behaviour-
+preserving. Selected by -DMAYTERAOS in the port cflags; every other target
+(including the real POSIX one) is byte-for-byte unaltered. The upstream source
+already ships this identical mapping for _WIN32; this hunk adds the MayteraOS
+branch beside it.
+--- a/include/status.h
++++ b/include/status.h
+@@ -77,6 +77,11 @@
+ 
+ #else // _WIN32
+ #define BC_FILE_SEP '/'
++#ifdef MAYTERAOS
++#define sigjmp_buf jmp_buf
++#define sigsetjmp(j, s) setjmp(j)
++#define siglongjmp longjmp
++#endif
+ #endif // _WIN32
+ 
+ #ifndef BC_ENABLED

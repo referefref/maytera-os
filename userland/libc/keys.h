@@ -112,7 +112,7 @@
 // names below keep their _DELIVERED_REL spelling (nothing that matches them
 // breaks) and simply equal the press codes now.
 //
-// MEASURED on VM <vmid> / golden build 2040 with tools/testing/probes/keyprobe.c
+// MEASURED on VM 2221 / golden build 2040 with tools/testing/probes/keyprobe.c
 // BEFORE the change:
 //     press  LShift -> EVENT_KEY_DOWN 0x95   release -> EVENT_KEY_UP 0x87 (== F10!)
 //     press  RShift -> EVENT_KEY_DOWN 0x96   release -> EVENT_KEY_UP 0x88 (== F1!)

@@ -17,6 +17,20 @@
 
 #include "../types.h"   // size_t, ssize_t, off_t, pid_t, intptr_t, uintptr_t
 
+// BSD unsigned type aliases, added for the libedit port (#745): vis.c uses
+// u_char and u_int32_t. Guarded so a consumer that already defines them wins.
+#ifndef __BSD_U_TYPES_DEFINED
+#define __BSD_U_TYPES_DEFINED 1
+typedef unsigned char      u_char;
+typedef unsigned short     u_short;
+typedef unsigned int       u_int;
+typedef unsigned long      u_long;
+typedef unsigned char      u_int8_t;
+typedef unsigned short     u_int16_t;
+typedef unsigned int       u_int32_t;
+typedef unsigned long long u_int64_t;
+#endif
+
 #ifndef _MODE_T_DEFINED
 #define _MODE_T_DEFINED
 typedef unsigned int mode_t;
@@ -68,6 +82,26 @@ typedef unsigned int  id_t;
 #ifndef _KEY_T_DEFINED
 #define _KEY_T_DEFINED
 typedef long          key_t;
+#endif
+
+// BSD short-name integer typedefs (#745 darkhttpd port). Individually guarded
+// like the POSIX types above so an app carrying its own <sys/types.h> shim can
+// still win. darkhttpd casts sin_family to (u_char).
+#ifndef _U_CHAR_DEFINED
+#define _U_CHAR_DEFINED
+typedef unsigned char      u_char;
+#endif
+#ifndef _U_SHORT_DEFINED
+#define _U_SHORT_DEFINED
+typedef unsigned short     u_short;
+#endif
+#ifndef _U_INT_DEFINED
+#define _U_INT_DEFINED
+typedef unsigned int       u_int;
+#endif
+#ifndef _U_LONG_DEFINED
+#define _U_LONG_DEFINED
+typedef unsigned long      u_long;
 #endif
 
 #endif // LIBC_SYS_TYPES_H

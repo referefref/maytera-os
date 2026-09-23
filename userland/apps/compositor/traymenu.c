@@ -82,6 +82,7 @@ static int g_tm_drag = -1;     // index of slider being dragged
 
 // ---- binding get/set -----------------------------------------------------
 extern int g_win_opacity;  // main.c global window opacity (0-255)
+extern int g_win_opacity_user_set;  // main.c (emfield-fix)
 extern int g_aichat_enabled;        // widgets.c (#185)
 void aichat_set_enabled(int on);    // main.c: launch/stop the AI Chat app (#185)
 
@@ -144,7 +145,7 @@ static void tm_set(const char *b, int v) {
     else if (!strcmp(b, "show_stickies")) g_show_stickies = v;
     else if (!strcmp(b, "show_aichat"))   aichat_set_enabled(v);
     else if (!strcmp(b, "volume"))        set_volume(v);
-    else if (!strcmp(b, "win_opacity")) { int o = v*255/100; if(o<40)o=40; if(o>255)o=255; g_win_opacity=o; set_win_opacity(o); }
+    else if (!strcmp(b, "win_opacity")) { int o = v*255/100; if(o<40)o=40; if(o>255)o=255; g_win_opacity=o; g_win_opacity_user_set=1; set_win_opacity(o); }
     else if (!strcmp(b, "bt_power"))      bt_power(v);            // #372
     else if (!strcmp(b, "wifi_power"))    wifi_power(v);          // #384
     // (#231r) and eq0..eq4 write straight through to the DSP.

@@ -55,6 +55,7 @@ fn panic(_info: &PanicInfo) -> ! {
 #[path = "../gen/rustkern/doswin.rs"]   mod doswin;
 #[path = "../gen/rustkern/dosprof.rs"]  mod dosprof;
 #[path = "../gen/rustkern/dosdisp.rs"]  mod dosdisp;
+#[path = "../gen/rustkern/dostick.rs"]  mod dostick;
 #[path = "../gen/rustkern/dosmick.rs"]  mod dosmick;
 #[path = "../gen/rustkern/dos4gw.rs"]   mod dos4gw;
 #[path = "../gen/rustkern/dpmi.rs"]     mod dpmi;

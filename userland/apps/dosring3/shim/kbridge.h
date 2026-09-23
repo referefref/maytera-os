@@ -172,6 +172,7 @@ void  kb_win_invalidate(int handle);
 int   kb_win_focused(int handle);
 int   kb_win_content_size(int handle, int *w, int *h);
 int   kb_win_work_area(int *x, int *y, int *w, int *h);
+int   kb_win_fullscreen_toggle(int handle);  /* dosfullscreen: #158 native FS toggle */
 
 // ---- input ---------------------------------------------------------------
 // Raw set-1 make/break scancode bytes for the guest's INT 9. Returns -1 when
@@ -181,9 +182,18 @@ void  kb_scancode_clear(void);
 void  kb_scancode_tap(int on);
 unsigned int kb_key_modifiers(void);
 void  kb_mouse_state(int *x, int *y, unsigned int *buttons);
+// (#dosmouse) Publishes kb_mouse_state() into the mouse_x/mouse_y/
+// mouse_buttons globals that dosexec.c reads. Defined in kshim.c beside
+// those globals, called by the window-event pump in ushim.c. Without it
+// the DOS layer sees a mouse frozen at 0,0 with no buttons.
+void  dosring3_mouse_publish(void);
 
 // ---- identity ------------------------------------------------------------
 unsigned int kb_uid(void);
+// (#dosperm) POSIX access(2) against THIS process's effective credentials,
+// answered by the kernel's own perms_check(). Primitive-typed so it crosses
+// the kernel/libc type wall. 0 = permitted, -1 = not.
+int kb_access(const char *path, int mode);
 unsigned int kb_gid(void);
 // The session user's home directory, no trailing '/'. Returns 0 on success,
 // -1 if it will not fit or there is no usable home. This is libc's

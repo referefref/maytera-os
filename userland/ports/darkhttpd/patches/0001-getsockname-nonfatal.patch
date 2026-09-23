@@ -1,0 +1,17 @@
+--- a/darkhttpd.c	2026-09-07 08:39:26.922502207 +0000
++++ b/darkhttpd.c	2026-09-07 08:39:26.922808370 +0000
+@@ -883,7 +883,13 @@
+                  sizeof(struct sockaddr_in)) == -1)
+             err(1, "bind(port %u)", bindport);
+         addrin_len = sizeof(addrin);
+-        if (getsockname(sockin, (struct sockaddr *)&addrin, &addrin_len) == -1)
++        /* MayteraOS (#745): the kernel exposes no getsockname(); the libc stub
++         * returns -1/ENOSYS. addrin already holds the address and port we bound
++         * with, so tolerate that one failure instead of aborting at startup. A
++         * real getsockname() error (any other errno) stays fatal. The only loss
++         * is that a --port 0 auto-assigned port is not reported back. */
++        if (getsockname(sockin, (struct sockaddr *)&addrin, &addrin_len) == -1
++            && errno != ENOSYS)
+             err(1, "getsockname()");
+         printf("listening on: http://%s:%u/\n",
+             get_address_text(&addrin.sin_addr), bindport);

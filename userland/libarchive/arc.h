@@ -52,6 +52,12 @@ arc_entry *arc_targz_extract(const uint8_t *gz, size_t len, int *out_count);
 // ---- zip ----------------------------------------------------------------
 // use_deflate: 0 = store (method 0), 1 = deflate (method 8).
 uint8_t  *arc_zip_create(const arc_entry *ents, int n, int use_deflate, size_t *out_len);
+// Like arc_zip_create, but if store_first is non-NULL the entry whose name
+// equals store_first is emitted FIRST and always STORED (method 0). Used for
+// ODF (.odt/.ods/.odp): the `mimetype` part must lead the zip and be stored.
+// store_first == NULL behaves exactly like arc_zip_create.
+uint8_t  *arc_zip_create_ex(const arc_entry *ents, int n, int use_deflate,
+                            const char *store_first, size_t *out_len);
 arc_entry *arc_zip_extract(const uint8_t *zip, size_t len, int *out_count);
 
 

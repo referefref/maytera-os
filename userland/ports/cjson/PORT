@@ -1,0 +1,53 @@
+# mports recipe: cJSON 1.7.18. The linkable JSON library that the AI
+# tool-contract layer and the App Store C code currently hand-roll. TOP
+# priority of the 2026-09 library-ports batch.
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA; there is
+# no cJSON-specific script in the tree and mports.sh has no idea what cJSON is.
+
+name=cjson
+version=1.7.18
+class=A
+homepage=https://github.com/DaveGamble/cJSON
+
+# The GitHub source tarball for tag v1.7.18. sha256 below is of THIS file and
+# was MEASURED on the build container, not copied from a web page:
+#   wget -O cJSON-1.7.18.tar.gz https://github.com/DaveGamble/cJSON/archive/refs/tags/v1.7.18.tar.gz
+#   sha256sum -> 3aa806844a03442c00769b83e99970be70fbef03735ff898f4811dd03b9f5ee5
+source_url=https://github.com/DaveGamble/cJSON/archive/refs/tags/v1.7.18.tar.gz
+tarball=cJSON-1.7.18.tar.gz
+sha256=3aa806844a03442c00769b83e99970be70fbef03735ff898f4811dd03b9f5ee5
+srcdir=cJSON-1.7.18
+
+licence=MIT
+licence_files=LICENSE
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): USES. cJSON is pure computation over
+# caller-supplied buffers: parse a char* into a tree, print a tree back to a
+# malloc-ed char*. The only platform surface is malloc/free/realloc and the
+# string/memory helpers in libc. No event loop, no main(), no filesystem, no
+# window system. It never wants to own the process.
+adoption=USES. Pure buffer-in/tree-out/buffer-out computation; the only platform surface is malloc/free/realloc and memcpy/strlen from libc. It imposes no event loop, main() or filesystem model.
+
+needs=libc
+
+prepare=none
+patches=none
+
+build=objects
+
+# Core library only. cJSON_Utils.c (JSON Patch / JSON Pointer / merge-patch) is
+# a separate optional layer the AI-contract and App Store consumers do not use;
+# excluded by name rather than pulled in unused.
+sources=cJSON.c
+
+exclude=cJSON_Utils.c
+exclude_reason=cJSON_Utils is the optional JSON Patch/Pointer/merge helper layer, not the core parse/print API the AI tool-contract and App Store consumers need. Left out to keep the archive to the promised surface; add it (and cJSON_Utils.h) here if a consumer needs it.
+
+headers=cJSON.h
+lib=libcjson.a
+
+# THE ANTI-NO-OP CHECK. mports.sh proves with nm that every one of these is a
+# DEFINED symbol in libcjson.a. The core parse/print/build/query API.
+symbols=cJSON_Version cJSON_Parse cJSON_ParseWithLength cJSON_Print cJSON_PrintUnformatted cJSON_Delete cJSON_CreateObject cJSON_CreateArray cJSON_CreateString cJSON_CreateNumber cJSON_CreateBool cJSON_AddItemToObject cJSON_AddItemToArray cJSON_GetObjectItem cJSON_GetObjectItemCaseSensitive cJSON_GetArraySize cJSON_GetArrayItem cJSON_IsString cJSON_IsNumber cJSON_IsObject cJSON_IsArray cJSON_free

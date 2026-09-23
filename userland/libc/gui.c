@@ -8,6 +8,7 @@
 #include "syscall.h"
 #include "string.h"
 #include "gui_scroll.h"   // gui_scroll_thumb_ink: ONE scrollbar contrast rule
+#include "wallpapers.h"   // wp_enumerate: the ONE wallpaper index -> file mapping (#517), used by gui_glass_backdrop_sync()
 
 // ============================================================================
 // Window Protocol Client Implementation
@@ -510,6 +511,17 @@ uint32_t gui_ensure_contrast2(uint32_t fg, uint32_t bg1, uint32_t bg2, int min_x
     return best_t < 256 ? best_clear : best;
 }
 
+// (widgetglass) See gui_style.h. Same step size as gui_ensure_contrast() so
+// the two are exact inverses of each other's walk.
+uint32_t gui_limit_contrast(uint32_t fg, uint32_t bg, int max_x100) {
+    if (gui_contrast_x100(fg, bg) <= max_x100) return fg;
+    for (int t = 8; t < 256; t += 8) {
+        uint32_t c = gui_mix(fg, bg, t);
+        if (gui_contrast_x100(c, bg) <= max_x100) return c;
+    }
+    return bg;
+}
+
 // (#117) Generic two-tone bevel pair. Walk `base` independently toward pure
 // black (shadow) and pure white (highlight) until each side clears
 // GUI_AIM_NONTEXT against `base` ITSELF (the colour the bevel sits on: the
@@ -560,6 +572,18 @@ void gui_bevel_pair(uint32_t base, uint32_t *shadow_out, uint32_t *highlight_out
     // fallback below always has something to fall back TO.
     if (shadow_out)    *shadow_out    = dark_ok  ? dark  : light;
     if (highlight_out) *highlight_out = light_ok ? light : dark;
+}
+
+// (widgetglass) See gui_style.h. gs_bevel_walk() against `base` ITSELF is
+// exactly the walk a state shade needs (the same reason gui_bevel_pair()
+// uses it): the first step in the preferred direction that a viewer can tell
+// from the rest fill, with the opposite direction as the fallback when the
+// preferred one cannot get there.
+uint32_t gui_state_shade(uint32_t base, int prefer_lighter) {
+    int ok;
+    uint32_t c = gs_bevel_walk(base, base, GUI_HOVER_MIN, prefer_lighter ? 1 : 0, &ok);
+    if (ok) return c;
+    return gs_bevel_walk(base, base, GUI_HOVER_MIN, prefer_lighter ? 0 : 1, &ok);
 }
 
 static int gs_isqrt(int n) { if (n<=0) return 0; int x=n, y=(x+1)/2; while (y<x){ x=y; y=(x+n/x)/2; } return x; }
@@ -873,6 +897,118 @@ void gui_fill_star_aa(int handle, int x, int y, int d, int fill_pct,
         }
     }
 }
+
+// --- (glasslib) Shared frosted-wallpaper glass backdrop --------------------
+// See gui_style.h for the contract. Implementation moved here verbatim from
+// the four apps that had it (Task Manager, Calculator, Media Player, Image
+// Viewer): only the buffer/state ownership changed (caller owns the two
+// small persistent pieces, this file owns the scratch), nothing about the
+// pixels.
+#define GLASS_RAW_CAP (256 * 1024)   // a 100x62 BMP is ~19 KB; larger files fall back to the gradient
+static uint32_t g_glass_tmp[GUI_GLASS_BD_W * GUI_GLASS_BD_H];
+static uint8_t  g_glass_raw[GLASS_RAW_CAP];
+
+static void glass_fill_gradient(uint32_t *bd, uint32_t top, uint32_t bottom) {
+    for (int y = 0; y < GUI_GLASS_BD_H; y++) {
+        uint32_t c = gui_mix(top, bottom, y * 255 / (GUI_GLASS_BD_H - 1));
+        for (int x = 0; x < GUI_GLASS_BD_W; x++) bd[y * GUI_GLASS_BD_W + x] = c;
+    }
+}
+
+static void glass_blur_and_tint(uint32_t *bd, uint32_t tint_color, int tint_amt) {
+    const int R = 2;
+    for (int pass = 0; pass < 3; pass++) {
+        for (int y = 0; y < GUI_GLASS_BD_H; y++)
+            for (int x = 0; x < GUI_GLASS_BD_W; x++) {
+                unsigned rr = 0, gg = 0, bb = 0, cnt = 0;
+                for (int dx = -R; dx <= R; dx++) {
+                    int xx = x + dx; if (xx < 0) xx = 0; if (xx >= GUI_GLASS_BD_W) xx = GUI_GLASS_BD_W - 1;
+                    uint32_t c = bd[y * GUI_GLASS_BD_W + xx];
+                    rr += (c >> 16) & 0xFF; gg += (c >> 8) & 0xFF; bb += c & 0xFF; cnt++;
+                }
+                g_glass_tmp[y * GUI_GLASS_BD_W + x] = ((rr / cnt) << 16) | ((gg / cnt) << 8) | (bb / cnt);
+            }
+        for (int x = 0; x < GUI_GLASS_BD_W; x++)
+            for (int y = 0; y < GUI_GLASS_BD_H; y++) {
+                unsigned rr = 0, gg = 0, bb = 0, cnt = 0;
+                for (int dy = -R; dy <= R; dy++) {
+                    int yy = y + dy; if (yy < 0) yy = 0; if (yy >= GUI_GLASS_BD_H) yy = GUI_GLASS_BD_H - 1;
+                    uint32_t c = g_glass_tmp[yy * GUI_GLASS_BD_W + x];
+                    rr += (c >> 16) & 0xFF; gg += (c >> 8) & 0xFF; bb += c & 0xFF; cnt++;
+                }
+                bd[y * GUI_GLASS_BD_W + x] = ((rr / cnt) << 16) | ((gg / cnt) << 8) | (bb / cnt);
+            }
+    }
+    for (int i = 0; i < GUI_GLASS_BD_W * GUI_GLASS_BD_H; i++)
+        bd[i] = gui_mix(bd[i], tint_color, tint_amt);
+}
+
+// Build the backdrop for wallpaper index wi. Any failure (a gradient
+// desktop, no thumbnail, a file over GLASS_RAW_CAP, a decode wider than the
+// plane) leaves the gradient, so the window never comes up on a blank
+// surface.
+static void glass_build(uint32_t *bd, int wi, uint32_t tint_color, int tint_amt,
+                        uint32_t grad_top, uint32_t grad_bottom) {
+    int ok = 0;
+    glass_fill_gradient(bd, grad_top, grad_bottom);
+    if (wi >= 0) {
+        static wp_entry_t wps[WP_MAX_ENTRIES];   // static: 96 entries are 7.5 KB
+        int n = wp_enumerate(wps, WP_MAX_ENTRIES);
+        if (wi < n && wps[wi].file[0]) {
+            char path[80];
+            strcpy(path, "/WPTHUMB/");
+            strncat(path, wps[wi].file, sizeof(path) - strlen(path) - 1);
+            int fd = sys_open(path, 0 /* O_RDONLY */);
+            if (fd >= 0) {
+                long got = sys_read(fd, g_glass_raw, GLASS_RAW_CAP);
+                sys_close(fd);
+                if (got > 0 && got < GLASS_RAW_CAP) {
+                    int dims[2] = {0, 0};
+                    int r = decode_image(g_glass_raw, (unsigned)got, GUI_GLASS_BD_W, GUI_GLASS_BD_H,
+                                         g_glass_tmp, sizeof(g_glass_tmp), dims);
+                    int sw = dims[0], sh = dims[1];
+                    if (r > 0 && sw >= 1 && sh >= 1 && sw <= GUI_GLASS_BD_W && sh <= GUI_GLASS_BD_H) {
+                        for (int y = 0; y < GUI_GLASS_BD_H; y++) {
+                            int sy = y * sh / GUI_GLASS_BD_H;
+                            for (int x = 0; x < GUI_GLASS_BD_W; x++) {
+                                int sx = x * sw / GUI_GLASS_BD_W;
+                                bd[y * GUI_GLASS_BD_W + x] = g_glass_tmp[sy * sw + sx] & 0x00FFFFFF;
+                            }
+                        }
+                        ok = 1;
+                    }
+                }
+            }
+        }
+    }
+    if (!ok) glass_fill_gradient(bd, grad_top, grad_bottom);
+    glass_blur_and_tint(bd, tint_color, tint_amt);
+}
+
+int gui_glass_backdrop_sync(uint32_t *bd, int *wi_state, uint32_t tint_color,
+                            int tint_amt, uint32_t grad_top, uint32_t grad_bottom) {
+    int wi = get_wallpaper();
+    if (wi == *wi_state) return 0;
+    *wi_state = wi;
+    glass_build(bd, wi, tint_color, tint_amt, grad_top, grad_bottom);
+    return 1;
+}
+
+void gui_glass_backdrop_blit(int handle, const uint32_t *bd) {
+    long packed = (long)((GUI_GLASS_BD_W & 0xFFFF) | ((GUI_GLASS_BD_H & 0xFFFF) << 16));
+    syscall5(SYS_WIN_BLIT, (long)handle, 0, 0, packed, (long)bd);
+}
+
+uint32_t gui_glass_backdrop_at(const uint32_t *bd, int win_w, int win_h, int x, int y) {
+    int dw = win_w > 0 ? win_w : 1, dh = win_h > 0 ? win_h : 1;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    int sx = x * GUI_GLASS_BD_W / dw, sy = y * GUI_GLASS_BD_H / dh;
+    if (sx >= GUI_GLASS_BD_W) sx = GUI_GLASS_BD_W - 1;
+    if (sy >= GUI_GLASS_BD_H) sy = GUI_GLASS_BD_H - 1;
+    return bd[sy * GUI_GLASS_BD_W + sx];
+}
+
 void gui_rounded_border(int handle, int x, int y, int w, int h, int r, uint32_t color) {
     if (w <= 0 || h <= 0) return;
     if (r*2 > w) r = w/2;
@@ -923,10 +1059,31 @@ void gui_button(int handle, int x, int y, int w, int h, const char *label,
                                            ink = gui_ink_on(base); bord = gui_ensure_contrast(gui_darken(base, 40), p->surface, GUI_FLOOR_NONTEXT); }
     else                                 { base = gui_mix(p->surface_raised, p->ink, 8); ink = p->ink; bord = p->edge_strong; }
     if (!disabled) {
-        if (st == GUI_ST_HOVER)        base = (variant==GUI_BTN_PRIMARY) ? p->accent_hover : gui_lighten(base, 18);
-        else if (st == GUI_ST_PRESSED) base = gui_darken(base, 18);
+        // (widgetglass) The authored shade (accent_hover, or the fixed
+        // lighten/darken) is kept wherever it already reads as a change; it
+        // is only replaced by gui_state_shade() where it does not, the same
+        // keep-if-it-clears rule gui_ensure_contrast() applies to colours.
+        // MEASURED: 11 of the 14 shipped themes author accent_hover equal to
+        // accent, the glass apps pass lighten(accent, 24) which is 1.03:1 on
+        // a mint accent, and lighten(18) of a white secondary fill is 1.00:1.
+        uint32_t rest = base;
+        if (st == GUI_ST_HOVER) {
+            base = (variant==GUI_BTN_PRIMARY) ? p->accent_hover : gui_lighten(base, 18);
+            if (gui_contrast_x100(base, rest) < GUI_HOVER_MIN) base = gui_state_shade(rest, 1);
+        } else if (st == GUI_ST_PRESSED) {
+            base = gui_darken(base, 18);
+            if (gui_contrast_x100(base, rest) < GUI_HOVER_MIN) base = gui_state_shade(rest, 0);
+        }
     } else {
-        base = gui_mix(base, p->surface, 150);
+        // (widgetglass) The fixed 150/255 mix is kept as the starting point
+        // (so palettes where it already lands close to the surface, which is
+        // every classic/light theme, are unchanged) and then bounded by the
+        // GUI_DISABLED_MAX_* ceilings against the surface the control sits on:
+        // see gui_style.h for the measurements that made this necessary. The
+        // outline was previously not faded at all (full 3:1+ strength around
+        // a dimmed fill is what made a dead button look live on a dark panel).
+        base = gui_limit_contrast(gui_mix(base, p->surface, 150), p->surface, GUI_DISABLED_MAX_FILL);
+        bord = gui_limit_contrast(gui_mix(bord, p->surface, 150), p->surface, GUI_DISABLED_MAX_EDGE);
         ink  = gui_mix(ink,  p->surface, 110);
         // (#appstyle) ...AND THEN GUARANTEE THE DISABLED LABEL IS STILL
         // READABLE. Both lines above walk toward p->surface by a FIXED amount,
@@ -1072,7 +1229,18 @@ void gui_toggle(int handle, int x, int y, int w, int h, bool on, gui_state_t st)
         if (!on) gui_rounded_border(handle, x, y, w, h, r, disabled ? gui_mix(p->field_border, p->surface, 140) : p->field_border);
         int kd = h - 6, kx = on ? (x + w - kd - 3) : (x + 3), ky = y + 3;
         if (g_style.shadows && !disabled) gui_fill_circle_aa(handle, kx+1, ky+1, kd, gui_mix(tr, 0x00000000, 45), tr);
-        gui_fill_circle_aa(handle, kx, ky, kd, 0x00FFFFFF, tr);
+        // (widgetglass) The knob stayed PURE WHITE in the disabled state while
+        // the track faded around it, so on a dark surface a disabled toggle
+        // kept its brightest, most "live" pixel (MEASURED 5.08:1 against its
+        // faded track on the glass palette, 11.2:1 on maytera_dark). Faded
+        // toward p->surface by the same 140/255 the classic branch's knob
+        // and the track already use: on a dark surface that lands at ~2:1
+        // against the track (dimmed, position still readable); on a light
+        // surface white mixed toward white is white, so nothing changes
+        // there. Deliberately NO contrast floor: a disabled knob must never
+        // be repaired to stand out MORE than the enabled white one does.
+        uint32_t knob = disabled ? gui_mix(0x00FFFFFF, p->surface, 140) : 0x00FFFFFF;
+        gui_fill_circle_aa(handle, kx, ky, kd, knob, tr);
     }
 }
 

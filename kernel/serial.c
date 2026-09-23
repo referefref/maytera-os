@@ -103,10 +103,32 @@ int serial_is_transmit_empty(uint16_t port) {
     return inb(port + SERIAL_LSR) & SERIAL_LSR_THRE;
 }
 
-// Read a character from serial port
+// Read a character from serial port.
+//
+// capspin (no-ticket): this used to be an UNBOUNDED while (!serial_received(port));
+// It had ZERO callers (its dos_getchar()/int21.c callers were deleted in #713),
+// so nothing paid for it, but an unbounded RX poll would hang the ENTIRE kernel
+// the moment anyone wired up a caller against a port that never receives. It is
+// capped BEFORE that happens, the same no-unbounded-busy-wait discipline (ticket
+// 426) serial_write already follows in this file: bound the poll and give up
+// loudly rather than freeze. When RX is ready the very first check passes, so a
+// live port is behaviour-identical. The bound is a plain iteration cap of the
+// same magnitude serial_write's THRE spin historically used; serial_read has no
+// caller and can run before mono_init(), so the calibrated time budget the TX
+// path now uses is deliberately not pulled in here.
+#define SERIAL_RX_MAX_SPINS 200000u
+volatile uint64_t g_serial_rx_timeouts = 0;   // times serial_read gave up
 char serial_read(uint16_t port) {
-    while (!serial_received(port));
-    return inb(port + SERIAL_DATA);
+    for (uint32_t spin = 0; spin < SERIAL_RX_MAX_SPINS; spin++) {
+        if (serial_received(port))
+            return inb(port + SERIAL_DATA);
+    }
+    // Loud give-up: no byte arrived within the cap. Return the -1 sentinel
+    // (0xFF as a char) instead of hanging; any future caller must check for it.
+    g_serial_rx_timeouts++;
+    kprintf("[SERIAL] serial_read: no RX on port 0x%x after %u polls, giving up\n",
+            port, (unsigned)SERIAL_RX_MAX_SPINS);
+    return (char)-1;
 }
 
 // #745 (task #69): how often the UART refused to drain, and the longest single
@@ -189,7 +211,7 @@ static void serial_write_locked(uint16_t port, char c) {
     // BOUNDED wait for the UART transmit-holding register to empty. An unbounded
     // poll here hangs the ENTIRE kernel when TX can't drain: e.g. QEMU's serial
     // chardev buffer fills because nothing is reading the serial socket, so the
-    // THRE bit never sets. That deterministically wedged VM <vmid>'s toram boot at
+    // THRE bit never sets. That deterministically wedged a test VM's toram boot at
     // "Starting desktop services..." (trapped RIP inside this loop, RDX=0x3F8 /
     // RBP=0x3FD). #426 no-unbounded-busy-wait discipline: cap the spin and drop
     // the char rather than freezing the machine. When TX is healthy the very

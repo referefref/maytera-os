@@ -19,6 +19,7 @@
 // established split in this tree (schedwatch.rs, sched_age.rs).
 
 #include "tickwatch.h"
+#include "tickack.h"    // #tickdead: BLOCKED vs ABSENT
 #include "pic.h"
 #include "apic.h"
 #include "mono.h"
@@ -28,6 +29,12 @@
 
 // Decisions, from rustkern/tickwatch.rs.
 extern int32_t  tick_health_verdict_rs(uint64_t dticks, uint64_t dms, uint32_t hz);
+// #tickdead: the BLAME decision, from rustkern/tickack.rs. Separates a tick
+// this kernel failed to ACKNOWLEDGE from one that was never DELIVERED. The two
+// produce an identical 8259 register shape, which is why the attribution below
+// used to have to guess between them.
+extern int32_t  tick_blame_rs(uint64_t dnative, uint64_t dms, uint32_t hz,
+                              uint32_t inflight, uint64_t ack_max_us);
 extern uint64_t tick_permille_rs(uint64_t dticks, uint64_t dms, uint32_t hz);
 extern uint32_t tick_watch_selftest_rs(void);
 
@@ -256,13 +263,40 @@ int tickwatch_poll(uint64_t ticks, uint64_t now_ms, uint32_t hz) {
                     "(mask bit 0 set). Something disabled the timer interrupt.\n");
             bootlog_write("[TICKSRC] DEAD: IRQ0 MASKED (imr=0x%02x)", dr.pic1_imr);
         } else if (dr.pic_isr & 0x01) {
-            kprintf("[TICKSRC] ATTRIBUTED: IRQ0 is UNMASKED but its IN-SERVICE "
-                    "bit is STUCK SET. A timer ISR did not reach its EOI, so the "
-                    "8259 will not deliver IRQ0 again until some other "
-                    "non-specific EOI clears it. This is a LOCKING bug, not a "
-                    "timer or routing bug.\n");
-            bootlog_write("[TICKSRC] DEAD: IRQ0 ISR BIT STUCK (isr=0x%04x) - missed EOI",
-                          dr.pic_isr);
+            // #tickdead: THE REGISTER SHAPE ALONE CANNOT TELL THESE APART, and
+            // this branch used to declare "a LOCKING bug" from it anyway. A set
+            // in-service bit says only that IRQ0 was DELIVERED and not
+            // acknowledged. That is equally true of a handler still waiting for
+            // a lock and of a handler that was killed and will never run, and
+            // the two have different fixes. The evidence that decides it is not
+            // in any register: it is whether a frame for this vector is between
+            // IDT entry and EOI right now, which is what cpu/tickack.c counts.
+            uint32_t infl   = tick_ack_inflight_pic();
+            uint64_t ackmax = g_tick_ack_max_us;
+            int blame = (int)tick_blame_rs(0, dms, hz, infl, ackmax);
+            if (blame == 1 /* TICK_BLAME_BLOCKED */) {
+                kprintf("[TICKSRC] ATTRIBUTED: IRQ0 was DELIVERED and THIS "
+                        "KERNEL did not acknowledge it. %u frame(s) are between "
+                        "IDT entry and EOI, and the worst acknowledgement so far "
+                        "took %lluus against a %lluus tick period. The 8259 will "
+                        "not raise IRQ0 again until that EOI is sent. This is "
+                        "ours, in the interrupt entry path, NOT a timer or "
+                        "routing fault.\n",
+                        infl, (unsigned long long)ackmax,
+                        (unsigned long long)(hz ? (1000000ull / hz) : 0));
+                bootlog_write("[TICKSRC] DEAD: IRQ0 BLOCKED by us (isr=0x%04x "
+                              "inflight=%u ackmax=%lluus earlyeoi=%d)",
+                              dr.pic_isr, infl,
+                              (unsigned long long)ackmax, g_tick_early_eoi);
+            } else {
+                kprintf("[TICKSRC] ATTRIBUTED: IRQ0's IN-SERVICE bit is set but "
+                        "no frame is in flight and every acknowledgement this "
+                        "kernel made was prompt. The bit was latched by "
+                        "something that never reached a handler at all.\n");
+                bootlog_write("[TICKSRC] DEAD: IRQ0 ISR BIT STUCK (isr=0x%04x) "
+                              "with nothing in flight - not an EOI we owed",
+                              dr.pic_isr);
+            }
         } else {
             kprintf("[TICKSRC] ATTRIBUTED: IRQ0 is unmasked and not in service, "
                     "so the 8259 believes it is idle. The interrupt is being "
@@ -323,7 +357,7 @@ int tickwatch_hb_field(char *buf, uint32_t cap) {
     //        it. Distinguishing that from a masked IRQ0 is the difference
     //        between a locking bug and an interrupt-routing bug, and the two
     //        have nothing in common except the symptom.
-    return snprintf(buf, cap,
+    int n = snprintf(buf, cap,
                     "tsrc=%s/%llu/%u ok1=%llums lapt=%llu "
                     "ic=%02x/%04x/%04x/%08x/%08x/%08x",
                     vs, (unsigned long long)tw_permille, tw_dead_windows,
@@ -331,6 +365,17 @@ int tickwatch_hb_field(char *buf, uint32_t cap) {
                     (unsigned long long)g_tick_src_lapic,
                     r.pic1_imr, r.pic_isr, r.pic_irr, r.lapic_lint0,
                     r.ioapic_redtbl0, r.ioapic_redtbl2);
+    // #tickdead: the acknowledgement latency rides along on THIS field rather
+    // than being threaded through main.c's format string, because it is the
+    // same measurement: `tsrc` says the clock stopped and `ack` says whether we
+    // are the reason. Splitting them across two edits of two files is how the
+    // next person ends up with one of the pair and not the other.
+    if (n > 0 && (uint32_t)n + 1 < cap) {
+        buf[n] = ' ';
+        int m = tick_ack_hb_field(buf + n + 1, cap - (uint32_t)n - 1);
+        if (m > 0) n += 1 + m; else buf[n] = '\0';
+    }
+    return n;
 }
 
 #ifdef TICKWATCH_FAULT_TEST

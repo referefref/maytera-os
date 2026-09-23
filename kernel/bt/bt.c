@@ -15,6 +15,7 @@
 #include "../string.h"
 #include "../fs/fat.h"
 #include "../mm/heap.h"
+#include "../fs/bootlog.h"
 
 extern fat_fs_t g_fat_fs;
 
@@ -34,6 +35,18 @@ volatile int g_bt_enable = 0;
 
 static bt_state_t g_bt_state = BT_STATE_OFF;
 static int        g_bt_scanning = 0;
+
+// bt-settings-ux (2026-09-16): latches an EXPLICIT bt_scan_stop() so the
+// background bt worker's opportunistic "keep scanning for HID devices" rescan
+// (hci_usb.c bt_worker, ~5s idle cadence) does not silently undo it. Before
+// this, Settings "Stop scanning" cleared g_bt_scanning for one tick and the
+// worker's own bt_scan_start() call a few ticks later flipped it straight back
+// on, so the UI kept showing "scanning" no matter how many times Stop was
+// clicked. Cleared on every explicit bt_scan_start() and on every bt_power()
+// transition (a fresh enable/disable is a fresh session, not a continuation of
+// a prior stop).
+static volatile int g_bt_scan_user_stopped = 0;
+int bt_scan_user_stopped(void) { return g_bt_scan_user_stopped; }
 
 // -----------------------------------------------------------------------------
 // Transport registry (glue between hci_usb.c and hci.c).
@@ -174,6 +187,23 @@ void bt_debug_scan_summary(void) {
                 d[i].addr.b[2], d[i].addr.b[1], d[i].addr.b[0],
                 d[i].addr_type ? "rand" : "pub", d[i].rssi, d[i].is_hid,
                 d[i].adv_type, d[i].name);
+    // btbootlog: persist the scan result to /BOOTLOG.TXT, but only when the
+    // device/HID counts CHANGE. This runs on a ~3s cadence, so mirroring every
+    // call would repeat the same list into the bootlog ring. One summary plus
+    // the device list per distinct scan state is enough to confirm what was seen.
+    {
+        static int last_n = -1, last_hid = -1;
+        if (n != last_n || hid != last_hid) {
+            last_n = n; last_hid = hid;
+            bootlog_write("[BT] scan: %d device(s) discovered (%d HID)", n, hid);
+            for (int i = 0; i < n && i < 12; i++)
+                bootlog_write("[BT]   %02x:%02x:%02x:%02x:%02x:%02x %s rssi=%d hid=%d adv=0x%02x '%s'",
+                              d[i].addr.b[5], d[i].addr.b[4], d[i].addr.b[3],
+                              d[i].addr.b[2], d[i].addr.b[1], d[i].addr.b[0],
+                              d[i].addr_type ? "rand" : "pub", d[i].rssi, d[i].is_hid,
+                              d[i].adv_type, d[i].name);
+        }
+    }
 }
 
 // One-shot diagnostic connect: if no HID device was found, connect to the
@@ -222,6 +252,8 @@ int bt_autostart(void) {
 
     kprintf("[BT] autostart: Bluetooth %s (default=%d, markers checked post-boot)\n",
             enable ? "ENABLED" : "disabled", BT_DEFAULT_ENABLE);
+    bootlog_write("[BT] autostart: Bluetooth %s (default=%d)",
+                  enable ? "ENABLED" : "disabled", BT_DEFAULT_ENABLE);
     if (enable) return bt_power(1);   // sets g_bt_enable + bt_init()
     g_bt_enable = 0;
     return BT_OK;
@@ -233,6 +265,11 @@ int bt_autostart(void) {
 static bt_pair_confirm_cb_t g_pair_confirm_cb = NULL;
 
 int bt_power(int on) {
+    // A power transition is a fresh session either way: an old Stop latch must
+    // not survive into the next enable (or the worker would never scan again
+    // after the first Stop click in a prior session), and turning off should
+    // not leave a stale latch behind either.
+    g_bt_scan_user_stopped = 0;
     if (on) {
         g_bt_enable = 1;
         return bt_init();
@@ -249,13 +286,24 @@ int bt_is_powered(void) {
 int bt_scan_start(void) {
     if (!bt_is_powered()) return BT_ERR_STATE;
     g_bt_scanning = 1;
+    g_bt_scan_user_stopped = 0;   // any successful start clears a prior Stop latch
     hci_disc_clear();
+    // Discover BOTH radios: a classic BR/EDR Inquiry (so a discoverable-only
+    // classic HID keyboard/mouse that never pages us is found) AND an LE active
+    // scan (HOGP keyboards/mice). Both are async and event-driven.
+    hci_classic_inquiry();
     return hci_le_scan(1);   // LE active scan (HOGP keyboards/mice)
 }
 
 int bt_scan_stop(void) {
     g_bt_scanning = 0;
+    g_bt_scan_user_stopped = 1;   // latch: the worker's idle rescan must not undo this
     hci_le_scan(0);
+    // Also cancel the classic BR/EDR Inquiry: it runs to its own Inquiry_Length
+    // (~10.24s) independent of the LE scan enable bit, so stopping only the LE
+    // side left a classic inquiry (and any Inquiry Result events it produces)
+    // running until it timed out on its own - the "Stop does nothing" bug.
+    hci_classic_inquiry_cancel();
     if (g_bt_state == BT_STATE_SCANNING) bt_set_state(BT_STATE_READY);
     return BT_OK;
 }
@@ -295,7 +343,7 @@ int bt_connect(const bt_addr_t *addr) {
     hci_disc_dev_t d;
     if (hci_disc_find(addr, &d) != BT_OK) return BT_ERR_NODEV;
     if (d.is_le) return hci_le_connect(&d.addr, d.addr_type);
-    return BT_ERR_NOTIMPL;   // classic connect: phase B
+    return hci_classic_connect(&d.addr);   // outbound BR/EDR page
 }
 
 int bt_pair(const bt_addr_t *addr) {
@@ -316,6 +364,21 @@ int bt_disconnect_dev(const bt_addr_t *addr) {
 int bt_forget(const bt_addr_t *addr) { return pair_forget(addr); }
 
 bt_state_t bt_status(void) { return g_bt_state; }
+
+int bt_get_state_info(bt_state_info_t *out) {
+    if (!out) return BT_ERR_PARAM;
+    memset(out, 0, sizeof(*out));
+    out->present   = bt_transport_present() ? 1 : 0;
+    out->driver_up = hci_is_ready() ? 1 : 0;
+    out->enabled   = g_bt_enable ? 1 : 0;
+    out->scanning  = g_bt_scanning ? 1 : 0;
+    out->state     = (int32_t)g_bt_state;
+    if (out->driver_up) {
+        const bt_addr_t *la = hci_local_addr();
+        if (la) out->local_addr = *la;
+    }
+    return BT_OK;
+}
 
 int bt_get_device(const bt_addr_t *addr, bt_device_t *out) {
     if (!addr || !out) return BT_ERR_PARAM;

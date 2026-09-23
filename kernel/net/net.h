@@ -106,6 +106,12 @@ uint32_t    net_fault_probe_grants(void);
 uint32_t    net_fault_probe_refused(void);
 int         net_fault_trip_rc(void);
 const char *net_fault_trip_host(void);
+// #httpdns: distinct hosts in the CURRENT failure streak, and the number of
+// streaks that reached the trip threshold but were held back because every
+// failure in them was to the SAME host (one dead destination is not evidence
+// the uplink is down).
+uint32_t    net_fault_streak_hosts(void);
+uint32_t    net_fault_held_back(void);
 
 // Current connectivity state (for the tray icon + Settings Network tab).
 net_conn_state_t net_get_conn_state(void);
@@ -149,7 +155,7 @@ void net_clear_fault(void);
 // sys_open(O_CREAT) on a path under it is refused for uid != 0. Worse, the
 // app's own failure breadcrumb (/SETLOG.TXT) is under "/" (root, 0755) and was
 // refused too, so the failure left NO trace anywhere: the panel updated, the
-// file never appeared, and nothing was logged. Measured on VM <vmid> after a
+// file never appeared, and nothing was logged. Measured on VM 2333 after a
 // real click on OK in Settings > Network > Configure IP.
 //
 // Persisting from Ring 0, in the SAME syscall that applies the change, makes
@@ -166,6 +172,7 @@ int net_persist_netcfg(void);
 // #381: start the background net worker (USB carrier polling + async DHCP/DAD).
 // Call once after preemption is enabled. See net.c.
 void net_start_worker(void);
+void netqa_start(void);  // netqa: gated end-to-end network census smoke test
 
 // Hot-plug NIC attach (no ticket, 2026-08-28). net_has_nic() is the single
 // definition of "a NIC is bound", asked by the USB probe path before it arms an

@@ -1,11 +1,13 @@
 // tcp.c - Transmission Control Protocol implementation
 #include "tcp.h"
+#include "../proc/capgate.h"   // Stage 0: handle-ownership rule
 #include "ip.h"
 #include "../serial.h"
 #include "../string.h"
 
 // #487: socket-ownership stamping needs only the current pid, not the PCB.
 extern uint32_t proc_current_pid(void);
+extern uint32_t proc_current_tgid(void);   // Stage 0: the tgid twin (proc/process.h)
 
 // External timer ticks (from ISR)
 extern volatile uint64_t timer_ticks;   // ISN/PRNG entropy only - NEVER a deadline (#499)
@@ -261,6 +263,23 @@ static tcp_conn_t* tcp_get_conn(int sock) {
     return conn;
 }
 
+// STAGE 0: report a slot's owning pid and thread group, for the Ring-3
+// ownership guard in proc/syscall.c. Returns 0 on success, -1 if the index is
+// out of range or the slot is not active.
+//
+// A READ-ONLY accessor rather than exporting `connections[]`, and deliberately
+// NOT a check: the OWNERSHIP DECISION belongs to rustkern/capgate.rs, which is
+// the one place that knows the thread-group rule. This function only answers
+// "who owns slot N".
+int tcp_conn_owner(int sock, uint32_t *owner_pid, uint32_t *owner_tgid) {
+    if (sock < 0 || sock >= TCP_MAX_CONNECTIONS) return -1;
+    tcp_conn_t *conn = &connections[sock];
+    if (!conn->active) return -1;
+    if (owner_pid)  *owner_pid  = conn->owner_pid;
+    if (owner_tgid) *owner_tgid = conn->owner_tgid;
+    return 0;
+}
+
 // Allocate a new connection slot
 static int tcp_alloc_conn(void) {
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
@@ -445,6 +464,13 @@ int tcp_socket(void) {
     // does not have to pull in the whole PCB definition; it returns 0 when
     // there is no current process, which reads as "unowned".
     connections[sock].owner_pid = proc_current_pid();
+    // STAGE 0: the owning thread group, through the SAME normaliser the check
+    // uses (rustkern/capgate.rs), so the stamp and the check cannot drift into
+    // disagreeing about what a thread group is. A disagreement here would show
+    // up as an intermittent, thread-dependent refusal, which is the hardest
+    // possible way to find it.
+    connections[sock].owner_tgid =
+        capgate_tgid_of_rs(proc_current_pid(), proc_current_tgid());
 
     kprintf("[TCP] Created socket %d\n", sock);
     return sock;
@@ -885,6 +911,9 @@ void tcp_handle(uint32_t src_ip_raw, const void *data, uint16_t length) {
                 // and using it would attribute inbound connections to random
                 // innocent processes.
                 conn->owner_pid = listener->owner_pid;
+                // STAGE 0: inherit the group too, for the same reason and from
+                // the same source. proc_current() is meaningless here (RX path).
+                conn->owner_tgid = listener->owner_tgid;
 
                 kprintf("[TCP] New connection from ");
                 ip_print(src_ip);

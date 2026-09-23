@@ -117,6 +117,8 @@ static int copy_field(const char **src, char *dst, size_t dst_size, char delim) 
 // standard PBKDF2 iteration loop over the existing HMAC. Stated per policy.
 // ============================================================================
 
+// >>> PBKDF2_SHADOW_KAT_REGION_BEGIN  (extracted verbatim by
+//     kernel/crypto/pbkdf2_shadow_kat.sh; keep this block self-contained)
 static const char HEX_CHARS[] = "0123456789abcdef";
 
 static void bytes_to_hex(const uint8_t *in, int n, char *out) {
@@ -204,6 +206,16 @@ static void make_pbkdf2_record(const char *password, const uint8_t *salt,
 // error. Constant-time on the final hash comparison.
 static int verify_against_record(const char *password, const char *username,
                                  const char *stored) {
+#ifdef PBKDF2_KAT_FAULT
+    /* HOST KAT RED-TEAM ONLY. The kernel build NEVER defines this flag (it
+       appears in no Makefile; grep the tree). pbkdf2_shadow_kat.sh compiles a
+       second copy WITH it to prove pbkdf2_shadow_selftest()'s reject checks
+       actually FIRE: an unconditional-accept verifier is the single most
+       dangerous auth bug, exactly the class this trust anchor must never be.
+       A KAT that could not catch it would be a no-op. See blame.md (authkat). */
+    (void)password; (void)username; (void)stored;
+    return 1;
+#endif
     if (strncmp(stored, "pbkdf2$", 7) == 0) {
         const char *p = stored + 7;
         // iters
@@ -251,6 +263,93 @@ static int verify_against_record(const char *password, const char *username,
         return ok;
     }
 }
+
+// ============================================================================
+// PBKDF2 + SHADOW verify known-answer + behavioural self-test (authkat).
+//
+// WHY: verify_against_record() is the password trust anchor for local login and
+// the ext2 /CONFIG SHADOW file. A passing build with real callers proves nothing
+// about whether it (a) computes PBKDF2-HMAC-SHA256 correctly and (b) REJECTS a
+// wrong password, a truncated record, or a flipped-byte record. This self-test
+// proves both. The negative (reject) checks are the security-relevant ones; the
+// guarded PBKDF2_KAT_FAULT branch in verify_against_record proves they are not
+// no-ops (RED->GREEN via kernel/crypto/pbkdf2_shadow_kat.sh, no VM needed).
+//
+// Justification for C (Rust-first mandate): this is a self-test OF existing C
+// that must call the file-static PBKDF2 helpers (pbkdf2_hmac_sha256,
+// make_pbkdf2_record, verify_against_record) in this same translation unit;
+// those statics are unreachable from a separate Rust TU. No new algorithm, no
+// float. Stated per policy.
+//
+// No secret is committed: RFC-style published PBKDF2-HMAC-SHA256 vectors
+// (P="password", S="salt", independently reproduced with hashlib.pbkdf2_hmac)
+// and a locally-built throwaway record only; never any live SHADOW content.
+// ============================================================================
+int pbkdf2_shadow_selftest(void) {
+    int fail = 0, checks = 0;
+
+    // (1) PBKDF2-HMAC-SHA256 KAT. dkLen == hLen == 32 (single output block).
+    static const struct { uint32_t c; const char *dk_hex; } KAT[] = {
+        { 1,    "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b" },
+        { 2,    "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43" },
+        { 4096, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a" },
+    };
+    for (unsigned t = 0; t < sizeof(KAT) / sizeof(KAT[0]); t++) {
+        uint8_t dk[PBKDF2_DK_LEN];
+        char got[PBKDF2_DK_LEN * 2 + 1];
+        pbkdf2_hmac_sha256((const uint8_t *)"password", 8,
+                           (const uint8_t *)"salt", 4, KAT[t].c, dk);
+        bytes_to_hex(dk, PBKDF2_DK_LEN, got);
+        checks++;
+        if (!ct_streq(got, KAT[t].dk_hex)) fail++;
+    }
+
+    // (2) Behavioural verify at the shipping work factor: ACCEPT the correct
+    // password, REJECT wrong / truncated / flipped-byte records.
+    const char *PW = "correct horse battery staple";
+    const char *USER = "kat";
+    uint8_t salt[PBKDF2_SALT_LEN];
+    for (int i = 0; i < PBKDF2_SALT_LEN; i++) salt[i] = (uint8_t)(0xA5 ^ i); // fixed test salt (NOT random; test-only)
+    char rec[PASSWORD_HASH_SIZE + 1];
+    make_pbkdf2_record(PW, salt, PBKDF2_ITERATIONS, rec);
+
+    checks++; if (verify_against_record(PW, USER, rec) != 1) fail++;               // accept correct
+    checks++; if (verify_against_record("wrong password", USER, rec) != 0) fail++; // reject wrong pw
+
+    { // truncated: drop the final hash hex char
+        char t[PASSWORD_HASH_SIZE + 1];
+        size_t n = strlen(rec);
+        memcpy(t, rec, n); t[n - 1] = '\0';
+        checks++; if (verify_against_record(PW, USER, t) != 0) fail++;
+    }
+    { // flipped byte: toggle one nibble of the stored hash
+        char t[PASSWORD_HASH_SIZE + 1];
+        size_t n = strlen(rec);
+        memcpy(t, rec, n + 1); t[n - 1] = (char)(t[n - 1] ^ 0x1);
+        checks++; if (verify_against_record(PW, USER, t) != 0) fail++;
+    }
+
+    // (3) Legacy bare-SHA256 record path: sha256hex(password || username).
+    {
+        char combined[64];
+        const char *lpw = "legacy", *luser = "user";
+        size_t pl = strlen(lpw), ul = strlen(luser);
+        memcpy(combined, lpw, pl); memcpy(combined + pl, luser, ul);
+        uint8_t d[SHA256_DIGEST_SIZE];
+        sha256(combined, pl + ul, d);
+        char lrec[SHA256_DIGEST_SIZE * 2 + 1];
+        bytes_to_hex(d, SHA256_DIGEST_SIZE, lrec);
+        checks++; if (verify_against_record(lpw, luser, lrec) != 1) fail++;        // accept legacy
+        checks++; if (verify_against_record("legacyX", luser, lrec) != 0) fail++;  // reject legacy wrong
+    }
+
+    kprintf("[PBKDF2-KAT] pbkdf2-sha256 vectors + shadow verify accept/reject : %s (checks=%d fail=%d)\n",
+            fail ? "FAIL" : "PASS", checks, fail);
+    bootlog_write("[PBKDF2-KAT] verify %s checks=%d fail=%d",
+                  fail ? "FAIL" : "PASS", checks, fail);
+    return fail;
+}
+// >>> PBKDF2_SHADOW_KAT_REGION_END
 
 // #307 real-hardware robustness: a single failed/short USB-MSC read of a
 // critical boot-path config file used to be indistinguishable from "the file

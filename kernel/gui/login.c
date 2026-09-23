@@ -1688,8 +1688,16 @@ int login_run(login_result_t *result) {
         // Draw
         login_draw();
 
-        // Yield CPU
-        proc_yield();
+        // #102/#180 (matches desktop.c): sleep the idle redraw wait instead of
+        // proc_yield(). proc_yield() keeps this proc READY so it is re-selected
+        // immediately, pegging a core at 100% and redrawing the login screen
+        // flat out for as long as nobody types. ~30 FPS is ample: the cursor
+        // blink is 500ms and keyboard/mouse are polled every iteration above,
+        // so a keystroke is still picked up promptly. Interactive path only;
+        // autologin returned from login_check_autologin() above without ever
+        // reaching this loop, so the fast-path never sleeps.
+        extern void proc_sleep(uint32_t ms);
+        proc_sleep(33);
     }
 }
 

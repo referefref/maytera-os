@@ -34,6 +34,13 @@ typedef struct {
 
 // #QUIETBOOT: bits of boot_info_t.diag_flags. See the field's comment below.
 #define BOOT_DIAG_SCREEN  0x1ULL   // on-screen boot diagnostics armed
+// #remotedeploy: the loader could not use \boot\kernel.elf (absent, or it
+// failed the ELF/length validation that a torn write fails) and booted
+// \boot\kernel.elf.bak instead. The machine is UP, but it is NOT running the
+// kernel that was last installed on it. This must be reported, not inferred:
+// the target iMac has no usable serial console, so the only way anyone finds
+// out is the /BOOTLOG.TXT line the kernel writes from this bit.
+#define BOOT_DIAG_BACKUP_KERNEL 0x2ULL
 
 // Framebuffer pixel format
 #define PIXEL_FORMAT_RGB  0  // Red-Green-Blue (8 bits each)

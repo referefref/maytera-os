@@ -87,6 +87,33 @@ void     bootlog_heartbeat_stats(uint64_t *beats, uint64_t *flushes);
 // (the kernel shell's `hblog`). Returns its length; *out points at the ring.
 uint32_t bootlog_heartbeat_ring(const char **out);
 
+// #dosmem: HAND A PERIODIC COUNTERS RECORD TO THE HEARTBEAT FROM A CONTEXT
+// THAT MUST NOT TOUCH THE MEDIUM.
+//
+// The scheduler/BKL counters are computed in sched_smp_report(), which runs
+// inside sched_tick(), which runs inside the TIMER ISR with RFLAGS.IF clear and
+// the BKL held. Every sink this file already offers is wrong for that context:
+// bootlog_write() enters the storage stack (and its own #745/#69 guard would
+// simply decline the line), bootlog_heartbeat() may flush, and
+// bootlog_fault_write()'s 2 KB ring is drained straight into /BOOTLOG.TXT,
+// which on the FAT ESP is a WHOLE-FILE REWRITE - at a 4 s cadence that is the
+// #373 mechanism, not a diagnostic.
+//
+// So the producer PUBLISHES and the consumer WRITES. This call does nothing
+// but memcpy into one static slot and set a length: no lock, no allocation, no
+// filesystem, safe from an ISR or a cli+spinlock section. The next
+// bootlog_heartbeat() beat (an ordinary kernel thread, interrupts on) appends
+// it to the SAME bounded ring the [HB] line uses, so it inherits that ring's
+// 30-minute / late-beat-anomaly / panic flush schedule and costs ZERO extra
+// device writes.
+//
+// ONE SLOT, NEWEST WINS, AND THE LOSS IS COUNTED. A producer faster than the
+// 2 s consumer overwrites, which is correct for a periodic snapshot (the newest
+// window is the interesting one) but must not be silent - this tree has paid
+// repeatedly for guards that drop evidence without saying so. The overwrite
+// count is reported in the record itself as `notedrop=`.
+void bootlog_heartbeat_note(const char *line);
+
 // #433 (re-scoped) USB descriptor / HID-enumeration diagnostic. Appends a line
 // to /USBLOG.TXT (own RAM buffer, flushed by the same bootlog_arm()). Use for
 // per-device descriptor dumps and the runtime HID enumeration decisions
@@ -134,6 +161,21 @@ int  bootlog_fault_flush(void);
 // any sink dropped because its RAM buffer was full. Both are zero on a healthy
 // boot; non-zero means the on-disk breadcrumb files are incomplete.
 uint32_t bootlog_fault_lost(void);
+// #dosmem: THE FAULT RING'S RAW BYTES, so a caller that cannot use
+// bootlog_fault_flush() can still get them out.
+//
+// bootlog_fault_flush() reaches the medium through bootlog_write(), which is
+// correct for the ordinary case and useless for the one that matters most: on a
+// KERNEL panic the CPU halts inside the handler, no safe context ever runs, and
+// every [FAULTLOG] record dies in RAM. fs/panic.c already persists the
+// HEARTBEAT ring at that moment (panic.c, after the panic record itself is
+// down) and does not persist this one, so a [WQBLOCK], [STACKSAVE] or
+// [SCHEDRACE] record written microseconds before a panic is lost precisely when
+// it is the whole explanation.
+//
+// This is the read side only; it takes no lock, writes nothing, and is safe
+// from the panic path. Returns the length and points *out at the ring.
+uint32_t bootlog_fault_ring(const char **out);
 uint64_t bootlog_dropped_bytes(void);
 
 // Lines that did not fit the 256-byte per-line format buffer, and the total
@@ -145,6 +187,13 @@ uint64_t bootlog_dropped_bytes(void);
 // to override the decision.
 uint32_t bootlog_truncated_lines(void);
 uint32_t bootlog_truncated_bytes(void);
+
+// #imachang: record that THIS boot reached a usable desktop. Called once, from
+// the compositor-handoff point in gui/desktop.c. The next boot reads the mark
+// back out of /BOOTLOG.TXT and uses it to decide whether the log it is about to
+// overwrite was a HUNG boot worth preserving as /BOOTLOG.PRV. See the long
+// comment above bootlog_rotate_previous() in bootlog.c.
+void bootlog_mark_boot_complete(void);
 
 void bootlog_defer_begin(void);
 void bootlog_defer_end(void);

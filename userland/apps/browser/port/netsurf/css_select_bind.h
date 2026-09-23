@@ -15,7 +15,23 @@ typedef struct mcs_ctx mcs_ctx;
 /* Create a selection context seeded with a built-in UA stylesheet. */
 mcs_ctx *mcs_create(void);
 
-/* Append author CSS source text (e.g. from a <style> element). 0 on success. */
+/*
+ * Tell the context how big the viewport is, in CSS px. This is NOT cosmetic:
+ * it is what @media conditions are evaluated against and what vw/vh resolve to.
+ * It was hardcoded to 1024x768 while the browser laid out at ~760, so a page
+ * with a responsive breakpoint was styled for a viewport the user did not have.
+ * Call this BEFORE adding any author CSS; the custom-property resolver needs it.
+ */
+void mcs_set_viewport(mcs_ctx *c, int w, int h);
+
+/*
+ * Append author CSS source text (e.g. from a <style> element). 0 on success.
+ *
+ * The text is run through cssvar_preprocess() first, which resolves CSS custom
+ * properties and the clamp()/min()/max()/calc() math functions. libcss supports
+ * none of those, and on a modern stylesheet they carry most of the palette and
+ * the whole spacing scale. See cssvar.h.
+ */
 int mcs_add_author_css(mcs_ctx *c, const char *css, unsigned long len);
 
 /* Compute the style for a libdom element node. Caller must

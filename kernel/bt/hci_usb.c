@@ -79,6 +79,14 @@ typedef struct {
 
 static bt_usb_ctx_t g_ctx;
 
+// [bthid] ACL RX diagnostics: prove whether inbound ACL is being reaped from
+// the bulk-IN endpoint at all (splits a transport RX defect from an L2CAP
+// dispatch defect). Cleared implicitly (BSS zero).
+static uint32_t g_aclrx_submits;   // bulk-IN TDs armed
+static uint32_t g_aclrx_reaps;     // bulk-IN TDs that completed with data
+static uint32_t g_aclrx_errs;      // bulk-IN completions that were errors/stalls
+static uint32_t g_aclrx_hb;        // poll counter for the heartbeat
+
 #define BT_EVT_BUF_LEN  260     // max HCI event = 2 hdr + 255 params
 #define BT_ACL_BUF_LEN  2048
 
@@ -152,11 +160,30 @@ static int bt_evt_reap(uint8_t *out, int cap) {
     return 0;
 }
 
+// [bthid] Dump the controller's OUTPUT endpoint context for a DCI: state (0=disabled
+// 1=running 2=halted 3=stopped 4=error), type, mps, TR dequeue. This is what
+// distinguishes "endpoint not running" from "endpoint running but device sends
+// nothing". Reads dev_ctx by byte offset (context_size honours CSZ 32/64).
+static void bt_dump_ep(const char *tag, int dci) {
+    if (!g_ctx.present || !g_ctx.xhc || dci < 0) return;
+    xhci_device_ctx_t *dc = g_ctx.xhc->dev_ctx[g_ctx.slot_id - 1];
+    if (!dc) { bootlog_write("[BT-ACLRX] %s dci=%d NO-DEVCTX", tag, dci); return; }
+    uint32_t cs = g_ctx.xhc->context_size;
+    xhci_ep_ctx_t *ep = (xhci_ep_ctx_t *)((uint8_t *)dc + cs * dci);
+    uint64_t deq = ep->tr_dequeue;
+    bootlog_write("[BT-ACLRX] %s dci=%d state=%u type=%u mps=%u cerr=%u deq=%08x:%08x",
+                  tag, dci, ep->ep_state, ep->ep_type, ep->max_packet, ep->cerr,
+                  (uint32_t)(deq >> 32), (uint32_t)deq);
+    kprintf("[BT-ACLRX] %s dci=%d state=%u type=%u mps=%u deq=%08x\n",
+            tag, dci, ep->ep_state, ep->ep_type, ep->max_packet, (uint32_t)deq);
+}
+
 static void bt_acl_in_submit(void) {
     if (!g_ctx.present || g_ctx.acl_in_dci < 0 || g_ctx.acl_in_pending) return;
     if (xhci_int_in_submit(g_ctx.xhc, g_ctx.slot_id, g_ctx.acl_in_dci,
                            (uint64_t)g_ctx.acl_in_buf, BT_ACL_BUF_LEN) == 0) {
         g_ctx.acl_in_pending = 1;
+        g_aclrx_submits++;
     }
 }
 
@@ -189,10 +216,23 @@ static int hci_usb_send_acl(const uint8_t *data, uint16_t len) {
         uint32_t done = 0;
         int r = xhci_int_in_poll(g_ctx.xhc, g_ctx.slot_id, g_ctx.acl_out_dci,
                                  &done, len);
-        if (r > 0) return BT_OK;
-        if (r < 0) return BT_ERR_HCI;
+        if (r > 0) {
+            static uint32_t nok = 0;
+            if (nok++ < 12)
+                bootlog_write("[BT-ACLTX] bulk-OUT sent %u bytes (dci=%d) OK after %dms",
+                              done, g_ctx.acl_out_dci, i);
+            return BT_OK;
+        }
+        if (r < 0) {
+            bootlog_write("[BT-ACLTX] bulk-OUT ERROR (dci=%d last_cc=0x%02x)",
+                          g_ctx.acl_out_dci,
+                          xhci_xfer_last_error(g_ctx.slot_id, g_ctx.acl_out_dci));
+            return BT_ERR_HCI;
+        }
         xhci_delay_ms(1);
     }
+    bootlog_write("[BT-ACLTX] bulk-OUT TIMEOUT (dci=%d, %u bytes never completed)",
+                  g_ctx.acl_out_dci, len);
     return BT_ERR_TIMEOUT;
 }
 
@@ -217,19 +257,61 @@ static void hci_usb_poll(void) {
     int n = bt_evt_reap(evt, sizeof(evt));
     if (n > 0) bt_transport_deliver_event(evt, (uint16_t)n);
 
-    bt_acl_in_submit();
-    uint32_t got = 0;
-    int r = xhci_int_in_poll(g_ctx.xhc, g_ctx.slot_id, g_ctx.acl_in_dci, &got,
-                             BT_ACL_BUF_LEN);
+    // [bthid] Pump the ACL bulk-IN endpoint. This is where inbound L2CAP (SSP
+    // is HCI-event driven, but HID reports and every L2CAP signalling PDU arrive
+    // here). Guard the poll on a configured endpoint so a -1 dci is a clean no-op.
     if (g_ctx.acl_in_dci >= 0) {
+        bt_acl_in_submit();
+        uint32_t got = 0;
+        int r = xhci_int_in_poll(g_ctx.xhc, g_ctx.slot_id, g_ctx.acl_in_dci, &got,
+                                 BT_ACL_BUF_LEN);
         if (r > 0) {
             g_ctx.acl_in_pending = 0;
-            if (got > 0) bt_transport_deliver_acl(g_ctx.acl_in_buf, (uint16_t)got);
+            g_aclrx_reaps++;
+            if (got > 0) {
+                const uint8_t *b = g_ctx.acl_in_buf;
+                bootlog_write("[BT-ACLRX] reaped %u bytes hf=%02x%02x dlen=%02x%02x l2=%02x%02x cid=%02x%02x",
+                              got, b[1], b[0], b[3], b[2],
+                              got > 5 ? b[5] : 0, got > 4 ? b[4] : 0,
+                              got > 7 ? b[7] : 0, got > 6 ? b[6] : 0);
+                kprintf("[BT-ACLRX] reaped %u bytes (first: %02x %02x %02x %02x %02x %02x %02x %02x)\n",
+                        got, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+                bt_transport_deliver_acl(g_ctx.acl_in_buf, (uint16_t)got);
+            }
             bt_acl_in_submit();
         } else if (r < 0) {
+            // #133/#426: a bulk-IN completion that STALLED/errored leaves the
+            // endpoint HALTED - it then ignores every doorbell, so a plain
+            // re-submit can never recover it and inbound ACL is dead for the rest
+            // of the boot. The interrupt-IN (HID) path already recovers here; the
+            // ACL bulk-IN path never did. Reset the endpoint, rewind the ring,
+            // then re-arm.
             g_ctx.acl_in_pending = 0;
+            g_aclrx_errs++;
+            uint8_t le = xhci_xfer_last_error(g_ctx.slot_id, g_ctx.acl_in_dci);
+            bootlog_write("[BT-ACLRX] bulk-IN error (last_cc=0x%02x) dci=%d: recovering endpoint",
+                          le, g_ctx.acl_in_dci);
+            kprintf("[BT-ACLRX] bulk-IN error last_cc=0x%02x dci=%d; recovering\n",
+                    le, g_ctx.acl_in_dci);
+            xhci_recover_endpoint(g_ctx.xhc, g_ctx.slot_id, g_ctx.acl_in_dci);
             bt_acl_in_submit();
         }
+    }
+
+    // [bthid] Heartbeat (~5s at the 50ms poll cadence): the single line that
+    // says whether ACL RX is alive. reaps==0 while a connection exists means the
+    // dongle is delivering NO inbound ACL (transport-layer defect); reaps>0 with
+    // no L2CAP progress means a dispatch defect further up.
+    if (++g_aclrx_hb % 100 == 0) {
+        bootlog_write("[BT-ACLRX] hb dci=%d submits=%u reaps=%u errs=%u pending=%d conns=%d",
+                      g_ctx.acl_in_dci, g_aclrx_submits, g_aclrx_reaps,
+                      g_aclrx_errs, g_ctx.acl_in_pending, hci_conn_count());
+        kprintf("[BT-ACLRX] hb dci=%d submits=%u reaps=%u errs=%u pending=%d conns=%d\n",
+                g_ctx.acl_in_dci, g_aclrx_submits, g_aclrx_reaps,
+                g_aclrx_errs, g_ctx.acl_in_pending, hci_conn_count());
+        bt_dump_ep("evt", g_ctx.evt_dci);
+        bt_dump_ep("acl-in", g_ctx.acl_in_dci);
+        bt_dump_ep("acl-out", g_ctx.acl_out_dci);
     }
 }
 
@@ -737,8 +819,13 @@ static void bt_worker(void *arg) {
     extern int  bt_scan_start(void);
     extern void bt_debug_scan_summary(void);
     extern int  bt_debug_try_connect(void);
+    extern int  bt_scan_user_stopped(void);   // bt-settings-ux: honor an explicit Stop
 
-    int scan_kicked = 0, ticks = 0, connect_tried = 0;
+    int scan_kicked = 0, ticks = 0, prev_conns = 0, rescan_ticks = 0;
+    (void)bt_debug_try_connect;   // [bthid] diag-connect to random advertisers
+                                  // retired: it disabled the LE scan and burned the
+                                  // connection slot on non-HID peers. HID devices
+                                  // are auto-targeted by gatt on discovery instead.
     for (;;) {
         bt_poll();
         // Once the controller finishes bring-up, start an LE scan so HOGP
@@ -752,8 +839,33 @@ static void bt_worker(void *arg) {
         if (scan_kicked) {
             ticks++;
             if (ticks % 60 == 0 && ticks <= 360) bt_debug_scan_summary();  // ~3s cadence
-            // ~10s in: if no HID device appeared, exercise the connect/ATT path.
-            if (!connect_tried && ticks == 200) { connect_tried = 1; bt_debug_try_connect(); }
+            // [bthid] KEEP SCANNING for HID devices. hci_le_connect() disables the
+            // LE scan before every connection attempt and nothing turned it back
+            // on, so an HID device that advertised AFTER the first attempt (or
+            // reconnected after a drop) was never re-discovered. Resume scanning
+            // whenever the radio is idle: right after a link drops, and as a
+            // periodic safety net if we are sitting with no connection.
+            //
+            // bt-settings-ux (2026-09-16): but NOT when the user explicitly hit
+            // Stop in Settings. Before the bt_scan_user_stopped() guard, this
+            // ~5s cadence silently called bt_scan_start() again after every
+            // Stop click, which is why "Stop scanning" looked like a no-op: the
+            // UI's own scan-stop worked for a moment and then the worker turned
+            // scanning right back on. The guard is cleared by the next explicit
+            // bt_scan_start() or bt_power() transition, so a fresh Scan click or
+            // a Bluetooth off/on cycle resumes the idle-rescan safety net.
+            int nc = hci_conn_count();
+            if (g_bt_enable && hci_is_ready() && nc == 0 && !bt_scan_user_stopped()) {
+                rescan_ticks++;
+                if (prev_conns > 0 || rescan_ticks >= 100) {   // ~5s cadence
+                    rescan_ticks = 0;
+                    kprintf("[BT] idle: (re)starting LE scan for HID devices\n");
+                    bt_scan_start();
+                }
+            } else {
+                rescan_ticks = 0;
+            }
+            prev_conns = nc;
         }
         proc_sleep(50);
     }

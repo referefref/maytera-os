@@ -26,6 +26,33 @@
 #define DNS_MAX_RETRIES     3
 #define DNS_BACKOFF_BASE_MS 200  // base spacing between attempts (+jitter)
 #define DNS_SEND_RETRIES    4    // transient send (ARP-not-ready) retries
+// #netfix2: how long the CONFIGURED resolver gets on its own before the same
+// question is also put to the network's own resolver. 400ms is comfortably more
+// than a LAN or a nearby public resolver needs (a local ICS/router proxy answers
+// in single-digit ms) and small enough that a user does not perceive it. The
+// alternative, lowering DNS_FAILOVER_AFTER, would abandon the user's chosen
+// resolver on one dropped packet; a hedge never abandons anything, it only
+// asks a second time.
+#define DNS_HEDGE_MS        400
+
+// #dnsfallback: A LONGER FUSE WHEN THE HEDGE WOULD LEAVE THE NETWORK.
+//
+// The hedge candidate can now be a PUBLIC resolver, which is what rescues a
+// machine whose whole local network is one silent host. But 400ms is a short
+// fuse, and a LAN resolver that is merely SLOW - a cold cache, a router still
+// waking its upstream link, the first lookup after DHCP - is not a broken one.
+// At 400ms the first lookup of every boot on a slow-but-healthy network would
+// send a copy of the user's query to Cloudflare, and if the public answer won
+// the race the machine would adopt it for the whole boot and stop seeing the
+// LAN's internal names.
+//
+// So an OFF-NETWORK hedge waits longer before it fires. 1200ms is chosen to sit
+// clearly above a slow-but-working resolver and clearly below DNS_TIMEOUT_MS *
+// DNS_MAX_RETRIES: the owner's twelve-second failure becomes a ~1.2s one on the
+// first lookup and is free afterwards, because the resolver that answered is
+// then remembered. A hedge to a LOCAL candidate keeps the original 400ms; there
+// is nothing to be careful about in asking the machine's own gateway.
+#define DNS_HEDGE_PUBLIC_MS 1200
 
 // DNS record types
 #define DNS_TYPE_A 1
@@ -103,7 +130,7 @@ void dns_set_server(uint32_t server_ip);
 // even PRINTED it, and NOBODY EVER CALLED dns_set_server() with it. The
 // resolver stayed on dns_init()'s compiled-in 8.8.8.8 on every DHCP machine
 // that has ever booted this kernel, while Settings displayed the offered
-// address as though it were in use. Measured on VM <vmid> / build 2054:
+// address as though it were in use. Measured on VM 2333 / build 2054:
 // `[NETDIAG] ... dhcp=BOUND ... dns=8.8.8.8` with the lease offering
 // 192.0.2.1, and a packet capture of the guest querying 8.8.8.8.
 //
@@ -115,12 +142,20 @@ void dns_set_server_dhcp(uint32_t server_ip);
 // 1 if the resolver was chosen explicitly (config file or user), 0 if it is
 // still the boot default or a DHCP-supplied value.
 int dns_server_is_pinned(void);
+// #netfix2: clear an explicit resolver choice and go back to whatever the
+// network offers. The only route back from a pin; see dns.c for why one was
+// needed. Safe to call when nothing is pinned.
+void dns_set_server_auto(void);
 
 // Resolve hostname to IPv4 address (host byte order)
 // Returns 0 on success, negative on error
 int dns_resolve(const char *hostname, uint32_t *ip_out);
-int dns_resolve_start(const char *hostname, uint32_t *ip_out);
-int dns_resolve_check(uint32_t *ip_out);
+// #httpdns: `owner` identifies the CALLING PROCESS (thread-group id). This
+// pair has no handle in its syscall ABI, so the owner is how a poll finds the
+// lookup it started. Two processes resolving at once used to share the
+// machine's single query record and read each other's answers.
+int dns_resolve_start(const char *hostname, uint32_t *ip_out, uint32_t owner);
+int dns_resolve_check(uint32_t *ip_out, uint32_t owner);
 
 // Clear DNS cache
 void dns_cache_clear(void);

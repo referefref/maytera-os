@@ -710,7 +710,7 @@ deletion with a feature and make the rollback of either harder.
 
 ## 18. Slice 1: what was built, and the evidence it ran
 
-MEASURED on 2026-08-06, kernel build 1713, throwaway VM <vmid> (kvm64, USB-MSC
+MEASURED on 2026-08-06, kernel build 1713, throwaway VM 2712 (kvm64, USB-MSC
 live boot of golden 1025 with this kernel and one test app overlaid; VM and both
 LVs destroyed afterwards).
 
@@ -842,7 +842,7 @@ Stated so a green run is not over-read:
 ## 19. Slice 2: the fold, and the evidence it runs
 
 MEASURED on 2026-08-07, kernel builds 1754 (green), 1755 (deliberately broken)
-and 1756 (restored, green again), throwaway VM <vmid> (kvm64, USB-MSC live boot of
+and 1756 (restored, green again), throwaway VM 2716 (kvm64, USB-MSC live boot of
 golden 1744 with this kernel and one test app overlaid; VM and both LVs destroyed
 afterwards).
 

@@ -25,7 +25,9 @@
 #define SHELL       "/bin/sh"
 #define WIZARD      0
 #define NUMSCORES   10
-#define NUMNAME     80
+#ifndef NUMNAME
+#define NUMNAME     "Ten"
+#endif
 #define ALLOC(x)    malloc(x)
 #define PACK_LIMIT  23
 #define PATH_MAX    256

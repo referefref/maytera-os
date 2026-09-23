@@ -1,0 +1,38 @@
+cutils-maytera.patch - MayteraOS target adaptation for QuickJS-ng cutils.h.
+
+WHY. cutils.h selects its allocator header by platform. Because this port
+cross-compiles as x86_64-linux-gnu, the __linux__ branch would #include
+<malloc.h> (for malloc_usable_size), a header the MayteraOS freestanding libc
+does not provide. This patch adds a MAYTERAOS branch (selected by -DMAYTERAOS in
+the recipe's cflags) that is tested BEFORE the __linux__ branch and:
+  - skips <malloc.h>, and
+  - makes js__malloc_usable_size() return 0, exactly as cutils.h's own generic
+    #else fallback does. QuickJS already handles a 0 here: it declines the
+    in-place string-concat optimisation (quickjs.c uses the value as a >= guard)
+    and reports 0 in JS_ComputeMemoryUsage stats. No behaviour is lost beyond
+    those two, both of which are optional.
+
+This is a target adaptation, not a bug fix. The engine source is otherwise
+byte-for-byte unaltered, so there is no frozen copy of upstream to rot at the
+next version bump: only these two small hunks.
+
+--- a/cutils.h
++++ b/cutils.h
+@@ -52,6 +52,8 @@
+ #endif
+ #if defined(__APPLE__)
+ #include <malloc/malloc.h>
++#elif defined(MAYTERAOS)
++/* MayteraOS: no malloc.h; see ports/quickjs patch */
+ #elif defined(__linux__) || defined(__ANDROID__) || defined(__CYGWIN__) || defined(__GLIBC__)
+ #include <malloc.h>
+ #elif defined(__FreeBSD__)
+@@ -604,6 +606,8 @@
+     return malloc_size(ptr);
+ #elif defined(_WIN32)
+     return _msize((void *)ptr);
++#elif defined(MAYTERAOS)
++    return 0; /* MayteraOS libc does not expose usable size */
+ #elif defined(__linux__) || defined(__ANDROID__) || defined(__CYGWIN__) || defined(__FreeBSD__) || defined(__GLIBC__)
+     return malloc_usable_size((void *)ptr);
+ #else

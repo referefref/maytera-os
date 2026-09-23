@@ -244,6 +244,13 @@ void socket_net_wake(void) {
     wake_up_all(&g_net_rx_wq);
 }
 
+// #httpsddl: expose the shared RX wait queue so the in-kernel HTTPS/TLS recv
+// path (net/https.c) can wait_event_timeout() on the SAME queue this layer's
+// blocking recv uses. socket_net_wake() above wakes it on every delivered frame.
+struct wait_queue_head *net_rx_waitq(void) {
+    return &g_net_rx_wq;
+}
+
 // ---- fd <-> sock resolution ----
 static sock_t *sock_from_fd(int fd) {
     file_t *f = fd_get(fd);

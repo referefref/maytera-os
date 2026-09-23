@@ -1,0 +1,67 @@
+# mports recipe: Expat 2.7.1, the self-contained XML pull-parser. Item 2 of the
+# 2026-09 library-ports batch. Expat is a stream-oriented (SAX-style) XML
+# parser: you feed it bytes and it calls your handlers for elements, attributes
+# and character data. No DOM, no allocation policy imposed on the caller beyond
+# malloc/free.
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA.
+
+name=expat
+version=2.7.1
+class=A
+homepage=https://libexpat.github.io/
+
+# The official GitHub release asset for tag R_2_7_1. sha256 below is of THIS
+# file and was MEASURED on the build container, not copied from a web page:
+#   wget -O expat-2.7.1.tar.gz https://github.com/libexpat/libexpat/releases/download/R_2_7_1/expat-2.7.1.tar.gz
+#   sha256sum -> 0cce2e6e69b327fc607b8ff264f4b66bdf71ead55a87ffd5f3143f535f15cfa2
+source_url=https://github.com/libexpat/libexpat/releases/download/R_2_7_1/expat-2.7.1.tar.gz
+tarball=expat-2.7.1.tar.gz
+sha256=0cce2e6e69b327fc607b8ff264f4b66bdf71ead55a87ffd5f3143f535f15cfa2
+srcdir=expat-2.7.1
+
+licence=MIT
+licence_files=COPYING
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): USES. Expat is pure computation over
+# caller-supplied byte buffers; it calls back into handlers the caller
+# registers. The only platform surface the library files touch is malloc/free
+# and the string/memory helpers, plus clock()/getpid() for the hash-salt
+# mitigation. No event loop, no main(), no filesystem, no window system.
+adoption=USES. Push-parser over caller-supplied byte buffers with caller-registered callbacks; the only platform surface is malloc/free, memcpy/memcmp and clock()/getpid() for the hash-salt mitigation. It never wants to own the process.
+
+needs=libc
+
+prepare=none
+
+# Our one delta: a first-party lib/expat_config.h. Expat's sources
+# #include "expat_config.h" unconditionally, and upstream's generated copy
+# assumes Linux getrandom/arc4random/mmap/dlfcn. Our header configures the honest
+# MayteraOS build and selects XML_POOR_ENTROPY (clock()^getpid()) for the hash
+# salt, which is a hash-flooding mitigation, not a crypto key. Added as a NEW
+# file by patch (the musl-regex precedent for first-party files inside an
+# upstream tree); it carries an SPDX tag and the MayteraOS copyright line.
+patches=0001-maytera-expat-config.patch
+
+build=objects
+
+# The three core translation units. xmltok_impl.c and xmltok_ns.c are #included
+# by xmltok.c (they are not standalone TUs) and must NOT be compiled separately.
+sources=lib/xmlparse.c lib/xmlrole.c lib/xmltok.c
+
+exclude=lib/xmltok_impl.c lib/xmltok_ns.c
+exclude_reason=Both are #included textually by lib/xmltok.c (upstream's own multi-instantiation trick for the byte-encoding tables), not compiled as separate translation units. Listing them in sources would define every xmltok symbol twice and fail the link.
+
+# XML_DTD: parse <!DOCTYPE> internal/external subsets. XML_NS: namespace
+# processing. XML_CONTEXT_BYTES=1024: upstream's default retained context window
+# for XML_GetInputContext. XML_GE defaults to 1 (general-entity / billion-laughs
+# accounting on).
+cflags=-DXML_DTD -DXML_NS -DXML_CONTEXT_BYTES=1024 -DXML_GE=1
+
+headers=lib/expat.h lib/expat_external.h
+lib=libexpat.a
+
+# THE ANTI-NO-OP CHECK. Proven defined in libexpat.a by nm. The parser
+# lifecycle, the feed API and the core handler registration surface.
+symbols=XML_ExpatVersion XML_ParserCreate XML_ParserCreateNS XML_ParserFree XML_Parse XML_ParseBuffer XML_GetBuffer XML_SetUserData XML_SetElementHandler XML_SetStartElementHandler XML_SetEndElementHandler XML_SetCharacterDataHandler XML_GetErrorCode XML_ErrorString XML_SetBase

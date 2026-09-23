@@ -1,0 +1,61 @@
+# mports recipe: libyaml 0.2.5, the reference C YAML 1.1 parser and emitter.
+# Item 3 of the 2026-09 library-ports batch. Immediately useful to the AI
+# tool-contract layer, whose per-app tool contracts are authored in YAML
+# (docs memory: #292/#293/#294 per-app YAML tool contracts).
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA.
+
+name=libyaml
+version=0.2.5
+class=A
+homepage=https://github.com/yaml/libyaml
+
+# The official GitHub release asset for tag 0.2.5. sha256 below is of THIS file
+# and was MEASURED on the build container, not copied from a web page:
+#   wget -O yaml-0.2.5.tar.gz https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz
+#   sha256sum -> c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4
+source_url=https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz
+tarball=yaml-0.2.5.tar.gz
+sha256=c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4
+srcdir=yaml-0.2.5
+
+licence=MIT
+licence_files=License
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): USES. libyaml is pure computation over
+# caller-supplied byte buffers (or caller read/write callbacks): parse bytes
+# into events/documents, emit documents back to a buffer. The only platform
+# surface is malloc/realloc/free and memcpy/memmove/strlen. No event loop, no
+# main(), no filesystem model imposed (file I/O is the caller's, via callbacks).
+adoption=USES. Parser/emitter over caller-supplied byte buffers or caller-provided read/write callbacks; the only platform surface is malloc/realloc/free and memcpy/memmove. It never wants to own the process.
+
+needs=libc
+
+prepare=none
+
+# Our one delta: a first-party src/config.h. libyaml's src/api.c reads the
+# YAML_VERSION_* macros that upstream generates via autotools into config.h;
+# we do not run configure, so this new file (added by patch, the musl-regex
+# precedent) supplies exactly those four constants, gated by -DHAVE_CONFIG_H=1.
+patches=0001-maytera-libyaml-config.patch
+
+build=objects
+
+# The eight core translation units: the full parser (reader/scanner/parser/
+# loader), emitter (writer/emitter/dumper) and the public API. This is
+# upstream's own src/ list.
+sources=src/api.c src/reader.c src/scanner.c src/parser.c src/loader.c src/writer.c src/emitter.c src/dumper.c
+
+# HAVE_CONFIG_H turns on the src/config.h include; -Iinclude lets the src files
+# find <yaml.h> (the public header lives in include/, and mports compiles with
+# cwd = the unpacked srcdir).
+cflags=-DHAVE_CONFIG_H=1 -Iinclude
+
+headers=include/yaml.h
+lib=libyaml.a
+
+# THE ANTI-NO-OP CHECK. Proven defined in libyaml.a by nm: the version query,
+# the parser lifecycle + input + parse/scan, the emitter lifecycle + output +
+# emit, and document/event teardown.
+symbols=yaml_get_version_string yaml_get_version yaml_parser_initialize yaml_parser_delete yaml_parser_set_input_string yaml_parser_parse yaml_parser_scan yaml_parser_load yaml_event_delete yaml_document_delete yaml_emitter_initialize yaml_emitter_delete yaml_emitter_set_output_string yaml_emitter_emit

@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Planetarium Alpaca Telescope Panel Spec</title>
+<style>
+  /* ============================================================
+     MayteraOS Planetarium - ASCOM Alpaca Telescope Control Panel
+     DESIGN-FIRST geometry + token SPEC (design-first rule
+     [[ui-build-process-design-first-then-port]]). This mockup is the
+     reviewable source of truth for the Rust render port in
+     userland/apps/stellarium/src/lib.rs (panel_render) and alpaca.rs.
+
+     WHY GLASS, NOT MOTIF-GRAY: the OS default is CDE/Motif gray
+     (docs/UI_STYLE_GUIDE.md), but the planetarium is a full-screen
+     dark night-sky app whose EXISTING control bar + status text
+     already use a dark teal "glass" language. A bright gray Motif
+     panel over the sky would destroy dark adaptation and clash with
+     every other pixel this app draws. The design language followed
+     here is therefore the app's own established glass tokens (the
+     same values already in lib.rs's control bar), which IS the
+     consistent choice for this surface. Spacing/typography follow
+     the style guide's grid and hierarchy conventions.
+
+     All panel text uses the antialiased TrueType path
+     (SYS_WIN_DRAW_TTF=235, size in the top byte of the colour word)
+     [[use-antialiased-truetype-fonts]], as win_text() already does.
+
+     COORDINATES ARE THE PORT CONTRACT. The panel is right-docked.
+     Given window content w x h, panel occupies x in [w-296, w].
+     Every rect/text offset below is relative to the panel origin
+     x0 = w - PANEL_W. The Rust port uses these exact numbers.
+     ============================================================ */
+  :root{
+    /* ---- COLOUR TOKENS (0xRRGGBB, alpha forced 0xFF by win_draw_rect) ---- */
+    --panel-bg:      #0B1A18;  /* 0x000B1A18 panel fill                     */
+    --bar-bg:        #0E1D1B;  /* 0x000E1D1B section band / control bar     */
+    --accent:        #6AE2CF;  /* 0x006AE2CF teal accent, top edge, title   */
+    --header:        #67B8A6;  /* 0x0067B8A6 section header text            */
+    --label:         #A9D9CC;  /* 0x00A9D9CC row label                      */
+    --value:         #F3FBF9;  /* 0x00F3FBF9 row value / primary text       */
+    --value-dim:     #709088;  /* 0x00709088 secondary / hint              */
+    --btn-bg:        #122420;  /* 0x00122420 button idle face              */
+    --btn-hot:       #1D3A33;  /* 0x001D3A33 button hover/active face      */
+    --btn-top:       #2C4A44;  /* 0x002C4A44 button 1px top highlight      */
+    --btn-bot:       #0A1614;  /* 0x000A1614 button 1px bottom shadow      */
+    --btn-txt:       #E8F4F0;  /* 0x00E8F4F0 button label                  */
+    --btn-dis-bg:    #0C1512;  /* 0x000C1512 disabled button face         */
+    --btn-dis-txt:   #435853;  /* 0x00435853 disabled button label        */
+    --divider:       #1B302C;  /* 0x001B302C section divider line          */
+    --ok:            #58E28A;  /* 0x0058E28A tracking ON / connected dot   */
+    --warn:          #FFC24A;  /* 0x00FFC24A SLEWING indicator (amber)     */
+    --alert:         #FF5A44;  /* 0x00FF5A44 Abort button / error dot      */
+    --scope:         #FF4030;  /* 0x00FF4030 reticle (already in app)      */
+  }
+  html{background:#04060a;color-scheme:dark}
+  body{margin:0;font:13px system-ui,sans-serif;color:#cfe;padding:20px;display:flex;gap:24px;flex-wrap:wrap}
+  .stage{position:relative;width:900px;height:650px;background:
+     radial-gradient(120% 90% at 30% 20%,#0a1428 0%,#04060e 70%);
+     border:1px solid #223;overflow:hidden;flex:0 0 auto}
+  .sky-note{position:absolute;left:16px;top:14px;color:#4a6;font:12px monospace;opacity:.7}
+  /* PANEL: right-docked, PANEL_W = 296 px, full content height */
+  .panel{position:absolute;top:0;right:0;width:296px;height:650px;
+     background:var(--panel-bg);border-left:1px solid var(--accent);
+     box-sizing:border-box;font-family:system-ui,sans-serif}
+  .pad{padding:0 12px}                 /* content inset 12px both sides   */
+  .title{display:flex;justify-content:space-between;align-items:baseline;
+     padding:8px 12px 6px}
+  .title b{color:var(--accent);font-size:14px;font-weight:600}
+  .title .hint{color:var(--value-dim);font-size:11px}
+  .divider{height:1px;background:var(--divider);margin:4px 0}
+  .hdr{color:var(--header);font-size:11px;letter-spacing:.08em;
+     text-transform:uppercase;padding:8px 12px 3px}
+  .row{display:flex;justify-content:space-between;padding:2px 12px;font-size:12px}
+  .row .l{color:var(--label)} .row .v{color:var(--value)}
+  .status{padding:3px 12px;font-size:12px;display:flex;align-items:center;gap:7px}
+  .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
+  .dot.ok{background:var(--ok)} .dot.off{background:var(--value-dim)}
+  .dot.err{background:var(--alert)}
+  .btns{display:flex;gap:6px;padding:5px 12px;flex-wrap:wrap}
+  .btn{background:var(--btn-bg);color:var(--btn-txt);border-top:1px solid var(--btn-top);
+     border-bottom:1px solid var(--btn-bot);border-left:0;border-right:0;
+     font-size:12px;padding:4px 9px;height:24px;box-sizing:border-box;
+     display:inline-flex;align-items:center;white-space:nowrap}
+  .btn .k{color:var(--accent);font-weight:600;margin-right:4px}
+  .btn.hot{background:var(--btn-hot)}
+  .btn.dis{background:var(--btn-dis-bg);color:var(--btn-dis-txt)}
+  .btn.dis .k{color:var(--btn-dis-txt)}
+  .btn.alert .k{color:var(--alert)}
+  .slew{color:var(--warn);font-weight:600}
+  .idle{color:var(--value-dim)}
+  .trk-on{color:var(--ok)}
+  .dpad{display:grid;grid-template-columns:repeat(3,54px);grid-template-rows:repeat(3,26px);
+     gap:5px;padding:5px 12px;justify-content:start}
+  .dpad .btn{justify-content:center;padding:0;width:54px}
+  .dpad .sp{visibility:hidden}
+  .foot{position:absolute;bottom:8px;left:12px;right:12px;color:var(--value-dim);font-size:11px;line-height:1.5}
+  .caption{max-width:520px;font-size:13px;line-height:1.5;color:#bcd}
+  .caption h2{color:#8fe;font-size:15px;margin:18px 0 6px}
+  code{background:#0d1a22;color:#7ec;padding:1px 4px;border-radius:3px;font-size:12px}
+  table{border-collapse:collapse;font-size:12px;margin:6px 0}
+  td,th{border:1px solid #2a3a3a;padding:3px 7px;text-align:left}
+  th{color:#8fe}
+</style>
+</head>
+<body>
+
+<div class="stage">
+  <div class="sky-note">[ live sky renders full-width underneath; panel is a glass overlay ]</div>
+
+  <div class="panel">
+    <div class="title"><b>Telescope Control</b><span class="hint">[T] hide</span></div>
+    <div class="divider"></div>
+
+    <div class="hdr">Connection</div>
+    <div class="row"><span class="l">Host</span><span class="v">192.0.2.1:11111</span></div>
+    <div class="btns">
+      <span class="btn"><span class="k">A</span>Edit</span>
+      <span class="btn hot"><span class="k">C</span>Connect</span>
+      <span class="btn"><span class="k">X</span>Disc</span>
+      <span class="btn"><span class="k">D</span>Discover</span>
+    </div>
+    <div class="status"><span class="dot ok"></span><span class="v">Connected</span></div>
+    <div class="row"><span class="l">Mount</span><span class="v">CG5-GT Simulator</span></div>
+
+    <div class="divider"></div>
+    <div class="hdr">Live Status</div>
+    <div class="row"><span class="l">RA</span><span class="v">05h 34.5m</span></div>
+    <div class="row"><span class="l">Dec</span><span class="v">+22.01&deg;</span></div>
+    <div class="row"><span class="l">Alt</span><span class="v">+41.20&deg;</span></div>
+    <div class="row"><span class="l">Az</span><span class="v">128.7&deg;</span></div>
+    <div class="row"><span class="l">Slewing</span><span class="slew">SLEWING</span></div>
+    <div class="row"><span class="l">Tracking</span><span class="trk-on">ON &middot; sidereal</span></div>
+    <div class="row"><span class="l">Target</span><span class="v">M42 05.6h -05.4&deg;</span></div>
+
+    <div class="divider"></div>
+    <div class="hdr">Slew / Sync</div>
+    <div class="btns">
+      <span class="btn"><span class="k">G</span>Goto</span>
+      <span class="btn"><span class="k">Y</span>Sync</span>
+      <span class="btn alert"><span class="k">B</span>Abort</span>
+    </div>
+
+    <div class="hdr">Jog &middot; rate <span style="color:#7ec">[R] 1.0&deg;/s</span></div>
+    <div class="dpad">
+      <span class="sp"></span><span class="btn"><span class="k">I</span>N</span><span class="sp"></span>
+      <span class="btn"><span class="k">J</span>W</span><span class="btn"><span class="k">.</span>Stop</span><span class="btn"><span class="k">L</span>E</span>
+      <span class="sp"></span><span class="btn"><span class="k">K</span>S</span><span class="sp"></span>
+    </div>
+
+    <div class="hdr">Tracking</div>
+    <div class="btns">
+      <span class="btn"><span class="k">O</span>On/Off</span>
+      <span class="btn"><span class="k">1</span>Sidereal</span>
+      <span class="btn"><span class="k">2</span>Lunar</span>
+      <span class="btn"><span class="k">3</span>Solar</span>
+    </div>
+
+    <div class="hdr">Mount</div>
+    <div class="btns">
+      <span class="btn"><span class="k">P</span>Park</span>
+      <span class="btn"><span class="k">U</span>Unpark</span>
+      <span class="btn dis"><span class="k">H</span>Home</span>
+    </div>
+
+    <div class="foot">Keys work whether the panel is shown or hidden.<br>
+      Disabled = mount reports it cannot do it (CanX).</div>
+  </div>
+</div>
+
+<div class="caption">
+  <h2>Panel geometry (the port contract)</h2>
+  <p><code>PANEL_W = 296</code>. Panel origin <code>x0 = w - 296</code>, spanning
+  <code>y in [0, h]</code>. Content inset 12&nbsp;px each side, so content x starts at
+  <code>x0 + 12</code>, content width <code>272</code>. Left edge is a 1&nbsp;px
+  <code>--accent</code> line. Section band/header text sizes: title 14, header 11,
+  rows/buttons 12. Row pitch ~18&nbsp;px; section gap = divider (1&nbsp;px) + 8&nbsp;px.
+  Buttons are 24&nbsp;px tall with a 1&nbsp;px top-highlight / bottom-shadow bevel
+  (same bevel as the existing <code>barbtn()</code>). Dpad buttons 54&nbsp;px wide,
+  26&nbsp;px tall, 5&nbsp;px gap, laid N-top / W-Stop-E / S-bottom.</p>
+
+  <h2>Controls and the Alpaca endpoint each drives</h2>
+  <table>
+    <tr><th>Control</th><th>Key</th><th>HTTP</th><th>Endpoint (telescope/0)</th></tr>
+    <tr><td>Edit host</td><td>A</td><td>-</td><td>ip:port entry (manual, reliable baseline)</td></tr>
+    <tr><td>Connect</td><td>C</td><td>PUT</td><td>/connected (true) then GET /name, capability GETs</td></tr>
+    <tr><td>Disconnect</td><td>X</td><td>PUT</td><td>/connected (false)</td></tr>
+    <tr><td>Discover</td><td>D</td><td>UDP</td><td>broadcast "alpacadiscovery1":32227, parse {AlpacaPort}</td></tr>
+    <tr><td>RA / Dec</td><td>(poll)</td><td>GET</td><td>/rightascension, /declination</td></tr>
+    <tr><td>Alt / Az</td><td>(poll)</td><td>GET</td><td>/altitude, /azimuth</td></tr>
+    <tr><td>Slewing</td><td>(poll)</td><td>GET</td><td>/slewing</td></tr>
+    <tr><td>Tracking state</td><td>(poll)</td><td>GET</td><td>/tracking</td></tr>
+    <tr><td>Goto</td><td>G</td><td>PUT</td><td>/slewtocoordinates (RA hours, Dec deg)</td></tr>
+    <tr><td>Sync</td><td>Y</td><td>PUT</td><td>/synctocoordinates</td></tr>
+    <tr><td>Abort</td><td>B</td><td>PUT</td><td>/abortslew</td></tr>
+    <tr><td>Jog N/S/E/W</td><td>I/K/J/L</td><td>PUT</td><td>/moveaxis (Axis 0/1, +/-rate)</td></tr>
+    <tr><td>Stop jog</td><td>.</td><td>PUT</td><td>/moveaxis (both axes, Rate 0)</td></tr>
+    <tr><td>Jog rate</td><td>R</td><td>-</td><td>cycle 0.5/1/2/4 deg/s (local)</td></tr>
+    <tr><td>Tracking on/off</td><td>O</td><td>PUT</td><td>/tracking (bool)</td></tr>
+    <tr><td>Track rate</td><td>1/2/3</td><td>PUT</td><td>/trackingrate (0 sid / 1 lunar / 2 solar)</td></tr>
+    <tr><td>Park</td><td>P</td><td>PUT</td><td>/park</td></tr>
+    <tr><td>Unpark</td><td>U</td><td>PUT</td><td>/unpark</td></tr>
+    <tr><td>Find Home</td><td>H</td><td>PUT</td><td>/findhome</td></tr>
+  </table>
+
+  <h2>Capability gating</h2>
+  <p>On connect the app also GETs <code>/canslew</code>, <code>/cansync</code>,
+  <code>/canpark</code>, <code>/canunpark</code>, <code>/canfindhome</code>,
+  <code>/cansettracking</code>, <code>/canmoveaxis?Axis=0</code>. A button whose
+  capability is false renders <code>.dis</code> (disabled tokens) and its key is a
+  no-op with a status note, rather than sending a command the mount will reject.</p>
+
+  <h2>Async contract</h2>
+  <p>Every command goes through the existing single-in-flight <code>alpaca_step()</code>
+  state machine, extended with a small bounded op QUEUE so multiple key presses
+  serialise WITHOUT blocking. The render thread never blocks on the network: at most
+  one non-blocking syscall's progress per frame, exactly as the RA/Dec poll already
+  does ([[no-block-context-cannot-wait-event-async-tx]]). A slow or absent endpoint
+  cannot freeze the sky.</p>
+</div>
+
+</body>
+</html>

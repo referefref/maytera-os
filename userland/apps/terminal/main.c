@@ -170,10 +170,39 @@ int main(int argc, char **argv) {
     // Print initial prompt
     print_prompt();
 
+    // (ncursespty) argv[1..]: run that command immediately, through the SAME
+    // external-command path a typed command takes (execute_command() ->
+    // term_layout_run_foreground() -> term_pty.c's real pty), instead of the
+    // interactive prompt. This is what compositor/desktop.c and startmenu.c
+    // now spawn a console/curses app (MyMan/Rogue/Angband) through - Terminal
+    // was already the ONE place these apps get a real tty (typing "myman" at
+    // this same prompt already worked; a bare desktop-icon/menu sys_spawn()
+    // never gave them one - see blame.md's appqa Finding 2). Takes priority
+    // over a profile start command below: the caller asked for ONE specific
+    // program, not the profile's own startup command. Joined with single
+    // spaces, no quoting: every caller of this path today passes exactly one
+    // /APPS path with no spaces in it (compositor_spawn_app() /
+    // launcher_is_console_app()'s two-element argv), same as the argv this
+    // shell already builds for a typed command.
+    if (argc > 1) {
+        char cmdline[512];
+        int ci = 0;
+        for (int ai = 1; ai < argc && ci < (int)sizeof(cmdline) - 2; ai++) {
+            if (ai > 1 && ci < (int)sizeof(cmdline) - 1) cmdline[ci++] = ' ';
+            for (const char *p = argv[ai]; *p && ci < (int)sizeof(cmdline) - 1; p++)
+                cmdline[ci++] = *p;
+        }
+        cmdline[ci] = '\0';
+        term_puts(cmdline);
+        term_puts("\n");
+        add_to_history(cmdline);
+        execute_command(cmdline);
+        // GUARDED: see the profile-start-cmd comment below for why.
+        if (!term_layout_pane_busy()) print_prompt();
+    } else {
     // profiles: run the active profile's start command once, through the
     // normal shell path, so it appears in the scrollback and in history
     // exactly as if it had been typed.
-    {
         const char *sc = term_profile_start_cmd();
         if (sc && sc[0]) {
             term_puts(sc);

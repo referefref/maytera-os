@@ -133,7 +133,47 @@ static uint32_t g_last_print = ' ';   // for REP (CSI b)
 // The last title an application asked for via OSC 0/2. See tcb_osc().
 char g_osc_title[128];
 
+// ---------------------------------------------------------------------------
+// DEC special graphics (line-drawing) charset. #745: the emulator previously
+// SWALLOWED ESC(0 / SO / SI but never switched sets, so ncurses box-drawing
+// (box(), ACS_HLINE, mc/nethack frames) printed literal q/x/l/k. The grid
+// stores Unicode and the renderer rasterises any codepoint via TrueType, so the
+// honest fix is to MAP the DEC graphics bytes 0x5f..0x7e to their Unicode
+// box-drawing equivalents at print time. Now the maytera terminfo can declare
+// smacs/rmacs/acsc truthfully.
+static int g_g0_graphics = 0;   // G0 designated as DEC special graphics (ESC ( 0)
+static int g_g1_graphics = 0;   // G1 designated as DEC special graphics (ESC ) 0)
+static int g_gl_is_g1    = 0;   // GL currently invokes G1 (SO) rather than G0 (SI)
+
+// Bytes 0x5f..0x7e of the DEC special graphics set -> Unicode. The load-bearing
+// entries for TUIs are the corners, lines, tees and cross (j k l m n q t u v w x).
+static const uint32_t k_dec_graphics[32] = {
+    0x0020, 0x25C6, 0x2592, 0x2409, 0x240C, 0x240D, 0x240A, 0x00B0,
+    0x00B1, 0x2424, 0x240B, 0x2518, 0x2510, 0x250C, 0x2514, 0x253C,
+    0x23BA, 0x23BB, 0x2500, 0x23BC, 0x23BD, 0x251C, 0x2524, 0x2534,
+    0x252C, 0x2502, 0x2264, 0x2265, 0x03C0, 0x2260, 0x00A3, 0x00B7,
+};
+
+static inline int term_charset_graphics_active(void) {
+    return g_gl_is_g1 ? g_g1_graphics : g_g0_graphics;
+}
+
+// Designate a charset into G0 (ESC ( final) or G1 (ESC ) final). Only the DEC
+// special graphics set (0) is a graphics set here; every other designation
+// (ASCII B, UK A, etc.) is treated as a normal text set.
+void term_charset_designate(char slot, char final) {
+    int gfx = (final == '0' || final == '2');
+    if (slot == 0) g_g0_graphics = gfx;
+    else           g_g1_graphics = gfx;
+}
+void term_charset_shift(int to_g1) { g_gl_is_g1 = to_g1 ? 1 : 0; }
+void term_charset_reset(void) { g_g0_graphics = g_g1_graphics = g_gl_is_g1 = 0; }
+
 static void term_put_cp(uint32_t cp) {
+    // DEC special graphics: remap 0x5f..0x7e to Unicode box-drawing when the
+    // active charset (G0/G1 per SI/SO) is the line-drawing set.
+    if (cp >= 0x5f && cp <= 0x7e && term_charset_graphics_active())
+        cp = k_dec_graphics[cp - 0x5f];
     int w = term_emu_wcwidth(cp);
     if (w < 0) return;                 // a control character has nothing to draw
 
@@ -209,8 +249,14 @@ static void tcb_execute(void *ctx, uint8_t c) {
             // OSC handler before this callback can see it.
             term_notify_bell(term_layout_active_tab());
             break;
+        case 0x0E:                     // SO - invoke G1 into GL
+            term_charset_shift(1);
+            break;
+        case 0x0F:                     // SI - invoke G0 into GL
+            term_charset_shift(0);
+            break;
         default:
-            // SO/SI (charset shift) and the rest: nothing this terminal models.
+            // The remaining C0 controls: nothing this terminal models.
             // Consumed, never printed.
             break;
     }
@@ -228,6 +274,7 @@ void term_soft_reset(void) {
     saved_cursor_x = 0; saved_cursor_y = 0;
     term_emu_sgr_reset(&g_saved_pen);
     term_tabstops_default(g_tabstop);
+    term_charset_reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -235,9 +282,11 @@ void term_soft_reset(void) {
 static void tcb_esc(void *ctx, const term_seq_t *sq) {
     (void)ctx;
     if (sq->ninter > 0) {
-        // ESC ( B, ESC ) 0, ESC * ... : charset designation. NOT modelled (the
-        // DEC line-drawing set is a separate piece of work) but correctly
-        // swallowed; the old code printed the final byte.
+        // ESC ( <final> / ESC ) <final>: designate G0 / G1. The DEC special
+        // graphics set (0) is now modelled (term_charset_designate); every other
+        // set is treated as normal text. G2/G3 (ESC * / ESC +) are swallowed.
+        if (sq->inter[0] == '(') { term_charset_designate(0, sq->final); return; }
+        if (sq->inter[0] == ')') { term_charset_designate(1, sq->final); return; }
         if (sq->inter[0] == '#' && sq->final == '8') {
             // DECALN: fill the screen with 'E'. Rarely used by applications;
             // kept because it is the canonical alignment self-test and makes a

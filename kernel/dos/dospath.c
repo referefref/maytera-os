@@ -8,7 +8,7 @@
 #include "diskimg.h"
 
 // Root FS access (the fat_* public wrappers route "/" paths to the ext2 root on
-// VM <vmid>; on a FAT-root system they hit FAT directly). Same handle used by the
+// a test VM; on a FAT-root system they hit FAT directly). Same handle used by the
 // DOS + Win16 file code.
 // #742: fat_mkdir/fat_exists/fat_write_file are NOT re-declared here. ../fs/fat.h
 // above owns them, and a private extern silently opts this whole file out of

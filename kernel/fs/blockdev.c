@@ -711,6 +711,31 @@ int blk_root_is_usb(void) { return g_root_usb; }
 // disk it booted from - cloning a disk onto itself corrupts the source.
 int blk_root_usb_index(void) { return g_root_usb_index; }
 
+// #wallpersist2: blk_write()'s comment two screens up is accurate that every
+// write is WRITE-THROUGH as far as this kernel is concerned - it always
+// issues a real usb_msc_write() before returning, never buffers a write in
+// RAM only. That guarantees the OS's own view is never behind the physical
+// medium's controller. It says nothing about what the STICK's OWN
+// controller does with that write: most USB flash controllers (and SD
+// cards behind a USB-SD adapter, common on real-hardware test rigs) hold
+// recently written sectors in a small onboard cache and are not required by
+// the SCSI/Bulk-Only spec to have committed them to flash until told to via
+// SYNCHRONIZE CACHE (0x35, usb_msc_sync() in usb_msc.c). That function has
+// existed with zero callers anywhere in the tree - the exact shape of the
+// ahci_flush() gap fixed alongside this one in ata_flush_all(). A warm
+// reboot on real hardware, or the stick being pulled the moment the screen
+// goes dark, can lose the last few sectors that only ever reached the
+// stick's cache. A QEMU/Proxmox usb-storage backend (see a test VM, which
+// boots a golden this same way) has no such onboard cache to lose, which is
+// why this class of bug is invisible in VM testing.
+void blk_flush_root_usb(void) {
+    if (!g_root_usb) return;
+    usb_msc_device_t *dev = usb_msc_get_device(g_root_usb_index);
+    if (!dev || !dev->ready) return;
+    int rc = usb_msc_sync(dev, 0);
+    kprintf("[BLK] USB MSC root SYNCHRONIZE CACHE -> %s\n", rc == 0 ? "OK" : "FAIL");
+}
+
 void blk_cache_stats(uint64_t *hits, uint64_t *misses, int *enabled) {
     if (hits) *hits = g_ram_hits;
     if (misses) *misses = g_usb_reads;

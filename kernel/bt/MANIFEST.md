@@ -65,17 +65,17 @@ boot-time USB enumeration is a hard no-op when Bluetooth is off.
 - Isolated -Werror compile of all 7 bt/*.c: PASS.
 - Full kernel build + link on the build container: GREEN (kernel.elf ~12MB, build 597).
   Only ld warning is the pre-existing benign .note.GNU-stack note.
-- Boot smoke test on VM <vmid> (OVMF/pc, e1000, 8 cores): desktop rendered
+- Boot smoke test on VM 2061 (OVMF/pc, e1000, 8 cores): desktop rendered
   (icons, taskbar, wallpaper, compositor), heartbeat advancing (uptime 30->34s,
   flips 122->232, ctxsw climbing = alive, no freeze), ZERO [BT] serial output
-  (bt correctly inert), no panic/fault. Screendump: vm <vmid>-desk.png.
+  (bt correctly inert), no panic/fault. Screendump: vm2061-desk.png.
 
 ## Files in this golden dir
 
   bt/*.h, bt/*.c        the full skeleton (contract + stubs)
   ARCHITECTURE.md, INTEGRATION.md, MANIFEST.md
-  vm <vmid>-boot.log       serial boot log (bt disabled)
-  vm <vmid>-desk.png       desktop screendump proving healthy boot
+  vm2061-boot.log       serial boot log (bt disabled)
+  vm2061-desk.png       desktop screendump proving healthy boot
 
 ## Kernel artifact
 

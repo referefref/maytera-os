@@ -57,6 +57,15 @@ typedef int (*aicap_consent_fn)(const char *tool_id, const char *cap, int risk,
 // to call repeatedly (a second call is a no-op once loaded).
 void aicap_init(void);
 
+// Re-read /CONFIG/AICAPS.CFG, DISCARDING the cached grant table. aicap_init()
+// caches on first use for the AI loop's sake, but a LONG-RUNNING process that
+// gates on behalf of others (a live-contract app answering delivered calls,
+// contract.c) must reflect a grant made mid-session, exactly as a freshly
+// SPAWNED contract process would. This makes the live path's authorization
+// equivalent to the spawn path's, not stuck on the table that was current at
+// startup.
+void aicap_reload(void);
+
 // Register the consent callback. If none is registered, HIGH-risk tools with no
 // valid token are DENIED (fail closed).
 void aicap_set_consent_cb(aicap_consent_fn fn);
@@ -91,5 +100,44 @@ int  aicap_preseed_consent(const char *tool_id, const char *cap);
 //   <rtc-timestamp>|<tool>|<cap>|<args-truncated>|<result>|<how>
 void aicap_audit(const char *tool_id, const char *cap, const char *args,
                  const char *result, const char *how);
+
+// ---------------------------------------------------------------------------
+// #712 escrow support. These expose the existing token mint/revoke and add a
+// process-lifetime capability DENYLIST, so the escrow layer (escrow.c) can:
+//   - mint a scoped grant (aicap_grant_scoped) instead of hand-rolling tokens,
+//   - revoke the grant as a set for an early close (aicap_revoke_tag),
+//   - forbid a capability outright for a contract's lifetime
+//     (aicap_deny_capability), which is how the no-delete promise is enforced.
+// A denied capability is refused by aicap_authorize()/aicap_path_in_scope()
+// regardless of any token or consent. Denies are refcounted so nested contracts
+// forbidding the same capability compose correctly.
+// ---------------------------------------------------------------------------
+
+// Mint a HIGH-risk token for `cap` (exact, e.g. "fs.write", or wildcard "fs.*")
+// scoped to `allowed_paths` (comma-separated prefixes; empty = any), expiring in
+// `ttl_secs` (<=0 = never), usable `max_uses` times (-1 = unlimited), tagged with
+// `tag` (used by aicap_revoke_tag). NOT persisted. Returns the token id string
+// (stable for the token's lifetime) or 0 on failure.
+const char *aicap_grant_scoped(const char *cap, const char *allowed_paths,
+                               long ttl_secs, int max_uses, const char *tag);
+
+// Revoke every in-memory token whose audit_tag equals `tag`. Returns the count
+// revoked. Used by escrow_close() to end a grant early.
+int aicap_revoke_tag(const char *tag);
+
+// Add / remove a capability to the process denylist (refcounted). While denied,
+// aicap_authorize() and aicap_path_in_scope() refuse the capability outright.
+void aicap_deny_capability(const char *cap);
+void aicap_allow_capability(const char *cap);
+// 1 if `cap` is currently denied by the denylist (for tests/introspection).
+int  aicap_cap_denied(const char *cap);
+
+// Non-consuming scope predicate (#711). Returns 1 if `path` would be permitted
+// for the capability of `tool_id` by the current usable tokens (or the tool is
+// LOW-risk / read-only), else 0. It does NOT consume a use, mint a token,
+// prompt for consent, or audit. Multi-path tools (files.move) use it to require
+// BOTH ends of a move to sit inside the granted scope: aicap_authorize() gates
+// (and consumes on) the source, and this checks the destination.
+int aicap_path_in_scope(const char *tool_id, const char *path);
 
 #endif // AICAP_H

@@ -62,6 +62,7 @@ size_t strlcat(char *dest, const char *src, size_t size);
 char *strchr(const char *s, int c);
 char *strrchr(const char *s, int c);
 char *strstr(const char *haystack, const char *needle);
+char *strcasestr(const char *haystack, const char *needle);  // #745: case-insensitive strstr
 size_t strspn(const char *s, const char *accept);
 size_t strcspn(const char *s, const char *reject);
 char *strpbrk(const char *s, const char *accept);

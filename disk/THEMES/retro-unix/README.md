@@ -133,7 +133,6 @@ The CDE-style front panel:
 
 ```
 THEMES/retro-unix/
-  theme.ini         - Theme configuration
   README.md         - This documentation
   colors/           - Color palette definitions
   cursors/          - X11-style cursors (16x16)

@@ -89,6 +89,12 @@ void ttf_draw_string(int x, int y, const char *str, int size, uint32_t color);
 // Measure the width of a string in pixels
 int ttf_measure_string(const char *str, int size);
 
+// #245: face-explicit measure. The sibling of ttf_measure_string() that the
+// face-aware DRAW (sys_win_draw_text_ttf_ex) has always needed and never had.
+// Uses the same shared cursor-step, so measured width == drawn width for the
+// face/style pair asked about, not just for the active face.
+int ttf_measure_string_f(int face, const char *str, int size, int style);
+
 // Draw a single character with anti-aliasing. Returns advance width.
 int ttf_draw_char(int x, int y, int codepoint, int size, int style, uint32_t color);
 

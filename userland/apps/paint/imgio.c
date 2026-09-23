@@ -1,7 +1,8 @@
 // imgio.c - Maytera Studio file I/O: BMP load/save (24-bit BGR, or 32-bit
 // BI_BITFIELDS BGRA when the doc has transparency), native layered .MSTU,
-// PNG export (real fixed-Huffman deflate + LZ77, RGB or RGBA). See studio.h
-// for the module contract.
+// PNG export (real fixed-Huffman deflate + LZ77, RGB or RGBA), JPEG export
+// (baseline, via jpegenc.c, flattened onto white). See studio.h for the
+// module contract.
 //
 // All buffers are malloc'd (no big static arrays, blame #444; the only static
 // table is the 1KB CRC32 LUT). File access uses the raw sys_open/sys_read/
@@ -181,14 +182,40 @@ static int bmp_load(const char *path) {
     return 0;
 }
 
-// Scaled thumbnail decode (BMP/DIB only), nearest-neighbour, into a caller
-// buffer. Never allocates or mutates g_doc; used by the file-browser preview.
+// Scaled thumbnail decode, nearest-neighbour, into a caller buffer. Never
+// mutates g_doc; used by the file-browser preview. BMP/DIB is read directly
+// (no allocation beyond the file). Everything else (JPEG, PNG, GIF) goes
+// through the kernel codec, decoded straight at thumbnail scale: until the
+// JPEG export phase the preview pane said "No preview" for every non-BMP
+// file, including the JPEGs Studio itself now writes.
+static int thumb_decode(const unsigned char *f, long len, uint32_t *out, int tw, int th) {
+    unsigned long cap = (unsigned long)tw * th * 4u;
+    uint32_t *tmp = (uint32_t *)malloc((size_t)cap);
+    if (!tmp) return -1;
+    int dims[2] = {0, 0};
+    int n = decode_image(f, (unsigned)len, tw, th, tmp, (unsigned)cap, dims);
+    int w = dims[0], h = dims[1];
+    if (n <= 0 || w < 1 || h < 1 || w > tw || h > th) { free(tmp); return -1; }
+    for (int ty = 0; ty < th; ty++) {
+        int sy = ty * h / th; if (sy >= h) sy = h - 1;
+        for (int tx = 0; tx < tw; tx++) {
+            int sx = tx * w / tw; if (sx >= w) sx = w - 1;
+            out[(long)ty * tw + tx] = 0xFF000000u | (tmp[(long)sy * w + sx] & 0x00FFFFFFu);
+        }
+    }
+    free(tmp);
+    return 0;
+}
 int io_thumb(const char *path, uint32_t *out, int tw, int th) {
     if (!out || tw < 1 || th < 1) return -1;
-    if (!(ext_is(path, "bmp") || ext_is(path, "dib"))) return -1;
     long len = 0;
     unsigned char *f = read_whole(path, &len);
     if (!f) return -1;
+    if (!(ext_is(path, "bmp") || ext_is(path, "dib"))) {
+        int rc = thumb_decode(f, len, out, tw, th);
+        free(f);
+        return rc;
+    }
     if (len < 54 || f[0] != 'B' || f[1] != 'M') { free(f); return -1; }
     unsigned dataoff = rd32le(f + 10);
     int w = (int)rd32le(f + 18), hraw = (int)rd32le(f + 22), bpp = (int)rd16le(f + 28);
@@ -790,6 +817,57 @@ static int png_save(const char *path) {
 }
 
 // ---------------------------------------------------------------------------
+// JPEG export (Studio plan P5). The encoder itself is jpegenc.c; this is the
+// document side: flatten onto WHITE (JPEG has no alpha, and the on-screen
+// composite g_doc.comp sits on the transparency checker, which must never
+// leak into an export), encode with the session's quality/chroma options,
+// write. io_jpeg_estimate() runs the same flatten+encode into memory so the
+// export dialog can show the real byte count for the current settings.
+// ---------------------------------------------------------------------------
+static int g_jpg_quality = 90;      // GIMP's default; 1..100
+static int g_jpg_chroma444 = 0;     // 0 = 4:2:0 (default), 1 = 4:4:4
+
+void io_jpeg_set(int quality, int chroma444) {
+    g_jpg_quality = quality < 1 ? 1 : (quality > 100 ? 100 : quality);
+    g_jpg_chroma444 = chroma444 ? 1 : 0;
+}
+void io_jpeg_get(int *quality, int *chroma444) {
+    if (quality) *quality = g_jpg_quality;
+    if (chroma444) *chroma444 = g_jpg_chroma444;
+}
+
+// Flatten + encode into a malloc'd buffer. Returns 0 and sets *out/*len (the
+// caller frees *out), or -1.
+static int jpeg_encode_doc(unsigned char **out, long *len) {
+    *out = 0; *len = 0;
+    if (g_doc.w < 1 || g_doc.h < 1) return -1;
+    uint32_t *flat = (uint32_t *)malloc((size_t)g_doc.w * (size_t)g_doc.h * 4);
+    if (!flat) return -1;
+    if (doc_flatten_to(flat, 0x00FFFFFFu) != 0) { free(flat); return -1; }
+    int rc = jpeg_encode_argb(flat, g_doc.w, g_doc.h, g_jpg_quality, g_jpg_chroma444, out, len);
+    free(flat);
+    return rc;
+}
+
+long io_jpeg_estimate(void) {
+    unsigned char *buf; long len;
+    if (jpeg_encode_doc(&buf, &len) != 0) return -1;
+    free(buf);
+    return len;
+}
+
+static int jpeg_save(const char *path) {
+    unsigned char *buf; long len;
+    if (jpeg_encode_doc(&buf, &len) != 0) return -1;
+    int fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd < 0) { free(buf); return -1; }
+    int rc = wr_all(fd, buf, (unsigned long)len);
+    sys_close(fd);
+    free(buf);
+    return rc;
+}
+
+// ---------------------------------------------------------------------------
 // Universal decode via the kernel image codec (SYS_DECODE_IMAGE): handles PNG,
 // JPEG, GIF and BMP (everything the kernel image_load() understands). The
 // result is scaled to fit within the canvas maximum, so an oversized photo
@@ -853,6 +931,7 @@ int io_save(const char *path) {
     if (ext_is(path, "bmp") || ext_is(path, "dib")) rc = bmp_save(path);
     else if (ext_is(path, "mstu"))                  rc = mstu_save(path);
     else if (ext_is(path, "png"))                   rc = png_save(path);
+    else if (ext_is(path, "jpg") || ext_is(path, "jpeg")) rc = jpeg_save(path);
     else return -1;
     if (rc == 0) {
         strlcpy(g_doc.path, path, sizeof(g_doc.path));

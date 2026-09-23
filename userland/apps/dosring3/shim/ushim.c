@@ -346,6 +346,18 @@ int kb_win_content_size(int handle, int *w, int *h) {
     return win_get_size(handle, w, h);
 }
 
+// (dosfullscreen) Toggle the native-fullscreen compositor bypass (#158) for
+// this window. sys_wm_fullscreen_enter() acts on the caller's OWN focused
+// window - the DOS host is that window when it processes its own Alt+Enter -
+// and the kernel owns every way back (F11, focus loss, close), so this only
+// ever toggles and keeps no state the kernel could contradict. Returns 1 (now
+// fullscreen), 0 (now windowed), or -1 (no change).
+int kb_win_fullscreen_toggle(int handle) {
+    (void)handle;
+    if (sys_wm_fullscreen_status() >= 0) { sys_wm_fullscreen_exit(); return 0; }
+    return (sys_wm_fullscreen_enter() == 0) ? 1 : -1;
+}
+
 // ---------------------------------------------------------------------------
 // Input and window events.
 //
@@ -538,7 +550,7 @@ static void pump_thread(void *arg) {
                 // stop, because nothing had told the GUEST to stop.
                 //
                 // THE FIX IS THE EXISTING PRIMITIVE, NOT A NEW ONE.
-                // dos_request_close() (dos/dosexec.c) is what the in-kernel
+                // dos_request_close_pid() (dos/dosexec.c) is what the in-kernel
                 // path's titlebar X already calls, via dos_host_close_handler()
                 // in proc/syscall.c. dosexec.c is compiled into this binary
                 // byte-identically, so the same function is right here; the
@@ -558,18 +570,42 @@ static void pump_thread(void *arg) {
                 // window.
                 s_closed = 1;
                 {
-                    extern void dos_request_close(void);
+                    extern void dos_request_close_pid(unsigned int);
                     static const char m[] =
                         "[DOSRING3] window closed: asking the guest to stop "
                         "(dos_request_close)\n";
                     (void)write(1, m, sizeof m - 1);
-                    dos_request_close();
+                    dos_request_close_pid(0u); // (dosconc4 followup) 0 => this host owns g_dos; byte-identical to old dos_request_close(void)
                 }
                 break;
             case SHIM_EVENT_MOUSE_MOVE:
             case SHIM_EVENT_MOUSE_DOWN:
             case SHIM_EVENT_MOUSE_UP:
-                s_mx = ev.mouse_x; s_my = ev.mouse_y; s_mbuttons = ev.mouse_buttons;
+                // (#dosmouse) BUTTON STATE COMES FROM THE EVENT TYPE, NOT FROM
+                // ev.mouse_buttons. The producer is
+                // kernel/gui/window.c:wm_inject_app_mouse(), which sets
+                //     ev.mouse_buttons = (button == 2) ? RIGHT : LEFT;
+                // BEFORE it looks at the type, so that field is NEVER zero -
+                // a plain pointer move over the window arrives carrying
+                // MOUSE_BUTTON_LEFT. Copying it verbatim, as this did, hands
+                // the guest a left button that is held down for ever: every
+                // move becomes a drag, and a mouse-driven game is unusable in
+                // a way that looks like the mouse is not working at all.
+                // A press sets its bit, a release clears it, a move changes
+                // neither. That is the state dos_pump_input() expects and it
+                // is what the in-kernel path gets from the PS/2 driver.
+                s_mx = ev.mouse_x; s_my = ev.mouse_y;
+                if (ev.type == SHIM_EVENT_MOUSE_DOWN)
+                    s_mbuttons |= (ev.mouse_buttons & 0x03u);
+                else if (ev.type == SHIM_EVENT_MOUSE_UP)
+                    s_mbuttons &= ~(ev.mouse_buttons & 0x03u);
+                // (#dosmouse) AND PUBLISH IT. The DOS layer does not call
+                // kb_mouse_state(); it reads the globals mouse_x/mouse_y/
+                // mouse_buttons directly (kernel/dos/dosexec.c:760-762), which
+                // in Ring 3 live in kshim.c. Nothing connected the two, so the
+                // guest saw a mouse pinned at 0,0 with no buttons for the life
+                // of the process. This is the one line that was missing.
+                dosring3_mouse_publish();
                 break;
             case SHIM_EVENT_KEY_DOWN:
             case SHIM_EVENT_KEY_UP:
@@ -611,6 +647,9 @@ void kb_pump_start(int win_handle) {
 // Identity
 // ---------------------------------------------------------------------------
 unsigned int kb_uid(void) { return (unsigned int)getuid(); }
+// (#dosperm) The kernel answers this from the SAME perms_check() it enforces
+// at open(), so the guest gate and the eventual open can never disagree.
+int kb_access(const char *path, int mode) { return sys_access(path, mode); }
 unsigned int kb_gid(void) { return (unsigned int)getgid(); }
 
 // THE home lookup, reused rather than reimplemented. libc/userconf.c's

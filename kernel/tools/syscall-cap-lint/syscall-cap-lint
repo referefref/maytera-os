@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""
+syscall-cap-lint - FAILS THE BUILD if a syscall dispatched in proc/syscall.c has
+no CAPABILITY CLASSIFICATION: it must be declared either as requiring no
+capability ([NOCAP] in kernel/syscall-cap.manifest) or as gated by a specific
+capability ([CAP] with the class name). A dispatched syscall in neither section
+is an UNDECLARED capability decision and fails the build.
+
+WHY THIS EXISTS (Stage 1 of the system capability API)
+------------------------------------------------------
+docs/SYSTEM_CAPABILITY_API.md principle 4: "make the fault inexpressible, or
+make it fail the build". The capability chokepoint in syscall_dispatch_inner()
+gates a syscall iff rustkern/caps.rs cap_required_for_syscall(num) returns a
+class. That is the ONLY gate. A NEW `case SYS_X:` added by any author defaults
+to CAP_NONE - ungated - and builds clean, which is exactly the "ambient by
+omission" default this whole design exists to remove. This lint makes the
+default a BUILD FAILURE: a new syscall must be a conscious "no capability
+required" ([NOCAP]) or a conscious "gated by X" ([CAP]), diffed on every build.
+
+Same philosophy and placement as tools/syscall-ptr-lint (which proves each
+POINTER syscall is validated): a checked-in fact diffed against the source on
+EVERY build, wired as an order-only prerequisite of kernel.elf, because
+"omits/defaults clean" bugs are the ones the compiler cannot catch.
+
+HOW IT ENUMERATES (auto-discovery, not a hand list)
+---------------------------------------------------
+It parses the dispatcher switch in proc/syscall.c and takes every `case SYS_X:`
+label (fallthrough labels share the body), exactly as syscall-ptr-lint does, so
+a new syscall is discovered the moment its case is added.
+
+THE RULES
+---------
+For every dispatched SYS_X:
+  1. It is listed under [NOCAP] => a conscious "requires no capability". Good.
+  2. It is listed under [CAP] with a class => it is gated. The class MUST equal
+     what rustkern/caps.rs actually gates it with (cross-checked against the
+     requirement table there, resolved through proc/syscall.h numbers). A [CAP]
+     line that disagrees with the kernel gate FAILS: the manifest is not allowed
+     to describe a gate the kernel does not enforce.
+  3. Else => the build FAILS, naming SYS_X: an undeclared capability decision.
+
+Cross-checks (both directions, so the manifest and the kernel cannot drift):
+  * every syscall caps.rs gates (requirement table != CAP_NONE) MUST be [CAP]
+    with the matching class, and MUST be dispatched. A gated-but-[NOCAP] entry,
+    or a gate on an undispatched number, FAILS.
+  * manifest hygiene: a name in either section that is not a real SYS_* #define
+    FAILS (typo guard, cf. winswitch/winswtch). A manifest name no longer
+    dispatched FAILS as stale (a ledger of things that used to be true is how
+    #514 happened).
+
+  --generate emits a [NOCAP] baseline of every dispatched syscall not gated by
+  caps.rs, for seeding the manifest. Never wired into the build.
+"""
+import sys, os, re, io, argparse
+
+DEFINE_RE = re.compile(r'^\s*#\s*define\s+(SYS_[A-Z0-9_]+)\s+(\d+)', re.M)
+LABEL_RE  = re.compile(r'\bcase\s+(SYS_[A-Z0-9_]+)\s*:|\bdefault\s*:')
+# caps.rs: `const SYS_FOO_NUM: u64 = 435;`  and a match arm `SYS_FOO_NUM => CAP_BAR,`
+RS_CONST_RE = re.compile(r'const\s+([A-Z0-9_]+)\s*:\s*u64\s*=\s*(\d+)\s*;')
+RS_ARM_RE   = re.compile(r'([A-Z0-9_]+)\s*=>\s*(CAP_[A-Z_]+)\s*,')
+
+def read(path):
+    with open(path) as f:
+        return f.read()
+
+def strip_comments(s):
+    s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+    s = re.sub(r'//[^\n]*', '', s)
+    return s
+
+def parse_defines(header_src):
+    name2num = {}
+    for m in DEFINE_RE.finditer(header_src):
+        name2num[m.group(1)] = int(m.group(2))
+    return name2num
+
+def parse_dispatched(dispatch_src):
+    """Every SYS_X with a dispatcher case (fallthrough labels included)."""
+    try:
+        body = dispatch_src[dispatch_src.index('switch (num)'):]
+    except ValueError:
+        body = dispatch_src
+    names = set()
+    for m in LABEL_RE.finditer(body):
+        nm = m.group(1)
+        if nm:
+            names.add(nm)
+    return names
+
+def parse_caps_rs_gates(caps_src, num2name):
+    """Return {SYS_NAME: CAP_CLASS} that rustkern/caps.rs actually gates."""
+    consts = {m.group(1): int(m.group(2)) for m in RS_CONST_RE.finditer(caps_src)}
+    gates = {}
+    # Only look inside cap_required_for_syscall for the arms.
+    try:
+        fn = caps_src[caps_src.index('fn cap_required_for_syscall'):]
+        fn = fn[:fn.index('\n}')]
+    except ValueError:
+        fn = caps_src
+    for m in RS_ARM_RE.finditer(fn):
+        cname, cap = m.group(1), m.group(2)
+        if cname in consts:
+            num = consts[cname]
+            sysname = num2name.get(num)
+            if sysname:
+                gates[sysname] = cap
+    return gates
+
+def parse_manifest(path):
+    """Return {SYS: ('NOCAP'|'CAP', capclass_or_None)}."""
+    out = {}
+    if not os.path.exists(path):
+        return out
+    section = None
+    for raw in read(path).splitlines():
+        line = raw.split('#', 1)[0].rstrip()
+        st = line.strip()
+        if not st:
+            continue
+        up = st.upper()
+        if up == '[NOCAP]':
+            section = 'NOCAP'; continue
+        if up == '[CAP]':
+            section = 'CAP'; continue
+        parts = st.split()
+        name = parts[0]
+        if section == 'CAP':
+            cap = parts[1] if len(parts) > 1 else None
+            out[name] = ('CAP', cap)
+        else:
+            out[name] = ('NOCAP', None)
+    return out
+
+def run(header, dispatch, caps_rs, manifest, out=sys.stdout):
+    name2num = parse_defines(read(header))
+    num2name = {}
+    for n, v in name2num.items():
+        num2name.setdefault(v, n)
+    dispatched = parse_dispatched(read(dispatch))
+    gates = parse_caps_rs_gates(read(caps_rs), num2name)
+    man = parse_manifest(manifest)
+    def p(*a): print(*a, file=out)
+
+    fail = 0
+
+    # Manifest hygiene: real #define, and still dispatched.
+    for name, (kind, cap) in sorted(man.items()):
+        if name not in name2num:
+            p("syscall-cap-lint: FAIL - manifest names %s, which is not a SYS_* "
+              "#define in proc/syscall.h (typo?)." % name); fail += 1
+        elif name not in dispatched:
+            p("syscall-cap-lint: FAIL - manifest lists %s but it has no "
+              "dispatcher case. Retire the line in the same change that retires "
+              "the syscall (a stale ledger is how #514 happened)." % name); fail += 1
+
+    # Every dispatched syscall must be classified.
+    undeclared = sorted(d for d in dispatched if d not in man)
+    if undeclared:
+        p("syscall-cap-lint: FAIL - %d dispatched syscall(s) with NO capability "
+          "classification (not [NOCAP], not [CAP]):" % len(undeclared))
+        for d in undeclared:
+            p("    %s" % d)
+        p("   A new syscall defaults to UNGATED and builds clean, which is the")
+        p("   ambient-by-omission default this design removes. Add each under")
+        p("   [NOCAP] (requires no capability) or [CAP <CLASS>] (gated, and wire")
+        p("   the gate in rustkern/caps.rs cap_required_for_syscall).")
+        fail += len(undeclared)
+
+    # [CAP] entries must match the kernel gate exactly.
+    for name, (kind, cap) in sorted(man.items()):
+        if kind != 'CAP':
+            continue
+        if name not in gates:
+            p("syscall-cap-lint: FAIL - manifest gates %s as [CAP] %s, but "
+              "rustkern/caps.rs cap_required_for_syscall does NOT gate it. The "
+              "manifest may not describe a gate the kernel does not enforce." %
+              (name, cap)); fail += 1
+        elif gates[name] != cap:
+            p("syscall-cap-lint: FAIL - %s: manifest says [CAP] %s, caps.rs gates "
+              "it with %s." % (name, cap, gates[name])); fail += 1
+
+    # Every kernel-gated syscall must be [CAP] with the right class and dispatched.
+    for name, cap in sorted(gates.items()):
+        if name not in dispatched:
+            p("syscall-cap-lint: FAIL - caps.rs gates %s (%s) but it has no "
+              "dispatcher case." % (name, cap)); fail += 1
+        m = man.get(name)
+        if not m or m[0] != 'CAP':
+            p("syscall-cap-lint: FAIL - caps.rs gates %s with %s, but the "
+              "manifest does not list it under [CAP]. A kernel gate must be "
+              "declared." % (name, cap)); fail += 1
+
+    if fail:
+        p("syscall-cap-lint: %d problem(s). Build stopped." % fail)
+        return 1
+
+    ngated = len(gates)
+    p("syscall-cap-lint: OK - %d dispatched syscall(s) classified: %d gated "
+      "([CAP]), %d ungated-by-decision ([NOCAP])." %
+      (len(dispatched), ngated, len(dispatched) - ngated))
+    if gates:
+        p("   gated: " + ", ".join("%s->%s" % (k, v) for k, v in sorted(gates.items())))
+    return 0
+
+def generate(header, dispatch, caps_rs, out=sys.stdout):
+    name2num = parse_defines(read(header))
+    num2name = {}
+    for n, v in name2num.items():
+        num2name.setdefault(v, n)
+    dispatched = parse_dispatched(read(dispatch))
+    gates = parse_caps_rs_gates(read(caps_rs), num2name)
+    print("[NOCAP]", file=out)
+    for d in sorted(dispatched):
+        if d not in gates:
+            print(d, file=out)
+    print("", file=out)
+    print("[CAP]", file=out)
+    for name, cap in sorted(gates.items()):
+        print("%s %s" % (name, cap), file=out)
+
+def self_test(header, dispatch, caps_rs, manifest):
+    """Prove RED on a broken fixture (a dispatched syscall dropped from the
+    manifest), GREEN on the real tree. Same contract as syscall-ptr-lint
+    --self-test / invariant-gate.sh --self-test."""
+    buf = io.StringIO()
+    rc_green = run(header, dispatch, caps_rs, manifest, out=buf)
+    if rc_green != 0:
+        print("syscall-cap-lint --self-test: FAIL - the REAL tree did not pass:")
+        print(buf.getvalue())
+        return 1
+    # RED fixture: drop one [NOCAP] entry -> that dispatched syscall becomes
+    # undeclared -> must fail.
+    man_txt = read(manifest)
+    dispatched = parse_dispatched(read(dispatch))
+    gates = parse_caps_rs_gates(read(caps_rs),
+             {v: k for k, v in parse_defines(read(header)).items()})
+    victim = None
+    for d in sorted(dispatched):
+        if d not in gates and ("\n%s\n" % d) in ("\n" + man_txt + "\n"):
+            victim = d; break
+    if victim is None:
+        print("syscall-cap-lint --self-test: FAIL - no [NOCAP] victim to drop.")
+        return 1
+    broken = re.sub(r'(?m)^%s\s*$\n?' % re.escape(victim), '', man_txt)
+    tmp = manifest + '.selftest'
+    with open(tmp, 'w') as f:
+        f.write(broken)
+    try:
+        buf2 = io.StringIO()
+        rc_red = run(header, dispatch, caps_rs, tmp, out=buf2)
+    finally:
+        os.remove(tmp)
+    if rc_red == 0:
+        print("syscall-cap-lint --self-test: FAIL - dropping %s from the manifest "
+              "did NOT fail the lint. The gate does not go red." % victim)
+        return 1
+    print("syscall-cap-lint --self-test: OK - GREEN on the real tree, RED when "
+          "%s is dropped from the manifest (undeclared capability decision)." % victim)
+    return 0
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--header', required=True)
+    ap.add_argument('--dispatch', required=True)
+    ap.add_argument('--caps-rs', required=True)
+    ap.add_argument('--manifest', required=True)
+    ap.add_argument('--self-test', action='store_true')
+    ap.add_argument('--generate', action='store_true')
+    a = ap.parse_args()
+    if a.generate:
+        generate(a.header, a.dispatch, a.caps_rs)
+        return 0
+    if a.self_test:
+        return self_test(a.header, a.dispatch, a.caps_rs, a.manifest)
+    return run(a.header, a.dispatch, a.caps_rs, a.manifest)
+
+if __name__ == '__main__':
+    sys.exit(main())

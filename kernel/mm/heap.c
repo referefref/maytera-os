@@ -5,7 +5,9 @@
 #include "pmm.h"
 #include "vmm.h"
 #include "../serial.h"
+#include "mmlog.h"   // #dosmem: mm anomalies must reach a serial-less machine
 #include "../string.h"
+#include "../sync/spinlock.h"   // #114/#75: the SHARED irqsave spinlock (was a private copy)
 
 // Heap configuration
 #define HEAP_INITIAL_SIZE   (128 * MB)     // Initial heap size - needs 64MB+ for NetHack ELF (8.4MB)
@@ -47,34 +49,39 @@ static size_t total_freed = 0;
 static size_t allocation_count = 0;
 static size_t free_count = 0;
 
-// Spinlock for thread safety
-static volatile int heap_lock = 0;
-
+// Spinlock for thread safety.
+//
 // #347: heap_lock used to be a plain busy-wait spinlock that never disabled
 // interrupts. Any interrupt handler that calls kmalloc()/kfree() on the same
 // CPU while foreground code already holds heap_lock (e.g. mid-split/coalesce)
 // would spin on this lock from inside the ISR - forever, since the CPU that
 // could release it is the one now stuck servicing the interrupt. That is a
 // self-deadlock with IF effectively pinned by the interrupt gate, silently
-// stopping the timer tick and every other interrupt on that core. Save/clear
-// IF around the critical section (matches the irqsave pattern already used by
-// sync/spinlock.h and proc_wake()) so an ISR on this core can never observe
-// heap_lock held mid-update, and so the critical section itself can't be
-// interrupted and re-entered.
+// stopping the timer tick and every other interrupt on that core. The fix was
+// to save/clear IF around the critical section so an ISR on this core can never
+// observe heap_lock held mid-update, and so the critical section itself can't
+// be interrupted and re-entered.
+//
+// #114/#75: that fix was a hand-rolled irqsave lock, a PRIVATE copy of a
+// primitive that already exists in sync/spinlock.h. The identical private lock
+// ten files away in mm/pmm.c was not converted alongside it and went on to
+// deadlock two cores at #75. So heap_lock is now the SHARED spinlock, exactly
+// as mm/pmm.c, fs/blockdev.c, fs/ext2.c and drivers/ata.c use it. The IF-masking
+// semantics #347 established are preserved unchanged: spinlock_acquire_irqsave()
+// does pushfq; popq; cli (identical to the old acquire), and
+// spinlock_release_irqrestore() does popfq, which restores IF to its saved value
+// (same net effect as the old conditional sti). The critical sections, their
+// scope, and the returned-flags convention are all unchanged; only the mechanism
+// is now the one shared implementation. spinlock_acquire_irqsave() itself does no
+// allocation, so there is no kmalloc recursion.
+static spinlock_t heap_lock = SPINLOCK_INIT_NAMED("heap");
+
 static uint64_t heap_acquire_lock(void) {
-    uint64_t rflags;
-    __asm__ volatile("pushfq; popq %0; cli" : "=r"(rflags) :: "memory");
-    while (__sync_lock_test_and_set(&heap_lock, 1)) {
-        __asm__ volatile("pause");
-    }
-    return rflags;
+    return spinlock_acquire_irqsave(&heap_lock);
 }
 
 static void heap_release_lock(uint64_t rflags) {
-    __sync_lock_release(&heap_lock);
-    if (rflags & (1ULL << 9)) {
-        __asm__ volatile("sti" ::: "memory");
-    }
+    spinlock_release_irqrestore(&heap_lock, rflags);
 }
 
 // Expand the heap by allocating more pages.
@@ -127,6 +134,8 @@ static int heap_expand_once(size_t expand_size) {
         if (vmm_map_page(virt, phys, VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE) != 0) {
             pmm_free_page(phys);
             heap_expand_rollback(i);
+            MM_ANOMALY("[HEAP] failed to MAP a kernel heap page: the physical page was "
+                       "obtained but vmm_map_page_in refused it");
             kprintf("[HEAP] ERROR: Failed to map heap page\n");
             return -1;
         }
@@ -288,7 +297,9 @@ void *kmalloc(size_t size) {
     if (!block) {
         if (heap_expand(size + BLOCK_HEADER_SIZE) != 0) {
             heap_release_lock(irqf);
-            kprintf("[HEAP] ERROR: Out of memory! Requested %lu bytes\n", size);
+            MM_ANOMALY("[HEAP] kmalloc(%lu) FAILED: the kernel heap is exhausted. Every "
+                   "caller that does not check its return now writes through NULL.", size);
+        kprintf("[HEAP] ERROR: Out of memory! Requested %lu bytes\n", size);
             return NULL;
         }
         block = find_free_block(size);
@@ -317,25 +328,127 @@ void *kmalloc(size_t size) {
     return (void *)((uint8_t *)block + BLOCK_HEADER_SIZE);
 }
 
-// Allocate aligned memory
-void *kmalloc_aligned(size_t size, size_t alignment) {
-    // Simple approach: allocate extra space and align within it
-    if (alignment <= 16) {
-        return kmalloc(size);  // Already 16-byte aligned
-    }
+// ===========================================================================
+// #dosmem: THE ALIGNED ALLOCATOR HAD NO FREE, AND TWENTY CALL SITES.
+//
+// FOUND BY MEASUREMENT, not by reading. Promoting mm/'s anomaly lines to
+// /BOOTLOG.TXT put this on disk on a HEALTHY 4 GB boot of build 2287:
+//
+//   [MM#1] [HEAP] kfree() on an INVALID pointer 0x11395300
+//          (magic=0x52415453 want 0x48454150) from ra=0x478cdd
+//   [MM#2] [HEAP] kfree() on an INVALID pointer 0x11395780
+//          (magic=0x0 want 0x48454150) from ra=0x478cf9
+//
+// addr2line: drivers/hda.c:1015 and :1019, i.e. hda_free_dma_buffers()'s
+// kfree(hda_state.bdl) and kfree(hda_state.dma_buffer). Both were allocated
+// with kzalloc_aligned(). 0x52415453 is not a corrupted magic, it is the ASCII
+// "STAR" - the four bytes that happen to live 16 bytes below an address in the
+// MIDDLE of somebody else's allocation, which is exactly where an aligned
+// pointer points.
+//
+// THE MECHANISM: kmalloc_aligned() returned an offset INTO a kmalloc block and
+// stashed the real base at aligned[-1], and NOTHING IN THE TREE EVER READ THAT
+// BACK. There was no kfree_aligned(), in this header or anywhere else. So every
+// one of the twenty kmalloc_aligned/kzalloc_aligned sites (drivers/hda.c,
+// drivers/intel_hda.c, drivers/ac97.c, drivers/intel_gpu.c, io/io_ring.c,
+// exec/elf.c, video/framebuffer.c) that is ever freed leaks its whole block,
+// including a PAGE_SIZE-aligned DMA buffer per audio teardown.
+//
+// It was ALSO silently inconsistent: `alignment <= 16` returned a plain
+// kmalloc() pointer, which kfree() frees correctly. So whether kfree(p) worked
+// depended on an alignment argument at a completely different call site. Half
+// the callers were right by accident.
+//
+// THE FIX IS IN THE MECHANISM, NOT THE TWENTY INSTANCES. Adding kfree_aligned()
+// and editing twenty call sites is a fix that can be half-applied, and the next
+// person to add a kmalloc_aligned() has no way to learn the rule. Instead the
+// aligned block now carries a TAG immediately below the pointer it hands out,
+// and kfree() itself recognises it. Every existing kfree(aligned_ptr) in the
+// tree becomes correct with no caller change, and so does every future one.
+// kfree_aligned() exists as an explicit spelling for new code; it is a direct
+// alias, not a second implementation.
+//
+// WHY THE TAG IS SAFE TO TRUST. kfree() consults it ONLY after the ordinary
+// block magic has already failed, i.e. only on a pointer it was about to
+// reject outright. It then requires all three of: a 64-bit magic, a recorded
+// base inside the live heap, and that base's OWN block header carrying
+// HEAP_BLOCK_MAGIC. A wild pointer that satisfies all three is not
+// distinguishable from a real aligned allocation by any means available here,
+// and the probability is negligible; a wild pointer that satisfies none is
+// reported exactly as it was before.
+// ===========================================================================
+#define HEAP_ALIGN_TAG_MAGIC  0x4B414C4E5F544147ULL   // "KALN_TAG"
 
-    // Allocate extra space for alignment
-    size_t extra = alignment - 1 + sizeof(void *);
+typedef struct {
+    uint64_t magic;     // HEAP_ALIGN_TAG_MAGIC
+    void    *raw;       // the kmalloc() base this aligned pointer sits inside
+} heap_align_tag_t;
+
+// Sits immediately below the returned pointer. 16 bytes, so an aligned pointer
+// stays aligned for every alignment this allocator supports (>= 16).
+#define HEAP_ALIGN_TAG_SIZE  ((size_t)sizeof(heap_align_tag_t))
+
+// Allocate aligned memory. See the block comment above for why the result is
+// tagged and why kfree() knows about it.
+void *kmalloc_aligned(size_t size, size_t alignment) {
+    // <= 16 is the natural alignment of every kmalloc() result (BLOCK_HEADER_SIZE
+    // and the size rounding are both multiples of 16), so a plain block is
+    // already correct AND is already freeable by kfree() with no tag.
+    if (alignment <= 16) {
+        return kmalloc(size);
+    }
+    // Reject a non-power-of-two alignment rather than computing nonsense with
+    // the ~(alignment-1) mask below. Previously this produced a wrong address
+    // silently.
+    if (alignment & (alignment - 1)) return NULL;
+
+    // Room to slide up to `alignment-1` bytes AND to carry the tag underneath.
+    size_t extra = alignment - 1 + HEAP_ALIGN_TAG_SIZE;
+    if (size + extra < size) return NULL;          // overflow
     void *raw = kmalloc(size + extra);
     if (!raw) return NULL;
 
-    // Calculate aligned address
-    uintptr_t aligned = ((uintptr_t)raw + extra) & ~(alignment - 1);
-
-    // Store original pointer just before aligned address
-    ((void **)aligned)[-1] = raw;
+    uintptr_t aligned = ((uintptr_t)raw + extra) & ~(uintptr_t)(alignment - 1);
+    // aligned >= raw + HEAP_ALIGN_TAG_SIZE by construction (the mask can move
+    // the address down by at most alignment-1), so the tag is inside our block.
+    heap_align_tag_t *tag = (heap_align_tag_t *)(aligned - HEAP_ALIGN_TAG_SIZE);
+    tag->magic = HEAP_ALIGN_TAG_MAGIC;
+    tag->raw   = raw;
 
     return (void *)aligned;
+}
+
+// Explicit spelling for new code. kfree() handles an aligned pointer on its
+// own, so this is an alias and NOT a second implementation: a private copy is
+// exactly how this defect would come back.
+void kfree_aligned(void *ptr) { kfree(ptr); }
+
+// Recover the kmalloc base from an aligned pointer, or NULL if `ptr` does not
+// carry a valid tag. Called ONLY from kfree(), and only after the ordinary
+// block magic has failed. Must not fault: it reads at most 16 bytes below a
+// pointer the caller already dereferenced (kfree read its block header there),
+// and validates everything it finds before returning it.
+static void *heap_align_tag_base(void *ptr) {
+    if (!ptr) return NULL;
+    uintptr_t a = (uintptr_t)ptr;
+    if (a < heap_start + HEAP_ALIGN_TAG_SIZE) return NULL;
+    if (a >= heap_start + heap_size) return NULL;
+
+    const heap_align_tag_t *tag = (const heap_align_tag_t *)(a - HEAP_ALIGN_TAG_SIZE);
+    if (tag->magic != HEAP_ALIGN_TAG_MAGIC) return NULL;
+
+    uintptr_t raw = (uintptr_t)tag->raw;
+    if (raw < heap_start + BLOCK_HEADER_SIZE) return NULL;
+    if (raw >= a) return NULL;                       // the base must be BELOW us
+    if (raw >= heap_start + heap_size) return NULL;
+
+    // Third and strongest check: the recorded base must itself be a live
+    // kmalloc block. A wild pointer does not get to free arbitrary memory.
+    const heap_block_t *rb = (const heap_block_t *)(raw - BLOCK_HEADER_SIZE);
+    if (rb->magic != HEAP_BLOCK_MAGIC) return NULL;
+    if (!(rb->flags & BLOCK_FLAG_USED)) return NULL;  // already free: not ours to free again
+
+    return (void *)raw;
 }
 
 // Allocate zeroed memory
@@ -372,6 +485,8 @@ void *krealloc(void *ptr, size_t new_size) {
 
     // Validate block
     if (block->magic != HEAP_BLOCK_MAGIC) {
+        MM_ANOMALY("[HEAP] krealloc() on an INVALID pointer: heap metadata corruption "
+                   "or a wild pointer");
         kprintf("[HEAP] ERROR: krealloc() called on invalid pointer!\n");
         return NULL;
     }
@@ -458,12 +573,49 @@ void kfree(void *ptr) {
     // Validate block
     if (block->magic != HEAP_BLOCK_MAGIC) {
         heap_release_lock(irqf);
+        // #dosmem: before calling this a bad pointer, ask whether it is an
+        // ALIGNED one. See the block comment above kmalloc_aligned(). The lock
+        // is already released, so the recursive kfree() below is a normal
+        // acquire, not a re-entry.
+        {
+            void *base = heap_align_tag_base(ptr);
+            if (base) {
+                static int reported = 0;
+                if (!reported) {
+                    reported = 1;
+                    MM_ANOMALY("[HEAP] aligned-free path ENGAGED: kfree(%p) recovered the "
+                               "kmalloc base %p from its tag and freed that instead. Before "
+                               "this existed the whole block LEAKED and the call was "
+                               "reported as an invalid free. Reported once per boot.",
+                               ptr, base);
+                }
+                kfree(base);
+                return;
+            }
+        }
+        // #dosmem: NAME THE CALLER. "There is an invalid free somewhere" is not
+        // actionable; an image offset an addr2line can resolve is. This line is
+        // MEASURED to fire twice on a HEALTHY 4 GB boot of golden 2286 + this
+        // instrument (/BOOTLOG.TXT: 0x11201a00 and 0x11201f00, 1280 bytes
+        // apart), which means the kernel heap has a live pointer defect that
+        // nobody could see, because kprintf goes to serial and the owner's two
+        // machines have no serial port. The magic word actually found is
+        // printed too: 0 says the header was zeroed (a double free that already
+        // coalesced, or a freed-then-reused block), anything else says the
+        // header was overwritten with data, and those are different bugs.
+        MM_ANOMALY("[HEAP] kfree() on an INVALID pointer %p (magic=0x%x want 0x%x) "
+                   "from ra=%p - addr2line this against kernel.dbg.elf",
+                   ptr, block->magic, HEAP_BLOCK_MAGIC,
+                   __builtin_return_address(0));
         kprintf("[HEAP] ERROR: kfree() called on invalid pointer 0x%p!\n", ptr);
         return;
     }
 
     if (!(block->flags & BLOCK_FLAG_USED)) {
         heap_release_lock(irqf);
+        MM_ANOMALY("[HEAP] DOUBLE FREE at %p (size=%lu) from ra=%p - addr2line "
+                   "this against kernel.dbg.elf", ptr, (unsigned long)block->size,
+                   __builtin_return_address(0));
         kprintf("[HEAP] ERROR: Double free detected at 0x%p!\n", ptr);
         return;
     }

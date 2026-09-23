@@ -10,7 +10,7 @@ CFLAGS = -ffreestanding -fstack-protector-strong -mstack-protector-guard=global 
          -I. -Icompat -I$(LIBC_DIR) \
          -isystem /usr/lib/gcc/x86_64-linux-gnu/12/include \
          -DMAYTERA -DHAVE_CONFIG_H -DSAVEDIR=\"/SAVES\" -DSCOREFILE=\"/ROGUE.SCR\" \
-         -DNUMSCORES=10 -DNUMNAME=80 -DWIZARD=0 \
+         -DNUMSCORES=10 -DNUMNAME='"Ten"' -DWIZARD=0 \
          -Wno-implicit-function-declaration \
          -Wno-implicit-int \
          -Wno-int-conversion \

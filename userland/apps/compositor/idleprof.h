@@ -5,7 +5,7 @@
 // The owner reports the compositor at 70% CPU AT IDLE on his own laptop. The
 // same class of report was raised once before (44% with Settings open), a VM
 // was measured at approximately 0%, the VM number was believed, and the ticket
-// died. Measured again here on VM <vmid> / golden 2065: at a bare idle desktop
+// died. Measured again here on VM 2465 / golden 2065: at a bare idle desktop
 // the compositor asks for 0 or 1 presents per TWO SECONDS and the kernel's
 // back->front copy costs 0% of a core. So the VM says, again, that nothing is
 // wrong, and the VM is again not the machine with the problem.

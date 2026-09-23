@@ -902,6 +902,40 @@ pub unsafe extern "C" fn gfsf_node_state(node_id: u32) -> i32 {
     }
 }
 
+/// The highest `local` (node_id & 0x00FF_FFFF) among nodes of `kind`, live OR
+/// retired, or 0 if there are none of that kind.
+///
+/// RETIRED nodes are INCLUDED on purpose. A retired node still OCCUPIES its id:
+/// `apply_node_create` refuses `E_DUP_NODE` for any id already present, whatever
+/// its state (retire is a state change, not a removal), so an allocator that
+/// only looked at live nodes could still collide with a retired one after a node
+/// was freed and its record replayed. This is the fold's answer to "what is the
+/// largest local already taken for this kind", used to seed the escrow
+/// per-contract local allocator ABOVE a prior boot's replayed nodes so a fresh
+/// contract's ids cannot DUP (fs/escrow_guard.c: the 2nd-boot ESCROW_E_GRAPH
+/// bug on a persisted journal).
+///
+/// # Safety
+/// Touches this module's tables only. The caller holds the fold spinlock.
+#[no_mangle]
+pub unsafe extern "C" fn gfsf_max_local(kind: u32) -> u32 {
+    // SAFETY: see fold(). The caller holds the fold spinlock.
+    let f = unsafe { fold() };
+    let mut max: u32 = 0;
+    let mut i = 0usize;
+    while i < f.n_nodes {
+        let nd = f.nodes[i];
+        if nd.kind as u32 == kind {
+            let local = nd.node_id & 0x00FF_FFFFu32;
+            if local > max {
+                max = local;
+            }
+        }
+        i += 1;
+    }
+    max
+}
+
 // ===========================================================================
 // Stats, lifecycle
 // ===========================================================================

@@ -14,4 +14,9 @@ int ed25519_verify(const uint8_t sig[64], const uint8_t *m, size_t mlen,
 // #404 batch-3: boot-time [RUST-DIFF] point-decode self-test (unpack25519).
 void ed25519_decode_selftest(void);
 
+// #658 precursor: RFC 8032 known-answer self-test of the full verify
+// (accept the canonical vectors, reject single-bit forgeries). Returns
+// the number of failed checks (0 == all correct). See ed25519.c.
+int ed25519_verify_selftest(void);
+
 #endif // ED25519_H

@@ -16,6 +16,7 @@
 #include "../../libc/unistd.h"
 #include "../../libc/assoc.h"
 #include "../../libc/gui_style.h"
+#include "netscan.h"   // automatic LAN share discovery (worker thread)
 
 // Route all in-window text through the antialiased TrueType path (matches Settings).
 #define win_draw_text(h, x, y, s, c)       win_draw_text_ttf((h), (x), (y), (s), 14, (c))
@@ -27,13 +28,24 @@ static int str_eq(const char *a, const char *b);
 static int g_win_w = 820, g_win_h = 560;  // live content size (EVENT_RESIZE)
 #define WIN_W        g_win_w
 #define WIN_H        g_win_h
-#define TABBAR_H     26
-#define TOOLBAR_H    40
-#define TOP_H        (TABBAR_H + TOOLBAR_H)
-#define STATUS_H     22
+// (filesglass) Glass geometry: the SAME numbers the Calculator, Task Manager,
+// Editor and Terminal glass restyles use (PAD 10 / TAB_H 26 / PANEL_R 12 /
+// PANEL_IN 12), so every glass window shares one geometry. Four panels sit on
+// the frosted backdrop: a header (tab pills + toolbar), the Places sidebar,
+// the list (with the status row inside it) and the optional preview.
+#define PAD          10      // window margin: the backdrop shows here
+#define PANEL_R      12      // panel corner radius
+#define PANEL_IN     12      // inset from a panel edge to its content
+#define PANEL_GAP    8       // gap between neighbouring panels
+#define TAB_H        26      // tab pill height (radius TAB_H/2)
+#define TOOL_H       24      // toolbar control height
+#define HDR_H        (6 + TAB_H + 6 + TOOL_H + 8)   // 70
+#define STATUS_H     24
 #define SIDEBAR_W    160
 #define PREVIEW_W    230
 #define ITEM_HEIGHT  24
+#define ROW_R        6       // row highlight / nested card radius
+#define SCROLL_GUT   14      // scrollbar gutter reserved right of the list
 #define ICON_SIZE    16
 #define MAX_ITEMS    512
 #define MAX_PATH_LEN 256
@@ -41,67 +53,109 @@ static int g_win_w = 820, g_win_h = 560;  // live content size (EVENT_RESIZE)
 #define MAX_TABS     8
 #define MAX_HIST     24
 
-// content/list geometry (preview pane optional)
-#define CONTENT_Y    TOP_H
-#define CONTENT_H    (WIN_H - TOP_H - STATUS_H)
 static int g_preview_on = 1;
 static int  g_last_click_idx = -1;   // double-click detection (file list)
 static long g_last_click_ticks = 0;
-static int list_x(void) { return SIDEBAR_W; }
-static int list_w(void) { return WIN_W - SIDEBAR_W - (g_preview_on ? PREVIEW_W : 0) - 16; }
+static int g_in_recycle = 0;   // 1 = content area shows the integrated Recycle Bin
 
-// ---- theme-aware colors ---------------------------------------------------
+// (filesglass) Panel rects. ONE definition each: the draw path and every hit
+// test read these, so a rect cannot drift between the two.
+static int hdr_x(void)   { return PAD; }
+static int hdr_y(void)   { return PAD; }
+static int hdr_w(void)   { return WIN_W - 2 * PAD; }
+static int tabrow_y(void){ return hdr_y() + 6; }                    // tab pills
+static int tool_y(void)  { return hdr_y() + 6 + TAB_H + 6; }        // toolbar controls
+static int body_y(void)  { return PAD + HDR_H + PANEL_GAP; }        // top of the three body panels
+static int body_h(void)  { return WIN_H - PAD - body_y(); }
+static int side_x(void)  { return PAD; }
+static int prev_x(void)  { return WIN_W - PAD - PREVIEW_W; }
+static int prev_on(void) { return g_preview_on && !g_in_recycle; }  // the preview panel is drawn
+static int cont_x(void)  { return PAD + SIDEBAR_W + PANEL_GAP; }    // list panel (or recycle panel)
+static int cont_w(void)  { return (prev_on() ? prev_x() - PANEL_GAP : WIN_W - PAD) - cont_x(); }
+// The file list inside the list panel: 6px in from the panel's rounded
+// corners, a SCROLL_GUT gutter on the right, the status row below it.
+static int list_x(void)  { return cont_x() + 6; }
+static int list_y(void)  { return body_y() + 6; }
+static int list_w(void)  { return cont_w() - 12 - SCROLL_GUT; }
+static int list_h(void)  { return body_h() - 6 - STATUS_H - 4; }
+static int status_y(void){ return body_y() + body_h() - STATUS_H; }
+#define CONTENT_Y    list_y()
+#define CONTENT_H    list_h()
+
+// ---------------------------------------------------------------------------
+// (filesglass) Colour tokens: docs/UI_GLASS_DESIGN_SYSTEM.md section 1, the
+// same names and hex the Calculator / Task Manager / Media Player / Image
+// Viewer / Editor / Terminal glass restyles use. FIXED dark glass regardless
+// of theme, as those are: the window carries its own frosted backdrop, so the
+// theme's window colours never appear inside it. (The previous palette derived
+// tinted greys from theme_color(); that derivation is gone, and the shared
+// gui_* widgets get these tokens through gui_set_palette() in
+// files_apply_style() below, so the widgets themselves are unchanged.)
+// ---------------------------------------------------------------------------
+#define C_PANEL       0x00122420   // WEL_BG_MID: panel fill, glass tint, the outer colour AA edges blend toward
+#define C_CARD        0x000E1D1B   // DK_CARD_FILL: popup / dialog fill, scroll track, unselected tab pill
+#define C_EDGE        0x002C4A44   // DK_STROKE_UNSEL: panel border, hairlines, separators
+#define C_EDGE_GLASS  0x006FA99E   // DK_EDGE_GLASS: strokes on glass (popup + dialog border), scroll thumb
+#define C_INK         0x00F3FBF9   // DK_HEADLINE: names, values, status
+#define C_INK_DIM     0x00A9D9CC   // DK_BODY: detail columns, tab labels, dialog labels
+#define C_EYEBROW     0x006AE2CF   // DK_EYEBROW: sidebar section headers, "PREVIEW"
+#define C_ACCENT      0x006AE2CF   // DK_ACCENT: selected row / tab / Places entry, hotspot links
+#define C_ACCENT_INK  0x0004231A   // text on the accent
+#define C_ERR         0x00FFAAA2   // DK_ERROR: tab close x, "(not readable)" note
+#define C_IN_PH       0x0087ABA2   // DK_INPUT_PH: filter placeholder
+#define C_IN_FILL     0x00213B34   // DK_INPUT_FILL
+#define C_IN_BORDER   0x004E7168   // DK_INPUT_BORDER (resting)
+#define WEL_BG_TOP    0x000A1614   // backdrop gradient fallback, top stop
+#define WEL_BG_BOTTOM 0x00050A09   // backdrop gradient fallback, bottom stop
+#define ERR_BAND      0x00A02020   // status-row failure band (#742), white ink
+
+// Ink for text on a given fill: the accent (and any light fill) takes the
+// accent ink, every glass fill takes the headline ink.
 static inline unsigned int files_fg(unsigned int bg) {
     int r = (bg >> 16) & 0xFF, g = (bg >> 8) & 0xFF, b = bg & 0xFF;
     int lum = (r * 30 + g * 59 + b * 11) / 100;
-    return lum > 140 ? 0x00181818u : 0x00F0F0F0u;
+    return lum > 140 ? C_ACCENT_INK : C_INK;
 }
-// ---- cohesive theme palette (#Files): derive harmonious greys from the theme
-// mode (dark/light by window-bg luminance) with a subtle accent tint, instead of
-// the theme's raw black/white pairs which clashed badly.
-static inline unsigned int fp_lum(unsigned int c){int r=(c>>16)&0xFF,g=(c>>8)&0xFF,b=c&0xFF;return (r*30+g*59+b*11)/100;}
-static inline int fp_dark(void){ return fp_lum(theme_color(THEME_COLOR_WINDOW_BG)) < 128; }
-static inline unsigned int fp_tint(unsigned int base, unsigned int acc, int pct){
-    int br=(base>>16)&0xFF,bg=(base>>8)&0xFF,bb=base&0xFF;
-    int ar=(acc>>16)&0xFF,ag=(acc>>8)&0xFF,ab=acc&0xFF;
-    return ((((br*(100-pct)+ar*pct)/100)&0xFF)<<16)|((((bg*(100-pct)+ag*pct)/100)&0xFF)<<8)|(((bb*(100-pct)+ab*pct)/100)&0xFF);
-}
-static inline unsigned int fp_acc(void){ return theme_color(THEME_COLOR_ACCENT); }
-static inline unsigned int fp_content(void){ return fp_tint(fp_dark()?0x00262A30:0x00F5F6F8, fp_acc(), 5); }
-static inline unsigned int fp_panel(void)  { return fp_tint(fp_dark()?0x001E2127:0x00E8EAEE, fp_acc(), 7); }
-static inline unsigned int fp_toolbar(void){ return fp_tint(fp_dark()?0x002C313B:0x00EDEFF3, fp_acc(), 6); }
-static inline unsigned int fp_field(void)  { return fp_dark()?0x00333A45:0x00FFFFFF; }
-static inline unsigned int fp_border(void) { return fp_dark()?0x003A424F:0x00CDD3DB; }
-// Row selection: a readable DARK GREY (accent-tinted) on dark themes, a light
-// accent-tint on light themes - NOT the raw accent, which rendered near-black on
-// Nord and made the selected row + its text unreadable.
-static inline unsigned int fp_sel(void){ return fp_dark()
-    ? fp_tint(0x003C434F, fp_acc(), 28)
-    : fp_tint(0x00CCD6E6, fp_acc(), 26); }
-#define BG_COLOR      fp_content()
-#define SIDEBAR_BG    fp_panel()
-#define TOOLBAR_BG    fp_toolbar()
-#define STATUS_BG     fp_toolbar()
-#define ITEM_HOVER    fp_tint(fp_content(), fp_acc(), 16)
-#define ITEM_SELECTED fp_sel()
-#define TEXT_COLOR    files_fg(BG_COLOR)
-#define SIDE_TEXT     files_fg(SIDEBAR_BG)
+static inline unsigned int fp_acc(void){ return C_ACCENT; }
+#define BG_COLOR      C_PANEL
+#define SIDEBAR_BG    C_PANEL
+#define ITEM_HOVER    gui_lighten(C_PANEL, 10)
+#define ITEM_SELECTED C_ACCENT
+#define TEXT_COLOR    C_INK
+#define SIDE_TEXT     C_INK
 static inline unsigned int files_dim(unsigned int bg) {
+    if (bg == C_PANEL) return C_INK_DIM;
     unsigned int ink = files_fg(bg);
     int ir=(ink>>16)&0xFF, ig=(ink>>8)&0xFF, ib=ink&0xFF;
     int br=(bg>>16)&0xFF, bgc=(bg>>8)&0xFF, bb=bg&0xFF;
-    // Bias toward the ink (5/8) so dim/detail text stays readable - a light grey
-    // on dark themes (the old 50/50 average was too dark on Nord).
+    // Bias toward the ink (5/8) so dim/detail text stays readable on the
+    // selection fill.
     return ((((ir*5+br*3)/8)&0xFF)<<16) | ((((ig*5+bgc*3)/8)&0xFF)<<8) | (((ib*5+bb*3)/8)&0xFF);
 }
-#define INPUT_BG      fp_field()
-#define INPUT_TEXT    files_fg(fp_field())
-#define BTN_FACE      fp_toolbar()
-#define BTN_TEXT      files_fg(fp_toolbar())
-#define DIM_TEXT      files_dim(BG_COLOR)
-#define SIDE_DIM      files_dim(SIDEBAR_BG)
+#define DIM_TEXT      C_INK_DIM
+#define SIDE_DIM      C_INK_DIM
 #define ICON_FOLDER   0x00FFC800
-#define BORDER_COLOR  fp_border()
+#define BORDER_COLOR  C_EDGE
+
+// (filesglass) The frosted-wallpaper backdrop: the shared libc recipe
+// (userland/libc/gui_style.h gui_glass_backdrop_*, consolidated at glasslib).
+// This app owns only the two persistent pieces the API asks for.
+static uint32_t g_bd[GUI_GLASS_BD_W * GUI_GLASS_BD_H];
+static int g_bd_wi = GUI_GLASS_BD_NEVER;   // wallpaper index the backdrop was built for
+static int g_chrome_dirty = 1;             // the ONLY thing that can make fb_redraw() blit the backdrop
+// Signature of the layout facts the last blitted frame was composed for
+// (window size, which panels exist, which popup/dialog floats over the
+// margins). A change in any of them UNCOVERS margin (the preview panel
+// hiding, the Recycle view widening the list panel, a menu or dialog
+// closing), so the next frame must blit the backdrop again (blame.md
+// audglass trap 4 / edglass trap 3). Tracked at the top of fb_redraw() by
+// construction rather than at each toggle site.
+static unsigned long g_layout_sig = ~0ul;
+
+static void sync_backdrop(void) {
+    if (gui_glass_backdrop_sync(g_bd, &g_bd_wi, C_PANEL, 158, WEL_BG_TOP, WEL_BG_BOTTOM))
+        g_chrome_dirty = 1;
+}
 
 // ---- model ----------------------------------------------------------------
 // #554: per-entry filesystem-aware permission/attribute info, fetched via
@@ -177,7 +231,6 @@ static void  draw_openwith(void);
 static int window_handle = -1;
 static int win_x = 90, win_y = 40;
 static char g_home[MAX_PATH_LEN] = "/APPS";
-static int g_in_recycle = 0;   // 1 = content area shows the integrated Recycle Bin
 
 // active tab convenience
 #define CUR (tabs[active_tab])
@@ -829,24 +882,115 @@ static bool item_is_hidden(int i) {
     return false;
 }
 
+// ---- #netshares: automatic LAN share discovery listing --------------------
+// The virtual "/NET" folder is built from four sources: the two control rows
+// (Add / Rescan), a status row, the user's saved mounts, and the live results
+// of the async subnet sweep in netscan.c. Each row carries an action kind plus
+// its target so open_selected() dispatches without re-parsing display text.
+enum { NR_NONE = 0, NR_ADD, NR_RESCAN, NR_STATUS, NR_SAVED, NR_DISC_SHARE, NR_DISC_SMB, NR_DISC_NFS };
+typedef struct { unsigned char kind; char server[64]; char share[MAX_NAME_LEN]; char user[40]; char pass[40]; char export[MAX_PATH_LEN]; } net_row_t;
+static net_row_t g_net_rows[MAX_ITEMS];
+
+static void push_net_row(const char *name, bool is_dir, unsigned char kind,
+                         const char *server, const char *share) {
+    if (item_count >= MAX_ITEMS) return;
+    str_copy(items[item_count].name, name, MAX_NAME_LEN);
+    items[item_count].is_directory = is_dir;
+    items[item_count].size = 0;
+    item_clear_perm(item_count);
+    net_row_t *r = &g_net_rows[item_count];
+    r->kind = kind; r->server[0] = 0; r->share[0] = 0; r->user[0] = 0; r->pass[0] = 0; r->export[0] = 0;
+    if (server) str_copy(r->server, server, sizeof(r->server));
+    if (share)  str_copy(r->share,  share,  sizeof(r->share));
+    item_count++;
+}
+
+// Rebuild the /NET item list from the current discovery state. Does NOT touch
+// history and preserves CUR.sel/scroll (clamped), so a live refresh mid-scan
+// does not fight the user. Safe to call on every scan-progress tick.
+static void build_net_listing(void) {
+    item_count = 0;
+    int st = ns_state();
+
+    push_net_row("[+ Add Network Location]", false, NR_ADD, 0, 0);
+    push_net_row(st == NS_SCANNING ? "[x Stop scan]" : "[o Rescan network]",
+                 false, NR_RESCAN, 0, 0);
+
+    char stat[96];
+    if (st == NS_SCANNING) {
+        int d = 0, t = 0; int sv = ns_progress(&d, &t);
+        snprintf(stat, sizeof(stat), "Scanning LAN %d/%d - %d found", d, t, sv);
+    } else if (st == NS_DONE && !ns_available()) {
+        snprintf(stat, sizeof(stat), "Network unavailable (no carrier or address)");
+    } else if (st == NS_DONE) {
+        int sv = ns_server_count();
+        snprintf(stat, sizeof(stat), "Scan complete - %d server%s found", sv, sv == 1 ? "" : "s");
+    } else {
+        snprintf(stat, sizeof(stat), "Rescan to discover shares on your network");
+    }
+    push_net_row(stat, false, NR_STATUS, 0, 0);
+
+    load_netmounts();
+    for (int k = 0; k < g_netmount_count && item_count < MAX_ITEMS; k++) {
+        push_net_row(g_netmounts[k].label, true, NR_SAVED,
+                     g_netmounts[k].server, g_netmounts[k].share);
+        str_copy(g_net_rows[item_count - 1].user, g_netmounts[k].user, 40);
+        str_copy(g_net_rows[item_count - 1].pass, g_netmounts[k].pass, 40);
+    }
+
+    int nsv = ns_server_count();
+    for (int i = 0; i < nsv && item_count < MAX_ITEMS; i++) {
+        ns_server_t s;
+        if (ns_get_server(i, &s) != 0) continue;
+        if (s.smb) {
+            if (s.nshares > 0) {
+                for (int j = 0; j < s.nshares && item_count < MAX_ITEMS; j++) {
+                    char label[MAX_NAME_LEN];
+                    snprintf(label, sizeof(label), "%s on %s", s.shares[j], s.ip_str);
+                    push_net_row(label, true, NR_DISC_SHARE, s.ip_str, s.shares[j]);
+                }
+            } else {
+                char label[MAX_NAME_LEN];
+                snprintf(label, sizeof(label), "%s (SMB, no shares listed)", s.ip_str);
+                push_net_row(label, true, NR_DISC_SMB, s.ip_str, 0);
+            }
+        }
+        if (s.nfs) {
+            if (s.nexports > 0) {
+                for (int j = 0; j < s.nexports && item_count < MAX_ITEMS; j++) {
+                    char label[MAX_NAME_LEN];
+                    snprintf(label, sizeof(label), "%s on %s (NFS)", s.exports[j], s.ip_str);
+                    push_net_row(label, true, NR_DISC_NFS, s.ip_str, 0);
+                    str_copy(g_net_rows[item_count - 1].export, s.exports[j], MAX_PATH_LEN);
+                }
+            } else {
+                char label[MAX_NAME_LEN];
+                snprintf(label, sizeof(label), "%s (NFS server)", s.ip_str);
+                push_net_row(label, false, NR_DISC_NFS, s.ip_str, 0);
+            }
+        }
+    }
+
+    if (CUR.sel >= item_count) CUR.sel = -1;
+    if (CUR.scroll < 0) CUR.scroll = 0;
+}
+
 static void load_directory(const char *path) {
+    bool was_net = str_eq(CUR.path, "/NET");
+    bool now_net = str_eq(path, "/NET");
     str_copy(CUR.path, path, MAX_PATH_LEN);
     current_path = CUR.path;
     item_count = 0;
     if (CUR.sel >= 0) CUR.sel = -1;
     CUR.scroll = 0;
 
-    // #317: the virtual Network folder lists saved SMB mounts + an Add entry.
-    if (str_eq(path, "/NET")) {
-        load_netmounts();
-        str_copy(items[item_count].name, "[+ Add Network Location]", MAX_NAME_LEN);
-        items[item_count].is_directory = false; items[item_count].size = 0; item_clear_perm(item_count); item_count++;
-        for (int k = 0; k < g_netmount_count && item_count < MAX_ITEMS; k++) {
-            str_copy(items[item_count].name, g_netmounts[k].label, MAX_NAME_LEN);
-            items[item_count].is_directory = true; items[item_count].size = 0; item_clear_perm(item_count); item_count++;
-        }
-        return;
-    }
+    // #netshares: entering the Network view kicks off an async LAN sweep;
+    // leaving it cancels the worker (freeing its sockets). The listing itself
+    // is built from live discovery state by build_net_listing().
+    if (now_net && !was_net) ns_start();
+    if (was_net && !now_net) ns_cancel();
+
+    if (now_net) { build_net_listing(); return; }
 
     if (path[0] == '/' && path[1] != '\0') {
         str_copy(items[item_count].name, "..", MAX_NAME_LEN);
@@ -1258,7 +1402,7 @@ static void load_preview(void) {
         key[n] = 0;
         if (!(prev_thumb_ok && str_eq(key, prev_thumb_key))) {
             prev_thumb_ok = 0; prev_thumb_key[0] = 0;
-            if (str_eq(e, "bmp") && build_bmp_thumb(PREVIEW_W - 20, CONTENT_H - 100)) {
+            if (str_eq(e, "bmp") && build_bmp_thumb(PREVIEW_W - 2 * PANEL_IN, body_h() - 100)) {
                 int k = 0; while (key[k] && k < (int)sizeof(prev_thumb_key) - 1) { prev_thumb_key[k] = key[k]; k++; }
                 prev_thumb_key[k] = 0;
             }
@@ -1268,16 +1412,73 @@ static void load_preview(void) {
     else prev_kind = PV_HEX;
 }
 
+// (filesglass) The backdrop colour under content pixel (x, y): what the
+// kernel's nearest-neighbour scale put there, to within the blur. Every AA
+// edge and shadow drawn onto the backdrop takes its outer colour from here;
+// a flat guess is what produces a square halo around a round corner.
+static uint32_t bd_at(int x, int y) {
+    return gui_glass_backdrop_at(g_bd, WIN_W, WIN_H, x, y);
+}
+
+// One glass panel: soft shadow, AA rounded fill, 1px border, 1px top
+// highlight; the layering the Calculator's / Editor's draw_panel() use.
+// Every outer colour is sampled from the backdrop under that edge so the
+// fringe and corners match what the blit put there. Drawn EVERY frame: the
+// same inputs give the same pixels, so the repaint is idempotent and there
+// is no static/dynamic chrome split to keep in step (glass doc section 11:
+// only the backdrop blit itself is a commit). `fill` is C_PANEL for the four
+// window panels and C_CARD for a floating dialog.
+static void draw_panel_fill(int x, int y, int w, int h, uint32_t fill, uint32_t border) {
+    uint32_t below = bd_at(x + w / 2, y + h + 3);
+    uint32_t c0 = bd_at(x + 4, y + 4),     c1 = bd_at(x + w - 4, y + 4),
+             c2 = bd_at(x + 4, y + h - 4), c3 = bd_at(x + w - 4, y + h - 4);
+    uint32_t outer = 0;
+    for (int sh = 0; sh <= 16; sh += 8) {
+        uint32_t m = (((c0 >> sh) & 0xFF) + ((c1 >> sh) & 0xFF) + ((c2 >> sh) & 0xFF) + ((c3 >> sh) & 0xFF)) / 4;
+        outer |= m << sh;
+    }
+    gui_soft_shadow(window_handle, x, y + 2, w, h, PANEL_R, below);
+    gui_fill_rounded_aa(window_handle, x, y, w, h, PANEL_R, fill, outer);
+    gui_rounded_border(window_handle, x, y, w, h, PANEL_R, border);
+    win_draw_rect(window_handle, x + PANEL_R, y + 1, w - 2 * PANEL_R, 1, gui_lighten(fill, 16));
+}
+static void draw_panel(int x, int y, int w, int h) { draw_panel_fill(x, y, w, h, C_PANEL, C_EDGE); }
+
+// Section eyebrow (glass doc section 5: small bold caps in DK_EYEBROW). The
+// TTF path has no bold face here, so the caps + the accent hue carry it.
+static void draw_eyebrow(int x, int y, const char *label) {
+    char up[24]; int i = 0;
+    for (; label[i] && i < 23; i++) up[i] = (label[i] >= 'a' && label[i] <= 'z') ? (char)(label[i] - 32) : label[i];
+    up[i] = 0;
+    win_draw_text_small(window_handle, x, y, up, C_EYEBROW);
+}
+
+// A row highlight inside a panel: rounded, AA-blended toward the panel.
+static void draw_row_fill(int x, int y, int w, int h, uint32_t fill) {
+    gui_fill_rounded_aa(window_handle, x, y, w, h, ROW_R, fill, C_PANEL);
+}
+
+// The list scrollbar: a 6px pill track (C_CARD) centred in the SCROLL_GUT
+// gutter with a C_EDGE_GLASS thumb, the Editor's grammar; geometry unchanged
+// from the flat version (thumb position = scroll * (h - th) / max).
+static void draw_scroll_pill(int gx, int y, int h, int scroll, int max_scroll, int visible, int total) {
+    int th = (visible * h) / total; if (th < 20) th = 20;
+    int ty = max_scroll ? (scroll * (h - th)) / max_scroll : 0;
+    int px = gx + (SCROLL_GUT - 6) / 2;
+    gui_fill_rounded_aa(window_handle, px, y, 6, h, 3, C_CARD, C_PANEL);
+    gui_fill_rounded_aa(window_handle, px, y + ty, 6, th, 3, C_EDGE_GLASS, C_CARD);
+}
+
 static void draw_preview(void) {
-    int px = WIN_W - PREVIEW_W, py = CONTENT_Y;
-    win_draw_rect(window_handle, px, py, PREVIEW_W, CONTENT_H, SIDEBAR_BG);
-    win_draw_rect(window_handle, px, py, 1, CONTENT_H, BORDER_COLOR);
-    win_draw_text(window_handle, px + 10, py + 8, "Preview", DIM_TEXT);
-    int cx = px + 10, cy = py + 30, cw = PREVIEW_W - 20;
+    int px = prev_x(), py = body_y();
+    draw_panel(px, py, PREVIEW_W, body_h());
+    draw_eyebrow(px + PANEL_IN, py + 10, "Preview");
+    int cx = px + PANEL_IN, cy = py + 30, cw = PREVIEW_W - 2 * PANEL_IN;
+    int bottom = py + body_h() - PANEL_IN;
     if (CUR.sel < 0 || CUR.sel >= item_count || prev_kind == PV_NONE) {
         if (CUR.sel >= 0 && CUR.sel < item_count && items[CUR.sel].is_directory)
-            win_draw_text(window_handle, cx, cy, "(folder)", SIDE_TEXT);
-        else win_draw_text(window_handle, cx, cy, "No preview", SIDE_TEXT);
+            win_draw_text(window_handle, cx, cy, "(folder)", DIM_TEXT);
+        else win_draw_text(window_handle, cx, cy, "No preview", DIM_TEXT);
         return;
     }
     // file name header
@@ -1295,13 +1496,13 @@ static void draw_preview(void) {
             }
         } else {
             gui_draw_rect_outline(window_handle, cx, cy, cw, 120, BORDER_COLOR);
-            win_draw_text(window_handle, cx + 8, cy + 52, "(image)", SIDE_TEXT);
+            win_draw_text(window_handle, cx + 8, cy + 52, "(image)", DIM_TEXT);
         }
         return;
     }
     if (prev_kind == PV_TEXT) {
         int x = cx, y = cy; int col = 0; int maxcol = cw / 8;
-        for (int i = 0; i < prev_len && y < py + CONTENT_H - 16; i++) {
+        for (int i = 0; i < prev_len && y < bottom - 12; i++) {
             char ch = (char)prev_buf[i];
             if (ch == '\n' || col >= maxcol) { y += 14; col = 0; if (ch == '\n') continue; }
             if (ch == '\r' || ch == '\t') continue;
@@ -1313,7 +1514,7 @@ static void draw_preview(void) {
     }
     // PV_HEX
     int y = cy; int shown = prev_len < 256 ? prev_len : 256;
-    for (int i = 0; i < shown && y < py + CONTENT_H - 16; i += 8) {
+    for (int i = 0; i < shown && y < bottom - 12; i += 8) {
         char line[64]; int l = 0;
         char hx[4];
         for (int j = 0; j < 8 && i + j < shown; j++) {
@@ -1332,26 +1533,35 @@ static void draw_preview(void) {
 }
 
 // ---- tab bar --------------------------------------------------------------
-#define TAB_W 130
+#define TAB_W   130
+#define TAB_GAP 4
+#define TTF_TAB 12   // tab pill labels (glass doc section 5: labels at 12)
+// Tab pill i's left edge; the "+" pill sits at tab_x(tab_count). ONE
+// definition, read by draw_tabbar() AND the tab-bar click handler.
+static int tab_x(int i) { return hdr_x() + PANEL_IN + i * (TAB_W + TAB_GAP); }
+
+// (filesglass) The tab strip lives on the header panel's top row: the
+// selected tab is the accent pill with the accent ink (the Calculator's
+// selected-pill grammar), the others are nested cards (C_CARD + C_EDGE).
 static void draw_tabbar(void) {
-    win_draw_rect(window_handle, 0, 0, WIN_W, TABBAR_H, SIDEBAR_BG);
-    win_draw_rect(window_handle, 0, TABBAR_H - 1, WIN_W, 1, BORDER_COLOR);
-    int rad = gui_theme_is_classic() ? 0 : 6;
+    int ty = tabrow_y();
     for (int i = 0; i < tab_count; i++) {
-        int tx = 4 + i * (TAB_W + 2);
+        int tx = tab_x(i);
         bool act = (i == active_tab);
-        uint32_t tb = act ? BG_COLOR : SIDEBAR_BG;
-        gui_fill_rounded_aa(window_handle, tx, 3, TAB_W, TABBAR_H - 3, rad, tb, SIDEBAR_BG);
+        gui_fill_rounded_aa(window_handle, tx, ty, TAB_W, TAB_H, TAB_H / 2, act ? C_ACCENT : C_CARD, C_PANEL);
+        if (!act) gui_rounded_border(window_handle, tx, ty, TAB_W, TAB_H, TAB_H / 2, C_EDGE);
         char title[18]; str_copy(title, basename_of(tabs[i].path), 18);
-        win_draw_text(window_handle, tx + 10, 6, title, act ? TEXT_COLOR : SIDE_TEXT);
-        // (#704) tab close affordance: was a hardcoded muted red, now the
-        // theme's error/danger token.
-        win_draw_text(window_handle, tx + TAB_W - 16, 6, "x", theme_color(THEME_COLOR_ERROR));
+        int lty = ty + (TAB_H - TTF_TAB) / 2 - 1;
+        win_draw_text_ttf(window_handle, tx + 12, lty, title, TTF_TAB, act ? C_ACCENT_INK : C_INK_DIM);
+        // (#704) tab close affordance in the error ink; on the accent pill the
+        // accent ink, because DK_ERROR on DK_ACCENT is under 1.5:1.
+        win_draw_text_ttf(window_handle, tx + TAB_W - 18, lty, "x", TTF_TAB, act ? C_ACCENT_INK : C_ERR);
     }
     if (tab_count < MAX_TABS) {
-        int ax = 4 + tab_count * (TAB_W + 2);
-        gui_fill_rounded_aa(window_handle, ax, 3, 24, TABBAR_H - 3, rad, SIDEBAR_BG, SIDEBAR_BG);
-        win_draw_text(window_handle, ax + 8, 6, "+", TEXT_COLOR);
+        int ax = tab_x(tab_count);
+        gui_fill_rounded_aa(window_handle, ax, ty, 24, TAB_H, TAB_H / 2, C_CARD, C_PANEL);
+        gui_rounded_border(window_handle, ax, ty, 24, TAB_H, TAB_H / 2, C_EDGE);
+        win_draw_text_ttf(window_handle, ax + 8, ty + (TAB_H - TTF_TAB) / 2 - 1, "+", TTF_TAB, C_INK);
     }
 }
 
@@ -1366,34 +1576,41 @@ static void files_icon_btn(int x, int y, int w, int h, const char *icn, int dir,
     if (!draw_mico(icn, ix, iy, 16, tint)) draw_arrow(ix + 2, y + h / 2, dir, tint);
 }
 
+// Toolbar geometry, ONE definition each (draw + hit-test): three 26px nav
+// buttons 28px apart from the panel's left inset, the address field filling
+// the middle, New / View / filter (60px each, 64px pitch) against the right.
+static int nav_x(int k)  { return hdr_x() + PANEL_IN + k * 28; }
+static int addr_x(void)  { return hdr_x() + PANEL_IN + 90; }
+static int cmd_x(void)   { return hdr_x() + hdr_w() - PANEL_IN - 3 * 64; }   // "New"; View at +64, filter at +128
+static int addr_w(void)  { return cmd_x() - 8 - addr_x(); }
+
+// (filesglass) The toolbar row of the header panel: the shared gui_button /
+// gui_textfield2 widgets, unchanged, rendering under the glass palette that
+// files_apply_style() installs.
 static void draw_toolbar(void) {
-    int ty = TABBAR_H;
-    win_draw_rect(window_handle, 0, ty, WIN_W, TOOLBAR_H, TOOLBAR_BG);
-    win_draw_rect(window_handle, 0, ty + TOOLBAR_H - 1, WIN_W, 1, BORDER_COLOR);
-    int by = ty + 8;
-    uint32_t ink = files_fg(fp_toolbar());
+    int by = tool_y();
+    uint32_t ink = C_INK;
     // nav icon buttons (Zest chevrons; dim when the action is unavailable)
-    files_icon_btn(8,  by, 26, 24, "CHEVL", 0, CUR.back_n ? ink : files_dim(fp_toolbar()), CUR.back_n != 0, false);
-    files_icon_btn(36, by, 26, 24, "CHEVR", 1, CUR.fwd_n  ? ink : files_dim(fp_toolbar()), CUR.fwd_n  != 0, false);
-    files_icon_btn(64, by, 26, 24, "CHEVU", 2, ink, true, false);
+    files_icon_btn(nav_x(0), by, 26, TOOL_H, "CHEVL", 0, CUR.back_n ? ink : C_INK_DIM, CUR.back_n != 0, false);
+    files_icon_btn(nav_x(1), by, 26, TOOL_H, "CHEVR", 1, CUR.fwd_n  ? ink : C_INK_DIM, CUR.fwd_n  != 0, false);
+    files_icon_btn(nav_x(2), by, 26, TOOL_H, "CHEVU", 2, ink, true, false);
     // address bar
-    int axx = 98, aw = WIN_W - 98 - 8 - 3 * 64;
-    gui_textfield2(window_handle, axx, by, aw, 24, CUR.path, false);
+    gui_textfield2(window_handle, addr_x(), by, addr_w(), TOOL_H, CUR.path, false);
     // command buttons: New / View
-    int bx = WIN_W - 8 - 3 * 64;
+    int bx = cmd_x();
     // #234i: New is DISABLED, not merely refused, on a read-only volume. A
     // control that can be pressed and then explains itself is worse than one
     // that visibly cannot be pressed; ro_block() still guards the action, so
     // this is the affordance and not the enforcement.
-    gui_button(window_handle, bx, by, 60, 24, "New", GUI_BTN_SECONDARY,
+    gui_button(window_handle, bx, by, 60, TOOL_H, "New", GUI_BTN_SECONDARY,
                cur_is_readonly() ? GUI_ST_DISABLED
                                  : (g_menu == MENU_NEW ? GUI_ST_PRESSED : GUI_ST_NORMAL));
-    gui_button(window_handle, bx + 64, by, 60, 24, "View", GUI_BTN_SECONDARY,
+    gui_button(window_handle, bx + 64, by, 60, TOOL_H, "View", GUI_BTN_SECONDARY,
                g_menu == MENU_VIEW ? GUI_ST_PRESSED : GUI_ST_NORMAL);
     // filter box
     int fx = bx + 128;
-    gui_textfield2(window_handle, fx, by, 60, 24, g_filter[0] ? g_filter : "", false);
-    if (!g_filter[0]) win_draw_text_small(window_handle, fx + 6, by + 7, "Filter..", files_dim(fp_field()));
+    gui_textfield2(window_handle, fx, by, 60, TOOL_H, g_filter[0] ? g_filter : "", false);
+    if (!g_filter[0]) win_draw_text_small(window_handle, fx + 6, by + 7, "Filter..", C_IN_PH);
 }
 
 // #234i fallback glyphs for the two disk-image volume classes. There is no
@@ -1465,33 +1682,42 @@ static int  side_kind[40];
 static int  side_vol[40];    // #250: volume index for kinds 4/5/6, else -1
 static int  side_rows = 0;
 
+// (filesglass) Sidebar row geometry relative to the sidebar panel's left
+// edge: the current-entry pill is inset 6px from the panel (radius ROW_R),
+// the icon sits 12px in, the label 34px in, the eject glyph 22px from the
+// right edge. The row's hit band is unchanged (side_y[i] - 2 .. + ITEM_HEIGHT - 2).
+#define SIDE_ICON_X   (side_x() + 12)
+#define SIDE_LABEL_X  (side_x() + 34)
+#define SIDE_EJECT_X  (side_x() + SIDEBAR_W - 22)
+static void side_row_fill(int y) { draw_row_fill(side_x() + 6, y - 2, SIDEBAR_W - 12, ITEM_HEIGHT, ITEM_SELECTED); }
+
 static void draw_sidebar(void) {
-    win_draw_rect(window_handle, 0, CONTENT_Y, SIDEBAR_W, CONTENT_H, SIDEBAR_BG);
-    win_draw_rect(window_handle, SIDEBAR_W - 1, CONTENT_Y, 1, CONTENT_H, BORDER_COLOR);
+    draw_panel(side_x(), body_y(), SIDEBAR_W, body_h());
     side_rows = 0;
-    int y = CONTENT_Y + 8;
-    win_draw_text(window_handle, 8, y, "Quick access", SIDE_TEXT); y += 20;
+    int ex = side_x() + PANEL_IN;        // eyebrow x
+    int y = body_y() + 10;
+    draw_eyebrow(ex, y, "Quick access"); y += 20;
     for (int i = 0; qa_label[i]; i++) {
         char p[MAX_PATH_LEN]; qa_path(i, p);
         bool cur = str_eq(CUR.path, p);
-        if (cur) win_draw_rect(window_handle, 4, y - 2, SIDEBAR_W - 8, ITEM_HEIGHT, ITEM_SELECTED);
+        if (cur) side_row_fill(y);
         { const char *icn = (i == 0) ? "HOME" : "FOLDER";
           uint32_t tint = cur ? files_fg(ITEM_SELECTED) : SIDE_TEXT;
-          if (!draw_mico(icn, 12, y, ICON_SIZE, tint)) draw_folder_icon(12, y); }
-        win_draw_text(window_handle, 34, y, qa_label[i], SIDE_TEXT);
+          if (!draw_mico(icn, SIDE_ICON_X, y, ICON_SIZE, tint)) draw_folder_icon(SIDE_ICON_X, y); }
+        win_draw_text(window_handle, SIDE_LABEL_X, y, qa_label[i], cur ? files_fg(ITEM_SELECTED) : SIDE_TEXT);
         str_copy(side_target[side_rows], p, MAX_PATH_LEN);
         side_y[side_rows] = y; side_kind[side_rows] = 0; side_vol[side_rows] = -1; side_rows++;
         y += ITEM_HEIGHT;
     }
     y += 6;
-    win_draw_text(window_handle, 8, y, "This PC", SIDE_TEXT); y += 20;
+    draw_eyebrow(ex, y, "This PC"); y += 20;
     // (#704) Sidebar device/network/trash icon literals below are fallback
     // glyphs (draw_mico() found no icon-font asset), same "icon identity
     // color, not chrome" classification as the file-type colors above -
     // intentionally not themed.
     for (int i = 0; i < g_disk_count; i++) {
-        win_draw_rect(window_handle, 12, y + 2, ICON_SIZE, ICON_SIZE - 2, 0x00808890);
-        gui_draw_rect_outline(window_handle, 12, y + 2, ICON_SIZE, ICON_SIZE - 2, 0x00505860);
+        win_draw_rect(window_handle, SIDE_ICON_X, y + 2, ICON_SIZE, ICON_SIZE - 2, 0x00808890);
+        gui_draw_rect_outline(window_handle, SIDE_ICON_X, y + 2, ICON_SIZE, ICON_SIZE - 2, 0x00505860);
         char lbl[40]; int l = 0;
         const char *pfx = "Disk "; while (*pfx) lbl[l++] = *pfx++;
         lbl[l++] = '0' + i; lbl[l++] = ' '; lbl[l++] = '(';
@@ -1499,19 +1725,20 @@ static void draw_sidebar(void) {
         for (int k = 0; mb[k] && l < 30; k++) lbl[l++] = mb[k];
         const char *sfx = "MB)"; while (*sfx && l < 38) lbl[l++] = *sfx++;
         lbl[l] = 0;
-        win_draw_text_small(window_handle, 34, y + 4, lbl, SIDE_TEXT);
+        win_draw_text_small(window_handle, SIDE_LABEL_X, y + 4, lbl, SIDE_TEXT);
         str_copy(side_target[side_rows], "/", MAX_PATH_LEN);
         side_y[side_rows] = y; side_kind[side_rows] = 1; side_vol[side_rows] = -1; side_rows++;
         y += ITEM_HEIGHT;
     }
-    if (g_disk_count == 0) { win_draw_text_small(window_handle, 34, y + 4, "(no drives)", SIDE_DIM); y += ITEM_HEIGHT; }
+    if (g_disk_count == 0) { win_draw_text_small(window_handle, SIDE_LABEL_X, y + 4, "(no drives)", SIDE_DIM); y += ITEM_HEIGHT; }
     // ext2 volume mounted at /ext2 by the kernel ext2 driver (#99). Browsable
     // (read + create) through the normal file API.
     {
-        if (str_eq(CUR.path, "/ext2")) win_draw_rect(window_handle, 4, y - 2, SIDEBAR_W - 8, ITEM_HEIGHT, ITEM_SELECTED);
-        win_draw_rect(window_handle, 12, y + 2, ICON_SIZE, ICON_SIZE - 2, 0x00608060);
-        gui_draw_rect_outline(window_handle, 12, y + 2, ICON_SIZE, ICON_SIZE - 2, 0x00405040);
-        win_draw_text_small(window_handle, 34, y + 4, "ext2 (/ext2)", SIDE_TEXT);
+        bool cur = str_eq(CUR.path, "/ext2");
+        if (cur) side_row_fill(y);
+        win_draw_rect(window_handle, SIDE_ICON_X, y + 2, ICON_SIZE, ICON_SIZE - 2, 0x00608060);
+        gui_draw_rect_outline(window_handle, SIDE_ICON_X, y + 2, ICON_SIZE, ICON_SIZE - 2, 0x00405040);
+        win_draw_text_small(window_handle, SIDE_LABEL_X, y + 4, "ext2 (/ext2)", cur ? files_fg(ITEM_SELECTED) : SIDE_TEXT);
         str_copy(side_target[side_rows], "/ext2", MAX_PATH_LEN);
         side_y[side_rows] = y; side_kind[side_rows] = 1; side_vol[side_rows] = -1; side_rows++;
         y += ITEM_HEIGHT;
@@ -1524,12 +1751,14 @@ static void draw_sidebar(void) {
     // ------------------------------------------------------------------
     if (g_vol_count > 0) {
         y += 6;
-        win_draw_text(window_handle, 8, y, "Removable", SIDE_TEXT); y += 20;
+        draw_eyebrow(ex, y, "Removable"); y += 20;
         for (int i = 0; i < g_vol_count && side_rows < 38; i++) {
             const sc_volume_t *v = &g_vols[i];
             int readable = (v->flags & MOSVOL_READABLE) && (v->flags & MOSVOL_MOUNTED);
             bool cur = readable && str_eq(CUR.path, v->mount);
-            if (cur) win_draw_rect(window_handle, 4, y - 2, SIDEBAR_W - 8, ITEM_HEIGHT, ITEM_SELECTED);
+            if (cur) side_row_fill(y);
+            uint32_t row_ink = cur ? files_fg(ITEM_SELECTED) : SIDE_TEXT;
+            uint32_t row_dim = cur ? files_dim(ITEM_SELECTED) : SIDE_DIM;
 
             // Icon, one per volume CLASS. #234i added the disc and floppy
             // glyphs: a mounted CD and a mounted floppy drawn with the same
@@ -1538,18 +1767,19 @@ static void draw_sidebar(void) {
             // can be dropped into /ICONS later without touching this file;
             // none of the three exists today, so all three fall through.
             {
-                uint32_t tint = cur ? files_fg(ITEM_SELECTED) : SIDE_TEXT;
+                uint32_t tint = row_ink;
+                int ix = SIDE_ICON_X;
                 if (v->flags & MOSVOL_OPTICAL) {
-                    if (!draw_mico("CDROM", 12, y, ICON_SIZE, tint))
-                        draw_disc_icon(12, y + 1, ICON_SIZE - 2,
+                    if (!draw_mico("CDROM", ix, y, ICON_SIZE, tint))
+                        draw_disc_icon(ix, y + 1, ICON_SIZE - 2,
                                        cur ? ITEM_SELECTED : SIDEBAR_BG);
                 } else if (v->flags & MOSVOL_FLOPPY) {
-                    if (!draw_mico("FLOPPY", 12, y, ICON_SIZE, tint))
-                        draw_floppy_icon(12, y + 1, ICON_SIZE - 2);
-                } else if (!draw_mico("USBDRIVE", 12, y, ICON_SIZE, tint)) {
-                    win_draw_rect(window_handle, 15, y + 5, ICON_SIZE - 6, ICON_SIZE - 6, 0x0060A0D0);
-                    gui_draw_rect_outline(window_handle, 15, y + 5, ICON_SIZE - 6, ICON_SIZE - 6, 0x00305070);
-                    win_draw_rect(window_handle, 18, y + 1, ICON_SIZE - 12, 4, 0x00B0B8C0);
+                    if (!draw_mico("FLOPPY", ix, y, ICON_SIZE, tint))
+                        draw_floppy_icon(ix, y + 1, ICON_SIZE - 2);
+                } else if (!draw_mico("USBDRIVE", ix, y, ICON_SIZE, tint)) {
+                    win_draw_rect(window_handle, ix + 3, y + 5, ICON_SIZE - 6, ICON_SIZE - 6, 0x0060A0D0);
+                    gui_draw_rect_outline(window_handle, ix + 3, y + 5, ICON_SIZE - 6, ICON_SIZE - 6, 0x00305070);
+                    win_draw_rect(window_handle, ix + 6, y + 1, ICON_SIZE - 12, 4, 0x00B0B8C0);
                 }
             }
 
@@ -1567,7 +1797,7 @@ static void draw_sidebar(void) {
                 while (*u && l < 24) nm[l++] = *u++;
             }
             nm[l] = 0;
-            win_draw_text_small(window_handle, 34, y + 1, nm, SIDE_TEXT);
+            win_draw_text_small(window_handle, SIDE_LABEL_X, y + 1, nm, row_ink);
 
             char sub[48]; int sl = 0;
             char sz[24]; vol_size_label(v, sz, sizeof(sz));
@@ -1597,13 +1827,13 @@ static void draw_sidebar(void) {
                 while (*w && sl < 46) sub[sl++] = *w++;
             }
             sub[sl] = 0;
-            win_draw_text_small(window_handle, 34, y + 12, sub, readable ? SIDE_DIM : 0x00C08040);
+            win_draw_text_small(window_handle, SIDE_LABEL_X, y + 12, sub, readable ? row_dim : C_ERR);
 
             // Eject button: a small triangle-over-bar, right-aligned.
-            int ex = SIDEBAR_W - 22;
-            win_draw_rect(window_handle, ex + 2, y + 13, 10, 2, SIDE_TEXT);
+            int ejx = SIDE_EJECT_X;
+            win_draw_rect(window_handle, ejx + 2, y + 13, 10, 2, row_ink);
             for (int r = 0; r < 5; r++)
-                win_draw_rect(window_handle, ex + 6 - r, y + 10 - r, 1 + 2 * r, 1, SIDE_TEXT);
+                win_draw_rect(window_handle, ejx + 6 - r, y + 10 - r, 1 + 2 * r, 1, row_ink);
 
             // TWO rows in the hit table for ONE visual row: the eject button
             // is listed FIRST so the click scan finds it before the
@@ -1622,10 +1852,10 @@ static void draw_sidebar(void) {
     }
 
     y += 6;
-    win_draw_text(window_handle, 8, y, "Network", SIDE_TEXT); y += 20;
-    if (!draw_mico("NETWORK", 12, y, ICON_SIZE, SIDE_TEXT))
-        win_draw_rect(window_handle, 12, y + 3, ICON_SIZE, ICON_SIZE - 4, 0x004A78C0);
-    win_draw_text(window_handle, 34, y, "Network", SIDE_TEXT);
+    draw_eyebrow(ex, y, "Network"); y += 20;
+    if (!draw_mico("NETWORK", SIDE_ICON_X, y, ICON_SIZE, SIDE_TEXT))
+        win_draw_rect(window_handle, SIDE_ICON_X, y + 3, ICON_SIZE, ICON_SIZE - 4, 0x004A78C0);
+    win_draw_text(window_handle, SIDE_LABEL_X, y, "Network", SIDE_TEXT);
     str_copy(side_target[side_rows], "/NET", MAX_PATH_LEN);
     side_y[side_rows] = y; side_kind[side_rows] = 2; side_vol[side_rows] = -1; side_rows++;
     y += ITEM_HEIGHT;
@@ -1633,23 +1863,27 @@ static void draw_sidebar(void) {
     // Recycle Bin: opens the integrated trash view (side_kind 3) instead of a
     // directory. Highlighted when the recycle view is the active content.
     y += 6;
-    win_draw_text(window_handle, 8, y, "System", SIDE_TEXT); y += 20;
-    if (g_in_recycle) win_draw_rect(window_handle, 4, y - 2, SIDEBAR_W - 8, ITEM_HEIGHT, ITEM_SELECTED);
+    draw_eyebrow(ex, y, "System"); y += 20;
+    if (g_in_recycle) side_row_fill(y);
     { uint32_t tint = g_in_recycle ? files_fg(ITEM_SELECTED) : SIDE_TEXT;
-      if (!draw_mico("RECYCLE", 12, y, ICON_SIZE, tint)) {
+      if (!draw_mico("RECYCLE", SIDE_ICON_X, y, ICON_SIZE, tint)) {
           // Simple trash-can fallback glyph.
-          win_draw_rect(window_handle, 13, y + 4, ICON_SIZE - 2, ICON_SIZE - 4, 0x00808890);
-          win_draw_rect(window_handle, 11, y + 1, ICON_SIZE + 2, 3, 0x00606870);
+          win_draw_rect(window_handle, SIDE_ICON_X + 1, y + 4, ICON_SIZE - 2, ICON_SIZE - 4, 0x00808890);
+          win_draw_rect(window_handle, SIDE_ICON_X - 1, y + 1, ICON_SIZE + 2, 3, 0x00606870);
       } }
-    win_draw_text(window_handle, 34, y, "Recycle Bin", SIDE_TEXT);
+    win_draw_text(window_handle, SIDE_LABEL_X, y, "Recycle Bin", g_in_recycle ? files_fg(ITEM_SELECTED) : SIDE_TEXT);
     str_copy(side_target[side_rows], TRASH_DIR, MAX_PATH_LEN);
     side_y[side_rows] = y; side_kind[side_rows] = 3; side_vol[side_rows] = -1; side_rows++;
 }
 
 // ---- file list ------------------------------------------------------------
+// (filesglass) The list panel: the rows sit directly on the panel fill; a
+// selected row is the accent pill, a hovered row a lightened panel pill.
+// The panel is drawn every frame (idempotent), and the rows over it, so no
+// flat clear is needed.
 static void draw_file_list(void) {
     int lx = list_x(), lw = list_w();
-    win_draw_rect(window_handle, lx, CONTENT_Y, lw + 16, CONTENT_H, BG_COLOR);
+    draw_panel(cont_x(), body_y(), cont_w(), body_h());
 
     if (g_view == VIEW_ICONS) {
         int cols = lw / 96; if (cols < 1) cols = 1;
@@ -1662,8 +1896,8 @@ static void draw_file_list(void) {
             int r = i / cols - CUR.scroll, c = i % cols;
             int cx = lx + c * cw, cy = CONTENT_Y + 6 + r * chh;
             if (cy + chh > CONTENT_Y + CONTENT_H) break;
-            if (i == CUR.sel) win_draw_rect(window_handle, cx + 4, cy, cw - 8, chh - 4, ITEM_SELECTED);
-            else if (i == hover_item) win_draw_rect(window_handle, cx + 4, cy, cw - 8, chh - 4, ITEM_HOVER);
+            if (i == CUR.sel) draw_row_fill(cx + 4, cy, cw - 8, chh - 4, ITEM_SELECTED);
+            else if (i == hover_item) draw_row_fill(cx + 4, cy, cw - 8, chh - 4, ITEM_HOVER);
             int icx = cx + cw / 2 - 16, icy = cy + 8;
             {
                 const char *icn = icon_for_entry(items[i].name, items[i].is_directory, i == CUR.sel);
@@ -1674,8 +1908,11 @@ static void draw_file_list(void) {
                 }
             }
             char nm[16]; str_copy(nm, items[i].name, 14);
-            win_draw_text_small(window_handle, cx + cw/2 - gui_ttf_width(nm, 11)/2, cy + 46, nm, TEXT_COLOR);
+            win_draw_text_small(window_handle, cx + cw/2 - gui_ttf_width(nm, 11)/2, cy + 46, nm,
+                                (i == CUR.sel) ? files_fg(ITEM_SELECTED) : TEXT_COLOR);
         }
+        if (total_rows > visible_rows && visible_rows > 0)
+            draw_scroll_pill(lx + lw, CONTENT_Y, CONTENT_H, CUR.scroll, total_rows - visible_rows, visible_rows, total_rows);
         return;
     }
 
@@ -1687,8 +1924,8 @@ static void draw_file_list(void) {
     int y = CONTENT_Y;
     for (int i = CUR.scroll; i < item_count && y < CONTENT_Y + CONTENT_H - ITEM_HEIGHT + 1; i++) {
         file_entry_t *it = &items[i];
-        if (i == CUR.sel) win_draw_rect(window_handle, lx + 2, y, lw - 4, ITEM_HEIGHT, ITEM_SELECTED);
-        else if (i == hover_item) win_draw_rect(window_handle, lx + 2, y, lw - 4, ITEM_HEIGHT, ITEM_HOVER);
+        if (i == CUR.sel) draw_row_fill(lx, y, lw, ITEM_HEIGHT, ITEM_SELECTED);
+        else if (i == hover_item) draw_row_fill(lx, y, lw, ITEM_HEIGHT, ITEM_HOVER);
         uint32_t tint = (i == CUR.sel) ? files_fg(ITEM_SELECTED) : TEXT_COLOR;
         {
             const char *icn = icon_for_entry(it->name, it->is_directory, i == CUR.sel);
@@ -1726,25 +1963,12 @@ static void draw_file_list(void) {
         }
         y += ITEM_HEIGHT;
     }
-    if (item_count > visible) {
-        int sbx = lx + lw, sh = CONTENT_H;
-        int th = (visible * sh) / item_count; if (th < 20) th = 20;
-        int ty = max_scroll ? (CUR.scroll * (sh - th)) / max_scroll : 0;
-        // Geometry is this app's; the COLOURS come from the shared rule, or
-        // the thumb is 1.23:1 on the default theme (#745 item 77). The surface
-        // is BG_COLOR, this app's OWN content fill (fp_content()), NOT the
-        // theme's window_bg: measured on a booted VM they are 0xEBEEF0 and
-        // 0xB4B4B4, and the repair has to be told the colour actually behind
-        // the gutter or it is contrast against a pixel nobody drew.
-        uint32_t sb_track, sb_thumb;
-        gui_scroll_colors(0, BG_COLOR, &sb_track, &sb_thumb);
-        win_draw_rect(window_handle, sbx, CONTENT_Y, 14, sh, sb_track);
-        // (#117) was fill-only, no boundary, so this trough never inherited
-        // #96's fix even though gui_scroll_draw_on()'s did - see
-        // gui_scroll_trough_border()'s comment in gui_scroll.h.
-        gui_scroll_trough_border(window_handle, sbx, CONTENT_Y, 14, sh, sb_track, BG_COLOR);
-        win_draw_rect(window_handle, sbx + 2, CONTENT_Y + ty, 10, th, sb_thumb);
-    }
+    // (filesglass) The scrollbar is the glass pill (track C_CARD, thumb
+    // C_EDGE_GLASS: 3.9:1 on the panel), the Editor's grammar, in the same
+    // SCROLL_GUT gutter the flat trough used; gui_scroll_colors() is not
+    // consulted because the colours are fixed tokens, not a theme surface.
+    if (item_count > visible)
+        draw_scroll_pill(lx + lw, CONTENT_Y, CONTENT_H, CUR.scroll, max_scroll, visible, item_count);
 }
 
 // ---- recycle view ---------------------------------------------------------
@@ -1762,19 +1986,21 @@ static void draw_file_list(void) {
 #define RB_BTN_EMPTY_X    244
 #define RB_BTN_EMPTY_W    100
 
-static int rb_area_x(void) { return SIDEBAR_W; }
-static int rb_area_w(void) { return WIN_W - SIDEBAR_W; }
+// (filesglass) The Recycle view takes the list panel, which spans to the
+// right margin while g_in_recycle (prev_on() is false); its rows use the
+// list's own inset (list_x / list_w plus the scroll gutter).
+static int rb_area_x(void) { return list_x(); }
+static int rb_area_w(void) { return list_w() + SCROLL_GUT; }
 static int rb_list_y(void) { return CONTENT_Y + RB_TOOLBAR_H + RB_HEADER_H; }
 static int rb_list_h(void) { return CONTENT_H - RB_TOOLBAR_H - RB_HEADER_H; }
 
 static void draw_recycle_view(void) {
     int ax = rb_area_x(), aw = rb_area_w();
-    // Background spans the whole content area (covers where preview would be).
-    win_draw_rect(window_handle, ax, CONTENT_Y, aw, CONTENT_H, BG_COLOR);
+    draw_panel(cont_x(), body_y(), cont_w(), body_h());
 
-    // Action toolbar
-    win_draw_rect(window_handle, ax, CONTENT_Y, aw, RB_TOOLBAR_H, TOOLBAR_BG);
-    win_draw_rect(window_handle, ax, CONTENT_Y + RB_TOOLBAR_H - 1, aw, 1, BORDER_COLOR);
+    // Action toolbar row, then a hairline (inset by PANEL_R so it never
+    // meets the rounded corners).
+    win_draw_rect(window_handle, cont_x() + PANEL_R, CONTENT_Y + RB_TOOLBAR_H - 1, cont_w() - 2 * PANEL_R, 1, C_EDGE);
     int by = CONTENT_Y + 5;
     int sel = rb_count_selected();
     gui_button(window_handle, ax + RB_BTN_RESTORE_X, by, RB_BTN_RESTORE_W, 24, "Restore",
@@ -1792,7 +2018,6 @@ static void draw_recycle_view(void) {
 
     // Column header
     int hy = CONTENT_Y + RB_TOOLBAR_H;
-    win_draw_rect(window_handle, ax, hy, aw, RB_HEADER_H, fp_panel());
     win_draw_text_small(window_handle, ax + 30, hy + 5, "Name", DIM_TEXT);
     win_draw_text_small(window_handle, ax + aw / 2, hy + 5, "Original Location", DIM_TEXT);
     win_draw_text_small(window_handle, ax + aw - 70, hy + 5, "Size", DIM_TEXT);
@@ -1809,16 +2034,17 @@ static void draw_recycle_view(void) {
         int idx = i + rb_scroll;
         int y = ly + i * RB_ROW_H;
         rb_item_t *it = &rb_items[idx];
-        if (it->selected) win_draw_rect(window_handle, ax + 2, y, aw - 4, RB_ROW_H, ITEM_SELECTED);
-        else if (idx == rb_hover) win_draw_rect(window_handle, ax + 2, y, aw - 4, RB_ROW_H, ITEM_HOVER);
+        if (it->selected) draw_row_fill(ax, y, aw - SCROLL_GUT, RB_ROW_H, ITEM_SELECTED);
+        else if (idx == rb_hover) draw_row_fill(ax, y, aw - SCROLL_GUT, RB_ROW_H, ITEM_HOVER);
         uint32_t tint = it->selected ? files_fg(ITEM_SELECTED) : TEXT_COLOR;
         uint32_t dimc = it->selected ? files_dim(ITEM_SELECTED) : DIM_TEXT;
-        // Checkbox
-        win_draw_rect(window_handle, ax + 8, y + 4, 16, 16, fp_field());
-        gui_draw_rect_outline(window_handle, ax + 8, y + 4, 16, 16, BORDER_COLOR);
+        // Checkbox (glass doc section 6: a hollow 2px frame, no fill; the
+        // check mark in the row's own ink so it reads on the accent pill).
+        gui_draw_rect_outline(window_handle, ax + 8, y + 4, 16, 16, it->selected ? tint : C_EDGE_GLASS);
+        gui_draw_rect_outline(window_handle, ax + 9, y + 5, 14, 14, it->selected ? tint : C_EDGE_GLASS);
         if (it->selected) {
-            win_draw_rect(window_handle, ax + 11, y + 9, 10, 2, fp_acc());
-            win_draw_rect(window_handle, ax + 13, y + 7, 2, 10, fp_acc());
+            win_draw_rect(window_handle, ax + 11, y + 9, 10, 2, tint);
+            win_draw_rect(window_handle, ax + 13, y + 7, 2, 10, tint);
         }
         // Name (trimmed)
         char nm[64]; int j = 0; while (it->name[j] && j < 60) { nm[j] = it->name[j]; j++; } nm[j] = 0;
@@ -1840,19 +2066,9 @@ static void draw_recycle_view(void) {
         char ss[24]; fmt_size(it->size, ss);
         win_draw_text_small(window_handle, ax + aw - 70, y + 6, ss, dimc);
     }
-    // Scrollbar
-    if (rb_count > visible) {
-        int sbx = ax + aw - 14, sh = lh;
-        int th = (visible * sh) / rb_count; if (th < 20) th = 20;
-        int maxs = rb_count - visible;
-        int ty = maxs ? (rb_scroll * (sh - th)) / maxs : 0;
-        uint32_t sb_track, sb_thumb;   // surface = BG_COLOR, see the list view
-        gui_scroll_colors(0, BG_COLOR, &sb_track, &sb_thumb);
-        win_draw_rect(window_handle, sbx, ly, 14, sh, sb_track);
-        // (#117) see the list view's trough above.
-        gui_scroll_trough_border(window_handle, sbx, ly, 14, sh, sb_track, BG_COLOR);
-        win_draw_rect(window_handle, sbx + 2, ly + ty, 10, th, sb_thumb);
-    }
+    // Scrollbar: the same glass pill the list view draws.
+    if (rb_count > visible)
+        draw_scroll_pill(ax + aw - SCROLL_GUT, ly, lh, rb_scroll, rb_count - visible, visible, rb_count);
 }
 
 // ---- dropdown menus -------------------------------------------------------
@@ -1876,62 +2092,120 @@ static void draw_menu(void) {
     int mx = g_menu_x, my = g_menu_y;
     if (mx + mw > WIN_W) mx = WIN_W - mw - 2;
     if (my + mh > WIN_H) my = WIN_H - mh - 2;
-    win_draw_rect(window_handle, mx, my, mw, mh, theme_color(THEME_COLOR_MENU_BG));
-    gui_draw_rect_outline(window_handle, mx, my, mw, mh, BORDER_COLOR);
+    // (filesglass) A popup floats over panels AND margin, so it is a square
+    // nested card with the on-glass stroke (DK_EDGE_GLASS), the Editor's
+    // menu-popup grammar; separators are the panel hairline.
+    win_draw_rect(window_handle, mx, my, mw, mh, C_CARD);
+    gui_draw_rect_outline(window_handle, mx, my, mw, mh, C_EDGE_GLASS);
     int yy = my + 3;
     for (int i = 0; m[i]; i++) {
-        if (str_eq(m[i], "--")) { win_draw_rect(window_handle, mx + 4, yy + 10, mw - 8, 1, BORDER_COLOR); yy += 22; continue; }
-        win_draw_text(window_handle, mx + 10, yy + 4, m[i], files_fg(theme_color(THEME_COLOR_MENU_BG)));
+        if (str_eq(m[i], "--")) { win_draw_rect(window_handle, mx + 4, yy + 10, mw - 8, 1, C_EDGE); yy += 22; continue; }
+        win_draw_text(window_handle, mx + 10, yy + 4, m[i], C_INK);
         yy += 22;
     }
 }
 
-// ---- status bar -----------------------------------------------------------
+// ---- status row -----------------------------------------------------------
+// (filesglass) Lives INSIDE the list panel, above its bottom edge, under a
+// hairline inset by PANEL_R so it never meets the rounded corners.
 static void draw_status(void) {
-    int y = WIN_H - STATUS_H;
-    win_draw_rect(window_handle, 0, y, WIN_W, STATUS_H, STATUS_BG);
-    win_draw_rect(window_handle, 0, y, WIN_W, 1, BORDER_COLOR);
+    int y = status_y();
+    int x0 = cont_x() + PANEL_IN, w = cont_w() - 2 * PANEL_IN;
+    win_draw_rect(window_handle, cont_x() + PANEL_R, y - 1, cont_w() - 2 * PANEL_R, 1, C_EDGE);
     if (g_err[0]) {
-        // Deliberately takes over the whole status bar and stays until the next
+        // Deliberately takes over the whole status row and stays until the next
         // action. A failed delete that scrolls away has not been reported.
-        win_draw_rect(window_handle, 0, y + 1, WIN_W, STATUS_H - 1, 0x00A02020);
-        win_draw_text(window_handle, 8, y + 4, g_err, 0x00FFFFFF);
+        gui_fill_rounded_aa(window_handle, x0 - 6, y + 2, w + 12, STATUS_H - 6, ROW_R, ERR_BAND, C_PANEL);
+        win_draw_text(window_handle, x0, y + 3, g_err, 0x00FFFFFF);
         return;
     }
     if (g_in_recycle) {
         char s[64]; gui_itoa(rb_count, s, 16); int l = str_len(s);
         const char *it = " items in Recycle Bin"; while (*it) s[l++] = *it++; s[l] = 0;
-        win_draw_text(window_handle, 8, y + 4, s, TEXT_COLOR);
+        win_draw_text(window_handle, x0, y + 3, s, TEXT_COLOR);
+        return;
+    }
+    // #netshares: on the Network view, the status row reports live sweep state.
+    if (str_eq(CUR.path, "/NET")) {
+        char ns[80];
+        int st = ns_state();
+        if (st == NS_SCANNING) {
+            int d = 0, t = 0; int sv = ns_progress(&d, &t);
+            snprintf(ns, sizeof(ns), "Discovering LAN shares  %d/%d  (%d found)", d, t, sv);
+        } else if (st == NS_DONE && !ns_available()) {
+            snprintf(ns, sizeof(ns), "Network unavailable");
+        } else {
+            int sv = ns_server_count();
+            snprintf(ns, sizeof(ns), "%d server%s on your network", sv, sv == 1 ? "" : "s");
+        }
+        win_draw_text(window_handle, x0, y + 3, ns, TEXT_COLOR);
         return;
     }
     char s[48]; gui_itoa(item_count, s, 16); int l = str_len(s);
     const char *it = " items"; while (*it) s[l++] = *it++; s[l] = 0;
-    win_draw_text(window_handle, 8, y + 4, s, TEXT_COLOR);
+    win_draw_text(window_handle, x0, y + 3, s, TEXT_COLOR);
     if (CUR.sel >= 0 && CUR.sel < item_count)
-        win_draw_text(window_handle, 200, y + 4, items[CUR.sel].name, TEXT_COLOR);
+        win_draw_text(window_handle, x0 + 120, y + 3, items[CUR.sel].name, TEXT_COLOR);
 }
 
-// Map the Files theme palette into the shared style engine each redraw, so the
-// gui_* primitives (buttons, fields, tabs) match the active theme + render
-// modern (rounded/AA) or classic (beveled) like the Settings app.
+// (filesglass) Map the glass tokens into the shared style engine each redraw,
+// so the gui_* primitives (buttons, fields, the confirm dialog) render in
+// the glass palette. The WIDGETS are untouched: this is the same
+// gui_set_palette() call every app makes, with fixed tokens instead of a
+// theme derivation. Always the modern (rounded/AA) family: the window is
+// fixed dark glass, and the glass doc forbids mixing the beveled classic
+// grammar into a glass window.
 static void files_apply_style(void) {
-    gui_set_style(gui_theme_is_classic() ? GUI_STYLE_CLASSIC : GUI_STYLE_MODERN);
+    gui_set_style(GUI_STYLE_MODERN);
     gui_palette_t p;
-    p.surface        = fp_content();
-    p.surface_raised = fp_toolbar();
-    p.ink            = files_fg(fp_content());
-    p.ink_dim        = files_dim(fp_content());
-    p.accent         = fp_acc();
-    p.accent_hover   = gui_lighten(fp_acc(), 24);
-    p.border         = theme_color(THEME_COLOR_TEXTBOX_BORDER);
-    p.field_bg       = fp_field();
-    p.field_border   = theme_color(THEME_COLOR_TEXTBOX_BORDER);
-    p.track          = fp_tint(fp_content(), fp_acc(), 30);
+    p.surface        = C_PANEL;
+    p.surface_raised = C_CARD;
+    p.ink            = C_INK;
+    p.ink_dim        = C_INK_DIM;
+    p.accent         = C_ACCENT;
+    p.accent_hover   = gui_lighten(C_ACCENT, 24);
+    p.border         = C_EDGE;
+    p.field_bg       = C_IN_FILL;
+    p.field_border   = C_IN_BORDER;
+    p.track          = C_CARD;
     gui_set_palette(&p);
 }
 
+// The layout facts the frame is composed for. Any change uncovers margin
+// (or leaves popup / dialog pixels over margin), so it forces a backdrop blit.
+static unsigned long layout_sig(void) {
+    unsigned long s = 2166136261ul;
+#define SIG(v) s = (s ^ (unsigned long)(v)) * 16777619ul
+    SIG(WIN_W); SIG(WIN_H); SIG(prev_on()); SIG(g_in_recycle);
+    SIG(g_menu); SIG(g_menu_x); SIG(g_menu_y);
+    SIG(g_props_open); SIG(g_te_open); SIG(g_openwith_open);
+    SIG(gui_confirm_singleton_is_open());
+#undef SIG
+    return s;
+}
+
+// Full redraw.
+//
+// (filesglass) THE ANTI-FLASH CONTRACT (docs/UI_GLASS_DESIGN_SYSTEM.md
+// section 11). SYS_WIN_BLIT self-commits: the kernel publishes the window the
+// instant the backdrop lands, and a compositor sample taken between that
+// commit and the win_invalidate() below would show a backdrop with no
+// panels on it. So the blit runs ONLY when the chrome is dirty (start,
+// EVENT_RESIZE, EVENT_REDRAW, wallpaper change, and a layout_sig() change),
+// never on a hover, a selection or a scroll. Everything else is plain
+// draws, which accumulate unpublished until the single invalidate at the
+// end. The window is never cleared with a flat fill: the panels cover every
+// pixel that changes, and the margins are the backdrop.
 static void fb_redraw(void) {
+    unsigned long sig = layout_sig();
+    if (sig != g_layout_sig) { g_layout_sig = sig; g_chrome_dirty = 1; }
+    sync_backdrop();
+    if (g_chrome_dirty) {
+        gui_glass_backdrop_blit(window_handle, g_bd);
+        g_chrome_dirty = 0;
+    }
     files_apply_style();
+    draw_panel(hdr_x(), hdr_y(), hdr_w(), HDR_H);
     draw_tabbar();
     draw_toolbar();
     draw_sidebar();
@@ -1939,7 +2213,7 @@ static void fb_redraw(void) {
         draw_recycle_view();
     } else {
         draw_file_list();
-        if (g_preview_on) draw_preview();
+        if (prev_on()) draw_preview();
     }
     draw_status();
     if (g_menu != MENU_NONE) draw_menu();
@@ -2041,24 +2315,64 @@ static void open_selected(void) {
     file_entry_t *it = &items[CUR.sel];
     if (str_eq(it->name, "..")) { navigate_up(); return; }
     if (str_eq(it->name, "(empty)")) return;
-    // #317: Network folder entries -> Add dialog or mount+browse a saved share.
+    // #317/#netshares: Network folder rows dispatch by their action kind (see
+    // build_net_listing()): controls, saved mounts, and live-discovered shares.
     if (str_eq(CUR.path, "/NET")) {
-        if (it->name[0] == '[') { open_add_network(); return; }
-        for (int k = 0; k < g_netmount_count; k++) {
-            if (str_eq(g_netmounts[k].label, it->name)) {
-                netmount_t *m = &g_netmounts[k];
-                net_mount(m->server, m->share, m->user, m->pass);
-                char np[MAX_PATH_LEN]; int l = 0;
-                const char *pfx = "/SMB/"; while (*pfx) np[l++] = *pfx++;
-                for (int i = 0; m->server[i] && l < MAX_PATH_LEN-2; i++) np[l++] = m->server[i];
-                np[l++] = '/';
-                for (int i = 0; m->share[i] && l < MAX_PATH_LEN-1; i++) np[l++] = m->share[i];
-                np[l] = 0;
-                navigate_to(np);
-                return;
+        net_row_t *r = &g_net_rows[CUR.sel];
+        char np[MAX_PATH_LEN];
+        switch (r->kind) {
+        case NR_ADD:
+            open_add_network();
+            return;
+        case NR_RESCAN:
+            // Toggle: cancel an in-flight sweep, or start a fresh one. Rebuild
+            // the listing immediately so the button label/status flip at once.
+            if (ns_state() == NS_SCANNING) ns_cancel(); else ns_start();
+            build_net_listing();
+            fb_redraw();
+            return;
+        case NR_STATUS:
+            return;   // informational, not clickable
+        case NR_SAVED:
+        case NR_DISC_SHARE:
+            // Mount (guest creds for a discovered share) then browse via the
+            // EXISTING /SMB VFS path - no invented mount syscall.
+            net_mount(r->server, r->share, r->user, r->pass);
+            snprintf(np, sizeof(np), "/SMB/%s/%s", r->server, r->share);
+            navigate_to(np);
+            return;
+        case NR_DISC_SMB:
+            // SMB host answered but shares could not be enumerated (guest denied
+            // srvsvc). Browse the server root via the existing /SMB path; if the
+            // server exposes nothing to us it simply shows empty.
+            snprintf(np, sizeof(np), "/SMB/%s", r->server);
+            navigate_to(np);
+            return;
+        case NR_DISC_NFS:
+            // #317 nfsbrowse: an NFS export row carries the server-side export
+            // path in r->export. Mount it on demand (SYS_NFS_MOUNT reuses the
+            // kernel NFSv3 client) then browse via the returned /NFS mount
+            // point. Like the SMB net_mount above, the mount is synchronous in
+            // this app's own thread (a deliberate click, not the compositor);
+            // the slow part, export enumeration, already ran on the netscan
+            // worker. A bare NFS-server row (showmount denied) has no export to
+            // mount, so say so honestly.
+            if (r->export[0]) {
+                char mp[MAX_PATH_LEN]; mp[0] = 0;
+                if (net_nfs_mount(r->server, r->export, mp, sizeof(mp)) == 0 && mp[0]) {
+                    navigate_to(mp);
+                } else {
+                    files_error("NFS mount failed", "could not mount the selected export");
+                    fb_redraw();
+                }
+            } else {
+                files_error("NFS server detected", "no exports could be listed (server denied showmount)");
+                fb_redraw();
             }
+            return;
+        default:
+            return;
         }
-        return;
     }
     if (it->is_directory) { char np[MAX_PATH_LEN]; path_join(np, CUR.path, it->name); navigate_to(np); }
     else { char full[MAX_PATH_LEN]; path_join(full, CUR.path, it->name);
@@ -2349,6 +2663,15 @@ static void do_paste(void) {
 #define PROPS_BH 300
 static inline int props_bx(void) { return (WIN_W - PROPS_BW) / 2; }
 static inline int props_by(void) { return (WIN_H - PROPS_BH) / 2; }
+// (filesglass) A floating dialog: a nested card (C_CARD, PANEL_R) with the
+// on-glass stroke, its title on the first row over a hairline. The content
+// still starts at by + 34 (where the old 22px title band ended), so every
+// hit-test offset below is unchanged.
+static void draw_dialog_frame(int bx, int by, int bw, int bh, const char *title) {
+    draw_panel_fill(bx, by, bw, bh, C_CARD, C_EDGE_GLASS);
+    win_draw_text(window_handle, bx + PANEL_IN, by + 6, title, C_INK);
+    win_draw_rect(window_handle, bx + PANEL_R, by + 28, bw - 2 * PANEL_R, 1, C_EDGE);
+}
 // Y of the permissions-edit / read-only-toggle hotspot line, shared by
 // draw_props() and props_hit() so they can never disagree.
 static int g_props_hotspot_y = 0;
@@ -2360,10 +2683,7 @@ static void draw_props(void) {
     file_entry_t *it = &items[CUR.sel];
     int bw = PROPS_BW, bh = PROPS_BH;
     int bx = props_bx(), by = props_by();
-    win_draw_rect(window_handle, bx, by, bw, bh, theme_color(THEME_COLOR_MENU_BG));
-    gui_draw_rect_outline(window_handle, bx, by, bw, bh, BORDER_COLOR);
-    win_draw_rect(window_handle, bx, by, bw, 22, fp_acc());
-    win_draw_text(window_handle, bx + 10, by + 4, "Properties", files_fg(fp_acc()));
+    draw_dialog_frame(bx, by, bw, bh, "Properties");
     int tx = bx + 16, ty = by + 34;
     win_draw_text(window_handle, tx, ty, "Name:", TEXT_COLOR);
     win_draw_text(window_handle, tx + 90, ty, it->name, TEXT_COLOR); ty += 24;
@@ -2452,25 +2772,21 @@ static inline int te_by(void){ return (WIN_H - TE_H) / 2; }
 static void draw_te(void) {
     if (!g_te_open) return;
     int bx = te_bx(), by = te_by();
-    win_draw_rect(window_handle, bx, by, TE_W, TE_H, theme_color(THEME_COLOR_MENU_BG));
-    gui_draw_rect_outline(window_handle, bx, by, TE_W, TE_H, BORDER_COLOR);
-    win_draw_rect(window_handle, bx, by, TE_W, 22, fp_acc());
-    win_draw_text(window_handle, bx + 10, by + 4, g_te_title, files_fg(fp_acc()));
-    win_draw_text(window_handle, bx + 16, by + 34, "New name:", TEXT_COLOR);
-    // editable field (with a simple trailing caret)
+    draw_dialog_frame(bx, by, TE_W, TE_H, g_te_title);
+    win_draw_text(window_handle, bx + 16, by + 34, "New name:", DIM_TEXT);
+    // editable field (with a simple trailing caret): the shared focused
+    // field, so it takes the glass input tokens from the palette.
     char disp[MAX_NAME_LEN + 2];
     str_copy(disp, g_te_buf, MAX_NAME_LEN);
     { int l = str_len(disp); if (l < MAX_NAME_LEN) { disp[l] = '_'; disp[l+1] = 0; } }
-    gui_draw_textfield(window_handle, bx + 16, by + 56, TE_W - 32, 28,
-                       disp, INPUT_BG, INPUT_TEXT, BORDER_COLOR);
-    // OK / Cancel buttons
+    gui_textfield2(window_handle, bx + 16, by + 56, TE_W - 32, 28, disp, true);
+    // OK / Cancel buttons: the shared primary / secondary buttons at the
+    // same rects te_hit() tests.
     int oy = by + TE_H - TE_BTN_H - 12;
     int okx = bx + TE_W - 2 * TE_BTN_W - 24;
     int cax = bx + TE_W - TE_BTN_W - 12;
-    gui_draw_button(window_handle, okx, oy, TE_BTN_W, TE_BTN_H, "OK",
-                    fp_acc(), files_fg(fp_acc()), false, false);
-    gui_draw_button(window_handle, cax, oy, TE_BTN_W, TE_BTN_H, "Cancel",
-                    BTN_FACE, BTN_TEXT, false, false);
+    gui_button(window_handle, okx, oy, TE_BTN_W, TE_BTN_H, "OK", GUI_BTN_PRIMARY, GUI_ST_NORMAL);
+    gui_button(window_handle, cax, oy, TE_BTN_W, TE_BTN_H, "Cancel", GUI_BTN_SECONDARY, GUI_ST_NORMAL);
 }
 // Returns: 0 = OK, 1 = Cancel, -1 = inside box (swallow), -2 = outside (cancel).
 static int te_hit(int lx, int ly) {
@@ -2495,18 +2811,14 @@ static inline int ow_by(void){ return (WIN_H - ow_h()) / 2; }
 static void draw_openwith(void) {
     if (!g_openwith_open) return;
     int bx = ow_bx(), by = ow_by(), bh = ow_h();
-    win_draw_rect(window_handle, bx, by, OW_W, bh, theme_color(THEME_COLOR_MENU_BG));
-    gui_draw_rect_outline(window_handle, bx, by, OW_W, bh, BORDER_COLOR);
-    win_draw_rect(window_handle, bx, by, OW_W, 22, fp_acc());
-    win_draw_text(window_handle, bx + 10, by + 4, "Open with", files_fg(fp_acc()));
+    draw_dialog_frame(bx, by, OW_W, bh, "Open with");
     if (CUR.sel >= 0 && CUR.sel < item_count)
-        win_draw_text(window_handle, bx + 16, by + 28, items[CUR.sel].name, DIM_TEXT);
+        win_draw_text_small(window_handle, bx + 16, by + 31, items[CUR.sel].name, DIM_TEXT);
     int yy = by + 46;
     for (int i = 0; i < OW_N; i++) {
         if (i == g_ow_hover)
-            win_draw_rect(window_handle, bx + 4, yy - 3, OW_W - 8, OW_ROWH - 2, ITEM_HOVER);
-        win_draw_text(window_handle, bx + 22, yy + 3, OW_APPS[i].label,
-                      files_fg(theme_color(THEME_COLOR_MENU_BG)));
+            gui_fill_rounded_aa(window_handle, bx + 6, yy - 3, OW_W - 12, OW_ROWH - 2, ROW_R, ITEM_HOVER, C_CARD);
+        win_draw_text(window_handle, bx + 22, yy + 3, OW_APPS[i].label, C_INK);
         yy += OW_ROWH;
     }
     win_draw_text(window_handle, bx + OW_W - 110, by + bh - 22, "Esc = Cancel", DIM_TEXT);
@@ -2676,8 +2988,20 @@ int main(int argc, char **argv) {
     tabs[0].used = true; str_copy(tabs[0].path, g_home, MAX_PATH_LEN);
     current_path = tabs[0].path;
 
-    window_handle = win_create("Files", win_x, win_y, WIN_W, WIN_H);
+    // (filesglass, #528 class) g_win_w/g_win_h are the CONTENT size (what
+    // EVENT_RESIZE delivers and what every layout helper assumes), and
+    // win_create() takes the OUTER size, so add the chrome (the Editor's /
+    // Settings' constants) and then read the real canvas back. Passing the
+    // content size directly, as this did, made the kernel carve the 24px
+    // chrome out of it and silently clipped the bottom of the layout: with
+    // the flat chrome the status bar's bottom rows went missing; with the
+    // glass panels the whole bottom margin and status row were cut off.
+    window_handle = win_create("Files", win_x, win_y, WIN_W + 4, WIN_H + 24);
     if (window_handle < 0) return 1;
+    {
+        int cw = 0, chh = 0;
+        if (win_get_size(window_handle, &cw, &chh) == 0 && cw > 0 && chh > 0) { g_win_w = cw; g_win_h = chh; }
+    }
 
     // #317: one-shot start-path override. If /CONFIG/FILESPATH.CFG exists, open
     // that path (e.g. "/NET" or "/SMB/<server>/<share>") instead of home, then
@@ -2731,13 +3055,31 @@ int main(int argc, char **argv) {
                 s_last_vol = now;
                 if (poll_volumes()) fb_redraw();
             }
+            // #netshares: while the Network view is open, refresh the listing
+            // whenever the async sweep has made progress (new probes done, a
+            // server found, or the scan finished). Cheap: an atomic read, and a
+            // rebuild+redraw only when something actually changed.
+            if (str_eq(CUR.path, "/NET")) {
+                static int s_np = -1, s_ns = -1, s_st = -1;
+                int d = 0, t = 0; int sv = ns_progress(&d, &t); int stt = ns_state();
+                if (d != s_np || sv != s_ns || stt != s_st) {
+                    s_np = d; s_ns = sv; s_st = stt;
+                    build_net_listing();
+                    fb_redraw();
+                }
+            }
             continue;
         }
         switch (event.type) {
-        case EVENT_REDRAW: fb_redraw(); break;
+        case EVENT_REDRAW:
+            // (filesglass) the compositor asked for the whole window again:
+            // chrome dirty, so the backdrop is blitted before the panels.
+            g_chrome_dirty = 1; fb_redraw(); break;
         case EVENT_RESIZE:
+            // (filesglass) a resize reallocates the content buffer, so the
+            // backdrop must be blitted again: chrome dirty.
             if (event.mouse_x > 0 && event.mouse_y > 0) { g_win_w = event.mouse_x; g_win_h = event.mouse_y; }
-            fb_redraw(); break;
+            g_chrome_dirty = 1; fb_redraw(); break;
         case EVENT_WINDOW_CLOSE: running = 0; break;
         case EVENT_KEY_DOWN: {
             char c = event.key_char; uint32_t kc = event.keycode;
@@ -2851,27 +3193,27 @@ int main(int argc, char **argv) {
                 else if (h >= 0) menu_select(h);
                 break;
             }
-            // tab bar
-            if (ly >= 0 && ly < TABBAR_H) {
+            // tab bar (the header panel's top row; the rects are tab_x())
+            if (ly >= tabrow_y() && ly < tabrow_y() + TAB_H) {
                 for (int i = 0; i < tab_count; i++) {
-                    int tx = 4 + i * (TAB_W + 2);
+                    int tx = tab_x(i);
                     if (lx >= tx && lx < tx + TAB_W) {
-                        if (lx >= tx + TAB_W - 16) tab_close(i); else tab_switch(i);
+                        if (lx >= tx + TAB_W - 22) tab_close(i); else tab_switch(i);
                         break;
                     }
                 }
-                int ax = 4 + tab_count * (TAB_W + 2);
+                int ax = tab_x(tab_count);
                 if (tab_count < MAX_TABS && lx >= ax && lx < ax + 24) tab_new();
                 break;
             }
-            // toolbar
-            int by = TABBAR_H + 8;
-            if (ly >= by && ly < by + 24) {
-                if (lx >= 8 && lx < 34) navigate_back();
-                else if (lx >= 36 && lx < 62) navigate_fwd();
-                else if (lx >= 64 && lx < 90) navigate_up();
+            // toolbar (the header panel's second row; nav_x()/cmd_x() rects)
+            int by = tool_y();
+            if (ly >= by && ly < by + TOOL_H) {
+                if (lx >= nav_x(0) && lx < nav_x(0) + 26) navigate_back();
+                else if (lx >= nav_x(1) && lx < nav_x(1) + 26) navigate_fwd();
+                else if (lx >= nav_x(2) && lx < nav_x(2) + 26) navigate_up();
                 else {
-                    int bx = WIN_W - 8 - 3 * 64;
+                    int bx = cmd_x();
                     if (lx >= bx && lx < bx + 60) {
                         // #234i: a DISABLED button must not open its menu. The
                         // draw path greys it on a read-only volume; without
@@ -2885,15 +3227,17 @@ int main(int argc, char **argv) {
                 }
                 break;
             }
-            // sidebar
-            if (lx < SIDEBAR_W && ly >= CONTENT_Y) {
+            // anything else above the body panels (header panel gaps) is inert
+            if (ly < body_y()) break;
+            // sidebar panel
+            if (lx >= side_x() && lx < side_x() + SIDEBAR_W) {
                 for (int i = 0; i < side_rows; i++) {
                     if (ly >= side_y[i] - 2 && ly < side_y[i] + ITEM_HEIGHT - 2) {
                         // #250: the eject hot zone is the right-hand end of a
                         // removable row only. Listed before the navigate row
                         // for the same volume, so a click inside it wins.
                         if (side_kind[i] == 5) {
-                            if (lx < SIDEBAR_W - 26) continue;   // not on the button
+                            if (lx < SIDE_EJECT_X - 4) continue;   // not on the button
                             int vi = side_vol[i];
                             if (vi < 0 || vi >= g_vol_count) break;
                             char mnt[MAX_PATH_LEN];
@@ -2957,10 +3301,10 @@ int main(int argc, char **argv) {
                 }
                 break;
             }
-            // preview pane (ignore clicks)
-            if (g_preview_on && lx >= WIN_W - PREVIEW_W) break;
+            // preview panel and the gap before it (ignore clicks)
+            if (lx >= cont_x() + cont_w()) break;
             // file list
-            if (lx >= list_x() && ly >= CONTENT_Y && ly < CONTENT_Y + CONTENT_H) {
+            if (lx >= list_x() && lx < list_x() + list_w() + SCROLL_GUT && ly >= CONTENT_Y && ly < CONTENT_Y + CONTENT_H) {
                 int idx;
                 if (g_view == VIEW_ICONS) {
                     int lw = list_w(); int cols = lw / 96; if (cols < 1) cols = 1; int cw = lw / cols, chh = 76;
@@ -3005,7 +3349,7 @@ int main(int argc, char **argv) {
                 break;
             }
             int nh = -1;
-            if (g_view != VIEW_ICONS && lx >= list_x() && (!g_preview_on || lx < WIN_W - PREVIEW_W)
+            if (g_view != VIEW_ICONS && lx >= list_x() && lx < list_x() + list_w()
                 && ly >= CONTENT_Y && ly < CONTENT_Y + CONTENT_H) {
                 int idx = (ly - CONTENT_Y) / ITEM_HEIGHT + CUR.scroll;
                 if (idx >= 0 && idx < item_count) nh = idx;
@@ -3029,6 +3373,7 @@ int main(int argc, char **argv) {
         default: break;
         }
     }
+    ns_cancel();   // #netshares: stop the discovery worker + free its sockets
     win_destroy(window_handle);
     return 0;
 }

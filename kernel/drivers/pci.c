@@ -110,6 +110,11 @@ static void pci_check_device(uint8_t bus, uint8_t slot, uint8_t func) {
         for (int i = 0; i < 6; i++) {
             dev->bar[i] = pci_read32(bus, slot, func, PCI_BAR0 + i * 4);
         }
+        // #imacnic: subsystem identity, type-0 header only. See pci.h for why
+        // reading these offsets on a bridge would produce a confident wrong
+        // answer rather than an obviously missing one.
+        dev->subsys_vendor = pci_read16(bus, slot, func, PCI_SUBSYS_VENDOR);
+        dev->subsys_id     = pci_read16(bus, slot, func, PCI_SUBSYS_ID);
     }
 }
 
@@ -162,6 +167,216 @@ void pci_init(void) {
                       "recorded and invisible to all drivers (cap %d)",
                       pci_dropped_count, MAX_PCI_DEVICES);
     }
+
+    // #imacnic: and now the table itself, durably. See pci_bootlog_inventory().
+    // Unconditional: a device inventory that only exists on a serial port the
+    // machine does not have is not an inventory.
+    pci_bootlog_inventory();
+}
+
+// ---------------------------------------------------------------------------
+// #imacnic: DURABLE PCI INVENTORY
+// ---------------------------------------------------------------------------
+
+// Render BAR `i` of `dev` into `out`, and return how many BAR slots it consumed
+// (2 for a 64-bit BAR, 1 otherwise) so the caller never prints the upper half of
+// a 64-bit BAR as though it were a separate region. Writes an empty string for
+// an unimplemented (zero) BAR.
+//
+// DELIBERATELY DOES NOT CALL pci_get_bar_size(). Sizing a BAR means writing
+// all-ones into it and reading the mask back, which momentarily aims a live
+// device's address decode at 0xFFFFFFFF before the original value is restored.
+// Doing that to every function of an unfamiliar machine during boot, purely to
+// make a log line more informative, is a bad trade against the thing we are
+// trying to protect: the boot. The base address and the BAR type are enough to
+// write a driver against, and a driver that needs the size asks at bring-up,
+// once, for the one device it owns.
+static int pci_bar_render(pci_device_t *dev, int i, char *out, size_t outsz) {
+    uint32_t bar = dev->bar[i];
+    out[0] = 0;
+    if (bar == 0) return 1;
+
+    if (bar & PCI_BAR_IO) {
+        snprintf(out, outsz, " bar%d=io:0x%04x", i, (unsigned)(bar & ~0x3u));
+        return 1;
+    }
+    // Bit 3 is prefetchable; bits 2:1 are the type (00 = 32-bit, 10 = 64-bit).
+    const char *pf = (bar & 0x8) ? "pf" : "";
+    if ((bar & 0x6) == PCI_BAR_MEM_64 && i < 5) {
+        uint64_t addr = ((uint64_t)dev->bar[i + 1] << 32) | (uint64_t)(bar & ~0xFu);
+        snprintf(out, outsz, " bar%d=mem64%s:0x%llx", i, pf,
+                 (unsigned long long)addr);
+        return 2;
+    }
+    snprintf(out, outsz, " bar%d=mem32%s:0x%08x", i, pf, (unsigned)(bar & ~0xFu));
+    return 1;
+}
+
+// Append `src` at *off within `dst` (capacity dstsz), keeping *off correct even
+// when snprintf reports the length it WOULD have written. One helper rather
+// than the same three-line clamp copied at each call site.
+static void pci_str_append(char *dst, size_t dstsz, size_t *off, const char *src) {
+    if (*off + 1 >= dstsz) return;
+    int n = snprintf(dst + *off, dstsz - *off, "%s", src);
+    if (n < 0) return;
+    size_t room = dstsz - *off - 1;
+    *off += ((size_t)n > room) ? room : (size_t)n;
+}
+
+// Format the subsystem identity, or say plainly that this header type does not
+// have one, rather than printing 0000:0000 and letting a reader take it for a
+// real answer from a real register.
+static void pci_subsys_str(pci_device_t *d, char *out, size_t outsz) {
+    if ((d->header_type & 0x7F) == 0)
+        snprintf(out, outsz, "%04x:%04x", d->subsys_vendor, d->subsys_id);
+    else
+        snprintf(out, outsz, "n/a-hdr%02x", d->header_type & 0x7F);
+}
+
+// One durable line per function. Called at the end of pci_init(), which runs at
+// boot stage 20, long before /DEVLOG.TXT (stage 38) exists: a boot that hangs
+// anywhere in USB, storage or SMP bring-up still leaves the full inventory.
+//
+// COST. 23 functions on the owner's iMac at roughly 200 bytes each is ~4.6 KB of
+// the 96 KB in-RAM bootlog buffer, spent at the earliest point in boot, so these
+// lines are appended to /BOOTLOG.TXT before anything else competes for the
+// buffer. That is the right place to spend it: an inventory you cannot read is
+// worth nothing, and every later line in the file presupposes knowing what
+// machine produced it.
+void pci_bootlog_inventory(void) {
+    // ONE DEVICE WRITE, NOT TWENTY-FOUR. /BOOTLOG.TXT is rewritten (or appended
+    // to) on every bootlog_write(), so a burst of lines is a burst of writes
+    // over whatever the root device happens to be, which on the #307 USB-MSC
+    // path is slow enough to have wedged a boot before (#373). The defer window
+    // keeps the serial mirror and the RAM buffer and suppresses only the device
+    // flush; the closing line after bootlog_defer_end() carries the whole
+    // accumulated delta down in a single transaction.
+    //
+    // In practice this window costs nothing at all today, because pci_init()
+    // runs at boot stage 20 and bootlog_arm() does not happen until stage 37:
+    // there is no medium yet, so nothing would have been flushed regardless.
+    // The window is here so that stays true if pci_init() ever moves later, and
+    // so a reader does not have to reconstruct that argument to be sure.
+    bootlog_defer_begin();
+
+    bootlog_write("[PCI] full device table follows, one line per function (%d of them). "
+                  "Fields: bus:slot.func vendor:device sub=subsystem-vendor:subsystem-device "
+                  "class=class:subclass:progif rev hdr irq=line/pin cmd=command-register, "
+                  "then every non-zero BAR with its type, then the class name. "
+                  "cmd bit0=IO-space bit1=MEM-space bit2=BUS-MASTER bit10=INTx-disabled. "
+                  "irq pin '-' means the function asserts no legacy INTx at all.",
+                  pci_device_count);
+
+    for (int i = 0; i < pci_device_count; i++) {
+        pci_device_t *d = &pci_devices[i];
+
+        char bars[224];
+        size_t off = 0;
+        bars[0] = 0;
+        for (int b = 0; b < 6; ) {
+            char one[48];
+            int used = pci_bar_render(d, b, one, sizeof(one));
+            if (one[0]) pci_str_append(bars, sizeof(bars), &off, one);
+            b += used;
+        }
+        if (off == 0) pci_str_append(bars, sizeof(bars), &off, " (no BARs)");
+
+        char sub[16];
+        pci_subsys_str(d, sub, sizeof(sub));
+
+        // Read the command register live rather than caching it at scan time:
+        // this runs microseconds later, but stating what it IS is honest and
+        // costs one config read.
+        uint16_t cmd = pci_read16(d->bus, d->slot, d->func, PCI_COMMAND);
+        char pin = (d->interrupt_pin <= 4) ? "-ABCD"[d->interrupt_pin] : '?';
+
+        bootlog_write("[PCI] %02x:%02x.%x %04x:%04x sub=%s class=%02x:%02x:%02x "
+                      "rev=%02x hdr=%02x irq=%u/%c cmd=0x%04x%s \"%s\"",
+                      d->bus, d->slot, d->func,
+                      d->vendor_id, d->device_id, sub,
+                      d->class_code, d->subclass, d->prog_if,
+                      d->revision, d->header_type,
+                      (unsigned)d->interrupt_line, pin, (unsigned)cmd,
+                      bars,
+                      pci_class_name(d->class_code, d->subclass));
+    }
+
+    bootlog_defer_end();
+    // The closing line is what actually persists everything above it.
+    bootlog_write("[PCI] end of device table (%d function(s) listed, %d dropped). "
+                  "This table is written at boot stage 20, so it survives a hang "
+                  "anywhere later; /DEVLOG.TXT at stage 38 carries the same data "
+                  "plus the memory map, ACPI tables and USB descriptor trees.",
+                  pci_device_count, pci_dropped_count);
+}
+
+// Is this a class a user would expect to be driven? Bridges and host bridges are
+// excluded on purpose: they are legitimately unclaimed on every machine, and
+// listing twelve of them would bury the one storage or network function that
+// actually is missing a driver.
+static int pci_class_is_interesting(uint8_t class_code) {
+    switch (class_code) {
+        case PCI_CLASS_STORAGE:
+        case PCI_CLASS_NETWORK:
+        case PCI_CLASS_DISPLAY:
+        case PCI_CLASS_MULTIMEDIA:
+        case PCI_CLASS_SERIAL:
+        case 0x0D:              // Wireless (WiFi / Bluetooth)
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+void pci_bootlog_claims(void) {
+    // Same one-flush discipline as pci_bootlog_inventory(), and here it is NOT
+    // free: this runs after bootlog_arm(), so without the window each line
+    // below would be its own write to the root device.
+    bootlog_defer_begin();
+
+    int claimed = 0, unclaimed_interesting = 0, unclaimed_other = 0;
+    for (int i = 0; i < pci_device_count; i++) {
+        pci_device_t *d = &pci_devices[i];
+        if (d->claimed) { claimed++; continue; }
+        if (pci_class_is_interesting(d->class_code)) unclaimed_interesting++;
+        else unclaimed_other++;
+    }
+
+    bootlog_write("[PCI] driver claim summary: %d of %d function(s) claimed by a driver; "
+                  "%d unclaimed in a class a user would expect to work (listed below); "
+                  "%d unclaimed bridges/host-bridges/other (expected, not listed). "
+                  "A function is 'claimed' only when a driver called pci_mark_claimed() "
+                  "after SUCCESSFUL bring-up, so unclaimed means 'not working', not "
+                  "merely 'not recognised'.",
+                  claimed, pci_device_count, unclaimed_interesting, unclaimed_other);
+
+    for (int i = 0; i < pci_device_count; i++) {
+        pci_device_t *d = &pci_devices[i];
+        if (d->claimed || !pci_class_is_interesting(d->class_code)) continue;
+
+        char sub[16];
+        pci_subsys_str(d, sub, sizeof(sub));
+
+        // The network case gets named explicitly. "No driver for the Ethernet
+        // controller" and "no Ethernet controller" produce identical symptoms
+        // from userland, and only one of them is fixable by writing code.
+        const char *note = "";
+        if (d->class_code == PCI_CLASS_NETWORK)
+            note = "  <== NETWORK CLASS: this machine HAS this Ethernet/network "
+                   "controller and this kernel does NOT drive it";
+        else if (d->class_code == PCI_CLASS_STORAGE)
+            note = "  <== STORAGE CLASS: a disk behind this controller is invisible";
+
+        bootlog_write("[PCI] UNCLAIMED %02x:%02x.%x %04x:%04x sub=%s class=%02x:%02x:%02x "
+                      "\"%s\"%s",
+                      d->bus, d->slot, d->func, d->vendor_id, d->device_id, sub,
+                      d->class_code, d->subclass, d->prog_if,
+                      pci_class_name(d->class_code, d->subclass), note);
+    }
+
+    bootlog_defer_end();
+    bootlog_write("[PCI] end of claim summary (%d claimed / %d total).", claimed,
+                  pci_device_count);
 }
 
 // ASUS bring-up: how many PCI functions the scan found but could NOT record.

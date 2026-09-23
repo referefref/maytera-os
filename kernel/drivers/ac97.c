@@ -11,6 +11,12 @@
 #include "../cpu/idt.h"
 #include "../gui/syslog.h"
 
+// audioyield: yield between hardware-settle polls instead of the
+// ac97_delay() io_wait busy-loop. AC97 has no codec-ready/DMA-halt
+// interrupt, so these stay bounded register-ready polls; the fix is
+// only that they now sleep (yield the core) rather than busy-spin.
+extern void proc_sleep(uint32_t ms);
+
 // ============================================================================
 // Driver State
 // ============================================================================
@@ -163,14 +169,19 @@ static int ac97_reset_codec(void) {
     ac97_glob_write(AC97_NABM_GLOB_CNT, glob_cnt);
     ac97_delay(100);
 
-    // Wait for codec ready
+    // Wait for codec ready. AC97 has no codec-ready interrupt: PCR is a
+    // register-ready settle with no wake source to park on, so this stays a
+    // bounded poll. The fix is to YIELD between polls (proc_sleep) instead of
+    // ac97_delay()'s io_wait busy-loop, which pegged a core for ~10s on the
+    // deferred PRIO_LOW audioinit thread. Same 100-try bound, now yielding;
+    // ac97_delay(10000) was a nominal 10ms settle (its comment), so proc_sleep(10).
     for (int i = 0; i < 100; i++) {
         uint32_t status = ac97_glob_read(AC97_NABM_GLOB_STA);
         if (status & AC97_GS_PCR) {
             kprintf("[AC97] Primary codec ready\n");
             return AUDIO_OK;
         }
-        ac97_delay(10000);  // 10ms
+        proc_sleep(10);  // yield ~10ms, was ac97_delay(10000) io_wait busy-loop
     }
 
     kprintf("[AC97] Codec not ready after reset\n");
@@ -467,13 +478,16 @@ int ac97_stop(void) {
     // Stop DMA
     ac97_nabm_write8(AC97_CHAN_PCMOUT, AC97_NABM_CR, 0);
 
-    // Wait for DMA to stop
+    // Wait for DMA to stop. No DMA-halt interrupt is wired for AC97, so this is
+    // a bounded register-ready settle. YIELD between polls (proc_sleep) rather
+    // than ac97_delay()'s io_wait busy-loop; on the media-stop path this used to
+    // busy-spin ~100ms. Same 100-try bound, now yielding.
     for (int i = 0; i < 100; i++) {
         uint16_t status = ac97_nabm_read16(AC97_CHAN_PCMOUT, AC97_NABM_SR);
         if (status & AC97_SR_DCH) {
             break;
         }
-        ac97_delay(100);
+        proc_sleep(1);  // yield ~1ms, was ac97_delay(100) io_wait busy-loop
     }
 
     ac97_state.playing = false;

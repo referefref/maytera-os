@@ -15,6 +15,12 @@
 #include "stdio.h"
 #include "errno.h"
 #include "syscall.h"
+#include "string.h"          // #745: memset for getrusage()
+#include "limits.h"
+#include "stdarg.h"          // #745: vsyslog()
+#include "grp.h"             // #745: setgroups()
+#include "syslog.h"          // #745: syslog()/openlog()/closelog()
+#include "sys/resource.h"    // #745: getrusage()
 
 // access(): resolve existence/permission via stat(). We do not have per-mode
 // kernel checks here, so a successful stat means the path is reachable.
@@ -143,3 +149,114 @@ int nanosleep(const struct timespec *req, struct timespec *rem) {
 // stdio helpers missing from the base libc.
 int getc(FILE *f) { return fgetc(f); }
 void clearerr(FILE *f) { (void)f; }  // no error-flag setter in this libc; no-op
+
+// realpath(): canonicalize an absolute or cwd-relative path LEXICALLY (resolve
+// "." and "..", collapse repeated slashes) and then verify the result exists
+// with stat(). MayteraOS has no symbolic links, so lexical canonicalization is
+// the whole job; the stat() is what makes this realpath rather than a string
+// tidy-up. Returns NULL with errno set for a NULL/empty path, one that is too
+// long, or one that does not exist. If resolved_path is NULL a PATH_MAX buffer
+// is malloc()d and returned (caller frees); otherwise the caller must supply at
+// least PATH_MAX bytes. Added for the jq port (module path resolution); useful
+// to any port that resolves paths.
+char *realpath(const char *path, char *resolved_path) {
+    if (!path || !*path) { errno = EINVAL; return (char *)0; }
+    char work[PATH_MAX];
+    if (path[0] == '/') {
+        if (strlen(path) >= sizeof work) { errno = ENAMETOOLONG; return (char *)0; }
+        strcpy(work, path);
+    } else {
+        char cwd[PATH_MAX];
+        if (!getcwd(cwd, sizeof cwd)) { cwd[0] = '/'; cwd[1] = '\0'; }
+        size_t cl = strlen(cwd);
+        if (cl + 1 + strlen(path) >= sizeof work) { errno = ENAMETOOLONG; return (char *)0; }
+        strcpy(work, cwd);
+        if (cl == 0 || work[cl - 1] != '/') strcat(work, "/");
+        strcat(work, path);
+    }
+    char out[PATH_MAX];
+    size_t olen = 0;
+    out[0] = '\0';
+    char *p = work;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        char *start = p;
+        while (*p && *p != '/') p++;
+        size_t clen = (size_t)(p - start);
+        if (clen == 1 && start[0] == '.') continue;
+        if (clen == 2 && start[0] == '.' && start[1] == '.') {
+            while (olen > 0 && out[olen - 1] != '/') olen--;
+            if (olen > 0) olen--;
+            out[olen] = '\0';
+            continue;
+        }
+        if (olen + 1 + clen >= sizeof out) { errno = ENAMETOOLONG; return (char *)0; }
+        out[olen++] = '/';
+        memcpy(out + olen, start, clen);
+        olen += clen;
+        out[olen] = '\0';
+    }
+    if (olen == 0) { out[0] = '/'; out[1] = '\0'; olen = 1; }
+    struct stat st;
+    if (stat(out, &st) != 0) { errno = ENOENT; return (char *)0; }
+    char *dst = resolved_path ? resolved_path : (char *)malloc(PATH_MAX);
+    if (!dst) { errno = ENOMEM; return (char *)0; }
+    strcpy(dst, out);
+    return dst;
+}
+
+// ---------------------------------------------------------------------------
+// #745 darkhttpd port: POSIX/BSD surface a static web server references. Where
+// the kernel has a backing primitive the call is real; where it does not, the
+// stub reports the honest failure (ENOSYS) rather than a silent success, so a
+// caller that truly needs the missing feature fails visibly instead of
+// appearing to work. darkhttpd only reaches chroot/setgroups/getrusage under
+// optional command-line flags; the default serve path touches none of them.
+// ---------------------------------------------------------------------------
+
+// (tzset() lives in tz.c; not redefined here.)
+
+// pwrite(): write at an absolute offset without a permanent seek. Implemented
+// over lseek()+write() (single-threaded userland, so the save/restore is safe).
+// darkhttpd uses it once, to write its pidfile.
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset) {
+    off_t cur = lseek(fd, 0, SEEK_CUR);
+    if (lseek(fd, offset, SEEK_SET) < 0) return -1;
+    ssize_t w = write(fd, buf, count);
+    if (cur >= 0) lseek(fd, cur, SEEK_SET);
+    return w;
+}
+
+// chroot(): MayteraOS has no filesystem-root confinement. Honest failure.
+int chroot(const char *path) { (void)path; errno = ENOSYS; return -1; }
+
+// setgroups(): MayteraOS has no supplementary-group model. Honest failure.
+int setgroups(int size, const gid_t *list) { (void)size; (void)list; errno = ENOSYS; return -1; }
+
+// getrusage(): no per-process resource accounting in the kernel. Zero the
+// struct (so a caller that prints it shows zeros, never uninitialised garbage)
+// and report ENOSYS.
+int getrusage(int who, struct rusage *usage) {
+    (void)who;
+    if (usage) memset(usage, 0, sizeof(*usage));
+    errno = ENOSYS;
+    return -1;
+}
+
+// syslog(): no syslog daemon exists. Route the message to stderr so it is not
+// silently lost; openlog()/closelog() are no-ops. The priority/facility are
+// accepted and ignored.
+void openlog(const char *ident, int option, int facility) { (void)ident; (void)option; (void)facility; }
+void closelog(void) { }
+void vsyslog(int priority, const char *format, va_list ap) {
+    (void)priority;
+    vfprintf(stderr, format, ap);
+    fputc(10, stderr);   // newline
+}
+void syslog(int priority, const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    vsyslog(priority, format, ap);
+    va_end(ap);
+}

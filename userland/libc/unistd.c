@@ -239,3 +239,38 @@ int chmod(const char *path, mode_t mode) {
 int chown(const char *path, uid_t uid, gid_t gid) {
     return (int)syscall3(SYS_CHOWN, (long)path, uid, gid);
 }
+
+// execlp: variadic front end to execvp, added for the libedit port (#745).
+// libedit's vi-mode "edit command in $EDITOR" uses it. Arguments are a
+// NULL-terminated list; they are gathered into an argv and handed to execvp,
+// which searches PATH.
+int execlp(const char *file, const char *arg0, ...)
+{
+	const char *argv[64];
+	int n = 0;
+	argv[n++] = arg0;
+	va_list ap;
+	va_start(ap, arg0);
+	while (n < 63) {
+		const char *a = va_arg(ap, const char *);
+		argv[n++] = a;
+		if (a == (const char *)0)
+			break;
+	}
+	va_end(ap);
+	argv[63] = (const char *)0;
+	return execvp(file, (char *const *)argv);
+}
+
+// issetugid: added for the libedit port (#745). Returns nonzero only if the
+// process was made setuid/setgid (i.e. is running with credentials that differ
+// from the invoking user). MayteraOS userland has NO such model: exec does not
+// change credentials and there are no setuid binaries, so a process never runs
+// elevated relative to its real uid. Always 0. libedit calls it inside its
+// fallback secure_getenv(); returning 1 (its default when issetugid is absent)
+// made secure_getenv() return NULL for every variable, so getenv("TERM") was
+// never consulted and libedit fell back to a dumb terminal.
+int issetugid(void)
+{
+    return 0;
+}

@@ -20,7 +20,7 @@
 // that belief. The first half is true - there is no modifier field on
 // gui_event_t. The conclusion drawn from it is FALSE.
 //
-// MEASURED on VM <vmid>, golden build 2040, keystrokes injected over the #334
+// MEASURED on VM 2221, golden build 2040, keystrokes injected over the #334
 // serial channel into a Ring-3 probe (tools/testing/probes/keyprobe.c) that
 // printed every event it received. Not read out of the source; typed:
 //

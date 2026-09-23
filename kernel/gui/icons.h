@@ -95,6 +95,13 @@ typedef enum {
     ICON_HARD_DRIVE,        // Hard drive
     ICON_EJECT,             // Eject/safely remove
 
+    // #titlebar-icon: app classes with no existing glyph (window titlebar
+    // identity fix, see window_title_icon() in window.c). Appended, never
+    // renumbered, same discipline as every other icon family above.
+    ICON_BROWSER,           // Web browser (globe)
+    ICON_PLANETARIUM,       // Planetarium / stellarium (star)
+    ICON_APPSTORE,          // App store / repo (shopping bag)
+
     ICON_COUNT              // Total number of icons
 } icon_id_t;
 

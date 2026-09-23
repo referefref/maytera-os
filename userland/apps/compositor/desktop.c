@@ -27,6 +27,13 @@
 #include "../../libc/userconf.h"
 #include "../../libc/assoc.h"
 #include "../../libc/notify.h"
+// devinfo.h drags in libc/types.h, whose bool block would re-typedef bool as
+// _Bool and clash with compositor.h (typedef int bool). compositor.h already
+// established bool without setting this guard, so satisfy it before the include.
+#ifndef __bool_true_false_are_defined
+#define __bool_true_false_are_defined 1
+#endif
+#include "../../libc/devinfo.h"   // #removdev: sys_dev_usb_list() for USB arrival toasts
 #include "../../libc/settingscfg.h"   // #236: settingscfg_dblclick_ms() - see desktop_release()
 
 // ============================================================================
@@ -318,6 +325,67 @@ static int selection_count(void) {
     return c;
 }
 
+// ---------------------------------------------------------------------------
+// (ncursespty) console/curses apps need a real pty to present anything
+// ---------------------------------------------------------------------------
+// appqa's Finding 2 (blame.md, 2026-09-12): MyMan/Rogue/Angband are ncurses
+// ports. A bare sys_spawn() (what every icon/menu click below used to do)
+// gives the child NO pty at all - no rows/cols, no termios, in Rogue's case
+// not even a working stdin/stdout fd triple - so curses' initscr() either
+// exits cleanly (MyMan, code 2), faults (Rogue, a real SIGSEGV-class crash)
+// or spins forever producing output nobody can see (Angband). Terminal's own
+// external-command path (term_shell.c's execute_command() ->
+// term_layout_run_foreground() -> term_pty.c's term_pty_start()) already
+// opens /dev/ptmx, sets TERM=maytera-256color and the window size, and hands
+// the child a real tty - which is exactly why typing "myman" at a Terminal
+// prompt already works and clicking its icon does not. The fix is routing,
+// not a new pty mechanism: launch known console apps INSIDE a hosted
+// Terminal window instead of bare.
+//
+// Bounded to a small, explicit list (not "every /APPS binary lacking a GUI
+// window"): most apps are ordinary windowed ELFs and must keep launching
+// exactly as before. NOTE: userland/ports/ninvaders and .../moonbuggy are
+// the SAME class of ncurses port (see build/assets/startmenu/system.d/
+// 03-games.MENU's own "the Terminal's pty ... gives them a real tty"
+// comment, written aspirationally - it was never true for an icon/menu
+// click) and are very likely to hit this identical bug, but they are OUT OF
+// SCOPE for this pass (not part of appqa's census) and are not added here;
+// follow-up should confirm and extend this list rather than assume.
+static int desk_is_console_app(const char *path) {
+    static const char *const console_apps[] = { "myman", "rogue", "angband" };
+    const char *base = path;
+    for (const char *p = path; *p; p++) if (*p == '/') base = p + 1;
+    for (unsigned i = 0; i < sizeof(console_apps) / sizeof(console_apps[0]); i++) {
+        const char *a = base, *b = console_apps[i];
+        while (*a && *b) {
+            char ca = *a, cb = *b;
+            if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
+            if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
+            if (ca != cb) break;
+            a++; b++;
+        }
+        if (*a == '\0' && *b == '\0') return 1;
+    }
+    return 0;
+}
+
+// Shared launch-routing chokepoint (compositor.h declares this so
+// startmenu.c can call it too, keeping the desktop icon path, the Start Menu
+// path and the taskbar/dock pinned-icon path from drifting apart the way
+// launch_app()/sm_launch_item()/startmenu_launch_path() already had three
+// separate copies of the plain sys_spawn() case). Same return convention as
+// sys_spawn()/sys_spawn_args(): >0 pid, <0 on failure.
+int compositor_spawn_app(const char *path) {
+    if (!path || path[0] == '\0') return -1;
+    if (desk_is_console_app(path)) {
+        char *av[2];
+        av[0] = (char *)"/APPS/TERMINAL";
+        av[1] = (char *)path;
+        return sys_spawn_args("/APPS/TERMINAL", av, 2);
+    }
+    return sys_spawn(path);
+}
+
 // Launch the app at exec_path using sys_spawn (no fork; forking from the
 // compositor hangs the OS because it duplicates framebuffer mappings).
 static void launch_app(const char *exec_path) {
@@ -330,7 +398,7 @@ static void launch_app(const char *exec_path) {
         sys_spawn("/APPS/FILES");
         return;
     }
-    sys_spawn(exec_path);
+    compositor_spawn_app(exec_path);
 }
 
 // ============================================================================
@@ -719,8 +787,16 @@ void desktop_volumes_tick(void) {
     if (s_primed && sig == s_sig) return;
 
     int had = s_primed;
-    unsigned prev_sig = s_sig;
-    (void)prev_sig;
+
+    // #removdev: name the drive that actually changed so the toast can say which
+    // one, rather than a generic "Drive connected". The opaque `index` is the
+    // stable per-device handle from vol_list(); diffing the current index set
+    // against the previous snapshot finds the added (or removed) volume with no
+    // second syscall.
+    static int32_t s_prev_idx[DESK_MAX_VOLS];
+    static char    s_prev_name[DESK_MAX_VOLS][64];
+    static int     s_prev_count;
+
     s_sig = sig;
     s_primed = 1;
 
@@ -729,12 +805,42 @@ void desktop_volumes_tick(void) {
     desktop_rescan_home(1);
 
     if (had) {
-        // Tell the user something happened. Without this a drive appears or
-        // vanishes with no acknowledgement, which reads as a glitch.
-        if (g_vol_count > 0)
-            notify_post("Removable drive", "Drive connected", NOTIFY_INFO);
-        else
-            notify_post("Removable drive", "Drive removed", NOTIFY_INFO);
+        if (g_vol_count > s_prev_count) {
+            const char *nm = 0;
+            for (int i = 0; i < g_vol_count; i++) {
+                int seen = 0;
+                for (int j = 0; j < s_prev_count; j++)
+                    if (g_vols[i].index == s_prev_idx[j]) { seen = 1; break; }
+                if (!seen) { nm = g_vols[i].name; break; }
+            }
+            char body[96];
+            if (nm && nm[0]) snprintf(body, sizeof(body), "%s is ready", nm);
+            else             snprintf(body, sizeof(body), "Drive connected");
+            notify_post("Removable drive", body, NOTIFY_SUCCESS);
+        } else if (g_vol_count < s_prev_count) {
+            const char *nm = 0;
+            for (int j = 0; j < s_prev_count; j++) {
+                int seen = 0;
+                for (int i = 0; i < g_vol_count; i++)
+                    if (g_vols[i].index == s_prev_idx[j]) { seen = 1; break; }
+                if (!seen) { nm = s_prev_name[j]; break; }
+            }
+            char body[96];
+            if (nm && nm[0]) snprintf(body, sizeof(body), "%s removed", nm);
+            else             snprintf(body, sizeof(body), "Drive removed");
+            notify_post("Removable drive", body, NOTIFY_INFO);
+        }
+        // equal count with a changed signature is a relabel / media swap; the
+        // desktop already re-rendered above, so no toast is warranted.
+    }
+
+    // Snapshot the current set for the next diff.
+    s_prev_count = g_vol_count;
+    for (int i = 0; i < g_vol_count && i < DESK_MAX_VOLS; i++) {
+        s_prev_idx[i] = g_vols[i].index;
+        int k = 0;
+        for (; k < 63 && g_vols[i].name[k]; k++) s_prev_name[i][k] = g_vols[i].name[k];
+        s_prev_name[i][k] = 0;
     }
 }
 
@@ -749,6 +855,81 @@ void desktop_home_tick(void) {
     if (s_last != 0 && (now - s_last) < 2000) return;
     s_last = now;
     desktop_rescan_home(0);
+}
+
+// ============================================================================
+// #removdev: NON-STORAGE USB device arrival notification.
+// ============================================================================
+// Owner requirement: "plugging in a new device (e.g. a USB Ethernet
+// controller) raises a notification popup." Removable STORAGE is already
+// announced by desktop_volumes_tick() above (which also names the mounted
+// volume), so this path deliberately DEFERS bDeviceClass 0x00 (per-interface /
+// composite, the usual mass-storage stick) and 0x08 (explicit mass storage) to
+// that path and never double-notifies. Hubs (0x09) and host-controller rows are
+// infrastructure and are skipped.
+//
+// Same shape as desktop_volumes_tick(): ONE throttled syscall
+// (sys_dev_usb_list) per second, primed on the first pass so nothing already
+// attached at login is announced. The device set is event-surfaced from the
+// kernel's xHCI enum registry (drivers/xhci.c records every enumerated device,
+// hotplug included), so this is a cheap poll of already-collected state, not a
+// hardware poll or a busy-wait. Runs from the input tick, never a render path.
+// Not static: reused verbatim by traydev.c (#removtray, owner req #5) so the
+// tray's device-class label and the arrival-toast label can never drift into
+// two different answers for the same device. Prototyped in compositor.h.
+const char *usb_class_label(uint8_t cls) {
+    switch (cls) {
+        case 0x01: return "USB audio device";
+        case 0x02: return "USB network adapter";   // CDC Communications
+        case 0x03: return "USB input device";      // HID
+        case 0x06: return "USB imaging device";    // still image / PTP
+        case 0x07: return "USB printer";
+        case 0x0A: return "USB network adapter";   // CDC Data
+        case 0x0E: return "USB video device";
+        case 0xE0: return "USB wireless device";   // RNDIS / Bluetooth
+        case 0xEF: return "USB device";            // miscellaneous / IAD composite
+        default:   return "USB device";            // 0xFF vendor-specific (e.g. ASIX NIC) + others
+    }
+}
+
+void desktop_usbdev_tick(void) {
+    static uint64_t s_last;
+    static int      s_primed;
+    static uint64_t s_known[32];
+    static int      s_nknown;
+    if (desktop_is_dragging()) return;
+    uint64_t now = uptime_ms();
+    if (s_last != 0 && (now - s_last) < 1000) return;
+    s_last = now;
+
+    devinfo_usb_t devs[32];
+    int n = sys_dev_usb_list(devs, 32);
+    if (n < 0) n = 0;
+    if (n > 32) n = 32;
+
+    for (int i = 0; i < n; i++) {
+        devinfo_usb_t *d = &devs[i];
+        if (d->is_controller) continue;
+        // Identity key for one attached device. The kernel enum registry is
+        // append-only, so keying on identity (not row order) is what stops a
+        // re-enumeration from re-announcing the same device.
+        uint64_t key = ((uint64_t)d->vendor_id << 32) | ((uint64_t)d->product_id << 16)
+                     | ((uint64_t)d->dev_class << 8)   | (uint64_t)d->address;
+        int known = 0;
+        for (int k = 0; k < s_nknown; k++) if (s_known[k] == key) { known = 1; break; }
+        if (known) continue;
+        if (s_nknown < 32) s_known[s_nknown++] = key;   // adopt either way
+
+        if (!s_primed) continue;                        // first pass: adopt boot set silently
+        if (d->dev_class == 0x00 || d->dev_class == 0x08 || d->dev_class == 0x09)
+            continue;                                   // storage / hub: handled elsewhere
+
+        char body[96];
+        snprintf(body, sizeof(body), "%s (%04x:%04x)",
+                 usb_class_label(d->dev_class), d->vendor_id, d->product_id);
+        notify_post("Device connected", body, NOTIFY_INFO);
+    }
+    s_primed = 1;
 }
 
 // ============================================================================
@@ -828,7 +1009,10 @@ static void activate_icon(int idx) {
     }
 
     if (ic->kind == DESK_KIND_EXEC) {
-        if (sys_spawn(ic->exec_path) < 0)
+        // (ncursespty) same launch-routing chokepoint as launch_app() above:
+        // a desktop icon for a console/curses app (MyMan/Rogue/Angband) needs
+        // a hosted Terminal window, not a bare spawn.
+        if (compositor_spawn_app(ic->exec_path) < 0)
             notify_post("Cannot run program", ic->name, NOTIFY_ERROR);
         return;
     }

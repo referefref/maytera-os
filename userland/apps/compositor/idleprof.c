@@ -17,7 +17,7 @@
 // NOTHING FOR 450 SECONDS.
 //
 // The first version wrote one long record to /COMPIDLE.TXT and echoed it with
-// sys_bootlog(). MEASURED on VM <vmid>: the dump function ran (proved with a
+// sys_bootlog(). MEASURED on VM 2465: the dump function ran (proved with a
 // throwaway counter, the interval clock advanced and the accumulators reset),
 // and NEITHER output existed. Two independent silent failures:
 //

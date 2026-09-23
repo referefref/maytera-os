@@ -48,6 +48,21 @@ BRANCH = '''#ifndef CC_BUILD_MANUAL
 \t#define CC_BUILD_MAYTERA
 \t#undef  CC_BUILD_FREETYPE   /* no freetype; use the built-in bitmap font */
 \t#undef  CC_BUILD_PLUGINS    /* no dlopen: nothing loads shared objects */
+\t/* #28 deliverable 2 (2026-08-17): upstream's default sound and music
+\t   assets are extracted from the same Mojang client.jar as the texture
+\t   pack (see Resources.c, the SoundAssets and MusicAssets functions,
+\t   which pull from resources.download.minecraft.net). MayteraOS has no
+\t   licence to redistribute those either, and unlike textures there is no
+\t   in-tree BSD-3 fallback asset to substitute (no audio equivalent of
+\t   SystemFonts.c's font_bitmap table). Building sound and music out
+\t   entirely means Resources_CheckExistence never adds them to
+\t   Resources_MissingCount, so the launcher never attempts an audio fetch
+\t   and never blocks on one. Gameplay degrades to silent rather than
+\t   shipping or faking Mojang audio. Revisit if an original,
+\t   MayteraOS-authored sound set is ever produced (see
+\t   userland/apps/classicube/assets/README.md). */
+\t#define CC_BUILD_NOMUSIC
+\t#define CC_BUILD_NOSOUNDS
 \t#define DEFAULT_NET_BACKEND CC_NET_BACKEND_BUILTIN
 \t#define DEFAULT_SSL_BACKEND CC_SSL_BACKEND_NONE
 \t#define DEFAULT_AUD_BACKEND CC_AUD_BACKEND_MAYTERA
@@ -58,4 +73,4 @@ BRANCH = '''#ifndef CC_BUILD_MANUAL
 src = src.replace(A2, BRANCH.replace('\n', NL), 1)
 
 io.open(path, 'w', encoding='utf-8', newline='').write(src)
-print('Core.h: patched (CC_WIN_BACKEND_MAYTERA=8, PLAT_MAYTERA branch)')
+print('Core.h: patched (CC_WIN_BACKEND_MAYTERA=8, PLAT_MAYTERA branch, NOMUSIC/NOSOUNDS)')

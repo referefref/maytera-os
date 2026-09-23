@@ -10,6 +10,7 @@
 #include "syscall.h"
 #include "string.h"
 #include "unistd.h"
+#include "stdlib.h"   // #745: malloc/free for vasprintf/asprintf
 #include "termios.h"   // #745 (local 99): getchar() probes fd 0 for a termios
 #include <stdint.h>
 
@@ -626,4 +627,31 @@ int printf(const char *format, ...) {
     int ret = vprintf(format, ap);
     va_end(ap);
     return ret;
+}
+
+// vasprintf/asprintf - allocate a buffer and printf into it (#745 darkhttpd
+// port; used by its xvasprintf/xasprintf response builders). Two-pass: measure
+// with vsnprintf(NULL,0,...), malloc len+1, then format. Returns the byte count
+// (excluding the NUL) or -1 on error, and sets *strp to NULL on failure.
+int vasprintf(char **strp, const char *format, va_list ap) {
+    if (!strp) return -1;
+    va_list aq;
+    va_copy(aq, ap);
+    int len = vsnprintf((char *)0, 0, format, aq);
+    va_end(aq);
+    if (len < 0) { *strp = (void *)0; return -1; }
+    char *buf = (char *)malloc((size_t)len + 1);
+    if (!buf) { *strp = (void *)0; return -1; }
+    int w = vsnprintf(buf, (size_t)len + 1, format, ap);
+    if (w < 0) { free(buf); *strp = (void *)0; return -1; }
+    *strp = buf;
+    return w;
+}
+
+int asprintf(char **strp, const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    int r = vasprintf(strp, format, ap);
+    va_end(ap);
+    return r;
 }

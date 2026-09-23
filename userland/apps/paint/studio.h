@@ -8,7 +8,8 @@
 //   select.c  - selection masks (rect/ellipse/lasso/wand)
 //   tools.c   - paint tools operating on the active layer through the mask
 //   filters.c - adjustments + convolution filters (integer/fixed-point)
-//   imgio.c   - BMP load/save, native layered .MSTU, PNG export
+//   imgio.c   - BMP load/save, native layered .MSTU, PNG + JPEG export
+//   jpegenc.c - baseline JPEG encoder (pure function, used by imgio.c)
 //   ai.c      - native LLM integration (Kimi over sys_http_post)
 //   ui.c      - all panels/menus/canvas view/event handling
 //   main.c    - window + event loop wiring only
@@ -17,12 +18,18 @@
 
 #include "../../libc/maytera.h"
 #include "../../libc/gui_font.h"   // #530: the shared ChooseFont dialog (gui_font_dialog)
+#include "../../libc/contract.h"   // tier-2 wire: AI-drivable contract on the live canvas
+
+// The app's tool contract (contract.c). Answered over --contract (spawn path)
+// and delivered live to this running instance via contract_live_poll().
+extern const ct_contract_t PAINT_CONTRACT;
 
 // ---------------------------------------------------------------------------
 // Limits
 // ---------------------------------------------------------------------------
 #define STUDIO_MAX_LAYERS 12
-#define STUDIO_MAX_UNDO   4          // full-doc snapshots; memory-guarded
+#define STUDIO_MAX_UNDO   64         // history steps (sealed deltas, see doc.c); budget-guarded
+#define STUDIO_UNDO_BUDGET (48u << 20) // payload bytes across both stacks; oldest steps drop first
 #define STUDIO_MAX_W      1600
 #define STUDIO_MAX_H      1200
 #define STUDIO_DEF_W      960
@@ -103,16 +110,33 @@ int  layer_move(int idx, int dir);                  // dir: +1 = up in z, -1 = d
 int  layer_merge_down(int idx);                     // blend idx onto idx-1
 void doc_flatten(void);
 void doc_composite(void);                           // rebuilds g_doc.comp if comp_dirty
+// Flatten every visible layer onto a SOLID ground `bg` (0xRRGGBB) into `out`
+// (caller-owned, w*h ARGB), leaving g_doc.comp alone. Same layer walk as
+// doc_composite() but over a colour instead of the transparency checker: for
+// exports whose format has no alpha channel (JPEG). Returns 0 ok, -1 if out
+// is NULL or there are no layers.
+int  doc_flatten_to(uint32_t *out, uint32_t bg);
 // One pixel of `src` (with its alpha) over `dst` using mode + layer opacity 0..255.
 uint32_t blend_px(uint32_t dst, uint32_t src, blend_t mode, int opacity);
 
-// Undo: full-document snapshots (layers + topology). If malloc fails, silently
-// drop the oldest snapshot and retry once; never crash.
+// Undo: a sealed delta journal (P7). undo_push() takes one full baseline BEFORE
+// the mutation (if malloc fails, drop the oldest step and retry once; never
+// crash); undo_seal() compacts it to the changed rectangles once the mutation
+// is complete. push/undo/redo/goto seal implicitly; ui_tick() seals between
+// strokes so the panel's byte read-outs settle within a tick. Depth is
+// STUDIO_MAX_UNDO steps under STUDIO_UNDO_BUDGET bytes.
 void        undo_push(const char *label);           // call BEFORE mutating
+int         undo_seal(void);                        // 1 if the history changed
 int         undo_undo(void);                        // 1 if applied
 int         undo_redo(void);
-int         undo_count(void);
+int         undo_goto(int target);                  // undo/redo until undo_count()==target; steps moved
+int         undo_count(void);                       // steps behind the current state (incl. pending)
+int         undo_redo_count(void);                  // steps ahead (undone)
 const char *undo_label(int i);                      // 0..undo_count()-1, newest last
+const char *redo_label(int i);                      // 0..undo_redo_count()-1, 0 = next redo
+size_t      undo_bytes(int i);                      // sealed payload of undo step i
+size_t      redo_bytes(int i);
+size_t      undo_mem_total(void);                   // payload held by both stacks + pending
 int         undo_can_undo(void);                    // 1 if an undo is available
 int         undo_can_redo(void);                    // 1 if a redo is available
 const char *undo_next_label(void);                  // label of the action a Ctrl+Z would undo
@@ -210,10 +234,25 @@ const char *filter_name(filter_id_t f);
 // File I/O (imgio.c). Format by extension (case-insensitive): .BMP flattened
 // 24-bit; .MSTU native layered (magic "MSTU", version, doc w/h, per-layer
 // header + raw ARGB, then optional selection mask); .PNG export flattened
-// (stored-deflate blocks are acceptable). Loading BMP creates a 1-layer doc.
+// (stored-deflate blocks are acceptable); .JPG/.JPEG export flattened onto
+// white through jpegenc.c at the quality/chroma set by io_jpeg_set().
+// Loading BMP creates a 1-layer doc.
 // ---------------------------------------------------------------------------
 int io_load(const char *path);
 int io_save(const char *path);
+// JPEG export options (Studio plan P5). quality 1..100 (default 90);
+// chroma444 = 1 writes 4:4:4 chroma, 0 writes 4:2:0 (default). The settings
+// persist for the session so Save to an existing .JPG path reuses them.
+void io_jpeg_set(int quality, int chroma444);
+void io_jpeg_get(int *quality, int *chroma444);
+// Encode the current document with the current options into memory and
+// return the byte count (the file that io_save would write), or -1. Used by
+// the export dialog's live size read-out; nothing is written.
+long io_jpeg_estimate(void);
+// jpegenc.c: baseline JPEG from an ARGB buffer (alpha ignored; flatten
+// first). Returns 0 and a malloc'd *out/*outlen the caller frees, or -1.
+int jpeg_encode_argb(const uint32_t *src, int w, int h, int quality, int chroma444,
+                     unsigned char **out, long *outlen);
 // Printing (#318): flatten to a temp PNG and submit over IPP. `printer` may be
 // NULL for the system default. io_printer_default() fills the default printer
 // name and returns 1 if any printer is configured, 0 if none.
@@ -246,6 +285,23 @@ int io_splash_art(int win, int x, int y, int boxw, int boxh);
 int ai_available(void);
 int ai_command(const char *prompt, char *reply, int cap);
 int ai_palette(const char *prompt, uint32_t *out, int max_colors); // ret count
+// Docked assistant (plan P6): a conversation scoped to the current document
+// that can apply edits through the same closed op vocabulary as ai_command,
+// one undo_push per turn. NON-BLOCKING: ai_assist_send() starts the request
+// (0 = in flight, -1 = not started and a notice turn explains why), and
+// ui_tick() calls ai_assist_poll() every loop iteration; poll returns 1 when
+// a turn was appended (and the document may have changed: check comp_dirty).
+// Turns are read back by index: role 0 = user, 1 = assistant, 2 = notice;
+// applied = edit steps the assistant turn applied (0 for the others).
+// ai_assist_reset() clears the transcript (call on New/Open: new scope).
+int         ai_assist_send(const char *msg);
+int         ai_assist_poll(void);
+int         ai_assist_busy(void);
+void        ai_assist_reset(void);
+int         ai_assist_count(void);
+int         ai_assist_role(int i);
+int         ai_assist_applied(int i);
+const char *ai_assist_text(int i);
 
 // ---------------------------------------------------------------------------
 // UI (ui.c): menubar (File/Edit/Image/Layer/Select/Filter/AI/Help), left tool
@@ -263,6 +319,10 @@ void ui_full_redraw(void);
 // when the app should exit.
 int  ui_handle_event(void *ev);
 void ui_status(const char *msg);
+// Called by main.c once per event-loop iteration (events and the 100 ms
+// timeout alike). Polls the in-flight assistant request and animates the
+// panel's "thinking" indicator; returns 1 if it repainted anything.
+int  ui_tick(void);
 
 // ---------------------------------------------------------------------------
 // Color picker + palette system (colorpick.c)

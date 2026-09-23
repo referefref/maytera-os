@@ -14,6 +14,7 @@
 #include "../serial.h"
 #include "../string.h"
 #include "../security/uaccess_smap.h"  // #19/#645: AC brackets for Ring-3 out-params
+#include "../fs/bootlog.h"  // #dosmem: the one Ring-3-reachable anomaly, persistently
 
 // External timer + frequency (ticks -> ms conversion).
 extern volatile uint64_t timer_ticks;
@@ -397,6 +398,25 @@ int64_t sys_futex(uint32_t *addr, int op, uint32_t val, uint64_t timeout,
         case FUTEX_WAIT_BITSET: return futex_wait(addr, val, timeout, val3);
         case FUTEX_WAKE_BITSET: return futex_wake(addr, (int)val, val3);
         default:
+            // #dosmem: RING 3 CHOOSES `cmd`, SO THIS IS RATE-LIMITED BEFORE
+            // IT IS PERSISTED. An unprivileged loop calling futex() with a bad
+            // opcode would otherwise drive an unbounded series of whole-file
+            // /BOOTLOG.TXT rewrites on the FAT ESP: a Ring-3 triggerable write
+            // storm, i.e. the #373 mechanism handed to an attacker. Eight
+            // records name the offending pid and opcode, which is all anyone
+            // needs to find the caller; after that it is serial only.
+            {
+                static unsigned s_unkop = 0;
+                if (s_unkop < 8) {
+                    s_unkop++;
+                    process_t *_me = proc_current();
+                    bootlog_write("[FUTEX] unknown operation %d from pid=%u "
+                                  "'%s'%s", cmd, _me ? _me->pid : 0u,
+                                  _me ? _me->name : "(none)",
+                                  s_unkop == 8 ? " (further occurrences are "
+                                                 "serial only)" : "");
+                }
+            }
             kprintf("[FUTEX] Unknown operation: %d\n", cmd);
             return -FUTEX_EINVAL;
     }
@@ -433,6 +453,12 @@ void futex_tick(void) {
 // ============================================================================
 // Debug
 // ============================================================================
+
+void futex_get_counts(uint64_t *waits, uint64_t *wakes, uint64_t *timeouts) {
+    if (waits)    *waits    = futex_wait_count;
+    if (wakes)    *wakes    = futex_wake_count;
+    if (timeouts) *timeouts = futex_timeout_count;
+}
 
 void futex_print_stats(void) {
     kprintf("\n=== Futex Statistics ===\n");

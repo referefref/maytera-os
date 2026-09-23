@@ -28,8 +28,18 @@ struct file;
 // User mode stack size (2MB)
 #define USER_STACK_SIZE     (2 * 1024 * 1024)
 
-// Kernel stack size for user processes (8KB)
-#define KERNEL_STACK_SIZE   (64 * 1024)
+// Kernel stack size for user processes.
+//
+// #stackguard: this is KSTACK_USABLE, not a round number, and that is
+// deliberate. mm/kstack.c hands out 64 KiB blocks ALIGNED TO 64 KiB whose
+// lowest 4 KiB is a poisoned guard band, because alignment == size is what lets
+// isr_handler() derive the band from RSP with a single AND and no per-CPU
+// state. A task must therefore never be told it owns the whole granule: its top
+// would land outside its own block and the check would police the neighbour.
+// Deriving it from KSTACK_USABLE makes that impossible to get wrong later.
+// The comment here used to say "(8KB)" while the value was 64 KiB.
+#include "../mm/kstack.h"
+#define KERNEL_STACK_SIZE   ((size_t)KSTACK_USABLE)
 
 // Privilege levels
 #define PRIV_KERNEL         0   // Ring 0 - kernel mode
@@ -83,6 +93,26 @@ typedef struct {
 } __attribute__((packed)) cpu_context_t;
 
 // Process Control Block (PCB)
+// Stage 1 capability grant (docs/SYSTEM_CAPABILITY_API.md section 5). Mirrors
+// CapGrant in rustkern/caps.rs; size locked to 96 in syscall_argtab_lock.c.
+#define CAP_MAX_GRANTS 8
+typedef struct {
+    uint32_t cap;          // CAP_* class (proc/caps.h); 0 = empty slot
+    uint32_t scope_kind;   // CAP_SCOPE_*
+    uint64_t expires_ms;   // absolute deadline; a grant is always time-bounded
+    uint32_t uses_left;    // remaining uses; 0xFFFFFFFF = unlimited in the window
+    uint32_t pad;
+    uint64_t granted_seq;  // the GraphFS journal edge (EDGE_ADD) that created it
+    char     scope[64];    // kernel-validated noun, never the app's raw string
+} cap_grant_t;
+
+// #246/#305 escrow-actor scope prefix length. A device mount prefix such as
+// "/MEDIA/USB" is short; the value is capped at 128 because that is the maximum
+// prefix length elev_path_covered_rs() (the reused, boundary-aware, "..-
+// refusing path-in-scope primitive) scans. Kept small deliberately: this is a
+// narrow, short-lived exception to the permission model, not a general path.
+#define ESCROW_SCOPE_PREFIX_MAX 128
+
 typedef struct process {
     // Process identification
     uint32_t pid;                   // Process ID
@@ -154,6 +184,51 @@ typedef struct process {
     // install landed on disk and reported "(not added to the Start menu)".
     char     elev_grant_prefix[2][40];
     uint64_t elev_last_input_ms;
+
+    // Stage 1 CAPABILITY GRANTS (proc/caps.h, docs/SYSTEM_CAPABILITY_API.md
+    // section 5). A small fixed array of grants Ring 3 has NO syscall to write,
+    // exactly like the #745 elevation fields above and for the same reasons:
+    // unforgeable without cryptography, revocable in flight (a field the kernel
+    // clears is revoked at the holder's next syscall), cannot leak into an LLM
+    // prompt, and dies with the process because proc_create() memset()s
+    // process_t. The DECISIONS about this array live in rustkern/caps.rs; only
+    // the storage is here. sizeof(cap_grant_t) is locked to 96 in
+    // proc/syscall_argtab_lock.c against CapGrant in rustkern/caps.rs.
+    cap_grant_t cap_grants[CAP_MAX_GRANTS];
+
+    // #246/#305 AI ESCROW ACTOR MODE (fs/escrow_guard.{c,h}, Stage 1 of
+    // docs/CONTRACT_ENFORCEMENT_PLAN.md). The unforgeable, kernel-side marker
+    // that graduates the AI escrow from advisory (Ring-3, bypassable) to
+    // kernel-enforced. Same unforgeability argument as the #745 elevation
+    // fields and the cap_grants array above: Ring 3 has NO syscall that writes
+    // any of these EXCEPT SYS_ESCROW_ENTER (which sets them) and
+    // SYS_ESCROW_EXIT (which clears them), proc_create()'s
+    // memset(proc,0,sizeof(process_t)) zeroes them so a NEW process is NEVER an
+    // escrow actor, and they are NOT copied on fork/spawn, so a normal process,
+    // the shell, the compositor, apps and the installer are all untouched and
+    // their filesystem operations take exactly the pre-escrow code path.
+    //   escrow_active     1 while acting under a live escrow contract, else 0.
+    //                     The ONLY bit escrow_fs_guard() branches on: when 0 it
+    //                     returns "allow" before reading anything else, which is
+    //                     what makes normal FS ops a zero-behaviour-change path.
+    //   escrow_task_node  the GraphFS AI_TASK node id that HOLDS the grant.
+    //   escrow_obj_node   the GraphFS OBJECT node id the grant is issued ON
+    //                     (the scope target).
+    //   escrow_grant_edge the grant edge's journal seq, used to REVOKE it on
+    //                     exit (revocation bites in flight, per
+    //                     docs/CONTRACT_ARCHITECTURE.md section 6).
+    //   escrow_scope_prefix the canonical absolute path prefix the writes are
+    //                     confined to, resolved through sc_path_from_user() at
+    //                     enter time (so "." and ".." are already collapsed).
+    // The AUTHORITY itself is NOT stored here: it lives in the GraphFS contract
+    // graph and is queried through gfs_grant_check(), so a stale field cannot
+    // grant anything the graph does not, and revocation/expiry in the graph
+    // denies at the next syscall.
+    uint8_t  escrow_active;
+    uint32_t escrow_task_node;
+    uint32_t escrow_obj_node;
+    uint64_t escrow_grant_edge;
+    char     escrow_scope_prefix[ESCROW_SCOPE_PREFIX_MAX];
 
     // Memory - kernel mode
     void *stack_base;               // Kernel stack base address
@@ -742,7 +817,7 @@ void proc_mm_unlock(void);
 //
 // Verification: reproduced the panic on the pre-refcount tree (crash
 // AssaultCube -> its own recoverable GPF -> a SECOND, fatal kernel GPF at
-// the same proc_mem_account_rs RIP, same throwaway VM <vmid>, build 910). See
+// the same proc_mem_account_rs RIP, same throwaway VM 2601, build 910). See
 // PORT-STATUS.md / CHANGELOG.md for the measured before/after boot logs
 // proving whether mm_users actually closes the gap.
 
@@ -753,6 +828,11 @@ uint32_t proc_thread_count(uint32_t pid);
 // callers that only need the pid (net/tcp.c stamping socket ownership) do not
 // have to pull the whole PCB definition into their layer.
 uint32_t proc_current_pid(void);
+
+// Stage 0: raw tgid of the running process (0 = no current process, or the
+// process is its own group leader). Pair it with capgate_tgid_of_rs() to get a
+// normalised group identity; do not normalise it by hand at a call site.
+uint32_t proc_current_tgid(void);
 
 
 // Return-work bits used by syscall_return_path and return_work_handler().

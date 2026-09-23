@@ -12,3 +12,5 @@ item: Music Player | /APPS/MUSICPLR | icon=music
 # missing this entry simply does not render, rather than launching nothing.
 item: MIDI Player | /APPS/MIDIPLAY | icon=music
 item: Snapshot | /APPS/SNAPSHOT | icon=snapshot
+item: Sprite Studio | /APPS/SPRITE | icon=paint
+item: Image Converter | /APPS/IMGCONV | icon=image

@@ -42,10 +42,18 @@ typedef unsigned long       uint64_t;
 #ifndef _STDDEF_H
 #ifndef __size_t_defined
 typedef unsigned long       size_t;
-typedef signed long         ssize_t;
 typedef signed long         ptrdiff_t;
 #define __size_t_defined 1
 #endif
+#endif
+
+// ssize_t is a POSIX type and is NOT provided by <stddef.h>. It therefore must
+// be defined regardless of whether stddef.h was included first. #745: it used to
+// sit inside the #ifndef _STDDEF_H guard above, so any translation unit that
+// pulled in <stddef.h> before this header (ncurses does) lost ssize_t entirely.
+#ifndef __ssize_t_defined
+typedef signed long         ssize_t;
+#define __ssize_t_defined 1
 #endif
 
 typedef unsigned long       uintptr_t;

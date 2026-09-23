@@ -34,6 +34,14 @@ Bluetooth is off.
 
 ## 2. Build serialization rule (the build container)
 
+> **Note (docs refresh, 2026-09-23):** this is a point-in-time #372 coordination
+> plan. The build model below (a shared `active-code/*` kernel tree with a manual
+> one-`make`-at-a-time poll) is superseded: builds now go through git and the
+> serialized build queue (`buildq` -> `build/build-golden.sh`), and the source of
+> truth is the git repo, not an `active-code` tree. Read the ownership table above
+> as the historical bt/ integration record; use the current build flow in
+> `BUILD.md` and `docs/BUILDQ.md`.
+
 All main-kernel builds happen in Proxmox the build container on the build server
 (<BUILD_SERVER>), tree `<BUILD_PATH>/active-code/source/kernel/`. The object
 dir is shared, so only ONE `make` may run at a time.
@@ -55,7 +63,7 @@ rule (added this pass), so adding a new `bt/*.c` needs no Makefile edit.
 
 Edit locally, then copy each changed file into the container. From the build server:
 ```
-pct push <ct> /path/on/host/bt/hci.c \
+pct push 3007 /path/on/host/bt/hci.c \
   <BUILD_PATH>/active-code/source/kernel/bt/hci.c
 ```
 Never bulk-sync; push individual files to the exact `bt/` path.

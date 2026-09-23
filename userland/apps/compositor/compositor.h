@@ -382,7 +382,16 @@ extern int DESKTOP_ICON_SPACING_Y;
 #define THUMB_CELL_W        (THUMB_WIDTH + THUMB_PADDING)
 #define THUMB_CELL_H        (THUMB_HEIGHT + THUMB_PADDING + ui_px(16))
 #define PICKER_WIDTH        (THUMB_COLS * THUMB_CELL_W + THUMB_PADDING * 2)
-#define PICKER_HEIGHT       ui_px(400)
+// #wpanim: the effect-mode row + intensity/repel row sit BELOW the thumbnail
+// grid, in a strip this tall. PICKER_HEIGHT grows by exactly this amount and
+// wallpaper.c's wallpaper_grid_rect() subtracts it back out of the grid
+// area, so the thumbnail grid keeps the exact same size/row-count it always
+// had - the added height goes entirely to the new strip, not a shrunk grid.
+// #wpcolor (2026-09-18): grown again to fit a THIRD row (base-hue slider +
+// Content/Spectrum/Mono buttons) below the existing mode row and
+// intensity/repel row, same "grid never shrinks" contract.
+#define WPANIM_STRIP_H      ui_px(90)
+#define PICKER_HEIGHT       (ui_px(400) + WPANIM_STRIP_H)
 #define PICKER_TITLE_H      ui_px(24)
 #define MAX_WALLPAPERS      64
 
@@ -414,7 +423,7 @@ extern int DESKTOP_ICON_SPACING_Y;
 // black frame, and then does nothing further per tick until real input wakes
 // it (screensaver_on_input(), unchanged). This bounds the steady-state cost
 // of an unattended machine to ~0 instead of the ~14% of a core measured
-// (VM <vmid>, golden 1016) for the GL/plasma savers running indefinitely at
+// (a test VM, golden 1016) for the GL/plasma savers running indefinitely at
 // the #650 SS_FRAME_MIN_MS-throttled rate. 15 minutes here plus the
 // SS_DEFAULT_TIMEOUT idle wait above totals ~25 minutes idle before the
 // display goes fully quiet. See screensaver_active_since_ms() below.
@@ -547,6 +556,14 @@ typedef enum {
     // a USB stick is a lie the user has to click to discover.
     ICON_CDROM,
     ICON_FLOPPY,
+    ICON_PLANETARIUM,   // Planetarium (embedded north-star glyph)
+    // Office suite launchers (/ICONS/WRITER.ICN, SHEETS.ICN, SLIDES.ICN) and
+    // the suite family mark (OFFICE.ICN). APPENDED, never inserted: the
+    // numeric values above are persisted (see the #44 note further up).
+    ICON_WRITER,
+    ICON_SHEETS,
+    ICON_SLIDES,
+    ICON_OFFICE,
     ICON_COUNT
 } icon_id_t;
 
@@ -688,7 +705,22 @@ typedef enum {
        APPENDED, never inserted: these ids are persisted numerically as
        screensaver:<n> in UIPROFIL.YML, so renumbering would silently change
        what every existing profile selects. */
-    SS_PLASMACLASSIC   /* #282 original plasma: 4px blocks, raw HSV wheel */
+    SS_PLASMACLASSIC,  /* #282 original plasma: 4px blocks, raw HSV wheel */
+    /* (lavalamp) proper 3D lava lamp: metaball wax isosurface (marching
+       tetrahedra over a Wyvill field) with buoyancy-convection dynamics,
+       rendered by the shared TinyGL core GLDEMO_LAVALAMP. APPENDED per the
+       persistence rule above (id 23). It is a GL type but sits OUTSIDE the
+       contiguous SS_GLCUBE..SS_GLLAVA range, so ss_is_gl_type() names it
+       explicitly. */
+    SS_GLLAVALAMP,     /* 3D lava lamp (TinyGL metaballs), kernel id 23 */
+    /* (aquarium) 3D reef aquarium: five procedural fish species (clownfish,
+       tang, angelfish, goby, boids school of neons) with spine undulation,
+       banking and glass avoidance, over sand/rocks/coral/kelp with per-
+       vertex depth fog, caustics, bubbles and god rays. Shared TinyGL core
+       GLDEMO_AQUARIUM. APPENDED per the persistence rule above (id 24);
+       like SS_GLLAVALAMP it is a GL type OUTSIDE the contiguous
+       SS_GLCUBE..SS_GLLAVA range, so ss_is_gl_type() names it explicitly. */
+    SS_GLAQUARIUM      /* 3D reef aquarium (TinyGL), kernel id 24 */
 } screensaver_type_t;
 
 // Screensaver star
@@ -912,6 +944,34 @@ void glass_invalidate_all(void);
 int  glass_perf_get(int surf, uint32_t *cold_n, uint32_t *cold_ms,
                     uint32_t *cold_worst, uint32_t *hit_n, int *tier);
 
+// (cfglass) THE SHARED BACKDROP PLANE: one whole-screen blur, N tints. For
+// a chrome layer with a VARIABLE number of translucent panes (the Cardfile
+// deck: rail + N edges + N plates + frames + panes + popup), where the
+// fixed-slot cache above would thrash. glass_backdrop_prepare() builds (or
+// reuses) ONE blurred 1/4-scale plane of the whole screen, under the same
+// g_glass_live / signature / rate-limit / tier rules as glass_render(); call
+// it once per frame BEFORE drawing any pane, then glass_backdrop_fill() any
+// number of rects, each with its own tint, alpha, sheen and depth dim,
+// straight into g_fb (clip-honouring). prepare() returns 1 if the plane is
+// usable this frame; fill() falls back to a flat tint by itself when it is
+// not, so callers need not branch. sat_pct is the spec's saturate() (100 =
+// none, 150 = the Cardfile design's 150%). See draw.c for the rationale.
+typedef struct {
+    uint32_t tint;        // surface colour (alpha byte ignored)
+    int32_t  alpha;       // 0..255: tint over the blurred backdrop
+    int32_t  dim_x10;     // darken the finished pane by tenths of a percent (0 = none)
+    int32_t  sheen_a;     // white sheen alpha (0..255) at its origin edge, 0 = none
+    int32_t  sheen_len;   // px over which the sheen fades to nothing
+    int32_t  sheen_org;   // absolute y (vertical) or x (horizontal) where it starts
+    int32_t  sheen_vert;  // 1 = fades top-to-bottom, 0 = left-to-right
+} glass_bd_style_t;
+int  glass_backdrop_prepare(int sat_pct);
+int  glass_backdrop_valid(void);
+void glass_backdrop_fill(int32_t x, int32_t y, int32_t w, int32_t h,
+                         const glass_bd_style_t *st);
+int  glass_backdrop_perf_get(uint32_t *cold_n, uint32_t *cold_ms,
+                             uint32_t *cold_worst, uint32_t *hit_n, int *tier);
+
 // (#glassmodal) Shared glass/chrome helpers, promoted from taskbar.c
 // (previously static, ~lines 130-195 there) so confirmdialog.c and
 // draw_perf_popup() can reuse the SAME edge/highlight/opacity-floor logic
@@ -1103,6 +1163,14 @@ void elevate_render(void);          // scrim + panel, drawn above everything
 int  elevate_modal_open(void);      // 1 while it owns the screen
 int  elevate_handle_key(int key);   // 1 if consumed (it consumes everything)
 int  elevate_handle_mouse(int32_t x, int32_t y, int clicked);
+// Stage 1 capability consent prompt (capconsent.c). Same shape as the elevate
+// modal above; the compositor is the only principal that may draw or resolve a
+// capability request (sys_cap_view / sys_cap_resolve are compositor-only).
+void capconsent_poll(void);
+void capconsent_render(void);
+int  capconsent_open(void);
+int  capconsent_handle_key(int key);
+int  capconsent_handle_mouse(int32_t x, int32_t y, int clicked);
 // (#73) draw_password_field() deleted: zero callers (both credential surfaces
 // use lock_draw_pill()) and it was the dead login layer's own password field.
 void draw_button(int32_t x, int32_t y, int32_t w, int32_t h, const char *label, uint32_t bg);
@@ -1130,6 +1198,15 @@ int  lock_handle_key(int key);
 int  lock_handle_mouse(int32_t x, int32_t y, bool clicked);
 
 // desktop.c - Desktop surface
+// (ncursespty) shared launch-routing chokepoint: sys_spawn()/sys_spawn_args()
+// wrapper that detects a known console/curses app (MyMan/Rogue/Angband,
+// desk_is_console_app() in desktop.c) and hosts it inside a Terminal window
+// on a real pty instead of a bare, tty-less spawn - see desktop.c's own
+// comment for the root cause. Same return convention as sys_spawn(): >0 pid,
+// <0 on failure. Used by desktop.c's own icon launch paths and by
+// startmenu.c's sm_launch_item()/startmenu_launch_path(), so there is one
+// place this routing decision is made, not three drifting copies.
+int  compositor_spawn_app(const char *path);
 void desktop_init(void);
 void desktop_render(void);
 void desktop_handle_mouse(int32_t x, int32_t y, bool left_click, bool right_click, bool dbl_click);
@@ -1185,6 +1262,45 @@ void desktop_home_tick(void);                    // throttled caller of the abov
 // drives actually changes. Like desktop_home_tick() it runs from the input
 // tick and NEVER from a render path.
 void desktop_volumes_tick(void);
+// #removdev: non-storage USB device arrival notification (owner req #1). Same
+// shape/cadence as desktop_volumes_tick(); runs from the input tick only.
+void desktop_usbdev_tick(void);
+// Friendly label for a USB device class byte ("USB network adapter", ...).
+// Not static so traydev.c (#removtray, owner req #5) can reuse the SAME
+// class->label mapping the arrival toast uses instead of a second copy that
+// could silently drift from it.
+const char *usb_class_label(uint8_t cls);
+
+// ============================================================================
+// #removtray (owner req #5): removable-devices system-tray widget MODEL.
+// traydev.c owns the JOIN of SYS_VOL_LIST (storage) and SYS_DEV_USB_LIST
+// (everything else) into one tray-ready row list, plus the per-class eject
+// decision. taskbar.c owns the tray icon glyph, the popup card, and the
+// Eject button click wiring - see its "#traydev" section. Same model/draw
+// split docs/REMOVABLE_DEVICES_TRAY_PLAN.md calls for.
+// ============================================================================
+typedef enum { TRAYDEV_STORAGE = 0, TRAYDEV_USBOTHER = 1 } traydev_kind_t;
+typedef struct {
+    traydev_kind_t kind;
+    char name[64];       // "SanDisk Cruzer Blade" / "USB network adapter"
+    char subtitle[64];    // "USB drive - /USB0" / "USB 0b95:1790"
+    int  can_eject;       // the per-class matrix decision for THIS row
+    int  vol_index;       // valid (>=0) only when kind == TRAYDEV_STORAGE
+} traydev_row_t;
+// Throttled (1s) model rebuild. Two syscalls, at most SC_VOL_MAX+32 records,
+// touches no hardware. Call from the input tick ONLY (#426) - never render.
+void traydev_poll(void);
+// Row count > 0 -> the tray icon/slot should be visible.
+int  traydev_present(void);
+// *out = pointer to the internal row array (valid until the next
+// traydev_poll()/traydev_eject()). Returns the row count.
+int  traydev_rows(const traydev_row_t **out);
+// Ejects the volume at vol_index (SYS_VOL_EJECT) and re-polls immediately on
+// success, so the row disappears on the same frame as the caller's own
+// confirmation - same "do not wait out the throttle" rule
+// desktop_icon_eject() already follows. Returns 0 on success.
+int  traydev_eject(int vol_index);
+
 // Volume behind desktop icon `idx`, or -1. Used by the context menu to offer
 // Eject on the right icon.
 int  desktop_icon_volume(int idx, int *out_kernel_index, int *out_readable);
@@ -1236,6 +1352,14 @@ bool taskbar_handle_mouse(int32_t x, int32_t y, bool clicked);
 bool taskbar_popup_active(void);                                    // #241
 bool taskbar_popup_handle_mouse(int32_t x, int32_t y, bool clicked); // #241
 int32_t taskbar_get_y(void);
+// (cfdock) Cardfile dock-bar hosting - see taskbar.c's own section header
+// comment. `items` are CF_DOCKITEM_* (cardfile_model.h); declared here with
+// a plain `const int *` so this header need not include cardfile_model.h.
+void taskbar_render_dock_items(int32_t x, int32_t y, int32_t w, int32_t h,
+                                const int *items, int nitems, uint32_t bar_bg,
+                                int vertical);
+int  taskbar_dock_items_handle_mouse(int32_t x, int32_t y, int clicked, int right_clicked,
+                                      int vertical);
 #ifdef MAYTERA_TESTHOOK
 // (#glassmodal) headless verification hook ONLY (see testhook.c). Opens the
 // CPU/RAM/DSK/NET perf pop-out for the given gauge index (0=CPU..3=NET),
@@ -1309,7 +1433,8 @@ void settings_open_panel(int tab);
 #define DOCK_CLASSIC_UNIX 2  // Classic UNIX: beveled CDE/Motif-style front panel (workspace switcher)
 #define DOCK_RETRO_BENCH 3   // Retro Bench: top screen bar (depth/zoom gadgets)
 #define DOCK_XFCE        4   // #26 XFCE ("Marble" in Settings): glass top panel + glass flush bottom dock (pinned+running), icons ease a hover lift/grow (#745)
-#define DOCK_COUNT       5
+#define DOCK_CARDFILE    5   // (cardfilearch) Cardfile: Rolodex card-deck shell - rail + fanned sideways-tabbed cards, the open card IS the app window. See cardfile.h / docs/CARDFILE_ARCHITECTURE.md
+#define DOCK_COUNT       6
 extern int g_dock_style;
 // (#123) Marble-dock geometry preferences. Owned by taskbar.c (the only
 // consumer of the geometry), persisted by profile.c into UIPROFIL.YML, and
@@ -1561,6 +1686,11 @@ int  iconpicker_handle_key(int key);
 // offering a "Speed..." item, so there is one definition of "this window is a
 // DOS guest" rather than two title-suffix checks drifting apart.
 int  dosspeed_window_is_dos(int win_id, char *game, int cap);
+// #dosmouse2: the raw title-suffix predicate dosspeed_window_is_dos() is
+// built on, exposed directly for main.c's cursor-suppression check (see
+// dos_cursor_should_hide() in main.c), which already has a wm_window_info_t
+// in hand and needs only the title test, not a second wm_get_windows() call.
+bool dos_title_is_dos_window(const char *title);
 void dosspeed_open(int win_id, const char *game);
 int  dosspeed_is_open(void);
 void dosspeed_render(void);
@@ -1578,6 +1708,20 @@ void wallpaper_render_picker(void);
 bool wallpaper_picker_handle_mouse(int32_t x, int32_t y, bool clicked);
 void wallpaper_picker_open(void);
 void wallpaper_picker_close(void);
+// #wpanim: animated, window-reactive wallpaper effect state (wallpaper.c-local,
+// no syscall - see profile.c's own extern block for why it needs one there).
+int  get_wallpaper_anim(void);
+void set_wallpaper_anim(int mode);
+int  get_wallpaper_anim_intensity(void);
+void set_wallpaper_anim_intensity(int v);
+int  get_wallpaper_anim_repel(void);
+void set_wallpaper_anim_repel(int repel);
+// #wpanim BUGFIX: true when a new animation frame is due (see wallpaper.c's
+// own comment) - main.c's ui_busy computation folds this in so the render
+// loop actually takes the full-composite path on the ticks that matter,
+// instead of the idle chrome-only path silently never calling
+// wallpaper_render_background() again once a static window is open.
+bool wallpaper_anim_due(void);
 
 // screensaver.c - Screensaver
 void screensaver_init(void);

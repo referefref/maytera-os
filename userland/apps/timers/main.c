@@ -153,16 +153,27 @@ enum {
     B_PO_STARTPAUSE, B_PO_SKIP, B_PO_RESET,
 };
 
-typedef struct { int id; int x, y, w, h; char label[16]; int variant; int enabled; } btn_t;
+// #239: `tok` is the STABLE dotted name of the action this button dispatches,
+// and it sits in the same table as the geometry because the tool contract is
+// PROJECTED from this table (see the contract block near the bottom). It is
+// separate from `label` for the same reason apps/calc's btn_t separates `tok`
+// from `face`: the label is display text that changes with state ("Start" /
+// "Pause" / "Resume"), so a name derived from it would rename itself every time
+// the user pressed it.
+typedef struct {
+    int id; int x, y, w, h; char label[16]; int variant; int enabled;
+    const char *tok;
+} btn_t;
 static btn_t g_btns[20];
 static int g_nbtns = 0;
 static int g_hover = -1;            // index into g_btns
 static int g_hover_tab = -1;
 
-static void add_btn(int id, int x, int y, int w, int h, const char *label,
-                    int variant, int enabled) {
+static void add_btn(int id, const char *tok, int x, int y, int w, int h,
+                    const char *label, int variant, int enabled) {
     btn_t *b = &g_btns[g_nbtns++];
-    b->id = id; b->x = x; b->y = y; b->w = w; b->h = h;
+    b->id = id; b->tok = tok;
+    b->x = x; b->y = y; b->w = w; b->h = h;
     strlcpy(b->label, label, sizeof(b->label));
     b->variant = variant; b->enabled = enabled;
 }
@@ -180,41 +191,44 @@ static void build_buttons(void) {
 
     if (g_tab == 0) {
         int bw = (cw - 2 * 10) / 3, by = ct + 118;
-        add_btn(B_SW_STARTPAUSE, PAD, by, bw, 38,
+        add_btn(B_SW_STARTPAUSE, "stopwatch.start_pause", PAD, by, bw, 38,
                 sw_running ? "Pause" : (sw_accum > 0 ? "Resume" : "Start"),
                 GUI_BTN_PRIMARY, 1);
-        add_btn(B_SW_LAP, PAD + bw + 10, by, bw, 38, "Lap",
+        add_btn(B_SW_LAP, "stopwatch.lap", PAD + bw + 10, by, bw, 38, "Lap",
                 GUI_BTN_SECONDARY, sw_running);
-        add_btn(B_SW_RESET, PAD + 2 * (bw + 10), by, bw, 38, "Reset",
+        add_btn(B_SW_RESET, "stopwatch.reset", PAD + 2 * (bw + 10), by, bw, 38, "Reset",
                 GUI_BTN_SECONDARY, sw_accum > 0 || sw_running || sw_lap_count > 0);
     } else if (g_tab == 1) {
         int py = ct + 128;
         int pw = (cw - 2 * 8) / 3;
         static const char *pl[6] = { "1 min", "3 min", "5 min", "10 min", "25 min", "60 min" };
         static const int   pid[6] = { B_TM_P1, B_TM_P3, B_TM_P5, B_TM_P10, B_TM_P25, B_TM_P60 };
+        static const char *ptok[6] = { "timer.preset_1min", "timer.preset_3min",
+                                       "timer.preset_5min", "timer.preset_10min",
+                                       "timer.preset_25min", "timer.preset_60min" };
         for (int i = 0; i < 6; i++) {
             int r = i / 3, c = i % 3;
-            add_btn(pid[i], PAD + c * (pw + 8), py + r * 36, pw, 30, pl[i],
+            add_btn(pid[i], ptok[i], PAD + c * (pw + 8), py + r * 36, pw, 30, pl[i],
                     GUI_BTN_SECONDARY, !tm_running);
         }
         int ay = py + 2 * 36 + 8;
         int aw = (cw - 3 * 8) / 4;
-        add_btn(B_TM_M1M,  PAD,                 ay, aw, 30, "-1m",  GUI_BTN_GHOST, 1);
-        add_btn(B_TM_M10S, PAD + (aw + 8),      ay, aw, 30, "-10s", GUI_BTN_GHOST, 1);
-        add_btn(B_TM_A10S, PAD + 2 * (aw + 8),  ay, aw, 30, "+10s", GUI_BTN_GHOST, 1);
-        add_btn(B_TM_A1M,  PAD + 3 * (aw + 8),  ay, aw, 30, "+1m",  GUI_BTN_GHOST, 1);
+        add_btn(B_TM_M1M,  "timer.minus_1min",  PAD,                 ay, aw, 30, "-1m",  GUI_BTN_GHOST, 1);
+        add_btn(B_TM_M10S, "timer.minus_10sec", PAD + (aw + 8),      ay, aw, 30, "-10s", GUI_BTN_GHOST, 1);
+        add_btn(B_TM_A10S, "timer.plus_10sec",  PAD + 2 * (aw + 8),  ay, aw, 30, "+10s", GUI_BTN_GHOST, 1);
+        add_btn(B_TM_A1M,  "timer.plus_1min",   PAD + 3 * (aw + 8),  ay, aw, 30, "+1m",  GUI_BTN_GHOST, 1);
         int gy = ay + 40;
         int gw = (cw - 10) / 2;
-        add_btn(B_TM_STARTPAUSE, PAD, gy, gw, 38,
+        add_btn(B_TM_STARTPAUSE, "timer.start_pause", PAD, gy, gw, 38,
                 tm_running ? "Pause" : "Start", GUI_BTN_PRIMARY, tm_remaining() > 0);
-        add_btn(B_TM_RESET, PAD + gw + 10, gy, gw, 38, "Reset", GUI_BTN_SECONDARY, 1);
+        add_btn(B_TM_RESET, "timer.reset", PAD + gw + 10, gy, gw, 38, "Reset", GUI_BTN_SECONDARY, 1);
     } else {
         int by = ct + 208;
         int bw = (cw - 2 * 10) / 3;
-        add_btn(B_PO_STARTPAUSE, PAD, by, bw, 38,
+        add_btn(B_PO_STARTPAUSE, "pomodoro.start_pause", PAD, by, bw, 38,
                 po_running ? "Pause" : "Start", GUI_BTN_PRIMARY, 1);
-        add_btn(B_PO_SKIP,  PAD + bw + 10,       by, bw, 38, "Skip",  GUI_BTN_SECONDARY, 1);
-        add_btn(B_PO_RESET, PAD + 2 * (bw + 10), by, bw, 38, "Reset", GUI_BTN_SECONDARY, 1);
+        add_btn(B_PO_SKIP,  "pomodoro.skip",  PAD + bw + 10,       by, bw, 38, "Skip",  GUI_BTN_SECONDARY, 1);
+        add_btn(B_PO_RESET, "pomodoro.reset", PAD + 2 * (bw + 10), by, bw, 38, "Reset", GUI_BTN_SECONDARY, 1);
     }
 }
 
@@ -527,11 +541,240 @@ static void on_key(gui_event_t *ev) {
     }
 }
 
-int main(int argc, char **argv) {
+// ---------------------------------------------------------------------------
+// Tool contract (#239) - PROJECTED FROM build_buttons(), NOT WRITTEN OUT.
+//
+// Same move as apps/calc (#233), against a table that is built rather than
+// declared. Nothing below lists a Timers button. The action surface is derived
+// by running the app's OWN build_buttons() once per tab and reading the g_btns[]
+// entries it produces - the SAME array draw_buttons() renders, hit_button()
+// hit-tests and EVENT_MOUSE_DOWN dispatches through do_button(g_btns[bi].id).
+//
+// The consequence is the point: a button that add_btn() does not create cannot
+// be drawn, cannot be clicked and cannot be described; one that IS created
+// appears in all three automatically, because `tok` lives in the same struct as
+// the geometry. Adding a preset to the timer tab gives it a contract action in
+// the same commit, with no edit here.
+//
+// WHY IT WALKS ALL THREE TABS. g_btns[] holds only the CURRENT tab's buttons -
+// it is rebuilt every frame. A projection that read it as-is would have
+// described 3 of 18 actions and looked complete. So ct_build() sets g_tab to
+// each value in turn, calls build_buttons(), harvests, and restores. The tab
+// loop is bounded by the same constant the tab bar draws from.
+//
+// COVERAGE, stated honestly (docs/CONTRACT_API.md section 6): 21 of 21
+// interactive targets - 18 buttons plus the 3 tabs, which hit_tab() selects and
+// which the `tab` row below is the same variable for. on_key() is a strict
+// SUBSET: 1/2/3 and Left/Right set g_tab, Space/L/N/R call the same
+// sw_*/tm_*/po_* functions do_button() calls. NOT covered, deliberately: hover
+// highlighting, live resize and window chrome, none of which is a feature.
+// ---------------------------------------------------------------------------
+#include "../../libc/contract.h"
+
+#define CT_MAX_BTN 32
+static int         g_ct_id[CT_MAX_BTN];       // the id do_button() dispatches on
+static const char *g_ct_tok[CT_MAX_BTN];      // its stable dotted name
+static char        g_ct_face[CT_MAX_BTN][16]; // a label, for the description
+static int         g_ct_n = -1;
+
+static void ct_build(void) {
+    if (g_ct_n >= 0) return;
+    g_ct_n = 0;
+    int saved = g_tab;
+    for (int t = 0; t < 3; t++) {
+        g_tab = t;
+        build_buttons();
+        for (int i = 0; i < g_nbtns && g_ct_n < CT_MAX_BTN; i++) {
+            if (!g_btns[i].tok) continue;
+            g_ct_id[g_ct_n]  = g_btns[i].id;
+            g_ct_tok[g_ct_n] = g_btns[i].tok;
+            strlcpy(g_ct_face[g_ct_n], g_btns[i].label, sizeof(g_ct_face[0]));
+            g_ct_n++;
+        }
+    }
+    g_tab = saved;
+    build_buttons();
+}
+
+// One handler for every projected button. The id comes from it->ctx, which the
+// projection pointed at the harvested table entry, and it goes straight to
+// do_button() - the SAME function EVENT_MOUSE_DOWN calls. A contract press is
+// not a parallel implementation of pressing the button; it IS pressing it.
+//
+// The reply is read back out of the app's own fmt_hms() AFTER the press, so the
+// caller sees the resulting state rather than an echo of the request.
+static void ct_state_line(char *out, int ocap) {
+    char t[24];
+    if (g_tab == 0) {
+        fmt_hms(sw_elapsed(), t, sizeof(t), 1);
+        snprintf(out, (size_t)ocap, "tab=stopwatch elapsed=%s running=%d laps=%d",
+                 t, sw_running, sw_lap_count);
+    } else if (g_tab == 1) {
+        char s[24];
+        fmt_hms(tm_remaining(), t, sizeof(t), 0);
+        fmt_hms(tm_set, s, sizeof(s), 0);
+        snprintf(out, (size_t)ocap, "tab=timer remaining=%s duration=%s running=%d finished=%d",
+                 t, s, tm_running, tm_finished);
+    } else {
+        static const char *PH[3] = { "focus", "short_break", "long_break" };
+        fmt_hms(po_remaining(), t, sizeof(t), 0);
+        snprintf(out, (size_t)ocap, "tab=pomodoro phase=%s remaining=%s running=%d sessions=%d",
+                 PH[po_phase], t, po_running, po_done);
+    }
+}
+
+static int ct_press(const ct_item_t *it, int argc, char **argv,
+                    char *out, int ocap) {
     (void)argc; (void)argv;
+    if (!it->ctx) return -1;
+    int id = *(const int *)it->ctx;
+    // A button belongs to a tab, and the GUI can only press one that is on the
+    // tab in view. Select it first, so the contract cannot do something the
+    // mouse could not, and so the state line below reports the right panel.
+    if      (id <= B_SW_RESET) g_tab = 0;
+    else if (id <= B_TM_RESET) g_tab = 1;
+    else                       g_tab = 2;
+    do_button(id);
+    ct_state_line(out, ocap);
+    return 0;
+}
+
+static int timers_project(int idx, ct_item_t *out) {
+    ct_build();
+    if (idx < 0 || idx >= g_ct_n) return 0;
+    // Shared and valid only until the next projection call. contract.c uses
+    // desc immediately (describe) and never retains it.
+    static char desc[112];
+    snprintf(desc, sizeof(desc),
+             "Timers button \"%s\" on the %s tab, via do_button()",
+             g_ct_face[idx],
+             g_ct_id[idx] <= B_SW_RESET ? "Stopwatch"
+             : (g_ct_id[idx] <= B_TM_RESET ? "Timer" : "Pomodoro"));
+
+    ct_item_t it;
+    __builtin_memset(&it, 0, sizeof(it));
+    it.name   = g_ct_tok[idx];
+    it.type   = CT_ACTION;
+    it.access = CT_WRITE;
+    // Every one of these is reversible, bounded and touches nothing outside the
+    // app. pomodoro.skip is the only one that would post a notification, and
+    // do_button() calls po_advance(0) - the same silent form the Skip button
+    // uses - so a contract press cannot raise a toast the button would not.
+    it.risk   = CT_SAFE;
+    it.actfn  = ct_press;
+    it.ctx    = &g_ct_id[idx];
+    it.desc   = desc;
+    *out = it;
+    return 1;
+}
+
+// ---- readable state and preferences, backed by the app's own variables -----
+static int ct_get_tm_set(void)       { return (int)tm_set; }
+static int ct_set_tm_set(int v)      { tm_apply_set((ms_t)v); return 0; }
+static int ct_get_tm_remain(void)    { return (int)tm_remaining(); }
+static int ct_get_sw_elapsed(void)   { return (int)sw_elapsed(); }
+static int ct_get_po_remain(void)    { return (int)po_remaining(); }
+static int ct_sw_display(char *o, int n) { char b[24]; fmt_hms(sw_elapsed(), b, sizeof(b), 1); strlcpy(o, b, (size_t)n); return 0; }
+static int ct_tm_display(char *o, int n) { char b[24]; fmt_hms(tm_remaining(), b, sizeof(b), 0); strlcpy(o, b, (size_t)n); return 0; }
+static int ct_po_display(char *o, int n) { char b[24]; fmt_hms(po_remaining(), b, sizeof(b), 0); strlcpy(o, b, (size_t)n); return 0; }
+
+static const ct_item_t TIMERS_ITEMS[] = {
+    // `tab` is the variable hit_tab() and on_key() assign to, so this row and
+    // the tab bar are one store, not two. Persisted: which panel you were last
+    // using is a preference, and it is the row that makes a contract write
+    // observable from a second process.
+    { "tab", CT_ENUM, CT_RW, CT_SAFE, 't', 0, 2, "Stopwatch|Timer|Pomodoro",
+      &g_tab, 0, 0, 0, 0, 0, 0,
+      "Which panel is in view; the same variable the tab bar sets" },
+    // The configured countdown, through the app's own clamp (10s..99h).
+    { "timer.duration_ms", CT_INT, CT_RW, CT_SAFE, 'd', 10000, 356400000, 0,
+      0, ct_get_tm_set, ct_set_tm_set, 0, 0, 0, 0,
+      "Configured countdown duration in ms, clamped by tm_apply_set()" },
+
+    { "timer.remaining_ms", CT_INT, CT_READ, CT_SAFE, 0, 0, 356400000, 0,
+      0, ct_get_tm_remain, 0, 0, 0, 0, 0,
+      "Milliseconds left on the countdown right now" },
+    { "timer.display", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
+      0, 0, 0, 0, ct_tm_display, 0, 0,
+      "The countdown as the app draws it, from the same fmt_hms()" },
+    { "timer.running", CT_BOOL, CT_READ, CT_SAFE, 0, 0, 1, 0,
+      &tm_running, 0, 0, 0, 0, 0, 0,
+      "Whether the countdown is counting down" },
+    { "timer.finished", CT_BOOL, CT_READ, CT_SAFE, 0, 0, 1, 0,
+      &tm_finished, 0, 0, 0, 0, 0, 0,
+      "Whether the countdown has expired and is flashing Time's up" },
+
+    { "stopwatch.elapsed_ms", CT_INT, CT_READ, CT_SAFE, 0, 0, 2000000000, 0,
+      0, ct_get_sw_elapsed, 0, 0, 0, 0, 0,
+      "Stopwatch elapsed time in ms, running or paused" },
+    { "stopwatch.display", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
+      0, 0, 0, 0, ct_sw_display, 0, 0,
+      "The stopwatch as the app draws it, tenths included" },
+    { "stopwatch.running", CT_BOOL, CT_READ, CT_SAFE, 0, 0, 1, 0,
+      &sw_running, 0, 0, 0, 0, 0, 0,
+      "Whether the stopwatch is running" },
+    { "stopwatch.lap_count", CT_INT, CT_READ, CT_SAFE, 0, 0, MAX_LAPS, 0,
+      &sw_lap_count, 0, 0, 0, 0, 0, 0,
+      "How many laps are recorded in the lap list" },
+
+    { "pomodoro.phase", CT_ENUM, CT_READ, CT_SAFE, 0, 0, 2, "Focus|Short break|Long break",
+      &po_phase, 0, 0, 0, 0, 0, 0,
+      "Which pomodoro phase is in progress" },
+    { "pomodoro.remaining_ms", CT_INT, CT_READ, CT_SAFE, 0, 0, 356400000, 0,
+      0, ct_get_po_remain, 0, 0, 0, 0, 0,
+      "Milliseconds left in the current pomodoro phase" },
+    { "pomodoro.display", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
+      0, 0, 0, 0, ct_po_display, 0, 0,
+      "The pomodoro clock as the app draws it" },
+    { "pomodoro.running", CT_BOOL, CT_READ, CT_SAFE, 0, 0, 1, 0,
+      &po_running, 0, 0, 0, 0, 0, 0,
+      "Whether the pomodoro clock is running" },
+    { "pomodoro.sessions", CT_INT, CT_READ, CT_SAFE, 0, 0, 100000, 0,
+      &po_done, 0, 0, 0, 0, 0, 0,
+      "Focus sessions completed since the last pomodoro reset" },
+};
+
+// The contract has to be named before load/commit can mention it and after
+// they are defined, so the indirection goes through an accessor rather than an
+// uninitialised forward declaration.
+static const ct_contract_t *timers_contract(void);
+#define TIMERS_CFG        "TIMERS.CFG"
+#define TIMERS_CFG_LEGACY "/CONFIG/TIMERS.CFG"
+
+static void timers_load(void) {
+    contract_load_cfg(timers_contract(), TIMERS_CFG, TIMERS_CFG_LEGACY);
+}
+static void timers_commit(void) {
+    // A failed save loses a preference, not data: the app keeps working from
+    // what is in memory and the next successful save fixes it, so there is
+    // nothing useful to report here and nothing is claimed.
+    contract_save_cfg(timers_contract(), TIMERS_CFG);
+}
+
+static const ct_contract_t TIMERS_CONTRACT = {
+    "timers", "Timers",
+    "Button actions are PROJECTED from build_buttons(), the same pass that "
+    "fills the g_btns[] array draw_buttons() renders and EVENT_MOUSE_DOWN "
+    "dispatches, walked once per tab, so the contract cannot omit a button "
+    "that exists or offer one that does not.",
+    TIMERS_ITEMS, (int)(sizeof(TIMERS_ITEMS) / sizeof(TIMERS_ITEMS[0])),
+    timers_project,
+    timers_load,
+    timers_commit
+};
+
+static const ct_contract_t *timers_contract(void) { return &TIMERS_CONTRACT; }
+
+int main(int argc, char **argv) {
+    // #233: a contract invocation must never open a window. Answering here,
+    // before win_create(), is what makes the API usable from a headless test
+    // harness and from the AI tool loop without a compositor.
+    if (contract_is_invocation(argc, argv))
+        return contract_cli(argc, argv, &TIMERS_CONTRACT);
 
     g_last_theme = get_theme();
     apply_theme(g_last_theme);
+    timers_load();
     g_window = win_create("Timers", 240, 110, WIN_W, WIN_H);
     if (g_window < 0) { printf("timers: failed to create window\n"); return 1; }
 
@@ -539,6 +782,7 @@ int main(int argc, char **argv) {
 
     gui_event_t ev;
     int running = 1;
+    int g_cfg_hash = contract_hash(&TIMERS_CONTRACT);
     while (running) {
         { int th = get_theme();
           if (th != g_last_theme) { g_last_theme = th; apply_theme(th); draw_all(); } }
@@ -582,6 +826,13 @@ int main(int argc, char **argv) {
                 break;
             default: break;
         }
+        // #239: persist when a PERSISTED row actually changed, using the
+        // contract's own DERIVED change signature rather than a hand-listed set
+        // of "things worth saving" - the fault #231 removed from the widget
+        // serializer. This is what stops the GUI and a `--contract set` from
+        // holding two different ideas of the saved state.
+        { int h = contract_hash(&TIMERS_CONTRACT);
+          if (h != g_cfg_hash) { g_cfg_hash = h; timers_commit(); } }
     }
     win_destroy(g_window);
     return 0;

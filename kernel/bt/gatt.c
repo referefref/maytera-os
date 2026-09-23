@@ -22,6 +22,7 @@
 #include "pair.h"
 #include "../serial.h"
 #include "../string.h"
+#include "../fs/bootlog.h"
 
 // --- ATT opcodes ---
 #define ATT_ERROR_RSP         0x01
@@ -205,6 +206,8 @@ static void enable_next(gatt_sess_t *s) {
     s->state = GS_READY;
     kprintf("[BT-GATT] HOGP ready: subscribed %d report notification(s) on handle 0x%04x\n",
             s->nrep, s->handle);
+    bootlog_write("[BT-GATT] HOGP ready: subscribed %d report notification(s) handle=0x%04x",
+                  s->nrep, s->handle);
     bt_hid_attach_ble(s->handle, &s->addr, BT_HID_OTHER);
     s->attached = 1;
 }
@@ -227,6 +230,7 @@ static void on_group_rsp(gatt_sess_t *s, const uint8_t *p, int n) {
             if (uuid == UUID_HID_SERVICE) {
                 s->hid_start = h; s->hid_end = end;
                 kprintf("[BT-GATT] HID service 0x1812 found: handles 0x%04x..0x%04x\n", h, end);
+                bootlog_write("[BT-GATT] HID service 0x1812 found: handles 0x%04x..0x%04x (link=0x%04x)", h, end, s->handle);
             }
         }
         i += elen;
@@ -234,6 +238,7 @@ static void on_group_rsp(gatt_sess_t *s, const uint8_t *p, int n) {
     if (s->hid_start) { s->nrep = 0; send_disc_char(s, s->hid_start); return; }
     if (last_end < 0xFFFF) { send_disc_svc(s, (uint16_t)(last_end + 1)); return; }
     kprintf("[BT-GATT] no HID service on this device; GATT idle\n");
+    bootlog_write("[BT-GATT] no HID service on this device (link=0x%04x); GATT idle", s->handle);
     s->state = GS_FAILED;
 }
 
@@ -262,6 +267,8 @@ static void on_type_rsp(gatt_sess_t *s, const uint8_t *p, int n) {
                 s->nrep++;
                 kprintf("[BT-GATT] input report char uuid=0x%04x val_handle=0x%04x boot=%d\n",
                         uuid, val, uuid != UUID_REPORT);
+                bootlog_write("[BT-GATT] input report char uuid=0x%04x val_handle=0x%04x boot=%d",
+                              uuid, val, uuid != UUID_REPORT);
             }
         }
         i += elen;
@@ -294,6 +301,8 @@ static void on_find_info_rsp(gatt_sess_t *s, const uint8_t *p, int n) {
     map_cccds(s);
     kprintf("[BT-GATT] discovery complete: %d report char(s), %d CCCD(s)\n",
             s->nrep, s->ncccd_tmp);
+    bootlog_write("[BT-GATT] discovery complete: %d report char(s), %d CCCD(s) link=0x%04x",
+                  s->nrep, s->ncccd_tmp, s->handle);
     start_enable(s);
 }
 
@@ -330,6 +339,7 @@ static void on_error_rsp(gatt_sess_t *s, const uint8_t *p, int n) {
         if (!s->pairing_kicked) {
             s->pairing_kicked = 1;
             kprintf("[BT-GATT] write needs encryption; starting SMP pairing\n");
+            bootlog_write("[BT-GATT] write needs encryption; starting SMP pairing handle=0x%04x", s->handle);
             pair_start_le(s->handle, &s->addr);
         }
         // resume happens on the encryption-change observer
@@ -402,6 +412,7 @@ static void gatt_conn_event(const hci_conn_t *c, int up) {
         s->addr = c->peer;
         s->addr_type = c->peer_addr_type;
         kprintf("[BT-GATT] LE link up (handle 0x%04x); exchanging ATT MTU\n", c->handle);
+        bootlog_write("[BT-GATT] LE link up (handle 0x%04x); exchanging ATT MTU", c->handle);
         send_mtu(s);
     } else {
         gatt_sess_t *s = sess_by_handle(c->handle);
@@ -414,6 +425,7 @@ static void gatt_encrypt_event(hci_handle_t h, uint8_t enabled) {
     if (!s || !enabled) return;
     if (s->state == GS_ENABLE || s->state == GS_FAILED) {
         kprintf("[BT-GATT] link encrypted; retrying notification enable\n");
+        bootlog_write("[BT-GATT] link encrypted; retrying notification enable handle=0x%04x", h);
         s->pairing_kicked = 0;
         start_enable(s);
     }
@@ -425,9 +437,18 @@ static int g_autoconnect_busy = 0;
 static void gatt_hid_found(const hci_disc_dev_t *d) {
     if (g_autoconnect_busy) return;
     g_autoconnect_busy = 1;
-    kprintf("[BT-GATT] auto-connecting to HID device %02x:%02x:%02x:%02x:%02x:%02x\n",
+    kprintf("[BT-GATT] auto-connecting to %s HID device %02x:%02x:%02x:%02x:%02x:%02x\n",
+            d->is_le ? "LE" : "classic",
             d->addr.b[5], d->addr.b[4], d->addr.b[3], d->addr.b[2], d->addr.b[1], d->addr.b[0]);
-    hci_le_connect(&d->addr, d->addr_type);
+    bootlog_write("[BT-GATT] auto-connecting to %s HID device %02x:%02x:%02x:%02x:%02x:%02x",
+                  d->is_le ? "LE" : "classic",
+                  d->addr.b[5], d->addr.b[4], d->addr.b[3], d->addr.b[2], d->addr.b[1], d->addr.b[0]);
+    // LE HID -> LE_Create_Connection (HOGP path). Classic BR/EDR HID -> page it
+    // with Create_Connection; its Connection Complete drives auth/SSP/encryption
+    // and the classic HIDP L2CAP servers, the same path as an inbound classic
+    // link. One attempt at a time (g_autoconnect_busy), so it does not thrash.
+    if (d->is_le) hci_le_connect(&d->addr, d->addr_type);
+    else          hci_classic_connect(&d->addr);
 }
 
 void gatt_poll(void) { /* event-driven */ }

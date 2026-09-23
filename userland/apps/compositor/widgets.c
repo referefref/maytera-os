@@ -1312,7 +1312,7 @@ static int *s_card_verbose[3] = { &g_weather_verbose, &g_crypto_verbose, &g_stoc
 // (#236) A DESKTOP WIDGET'S FOOTPRINT IS A FUNCTION OF ITS SETTINGS, NEVER OF
 // WHETHER ITS DATA ARRIVED.
 //
-// MEASURED (golden 2054 = dev c537f63c, throwaway VM <vmid>, 1280x800, fresh
+// MEASURED (golden 2054 = dev c537f63c, throwaway VM 2812, 1280x800, fresh
 // first boot through the OOBE wizard, positions read back out of the
 // /HOME/JAMES/UIPROFIL.YML that boot wrote): Calendar y=14 h=158, Weather
 // y=184, Uptime y=314, Home Assistant y=398. widgets_layout_rail_defaults()

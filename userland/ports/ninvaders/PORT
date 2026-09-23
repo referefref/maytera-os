@@ -1,0 +1,141 @@
+# mports recipe: ninvaders 0.1.1. Tier 3 item #17 of
+# docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md ("myman, ninvaders,
+# moon-buggy ... near-zero individual cost once ncurses lands. Useful
+# specifically as VOLUME PROOF that the recipe system works"). GPL-2.0-or-
+# later, dependency closure 1 (ncurses).
+#
+# WHAT THIS PORT SHIPS. nInvaders is Dettus's ncurses Space Invaders clone
+# (http://ninvaders.sourceforge.net). Six small translation units
+# (globals/view/aliens/ufo/player/nInvaders.c), no other dependency: no data
+# files, no sound, self-contained ASCII-art rendering via ncurses only.
+#
+# THIS PORT NEEDED TWO REAL ADAPTATIONS, both documented below and in
+# CHANGELOG.md #745, matching the assessment's expectation (section 2.3) that
+# a small ncurses port can still name an unimplemented syscall:
+#   1. view.h includes <ncurses.h> by name; this tree's ncurses port installs
+#      only curses.h (no ncurses.h alias). One-line patch.
+#   2. nInvaders.c drives its 1/FPS game tick from setitimer(ITIMER_REAL, ...)
+#      + a SIGALRM handler, both of which need MayteraOS libc surface that
+#      does not exist (setitimer()/ITIMER_REAL are absent; only the
+#      one-second-granularity alarm() is provided) and a signal-delivery
+#      guarantee (interrupting a blocked getch() on the compositor pty) this
+#      port does not want to depend on. Patched to drive the same tick off
+#      ncurses' own timeout()/getch() idiom instead - the exact mechanism
+#      docs/MPORTS.md and this recipe's CONTEXT note point at ("ncurses
+#      already provides napms() for timing"). See
+#      patches/0003-ncurses-timeout-instead-of-setitimer.patch for the full
+#      reasoning inline.
+# A third, smaller portability gap (BSD random()/srandom(), which
+# userland/libc does not provide; only ISO C rand()/srand() do) is fixed by
+# patches/0002-random-to-rand.patch.
+
+name=ninvaders
+version=0.1.1
+class=C
+homepage=http://ninvaders.sourceforge.net
+
+# The SourceForge release tarball, the latest numbered release (read from the
+# SourceForge file listing at port time, not assumed; a newer 0.0.10 exists
+# but is numerically OLDER - it predates 0.1.1's own versioning reset, per
+# ChangeLog). The sha256 below is of THIS file, MEASURED on the build container with
+# sha256sum, not copied from a web page:
+#   wget -O ninvaders-0.1.1.tar.gz \
+#     https://downloads.sourceforge.net/project/ninvaders/ninvaders/0.1.1/ninvaders-0.1.1.tar.gz
+#   sha256sum ninvaders-0.1.1.tar.gz
+#   -> bfbc5c378704d9cf5e7fed288dac88859149bee5ed0850175759d310b61fd30b (31,275 bytes)
+source_url=https://downloads.sourceforge.net/project/ninvaders/ninvaders/0.1.1/ninvaders-0.1.1.tar.gz
+tarball=ninvaders-0.1.1.tar.gz
+sha256=bfbc5c378704d9cf5e7fed288dac88859149bee5ed0850175759d310b61fd30b
+srcdir=ninvaders-0.1.1
+
+# GPL-2.0-or-later. Every source file's header reads "either version 2 of the
+# License, or (at your option) any later version"; the full grant is in
+# gpl.txt (v2 text) and is reproduced in ATTRIBUTION.md, copied out of THIS
+# tarball. The assessment's table entry says plain "GPL-2.0"; the header
+# comments in the actual source are the ground truth and say "or later", so
+# this manifest and components.tsv record GPL-2.0-or-later.
+licence=GPL-2.0-or-later
+licence_files=gpl.txt
+copyleft=combined
+
+# THE COPYLEFT QUESTION (MPORTS.md): combined, not aggregate. ninvaders'
+# object files are statically linked together with the permissively-licensed
+# ncurses and userland/libc into ONE executable, /APPS/NINVADERS - the exact
+# "linked into a work we distribute, and then its terms flow into that work"
+# shape MPORTS.md defines as combined (the same shape as VI: busybox GPLv2 +
+# LGPLv3 GNU regex in one binary, "must therefore be offered as GPLv3"). Here
+# the combined NINVADERS binary must be offered under GPL-2.0-or-later as a
+# WHOLE. This does not make ncurses or userland/libc themselves GPL: neither
+# is modified, each keeps its own licence as source, and neither is made
+# copyleft by this one program linking it (MPORTS.md's libc note: statically
+# linking MIT libc does not make an application GPL - the same non-flow-back
+# holds in the other direction, permissive code linked BY a GPL program does
+# not become GPL). Corresponding source for /APPS/NINVADERS is: this pinned
+# tarball, the three patches below, and the (already open) ncurses/libc
+# source this recipe builds against.
+copyleft_note=Statically combined into one binary (/APPS/NINVADERS) with permissively-licensed ncurses and userland/libc; the combined binary as a whole must be offered under GPL-2.0-or-later (same shape as the VI precedent: the more restrictive licence governs the combined work). ncurses and userland/libc are not thereby made GPL; each remains available under its own permissive terms and neither is modified by this port. Corresponding source is the pinned ninvaders-0.1.1.tar.gz, the three patches in patches/, and this repository's own ncurses/libc source.
+
+# ncurses supplies the whole screen/input model. libc is the shared platform
+# library, not a port.
+
+# THE ADOPTION TEST (owner rule 2): does this want to USE a platform layer, or
+# to BE one? ninvaders USES. It is an ordinary Ring-3 program driven entirely
+# by ncurses screen/input calls plus the ordinary libc surface (malloc/free,
+# str/mem, stdio, usleep, signal/sigaction, rand). Measured: the six objects
+# (globals/view/aliens/ufo/player/nInvaders.o) link against the built
+# libncurses.a + userland/libc/libc.a (crt0.o + user-pie.ld) with ZERO
+# undefined symbols. It owns no event loop or framework anyone else must
+# adopt; it calls getch() itself from its own main().
+adoption=USES. Measured: the six compiled objects link against the built libncurses.a + userland/libc/libc.a (crt0.o + user-pie.ld) with zero undefined symbols. ninvaders owns its own game/screen state but never the process or an event loop the rest of the system must adopt; it calls getch() itself from main() in nInvaders.c.
+needs=libc ncurses
+
+prepare=none
+
+# THREE PATCHES, each documented at the top of its own file:
+#   0001 - <ncurses.h> -> <curses.h> (this tree's ncurses installs only the
+#          latter; see userland/ports/ncurses/PORT's `headers=`).
+#   0002 - random()/srandom() (BSD) -> rand() (ISO C, what userland/libc
+#          provides); the two call sites (aliens.c, ufo.c) only ever used
+#          `% N`, so the distribution/period difference is immaterial here.
+#   0003 - replace the SIGALRM/setitimer(ITIMER_REAL, ...) game tick with
+#          ncurses timeout()-driven polling, called synchronously from the
+#          main loop. See the header comment above and the patch file itself.
+# Load-bearing together: main/aliensMove/playerMoveLeft/ufoShowUfo/doScoring/
+# doSleep/graphicEngineInit (the `symbols` list below) are all still defined
+# after every patch, so a patch that stopped applying would fail the build
+# rather than shipping something that silently doesn't tick.
+patches=0001-ncurses-header-to-curses-h.patch 0002-random-to-rand.patch 0003-ncurses-timeout-instead-of-setitimer.patch
+
+# build=objects: the six translation units into libninvaders.a. See the
+# header comment for why an APP (main() included, in nInvaders.c) is
+# expressed as a one-member... six-member archive here, matching the
+# darkhttpd precedent (a library carrying main() is fine when there is
+# exactly one intended consumer, userland/apps/ninvaders, that wants it).
+build=objects
+sources=globals.c view.c aliens.c ufo.c player.c nInvaders.c
+
+# -fcommon: aliens.h/nInvaders.h/ufo.h declare their shared game-state arrays
+# (aliens[], bunker[], level, weite, ufo, ...) directly in the header with no
+# `extern`, a common pre-C99/pre-gcc10 pattern where every including .c file
+# gets a TENTATIVE definition and the linker was expected to fold them into
+# one (the historical "common symbol" model). gcc 10+ defaults to
+# -fno-common, which turns that into real per-TU definitions and a "multiple
+# definition" link error (measured: linking without this flag fails exactly
+# that way on globals shared by 3+ of the six .c files). -fcommon restores
+# the traditional behaviour upstream's own 2003-era build always relied on;
+# it changes no semantics upstream did not already depend on, only which of
+# two link-time symbol-resolution rules gcc uses by default.
+cflags=-fcommon
+
+# A program installs no public header (see darkhttpd's headers=none literal).
+headers=none
+
+lib=libninvaders.a
+
+# THE ANTI-NO-OP CHECK. One symbol per translation unit (six files, six
+# symbols, plus main), proven DEFINED in the archive with `nm`. A build that
+# compiled the wrong source list, or lost a file to a bad patch, cannot define
+# all seven: globals.c (doSleep), view.c (graphicEngineInit), aliens.c
+# (aliensMove), ufo.c (ufoShowUfo), player.c (playerMoveLeft), nInvaders.c
+# (main, doScoring).
+symbols=main doScoring graphicEngineInit aliensMove ufoShowUfo playerMoveLeft doSleep

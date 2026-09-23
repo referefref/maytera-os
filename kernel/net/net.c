@@ -12,6 +12,7 @@
 #include "dns.h"
 #include "firewall.h"   // #238: packet filter boot load
 #include "https.h"
+#include "netfail.h"   // #netfix2
 #include "ftp.h"
 #include "wget.h"
 #include "../crypto/crypto.h"
@@ -66,7 +67,7 @@ int g_net_static_configured = 0;
 // failed fetch drives DNS/SYN retransmits; on the iMac's USB Ethernet dongle
 // every single send busy-polls the xHCI up to 40ms (usbnet_bulk_out), so the
 // retry storm pegged a core. (On an e1000 VM the same sends are cheap MMIO, which
-// is why VM <vmid> and an e1000 repro stay idle - the spin is USB-amplified.)
+// is why a test VM and an e1000 repro stay idle - the spin is USB-amplified.)
 //
 // THE FIX (the user's stated design): DETECT persistent unreachability, then
 // FAIL SAFE AND QUIET - mark the interface NET_STATE_FAULTY, make net_is_up()
@@ -134,6 +135,60 @@ static char g_net_trip_host[40];                   // host that COMPLETED the st
 static volatile int g_net_fail_rc = 0;             // rc of the most recent failure
 static volatile int g_net_trip_rc = 0;             // rc that COMPLETED the streak
 
+// #httpdns 2026-09-03: ONE DEAD TARGET MUST NOT SPEAK FOR THE WHOLE MACHINE.
+//
+// browsenet MEASURED this on 2026-09-01 and named it as a residual defect:
+// "ONE unreachable background target takes the whole machine's HTTP offline in
+// about 40 seconds, on a box whose internet works perfectly." haservice issues
+// up to 24 fetches per refresh cycle, so a single unreachable Home Assistant -
+// the shipped /CONFIG/EXTSVC.CFG points at a LAN address that answers on the
+// owner's home network and NOWHERE ELSE - completes the six-failure streak
+// inside one cycle, on every boot, on any other network. The user then sees the
+// browser and the App Store refuse to work while ping is perfect.
+//
+// The fix is to make the streak require evidence about the UPLINK rather than
+// about one destination: a trip now needs failures to at least two DISTINCT
+// hosts. This does not weaken #549 at all. #549 exists to stop a retry storm
+// when the uplink is dead, and a dead uplink fails EVERY host, so the
+// multi-host condition is satisfied immediately in the case the breaker is for.
+// It is only unsatisfiable in the case the breaker was never meant to catch.
+//
+// A failure with no URL in scope counts as its own distinct host, so the
+// back-compat net_report_reach_fail() entry point keeps its old trip behaviour
+// rather than silently becoming un-trippable.
+#define NET_STREAK_HOSTS 4
+static char g_net_streak_hosts[NET_STREAK_HOSTS][40];
+static volatile uint32_t g_net_streak_nhosts = 0;   // distinct hosts in this streak
+static volatile uint32_t g_net_streak_singleton = 0; // streaks held back by the rule
+
+// Note `host` against the current streak. Returns the number of distinct hosts
+// the streak has now seen (capped at NET_STREAK_HOSTS).
+static uint32_t net_streak_note_host(const char *host) {
+    if (!host || !host[0]) {          // unknown: cannot prove it is the same one
+        if (g_net_streak_nhosts < NET_STREAK_HOSTS) g_net_streak_nhosts++;
+        return g_net_streak_nhosts;
+    }
+    for (uint32_t i = 0; i < g_net_streak_nhosts && i < NET_STREAK_HOSTS; i++) {
+        if (strcmp(g_net_streak_hosts[i], host) == 0) return g_net_streak_nhosts;
+    }
+    if (g_net_streak_nhosts < NET_STREAK_HOSTS) {
+        uint32_t slot = g_net_streak_nhosts;
+        unsigned k = 0;
+        for (; host[k] && k < sizeof(g_net_streak_hosts[0]) - 1; k++)
+            g_net_streak_hosts[slot][k] = host[k];
+        g_net_streak_hosts[slot][k] = 0;
+        g_net_streak_nhosts = slot + 1;
+    }
+    return g_net_streak_nhosts;
+}
+
+static void net_streak_reset(void) {
+    g_net_streak_nhosts = 0;
+}
+
+uint32_t net_fault_streak_hosts(void)  { return g_net_streak_nhosts; }
+uint32_t net_fault_held_back(void)     { return g_net_streak_singleton; }
+
 // Copy the host out of a URL ("scheme://host[:port]/...") into dst. No strstr
 // here (freestanding); this is a bounded hand walk on purpose.
 static void net_note_host(char *dst, unsigned long cap, const char *url) {
@@ -161,6 +216,7 @@ const char *net_fault_trip_host(void)  { return g_net_trip_host[0] ? g_net_trip_
 void net_report_reach_ok(void) {
     g_net_fail_streak = 0;
     g_net_probe_next_ms = 0;
+    net_streak_reset();
     if (g_net_conn_state != NET_STATE_UP) {
         g_net_conn_state = NET_STATE_UP;
         g_net_recover_count++;
@@ -189,6 +245,22 @@ void net_report_reach_fail_url(const char *url) {
     if (!net_wire_usable()) return;
     if (g_net_fail_streak < 0xFFFFFFFFu) g_net_fail_streak++;
     if (g_net_fail_total < 0xFFFFFFFFu) g_net_fail_total++;
+    // #httpdns: evidence about the UPLINK, not about one destination.
+    uint32_t nhosts = net_streak_note_host(g_net_fail_host);
+    if (g_net_fail_streak >= NET_FAIL_STREAK_MAX && nhosts < 2) {
+        // Loud exactly once per streak, then quiet: this is the line that says
+        // "your Home Assistant is unreachable" instead of the machine silently
+        // refusing every fetch the user makes.
+        if (g_net_fail_streak == NET_FAIL_STREAK_MAX) {
+            g_net_streak_singleton++;
+            kprintf("[NET] %u consecutive failures, but ALL to one host ('%s' rc=%d): "
+                    "NOT tripping the breaker. One unreachable destination is not "
+                    "evidence the uplink is down.\n",
+                    (unsigned)g_net_fail_streak,
+                    g_net_fail_host[0] ? g_net_fail_host : "?", g_net_fail_rc);
+        }
+        return;
+    }
     if (g_net_fail_streak >= NET_FAIL_STREAK_MAX) {
         g_net_conn_state = NET_STATE_FAULTY;
         g_net_probe_next_ms = mono_ms() + NET_PROBE_INTERVAL_MS;
@@ -262,6 +334,7 @@ int net_fetch_probe_take(void) {
 void net_clear_fault(void) {
     g_net_fail_streak = 0;
     g_net_probe_next_ms = 0;
+    net_streak_reset();
     if (g_net_conn_state != NET_STATE_UP) {
         g_net_conn_state = NET_STATE_UP;
         kprintf("[NET] fault cleared; interface re-enabled (manual reconnect)\n");
@@ -438,10 +511,22 @@ static int net_apply_static_config(void) {
         if (have_dns) {
             dns_set_server(dns);
             uint8_t *pd0 = (uint8_t *)&dns;
-            kprintf("[NET] %s: dns-only config, resolver %d.%d.%d.%d (DHCP still runs)\n",
-                    src, pd0[3], pd0[2], pd0[1], pd0[0]);
+            // #netfix2: DURABLE. This one line explains, on a machine with no
+            // serial port, why the resolver is what it is - and it is the fact
+            // that made the owner's iMac unfixable from the outside. A dns=
+            // line here PINS on every network forever; if it does not match
+            // what you expect, this file is why.
+            bootlog_write("[NET] %s pins the resolver to %d.%d.%d.%d on every "
+                          "network (DHCP still supplies the address). "
+                          "Settings > Network > DNS Server > Automatic clears it.",
+                          src, pd0[3], pd0[2], pd0[1], pd0[0]);
         } else {
-            kprintf("[NET] %s present but no valid ip= or dns= line; ignoring\n", src);
+            // #netfix2: NOT an error and NOT "ignoring". A file with no ip= and
+            // no dns= is the documented spelling of "use whatever the network
+            // offers", which is exactly what net_persist_netcfg() now writes
+            // when the user chooses Automatic. Calling it malformed would make
+            // the recovery path look like a bug in the log.
+            kprintf("[NET] %s: automatic (no ip= and no dns=); DHCP decides both\n", src);
         }
         return 0;
     }
@@ -525,9 +610,39 @@ int net_persist_netcfg(void) {
         netcfg_put_kv(&p, "mask", ip_get_netmask());
         netcfg_put_kv(&p, "gw",   ip_get_gateway());
     }
-    if (dns) netcfg_put_kv(&p, "dns", dns);
+    // #netfix2: ONLY PERSIST A RESOLVER THE USER ACTUALLY CHOSE.
+    //
+    // This wrote dns=<whatever is live> unconditionally, and "whatever is live"
+    // on a DHCP machine is the resolver the LEASE handed out. So applying a
+    // static IP in Settings - a change that has nothing to do with DNS - wrote
+    // the DHCP-learned resolver into the file, and net_apply_static_config()
+    // then PINNED it on every subsequent boot, on every subsequent network. The
+    // user never typed it and has no reason to suspect it.
+    //
+    // dns_server_is_pinned() is true only after an EXPLICIT choice
+    // (dns_set_server, i.e. SYS_NET_SET_DNS or a dns= line already in the
+    // file), which is precisely the set of resolvers worth persisting.
+    if (dns && dns_server_is_pinned()) netcfg_put_kv(&p, "dns", dns);
 
-    if (p == buf) return -1;                // neither static nor a resolver
+    // #netfix2: and when there is nothing to persist, WRITE THAT DOWN rather
+    // than returning early. Returning -1 here left the OLD file on disk, so
+    // "the user chose Automatic" would have been undone by the next boot
+    // re-reading the pin it was supposed to have cleared. A recovery that a
+    // reboot silently reverses is not a recovery.
+    if (p == buf) {
+        static const char automatic[] =
+            "# MayteraOS network configuration.\n"
+            "# No ip= and no dns= means AUTOMATIC: DHCP supplies both.\n"
+            "# A dns= line here PINS that resolver on every network, forever.\n";
+        if (fat_write_file(&g_fat_fs, "/CONFIG/NETIP.CFG", automatic,
+                           (uint32_t)(sizeof(automatic) - 1)) != 0) {
+            kprintf("[NET] FAILED to persist /CONFIG/NETIP.CFG (automatic)\n");
+            return -1;
+        }
+        bootlog_write("[NET] /CONFIG/NETIP.CFG set to AUTOMATIC; any pinned "
+                      "resolver is now cleared and will not return on reboot");
+        return 0;
+    }
     if (fat_write_file(&g_fat_fs, "/CONFIG/NETIP.CFG", buf,
                        (uint32_t)(p - buf)) != 0) {
         kprintf("[NET] FAILED to persist /CONFIG/NETIP.CFG\n");
@@ -874,7 +989,7 @@ uint64_t g_net_poll_calls = 0, g_net_poll_pkts = 0, g_net_poll_max = 0;
 // #69: THE SHARED CHUNKED RX DRAIN, and the one place the NIC CR3 window is
 // opened for a drain.
 //
-// WHAT WAS MEASURED (golden 1963 + this instrumentation, e1000, VM <vmid>, a
+// WHAT WAS MEASURED (golden 1963 + this instrumentation, e1000, VM 2310, a
 // userland load of 671 x 512 KB bulk TCP transfers over BOTH syscall families):
 //
 //   trecv (whole tcp_recv_kcr3 window)   max  890us   avg 34us
@@ -1301,6 +1416,7 @@ int net_is_up(void) {
 // ---------------------------------------------------------------------------
 extern int  dhcp_is_bound(void);
 extern int  dhcp_discover(void);
+extern void dhcp_wake(void);   // #dhcpwake: wake the SYS_NET_DHCP blocking waiter
 
 // Unbind a NIC that was UNPLUGGED. Runs ONLY on net_worker, for the same reason
 // the bind does: the USB side must not touch the network stack from inside slot
@@ -1480,6 +1596,14 @@ static void net_worker(void *arg) {
 
         int link = nic_refresh_link();   // slow USB PHY read here, OFF the UI path
 
+        // #dhcpwake: redundant, ALWAYS-ARMED waker for dhcp_discover_blocking().
+        // Fired once per ~1s worker pass, right after g_link_cached was
+        // refreshed above, so a thread parked on carrier-up or on DORA-complete
+        // re-checks its condition at least this often even if a natural edge
+        // wake (dhcp_handle RX / dhcp_poll BOUND / the carrier-up branch below)
+        // were ever lost. No wake can strand the blocking path for >1 pass.
+        dhcp_wake();
+
         if (!link) {
             // Carrier DOWN: fast no-op. No DHCP, no DAD, no fetches, no wire.
             prev_link = 0;
@@ -1516,6 +1640,7 @@ static void net_worker(void *arg) {
                 kprintf("[NET] carrier relink (down->up); re-running DHCP for a fresh lease\n");
                 dhcp_reset();
                 dhcp_discover();
+                dhcp_wake();   // #dhcpwake: carrier-up edge; kick the link waiter now
             } else if (!dhcp_is_bound() && ip_get_address() == 0) {
                 // First observation at boot with nothing acquired yet.
                 kprintf("[NET] carrier up; starting DHCP (background)\n");
@@ -1667,6 +1792,10 @@ void net_start_worker(void) {
     extern void sntp_probe_start(void);
     sntp_probe_start();
 #endif
+    // netqa: gated end-to-end network census smoke test (no-op unless
+    // /CONFIG/NETQA.RUN present). Placed here so it spawns after the
+    // scheduler is live, alongside netmon/netpump.
+    netqa_start();
 }
 
 // ---------------------------------------------------------------------------
@@ -1736,13 +1865,65 @@ int net_diag_line(char *buf, unsigned long len) {
     extern uint64_t g_usbnet_rx_reaped, g_usbnet_rx_dry, g_usbnet_rx_resyncs;
     extern uint64_t g_usbnet_rx_refills;
     extern uint64_t g_usbnet_fifo_drops;
+    // #imacnet: dnsq= and dnspref= ride the line that is ALREADY durable, so
+    // they cost no extra bootlog budget at all and are readable off a stick
+    // from a machine with no serial port.
+    //
+    //   dnsq=SENT/OK/SILENT/RCODE/FAILOVERS
+    //     SENT     - query datagrams that reached the wire. ZERO here with a
+    //                browser that "does nothing" means the failure is ABOVE the
+    //                resolver and no amount of network debugging will find it.
+    //     OK       - answers carrying an A record.
+    //     SILENT   - lookups where the entire retry budget produced NO reply.
+    //                A large SILENT with SENT > 0 and OK == 0 is the exact
+    //                signature of a configured-but-unreachable resolver, which
+    //                looks identical to "the internet is down" from the desktop
+    //                while ping to a literal address keeps working.
+    //     RCODE    - answers that were errors (NXDOMAIN/SERVFAIL). These prove
+    //                the resolver IS working; they are a fact about the name.
+    //     FAILOVERS- times the resolver was advanced because it went silent.
+    //   dnspref= is the PREFERRED (user/config-chosen) resolver. When it differs
+    //     from dns= above, a failover has happened and dns= is what is actually
+    //     in use. Two different addresses on this line is the whole story.
+    extern void netbread_dns_counters_rs(uint32_t *, uint32_t *, uint32_t *,
+                                         uint32_t *, uint32_t *);
+    extern uint32_t netbread_dns_preferred_rs(void);
+    uint32_t dq_sent = 0, dq_ok = 0, dq_to = 0, dq_rc = 0, dq_fo = 0;
+    netbread_dns_counters_rs(&dq_sent, &dq_ok, &dq_to, &dq_rc, &dq_fo);
+    uint32_t dpref = netbread_dns_preferred_rs();
+    uint8_t *pp = (uint8_t *)&dpref;
+    // #dnsfallback: dnsl= is the LEARNED resolver (the last one that actually
+    // put a datagram back on the wire) and STAGE is where the escalation ladder
+    // has got to: 0 preferred, 1 DHCP-offered, 2 gateway, 3-5 public. This is
+    // the pair a reader needs the moment dnsq's FAILOVERS field is non-zero,
+    // and it was not answerable off the owner's stick.
+    extern void netbread_dns_ladder_rs(uint32_t *, uint32_t *);
+    uint32_t dstage = 0, dlearn = 0;
+    netbread_dns_ladder_rs(&dstage, &dlearn);
+    uint8_t *pl = (uint8_t *)&dlearn;
+    // #httpdns: dnstx=LIVE/PEAK/ALLOCFAIL/NOMATCH. It rides the already-durable
+    // line, so it costs no extra log budget.
+    //   LIVE/PEAK - concurrent name lookups now and at the high-water mark. A
+    //               PEAK above 1 is proof this machine overlaps lookups, which
+    //               is the condition the old single-global resolver corrupted.
+    //   ALLOCFAIL - lookups refused because all 16 slots were busy. Must be 0;
+    //               anything else means the table needs to be bigger, and the
+    //               caller got an honest soft failure rather than somebody
+    //               else's address.
+    //   NOMATCH   - replies for a transaction nobody is waiting on (a straggler
+    //               from an abandoned query, or a duplicate). Dropped safely.
+    extern void dnstx_stats_rs(uint32_t *, uint32_t *, uint32_t *, uint32_t *, uint32_t *);
+    uint32_t tx_live = 0, tx_peak = 0, tx_af = 0, tx_nm = 0, tx_rp = 0;
+    dnstx_stats_rs(&tx_live, &tx_peak, &tx_af, &tx_nm, &tx_rp);
     return snprintf(buf, len,
         "drv=%s carrier=%d state=%s cfg=%s dhcp=%s ip=%d.%d.%d.%d "
-        "gw=%d.%d.%d.%d gwarp=%s dns=%d.%d.%d.%d trip=%s/%d "
+        "gw=%d.%d.%d.%d gwarp=%s dns=%d.%d.%d.%d dnspref=%d.%d.%d.%d trip=%s/%d "
         "rx=%lu tx=%lu txfail=%lu "
         "nfail=%u ntrip=%u nrec=%u nprobe=%u/%u "
         "usbagg=%lu usbsplit=%lu usbdesync=%lu "
-        "usbq=%d usbrx=%lu usbdry=%lu usbfd=%lu usbrsy=%lu usbref=%lu",
+        "usbq=%d usbrx=%lu usbdry=%lu usbfd=%lu usbrsy=%lu usbref=%lu "
+        "dnsq=%u/%u/%u/%u/%u dnsl=%d.%d.%d.%d/%u "
+        "dnstx=%u/%u/%u/%u nhosts=%u/%u",
         drv, carrier, state,
         g_net_static_configured ? "static" : "dhcp",
         dhcp_is_bound() ? "BOUND" : "unbound",
@@ -1750,6 +1931,7 @@ int net_diag_line(char *buf, unsigned long len) {
         pg[3], pg[2], pg[1], pg[0],
         gwarp ? "RESOLVED" : "UNRESOLVED",
         pd[3], pd[2], pd[1], pd[0],
+        pp[3], pp[2], pp[1], pp[0],
         g_net_trip_host[0] ? g_net_trip_host : "-",
         g_net_trip_rc,
         (unsigned long)g_net_poll_pkts,
@@ -1768,7 +1950,12 @@ int net_diag_line(char *buf, unsigned long len) {
         (unsigned long)g_usbnet_rx_dry,
         (unsigned long)g_usbnet_fifo_drops,
         (unsigned long)g_usbnet_rx_resyncs,
-        (unsigned long)g_usbnet_rx_refills);
+        (unsigned long)g_usbnet_rx_refills,
+        (unsigned)dq_sent, (unsigned)dq_ok, (unsigned)dq_to,
+        (unsigned)dq_rc, (unsigned)dq_fo,
+        pl[3], pl[2], pl[1], pl[0], (unsigned)dstage,
+        (unsigned)tx_live, (unsigned)tx_peak, (unsigned)tx_af, (unsigned)tx_nm,
+        (unsigned)g_net_streak_nhosts, (unsigned)g_net_streak_singleton);
 }
 
 // ---------------------------------------------------------------------------

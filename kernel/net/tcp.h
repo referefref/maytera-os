@@ -142,6 +142,19 @@ typedef struct {
     // the RX softirq/IRQ, where proc_current() is whatever process happened to
     // be interrupted, which would attribute the connection to a random victim.
     uint32_t owner_pid;
+    // STAGE 0 (docs/SYSTEM_CAPABILITY_API.md 1.4). The owning THREAD GROUP,
+    // normalised through capgate_tgid_of_rs() at the moment of the stamp.
+    //
+    // owner_pid alone is not a usable ownership key, and the reason is the one
+    // drivers/audio_pcm.c:171-196 already paid for: a pthread in MayteraOS is a
+    // separate process_t with its OWN pid (proc_clone does
+    // `child->pid = next_pid++`) sharing the address space, with the group
+    // leader in `tgid`. A pid-only gate would mean "this socket belongs to the
+    // one THREAD that called socket()", so an app that connects on one thread
+    // and reads on another would be refused its own connection, with nothing in
+    // the failure that points at threads. Stamping the group here is what lets
+    // the check be one comparison at the Ring-3 chokepoint.
+    uint32_t owner_tgid;
 } tcp_conn_t;
 
 // Error codes
@@ -257,5 +270,10 @@ int conn_filter_by_pid_c(const tcp_conn_info_t *in, uint32_t n, uint32_t pid,
 
 // #404 boot-time [RUST-DIFF] differential for the conn_owner seam.
 void conn_owner_selftest(void);
+
+// STAGE 0: who owns TCP slot `sock`? 0 on success, -1 if out of range or the
+// slot is inactive. Used by the Ring-3 socket-syscall ownership guard in
+// proc/syscall.c. See docs/SYSTEM_CAPABILITY_API.md 1.4.
+int tcp_conn_owner(int sock, uint32_t *owner_pid, uint32_t *owner_tgid);
 
 #endif // TCP_H

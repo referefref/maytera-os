@@ -39,13 +39,70 @@ pub const TAB_H: i32 = 26;
 pub const ROW_H: i32 = 20;
 pub const PAD: i32 = 10;
 
+/// Tab width and the gap between tabs.
+pub const TAB_W: i32 = 96;
+pub const TAB_GAP: i32 = 6;
+/// (2026-09-16 owner fix) top-corner radius for a tab, kept smaller than the
+/// panel's own PANEL_R so a tab's rounded-then-squared extension (see
+/// draw_tabs() in main.rs) sits entirely inside the panel's own top-square
+/// strip.
+pub const TAB_R: i32 = 8;
+/// The panel: top edge, corner radius, and the inset content keeps from its
+/// border (so nothing sits on the 1px edge or the rounded corners).
+///
+/// (2026-09-16 owner fix) PANEL_Y used to be `PAD + TAB_H + 10`: a 10px gap
+/// that made the tab strip read as pills floating above a separate box
+/// rather than a tab strip attached to it. There is now no gap at all - the
+/// panel's top edge starts exactly where the tabs end - so main.rs's
+/// draw_tabs()/draw_panel() can make the two continuous.
+pub const PANEL_Y: i32 = PAD + TAB_H;
+pub const PANEL_R: i32 = 12;
+pub const PANEL_IN: i32 = 12;
+/// X of the first column / the left-aligned footer buttons: inside the panel.
+pub const CX: i32 = PAD + PANEL_IN;
+
+/// The panel rectangle for a content area of dw x dh: (x, y, w, h).
+pub fn panel_rect(dw: i32, dh: i32) -> (i32, i32, i32, i32) {
+    (PAD, PANEL_Y, dw - 2 * PAD, dh - PANEL_Y - PAD)
+}
+
+/// The i-th tab pill, in X. THE one definition: draw_tabs() and the click
+/// handler both call it (the old hit-test divided by a literal 87 while the
+/// draw loop stepped by 84 + 3, two spellings of one number).
+pub fn tab_rect(i: usize) -> Btn {
+    Btn { x: PAD + (i as i32) * (TAB_W + TAB_GAP), w: TAB_W }
+}
+/// Which of the `n` tabs a click at mx lands on, for a click already known to
+/// be in the strip's Y band (PAD .. PAD + TAB_H). The gaps between pills are
+/// dead on purpose: a pill is the control, the strip is not.
+pub fn tab_at(n: usize, mx: i32) -> Option<usize> {
+    let mut i = 0;
+    while i < n {
+        if tab_rect(i).hit(mx) { return Some(i); }
+        i += 1;
+    }
+    None
+}
+
 /// Y of the column-header text row on any list tab.
-pub const LIST_HDR_Y: i32 = PAD + TAB_H + 6;
+pub const LIST_HDR_Y: i32 = PANEL_Y + 10;
 /// Y of the first data row: the header band is LIST_HDR_Y .. LIST_TOP_Y.
 pub const LIST_TOP_Y: i32 = LIST_HDR_Y + 18;
-/// Footer button height, and the footer's Y for a window of height `dh`.
+/// Footer button height, and the footer's Y for a window of height `dh`: the
+/// buttons end 8px above the panel's bottom edge (dh - PAD).
 pub const FOOT_H: i32 = 26;
-pub fn foot_y(dh: i32) -> i32 { dh - 36 }
+pub fn foot_y(dh: i32) -> i32 { dh - PAD - 8 - FOOT_H }
+/// Y below which no list row may be drawn (the footer hairline sits at
+/// foot_y - 8, so rows stop two pixels above it).
+pub fn list_bottom(dh: i32) -> i32 { foot_y(dh) - 10 }
+
+/// Performance tab: the control row (Overall / Per-core / Speed) Y and height.
+pub const PERF_CTL_Y: i32 = PANEL_Y + 8;
+pub const PERF_CTL_H: i32 = 22;
+/// Overall | Per-core, the pair the speed buttons must not overlap.
+pub fn perf_mode_btns() -> [Btn; 2] {
+    [Btn { x: CX, w: 80 }, Btn { x: CX + 86, w: 80 }]
+}
 
 /// A button/column rectangle in X only (Y comes from the band it lives in).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -73,7 +130,7 @@ pub struct ProcCols {
 }
 pub fn proc_cols(dw: i32) -> ProcCols {
     ProcCols {
-        name: PAD + 4,
+        name: CX,
         pid: dw - 330,
         state: dw - 268,
         core: dw - 196,
@@ -229,16 +286,19 @@ pub fn sort_perm(col: SortCol, desc: bool, keys: &[RowKey], n: usize, out: &mut 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FootAct { None, EndTask, Kill, PrioDown, PrioUp }
 
-/// End Task | Kill | Prio - | Prio +, right-aligned. End Task and Kill keep the
-/// exact X they have always had; the single dead "Prio +/-" button is replaced
-/// by the two buttons its label was promising, inside the SAME dw-90..dw-16
-/// strip it already occupied, so nothing else on the footer moves.
+/// End Task | Kill | Prio - | Prio +, right-aligned so the last button ends
+/// PANEL_IN inside the panel's right edge (dw - PAD). The single dead
+/// "Prio +/-" button was replaced (#188) by the two buttons its label was
+/// promising, inside the same 74px strip; (tmglass) the whole group moved 6px
+/// left with the glass panel inset, and it moved HERE, once, for both the
+/// draw call and the hit-test.
 pub fn proc_btns(dw: i32) -> [Btn; 4] {
+    let right = dw - PAD - PANEL_IN;
     [
-        Btn { x: dw - 250, w: 74 },  // End Task
-        Btn { x: dw - 170, w: 74 },  // Kill
-        Btn { x: dw - 90, w: 35 },   // Prio -
-        Btn { x: dw - 51, w: 35 },   // Prio +
+        Btn { x: right - 234, w: 74 },  // End Task
+        Btn { x: right - 154, w: 74 },  // Kill
+        Btn { x: right - 74, w: 35 },   // Prio -
+        Btn { x: right - 35, w: 35 },   // Prio +
     ]
 }
 
@@ -260,8 +320,12 @@ pub fn proc_foot_hit(dw: i32, mx: i32) -> FootAct {
 pub enum SchedAct { None, Enable, Disable }
 
 pub fn sched_btns() -> [Btn; 2] {
-    [Btn { x: PAD, w: 74 }, Btn { x: PAD + 80, w: 74 }]
+    [Btn { x: CX, w: 74 }, Btn { x: CX + 80, w: 74 }]
 }
+/// (tmglass) The Services tab's Start/Stop pair: the SAME rectangles, by
+/// construction. draw_services() and its click handler used to spell these
+/// as inline `PAD`/`PAD + 80`/`PAD + 74` literals; now both read this.
+pub fn svc_btns() -> [Btn; 2] { sched_btns() }
 
 pub fn sched_foot_hit(mx: i32) -> SchedAct {
     let b = sched_btns();
@@ -273,7 +337,7 @@ pub fn sched_foot_hit(mx: i32) -> SchedAct {
 // ---------------------------------------------------------------------------
 // Details tab: the connections scope toggle (this process / all processes).
 // ---------------------------------------------------------------------------
-pub fn conn_scope_btn(dw: i32) -> Btn { Btn { x: dw - 130, w: 120 } }
+pub fn conn_scope_btn(dw: i32) -> Btn { Btn { x: dw - PAD - PANEL_IN - 120, w: 120 } }
 
 // ---------------------------------------------------------------------------
 // Update speed. `ms` is what goes to win_get_event()'s timeout; PAUSED still
@@ -310,13 +374,13 @@ pub fn speed_label(s: Speed) -> &'static [u8] {
 }
 
 /// The four speed buttons on the Performance tab, to the right of the
-/// Overall / Per-core pair (which end at PAD + 166).
+/// Overall / Per-core pair (perf_mode_btns(), which ends at CX + 166).
 pub fn speed_btns() -> [Btn; 4] {
     [
-        Btn { x: PAD + 220, w: 52 },
-        Btn { x: PAD + 276, w: 62 },
-        Btn { x: PAD + 342, w: 48 },
-        Btn { x: PAD + 394, w: 62 },
+        Btn { x: CX + 220, w: 52 },
+        Btn { x: CX + 276, w: 62 },
+        Btn { x: CX + 342, w: 48 },
+        Btn { x: CX + 394, w: 62 },
     ]
 }
 pub fn speed_at(mx: i32) -> Option<Speed> {

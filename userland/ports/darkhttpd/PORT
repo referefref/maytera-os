@@ -1,0 +1,129 @@
+# mports recipe: darkhttpd 1.16. Tier 2 item #12 of
+# docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md: a single-file static web
+# server, ISC licence, dependency closure 0, useful for on-device debugging and
+# asset serving, and the first CLASS-E proof for the ports mechanism (sockets +
+# file I/O, no name resolution: darkhttpd serves by IP address only).
+#
+# WHY THIS PORT IS SHAPED UNLIKE THE FOUR BEFORE IT. zlib/pcre2/lua/sqlite are
+# LIBRARIES: they compile a source list into an archive that a separate consumer
+# app links. darkhttpd is a PROGRAM. Its entire implementation, main() included,
+# is one file (darkhttpd.c). So:
+#   * `lib=libdarkhttpd.a` is a real archive, but it exists to be linked by
+#     exactly ONE consumer, userland/apps/darkhttpd, which pulls in main() from
+#     it. A library carrying a main() is a trap ONLY when an unwitting consumer
+#     links it and inherits an entry point it did not want (which is why the Lua
+#     port keeps lua.c OUT of liblua.a). Here main() is precisely what the sole
+#     consumer wants, so archiving the whole program is correct, not a trap.
+#   * `headers=none`: a program installs no public header. This is the first use
+#     of the headers=none literal (added to mports.sh alongside this recipe,
+#     with two self-test cases proving it accepts the literal but still rejects a
+#     bogus header name).
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA.
+
+name=darkhttpd
+version=1.16
+
+# CLASS E. The assessment's section-3 letter for "sockets + file I/O". darkhttpd
+# is beyond class B (file I/O) because it is a network server: it creates a
+# listening socket and drives a select() accept/serve loop over the BSD sockets
+# libc exposes (net/socket.c, SYS_SOCK_*). It is BELOW the classes that need
+# name resolution, a process model or a window, because it serves static files
+# by IP with no getaddrinfo/gethostbyname anywhere in it (measured: the only
+# net-name calls are inet_addr/inet_ntoa, IP<->string, never a resolver).
+class=E
+homepage=https://unix4lyfe.org/darkhttpd/
+
+# The GitHub release-tag source archive. darkhttpd publishes no separate release
+# tarball (checked: the GitHub release for v1.16 carries only the auto-generated
+# source archive, and unix4lyfe.org/darkhttpd/ lists no tarball), so this is the
+# canonical source, the same one Homebrew's darkhttpd formula pins. The sha256
+# below is of THIS file and was MEASURED on the build container, and confirmed reproducible
+# across two independent downloads (GitHub commits to stable checksums for
+# release-tag archives):
+#   wget -O darkhttpd-1.16.tar.gz \
+#     https://github.com/emikulic/darkhttpd/archive/refs/tags/v1.16.tar.gz
+#   sha256sum darkhttpd-1.16.tar.gz
+#   -> ab97ea3404654af765f78282aa09cfe4226cb007d2fcc59fe1a475ba0fef1981  (40,912 bytes)
+# mports downloads with `wget -O $tarball`, so the ambiguous URL basename
+# (v1.16.tar.gz) is stored under the descriptive `tarball` name below.
+source_url=https://github.com/emikulic/darkhttpd/archive/refs/tags/v1.16.tar.gz
+tarball=darkhttpd-1.16.tar.gz
+sha256=ab97ea3404654af765f78282aa09cfe4226cb007d2fcc59fe1a475ba0fef1981
+srcdir=darkhttpd-1.16
+
+# darkhttpd is ISC-licensed (the "Permission to use, copy, modify, and
+# distribute ... with or without fee" grant with the AS-IS disclaimer). The
+# verbatim text is in COPYING and reproduced in ATTRIBUTION.md, copied out of
+# THIS tarball. If a future upstream moves or renames it, mports fails the build
+# rather than shipping an unattributed program.
+licence=ISC
+licence_files=COPYING
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): does this want to USE a platform layer, or
+# to BE one? darkhttpd USES. It is an ordinary Ring-3 program that opens sockets
+# and files through the libc/kernel syscall surface and imposes nothing on the
+# rest of the system: no event loop everyone must adopt, no service manager, no
+# framework. It is a leaf consumer of the platform, the textbook USES case.
+adoption=USES. darkhttpd is a self-contained Ring-3 program: it opens a listening socket and reads files through the BSD sockets + file I/O the libc already exposes, and imposes no event loop, framework or service model on anything else. It is a leaf consumer of the platform, not a would-be platform.
+
+# `libc` is the shared platform library, not a port. darkhttpd needs no other
+# port. Its ENTIRE external surface, measured with nm -u on the compiled object
+# against nm --defined-only on libc.a with -DNO_IPV6, resolves to libc: sockets
+# (socket/bind/listen/accept/select/send/recv/setsockopt), file I/O
+# (open/read/lseek/close/stat/fstat/opendir/readdir), string/stdio/malloc, and
+# the small BSD surface added to libc for this port (see cflags/patches below).
+needs=libc
+
+# No generated files to stage: the tarball is source-complete.
+prepare=none
+
+# ONE PATCH, and it is the documented socket-API adaptation. MayteraOS's kernel
+# exposes no getsockname() (net/socket.c has bind/connect/listen/accept/... but
+# not getsockname), so the libc getsockname() is an honest -1/ENOSYS stub. Left
+# unpatched, darkhttpd's init_sockin() calls err(1,"getsockname()") and ABORTS
+# AT STARTUP. The patch makes exactly that one call non-fatal: addrin already
+# holds the address and port bound with, so on ENOSYS darkhttpd keeps them and
+# continues; any OTHER getsockname errno stays fatal. The only lost behaviour is
+# reporting the auto-assigned port back for a --port 0 bind. Confined to the one
+# hunk so a version bump shows a reviewable delta (applied with patch -F0).
+patches=0001-getsockname-nonfatal.patch
+
+# build=objects: compile the one translation unit into libdarkhttpd.a. See the
+# header comment for why an APP is expressed as a one-member archive here.
+build=objects
+sources=darkhttpd.c
+
+# WHY EACH FLAG, smallest correct set for this target:
+#   -DNO_IPV6   Upstream's own documented build option ("Possible build options:
+#               -DDEBUG -DNO_IPV6"). MayteraOS's socket layer never returns
+#               AF_INET6 (libc sys/socket.h: "AF_INET6 ... Never returned by a
+#               real socket() call on this OS today") and the kernel has no IPv6
+#               stack, so the IPv6 half is dead code. Removing it drops the need
+#               for INET6_ADDRSTRLEN, IPV6_V6ONLY, in6_addr and inet_ntop/pton,
+#               and is the CORRECT configuration for this OS, not a workaround.
+#   -U__linux -U__linux__ -Ulinux -U__gnu_linux__
+#               The userland cross-build uses the host gcc (x86_64-linux-gnu),
+#               which predefines the Linux identity macros. darkhttpd keys its
+#               platform branches on __linux (Linux sendfile(2), the _GNU_SOURCE
+#               strsignal/vasprintf branch, sys/sendfile.h). We are NOT building
+#               Linux userspace: undefining these makes darkhttpd take its
+#               generic-POSIX branch, which uses the portable read()-based file
+#               send (no Linux sendfile syscall, which this OS lacks) and the
+#               ISO C paths. This is the honest statement of the target.
+cflags=-DNO_IPV6 -U__linux -U__linux__ -Ulinux -U__gnu_linux__
+
+# A program installs no public header. See the header comment; this is the first
+# use of the headers=none literal.
+headers=none
+
+lib=libdarkhttpd.a
+
+# THE ANTI-NO-OP CHECK. darkhttpd.c compiles to only three GLOBAL symbols (the
+# rest are file-static): main (the entry point), password_equal (its HTTP Basic
+# auth constant-time compare) and running (the main-loop flag). Requiring all
+# three proves the REAL darkhttpd source compiled into the archive: a build that
+# lost the source, or #ifdef'd main away, cannot define them. Measured with
+# `nm --defined-only --extern-only` on the compiled object.
+symbols=main password_equal running

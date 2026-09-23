@@ -43,7 +43,7 @@ static int sel_click_count = 0;
 // on button-up, so comparing against sel_owner made every second click of a
 // double-click look like a click in a different pane and reset the streak to
 // one. That turned every double-click back into two single clicks and no word
-// was ever selected. MEASURED on VM <vmid> before this line existed.
+// was ever selected. MEASURED on VM 2421 before this line existed.
 static int sel_click_pane = -1;
 // Press position, so a click that never moves is a DESELECT rather than a
 // zero-length selection. That threshold also leaves room for the OSC-8 / URL

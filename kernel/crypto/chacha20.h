@@ -115,4 +115,9 @@ int chacha20_poly1305_open(const uint8_t key[32], const uint8_t nonce[12],
                            const uint8_t *ciphertext, size_t ciphertext_len,
                            uint8_t *plaintext);
 
+// aeadkat: RFC 8439 2.5.2/2.8.2 AEAD known-answer + tamper-reject self-test.
+// Returns the number of FAILED checks (0 == all vectors behaved). Run at boot
+// from main.c and in the build container by chacha20_poly1305_kat.sh.
+int chacha20_poly1305_selftest(void);
+
 #endif // CHACHA20_H

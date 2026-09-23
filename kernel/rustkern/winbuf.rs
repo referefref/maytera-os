@@ -8,7 +8,7 @@
 // absent) version of it.
 //
 // ===========================================================================
-// THE DEFECT THIS REMOVES, MEASURED (#137, kernel build 1914, VM <vmid>)
+// THE DEFECT THIS REMOVES, MEASURED (#137, kernel build 1914, VM 2137)
 // ---------------------------------------------------------------------------
 // proc/syscall.c's sys_win_create() took `width` and `height` STRAIGHT FROM
 // RING 3 with no validation of any kind, handed them to window_create() (which

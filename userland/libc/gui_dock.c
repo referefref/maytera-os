@@ -15,6 +15,10 @@
 //                       fixed, see compositor.h's own DOCK_XFCE comment,
 //                       which already carried the correct "glass" wording;
 //                       this one had not been updated to match)
+//   5 DOCK_CARDFILE     (cfsettings) Rolodex card-deck shell: a left rail plus
+//                       fanned sideways-tabbed cards, the open card IS the app
+//                       window; no taskbar, no dock, no start menu
+//                       (docs/CARDFILE_ARCHITECTURE.md)
 // The enum identifiers and the persisted digits are historical and stay put;
 // only these strings are shown to a user, and none of them names someone
 // else's desktop.
@@ -24,6 +28,7 @@ static const char *const DOCK_STYLE_NAMES[GUI_DOCK_COUNT] = {
     "Classic UNIX",
     "Retro Bench",
     "Marble",
+    "Cardfile",
 };
 
 const char *const *gui_dock_style_names(void) { return DOCK_STYLE_NAMES; }

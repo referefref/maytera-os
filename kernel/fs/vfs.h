@@ -129,6 +129,7 @@ typedef struct {
     int trunc;      // O_TRUNC: emptied AT OPEN, and only once the open succeeded
     int append;     // O_APPEND: every write lands at end-of-file
     int create;     // O_CREAT
+    int excl;       // O_EXCL: with O_CREAT, fail if the target exists
 } open_mode_t;
 
 static inline open_mode_t open_mode_decode(int flags) {
@@ -144,6 +145,7 @@ static inline open_mode_t open_mode_decode(int flags) {
     m.trunc     = (flags & O_TRUNC)  != 0;
     m.append    = (flags & O_APPEND) != 0;
     m.create    = (flags & O_CREAT)  != 0;
+    m.excl      = (flags & O_EXCL)   != 0;
     // POSIX leaves O_TRUNC on a read-only fd undefined. This kernel has always
     // treated it as a request to empty the file and the /CONFIG writers depend
     // on that, so it keeps meaning "write" - but it does NOT take away the read.

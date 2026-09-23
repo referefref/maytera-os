@@ -4,6 +4,7 @@
 #include "vmm.h"
 #include "demand.h"   // PTE_COW_FLAG (#640: one COW rule, not two)
 #include "pmm.h"
+#include "mmlog.h"   // #dosmem: mm anomalies must reach a serial-less machine
 #include "../serial.h"
 #include "../string.h"
 #include "../gui/syslog.h"
@@ -393,6 +394,8 @@ int vmm_map_page(uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
     // Check if this is a huge page
     if (pd[pd_idx] & VMM_FLAG_HUGE) {
         // Cannot map a 4KB page over a 2MB huge page without splitting
+        MM_ANOMALY("[VMM] REFUSED to map a 4KB page over a live 2MB huge page at 0x%lx",
+                   virt_addr);
         kprintf("[VMM] WARNING: Cannot map 4KB page over 2MB huge page at 0x%lx\n", virt_addr);
         return -1;
     }
@@ -1216,13 +1219,15 @@ int vmm_map_page_in(uint64_t pml4_phys, uint64_t virt_addr, uint64_t phys_addr, 
     // Get or create PML4 entry
     uint64_t pml4_idx = VMM_PML4_INDEX(virt_addr);
     uint64_t *pdpt = vmm_get_or_create_entry_in(pml4, pml4_idx, flags);
-    if (!pdpt) { kprintf("[VMM] Failed at PDPT creation, pml4_idx=%d\n", (int)pml4_idx); return -1; }
+    if (!pdpt) { MM_ANOMALY("[VMM] map 0x%lx: PDPT alloc FAILED (pml4_idx=%d)", virt_addr, (int)pml4_idx);
+                 kprintf("[VMM] Failed at PDPT creation, pml4_idx=%d\n", (int)pml4_idx); return -1; }
     if (!pdpt) return -1;
 
     // Get or create PDPT entry
     uint64_t pdpt_idx = VMM_PDPT_INDEX(virt_addr);
     uint64_t *pd = vmm_get_or_create_entry_in(pdpt, pdpt_idx, flags);
-    if (!pd) { kprintf("[VMM] Failed at PD creation, pdpt_idx=%d\n", (int)pdpt_idx); return -1; }
+    if (!pd) { MM_ANOMALY("[VMM] map 0x%lx: PD alloc FAILED (pdpt_idx=%d)", virt_addr, (int)pdpt_idx);
+               kprintf("[VMM] Failed at PD creation, pdpt_idx=%d\n", (int)pdpt_idx); return -1; }
     if (!pd) return -1;
 
     // Get or create PD entry
@@ -1241,7 +1246,8 @@ int vmm_map_page_in(uint64_t pml4_phys, uint64_t virt_addr, uint64_t phys_addr, 
         did_split = 1;   // #404: a live 2MB leaf just became a table pointer
     }
     uint64_t *pt = vmm_get_or_create_entry_in(pd, pd_idx, flags);
-    if (!pt) { kprintf("[VMM] Failed at PT creation, pd_idx=%d\n", (int)pd_idx); return -1; }
+    if (!pt) { MM_ANOMALY("[VMM] map 0x%lx: PT alloc FAILED (pd_idx=%d)", virt_addr, (int)pd_idx);
+               kprintf("[VMM] Failed at PT creation, pd_idx=%d\n", (int)pd_idx); return -1; }
     if (!pt) return -1;
 
     // Set PT entry
@@ -1506,6 +1512,8 @@ int vmm_alloc_user_pages(uint64_t pml4_phys, uint64_t virt_addr, uint64_t count,
     for (uint64_t i = 0; i < count; i++) {
         uint64_t page = pmm_alloc_page();
         if (page == 0) {
+            MM_ANOMALY("[VMM] alloc_user_pages(0x%lx, %lu): OUT OF PHYSICAL MEMORY at page %lu",
+                       virt_addr, count, (uint64_t)i);
             kprintf("[VMM] alloc_user_pages: pmm_alloc_page failed at page %llu\n", i);
             LOG_ERROR("[VMM] Out of physical memory for user pages");
             // Failed - free what we allocated
@@ -1795,7 +1803,7 @@ static uint64_t vmm_pat_bits(int idx, int large) {
 // ---------------------------------------------------------------------------
 // #COMPIDLE: SPLIT A PARTIALLY-COVERED LARGE PAGE INSTEAD OF SKIPPING IT.
 //
-// MEASURED on VM <vmid>, golden 2065, before this change:
+// MEASURED on VM 2465, golden 2065, before this change:
 //
 //   [PAT] 0xc0000000..0xc03e8000 -> slot 1: 2048 KB re-typed, 1952 KB left as-is
 //   [FB] #642 WC ACTIVE on 0xc0000000..0xc03e8000: 2048 of 4000 KB re-typed (51%)
@@ -2048,4 +2056,136 @@ int64_t vmm_set_memtype_range(uint64_t pml4_phys, uint64_t virt_addr,
             start, end, pat_index, done / 1024, skipped / 1024,
             did_split, refused_split, g_split_pool_used, VMM_SPLIT_POOL_PAGES);
     return (int64_t)done;
+}
+
+// #305 immutable security core (Stage 5A). Make a single KERNEL 4KB page
+// read-only or writable in the current address space. The kernel RO-maps its own
+// page tables, so editing a page-table entry needs CR0.WP cleared first (exactly
+// as vmm_set_memtype_range does above); vmm_map_page_in() omits that dance because
+// it is used on user page tables, which is why using it on a kernel address faults
+// on the page-directory write during a huge-page split. This primitive reuses the
+// proven vmm_split_large_leaf() splitter (split pool, no allocation in the critical
+// section) and the same WP + flush pattern. Returns 0 on success, -1 if the page is
+// not mapped or a split failed.
+int vmm_protect_kernel_page(uint64_t virt_addr, int writable) {
+    uint64_t va = virt_addr & ~0xFFFULL;
+    uint64_t *pml4 = (uint64_t *)(read_cr3() & ~0xFFFULL);
+    int did_split = 0, rc = -1;
+
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0" : "=r"(rflags));
+    __asm__ volatile("cli");
+    uint64_t cr0_saved;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0_saved));
+    if (cr0_saved & CR0_WP_BIT)
+        __asm__ volatile("mov %0, %%cr0" :: "r"(cr0_saved & ~CR0_WP_BIT) : "memory");
+
+    do {
+        if (!(pml4[VMM_PML4_INDEX(va)] & VMM_FLAG_PRESENT)) break;
+        uint64_t *pdpt = (uint64_t *)(pml4[VMM_PML4_INDEX(va)] & VMM_ADDR_MASK);
+        uint64_t pdpt_e = pdpt[VMM_PDPT_INDEX(va)];
+        if (!(pdpt_e & VMM_FLAG_PRESENT) || (pdpt_e & VMM_FLAG_HUGE)) break;
+        uint64_t *pd = (uint64_t *)(pdpt_e & VMM_ADDR_MASK);
+        uint64_t pd_i = VMM_PD_INDEX(va);
+        if (!(pd[pd_i] & VMM_FLAG_PRESENT)) break;
+        if (pd[pd_i] & VMM_FLAG_HUGE) {
+            if (!vmm_split_large_leaf(pml4, &pd[pd_i], 0)) break;
+            did_split = 1;
+        }
+        uint64_t *pt = (uint64_t *)(pd[pd_i] & VMM_ADDR_MASK);
+        uint64_t pt_i = VMM_PT_INDEX(va);
+        if (!(pt[pt_i] & VMM_FLAG_PRESENT)) break;
+        if (writable) pt[pt_i] |= VMM_FLAG_WRITABLE;
+        else          pt[pt_i] &= ~VMM_FLAG_WRITABLE;
+        rc = 0;
+    } while (0);
+
+    // Flush: a split retired a large entry (CR4.PGE toggle, or a full flush);
+    // otherwise invlpg the single page. Then an SMP-wide shootdown if APs run.
+    if (did_split) {
+        uint64_t cr4_now;
+        __asm__ volatile("mov %%cr4, %0" : "=r"(cr4_now));
+        if (cr4_now & CR4_PGE_BIT) {
+            __asm__ volatile("mov %0, %%cr4" :: "r"(cr4_now & ~CR4_PGE_BIT) : "memory");
+            __asm__ volatile("mov %0, %%cr4" :: "r"(cr4_now) : "memory");
+        } else {
+            vmm_flush_tlb();
+        }
+    } else if (rc == 0) {
+        vmm_invlpg(va);
+    }
+    {
+        extern uint32_t smp_get_online_count(void);
+        extern void tlb_flush_all(void);
+        if (rc == 0 && smp_get_online_count() > 1) tlb_flush_all();
+    }
+
+    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0_saved) : "memory");
+    if (rflags & (1ULL << 9)) __asm__ volatile("sti");
+    return rc;
+}
+
+// #305 immutable security core (Stage 5A): make a KERNEL virtual RANGE read-only
+// or writable in ONE CR0.WP window with ONE TLB shootdown (so sealing the whole
+// ~2.8MB kernel .text is not thousands of separate shootdowns). Same discipline
+// as vmm_set_memtype_range and vmm_protect_kernel_page: cli + clear WP (kernel
+// page tables are read-only mapped), split any covering 2MB huge page via the
+// proven vmm_split_large_leaf(), edit the 4KB leaves, flush, restore WP. Walks
+// the ACTIVE read_cr3() tables. Returns 0 if any leaf was changed, -1 otherwise.
+int vmm_protect_kernel_range(uint64_t start, uint64_t end, int writable) {
+    uint64_t va0 = start & ~0xFFFULL;
+    uint64_t va1 = (end + 0xFFFULL) & ~0xFFFULL;
+    if (va1 <= va0) return -1;
+    uint64_t *pml4 = (uint64_t *)(read_cr3() & ~0xFFFULL);
+    int did_split = 0, any = 0;
+
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0" : "=r"(rflags));
+    __asm__ volatile("cli");
+    uint64_t cr0_saved;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0_saved));
+    if (cr0_saved & CR0_WP_BIT)
+        __asm__ volatile("mov %0, %%cr0" :: "r"(cr0_saved & ~CR0_WP_BIT) : "memory");
+
+    for (uint64_t va = va0; va < va1; va += 0x1000) {
+        if (!(pml4[VMM_PML4_INDEX(va)] & VMM_FLAG_PRESENT)) continue;
+        uint64_t *pdpt = (uint64_t *)(pml4[VMM_PML4_INDEX(va)] & VMM_ADDR_MASK);
+        uint64_t pdpt_e = pdpt[VMM_PDPT_INDEX(va)];
+        if (!(pdpt_e & VMM_FLAG_PRESENT) || (pdpt_e & VMM_FLAG_HUGE)) continue;
+        uint64_t *pd = (uint64_t *)(pdpt_e & VMM_ADDR_MASK);
+        uint64_t pd_i = VMM_PD_INDEX(va);
+        if (!(pd[pd_i] & VMM_FLAG_PRESENT)) continue;
+        if (pd[pd_i] & VMM_FLAG_HUGE) {
+            if (!vmm_split_large_leaf(pml4, &pd[pd_i], 0)) continue;
+            did_split = 1;
+        }
+        uint64_t *pt = (uint64_t *)(pd[pd_i] & VMM_ADDR_MASK);
+        uint64_t pt_i = VMM_PT_INDEX(va);
+        if (!(pt[pt_i] & VMM_FLAG_PRESENT)) continue;
+        if (writable) pt[pt_i] |= VMM_FLAG_WRITABLE;
+        else          pt[pt_i] &= ~VMM_FLAG_WRITABLE;
+        any = 1;
+    }
+
+    if (did_split) {
+        uint64_t cr4_now;
+        __asm__ volatile("mov %%cr4, %0" : "=r"(cr4_now));
+        if (cr4_now & CR4_PGE_BIT) {
+            __asm__ volatile("mov %0, %%cr4" :: "r"(cr4_now & ~CR4_PGE_BIT) : "memory");
+            __asm__ volatile("mov %0, %%cr4" :: "r"(cr4_now) : "memory");
+        } else {
+            vmm_flush_tlb();
+        }
+    } else {
+        vmm_flush_tlb();
+    }
+    {
+        extern uint32_t smp_get_online_count(void);
+        extern void tlb_flush_all(void);
+        if (any && smp_get_online_count() > 1) tlb_flush_all();
+    }
+
+    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0_saved) : "memory");
+    if (rflags & (1ULL << 9)) __asm__ volatile("sti");
+    return any ? 0 : -1;
 }

@@ -285,11 +285,20 @@ static void swap_rect(int *x, int *y, int *w, int *h) {
 }
 
 // keypad: 4 rows x 4 cols
-static const char *KEYS[16] = {
-    "7", "8", "9", "C",
-    "4", "5", "6", "\x7f",     // backspace glyph
-    "1", "2", "3", "+/-",
-    "0", ".",  "",  "",        // "0" spans handled below; last two unused
+//
+// #239: each key carries its STABLE dotted name next to its label, in the same
+// table, because the tool contract is PROJECTED from this array (see the
+// contract block near the bottom). The label is what is drawn and what do_key()
+// dispatches on; the token is what a caller names. They are separate for the
+// same reason apps/calc's btn_t separates `tok` from `face`: several labels are
+// glyphs or punctuation ("\x7f", "+/-", ".") that cannot be a dotted name.
+typedef struct { const char *label; const char *tok; } key_t;
+static const key_t KEYS[16] = {
+    { "7", "key.7" },   { "8", "key.8" },   { "9", "key.9" },  { "C", "key.clear" },
+    { "4", "key.4" },   { "5", "key.5" },   { "6", "key.6" },  { "\x7f", "key.backspace" },
+    { "1", "key.1" },   { "2", "key.2" },   { "3", "key.3" },  { "+/-", "key.negate" },
+    { "0", "key.0" },   { ".", "key.dot" }, { "Swap", "key.swap" }, { "", 0 },
+    // index 15 is unused; key_active() is what says so.
 };
 static void key_rect(int i, int *x, int *y, int *w, int *h) {
     int r = i / 4, c = i % 4;
@@ -301,9 +310,11 @@ static void key_rect(int i, int *x, int *y, int *w, int *h) {
     if (i == 13) { }                                 // "."
     if (i == 14) { *w = 2 * kw + 6; }                // wide Swap key
 }
+// #239: the Swap key's label used to be special-cased here while KEYS[14] held
+// "". It is now simply in the table, so there is one description of what the
+// key says and key_active() below reads it directly.
 static const char *key_label(int i) {
-    if (i == 14) return "Swap";
-    return KEYS[i];
+    return KEYS[i].label;
 }
 static int key_active(int i) { return i != 15 && key_label(i)[0] != '\0'; }
 
@@ -544,13 +555,280 @@ static void on_key(gui_event_t *ev) {
     if (ev->keycode == GUI_KEY_DOWN) { select_cat((g_cat + 1) % NCATS); return; }
 }
 
-int main(int argc, char **argv) {
+// ---------------------------------------------------------------------------
+// Tool contract (#239) - PROJECTED FROM CATS[] AND KEYS[], NOT WRITTEN OUT.
+//
+// Same move as apps/calc (#233). Nothing below lists a category, a unit or a
+// key. Every row is derived from the tables the app already draws and hit-tests
+// against:
+//
+//   category    CATS[], which draw_sidebar() renders and hit_cat() indexes.
+//               One enum row whose bounds and option labels come from the
+//               array, so an added category is an added option in the same
+//               commit.
+//   from_unit   CATS[g_cat].units[], which draw_unit_lists() renders and the
+//   to_unit     EVENT_MOUSE_DOWN handler indexes. Their bounds move WITH the
+//               selected category, because they are read from it at projection
+//               time rather than written down here - which is also what stops a
+//               stale index addressing a 3-entry table (U_TEMP) as if it had 8.
+//   key.*       KEYS[], which draw_keypad() renders, hit_key() hit-tests and
+//               do_key() dispatches on.
+//
+// A category, unit or key that is not in those tables cannot be drawn, cannot
+// be clicked and cannot be described.
+//
+// COVERAGE, stated honestly (docs/CONTRACT_API.md section 6): every interactive
+// target. 8 sidebar rows -> the 8 values of `category`; the two unit columns ->
+// the values of `from_unit`/`to_unit` (3 to 8 per category, 8 in Length); 15
+// keypad keys -> 15 actions; the separate Swap button -> the same do_swap()
+// `key.swap` calls, so it is the same capability rather than a second one.
+// on_key() is a strict SUBSET: digits, '.', backspace, '-', C and S/Tab all
+// reach the same input_* / do_swap() primitives the keypad does, and Up/Down
+// call select_cat(), which is what `category` writes. NOT covered,
+// deliberately: hover highlighting, live resize and window chrome.
+//
+// `value` is the one row that is not a control the mouse can hit, and it is not
+// a new capability: it drives the app's OWN input_clear/input_digit/input_dot/
+// input_negate one character at a time, which is exactly what pressing those
+// keys does. It exists because a contract call is a fresh process, so typing a
+// multi-digit number one key.N call at a time would type it into a different
+// process each time.
+// ---------------------------------------------------------------------------
+#include "../../libc/contract.h"
+
+#define CT_MAX_KEY 16
+static int  g_ct_key[CT_MAX_KEY];    // keypad indices that are actually active
+static int  g_ct_nkey = -1;
+
+static void ct_build(void) {
+    if (g_ct_nkey >= 0) return;
+    g_ct_nkey = 0;
+    for (int i = 0; i < 16; i++) {
+        if (!key_active(i) || !KEYS[i].tok) continue;
+        g_ct_key[g_ct_nkey++] = i;
+    }
+}
+
+// "A|B|C" built from a table, never written out. Truncates rather than
+// overruns; CT_OPTS_MAX is 192 and the longest real list (Length, 8 units) is
+// well inside it.
+static char g_ct_cat_opts[CT_OPTS_MAX];
+static char g_ct_unit_opts[CT_OPTS_MAX];
+
+static int ct_append(char *out, int cap, int o, const char *s) {
+    if (o && o < cap - 1) out[o++] = '|';
+    for (int k = 0; s[k] && o < cap - 1; k++) out[o++] = s[k];
+    return o;
+}
+
+static void ct_refresh_opts(void) {
+    int o = 0;
+    for (int i = 0; i < NCATS; i++)
+        o = ct_append(g_ct_cat_opts, (int)sizeof(g_ct_cat_opts), o, CATS[i].name);
+    g_ct_cat_opts[o] = 0;
+
+    const cat_t *c = &CATS[g_cat];
+    o = 0;
+    for (int i = 0; i < c->n; i++)
+        o = ct_append(g_ct_unit_opts, (int)sizeof(g_ct_unit_opts), o, c->units[i].name);
+    g_ct_unit_opts[o] = 0;
+}
+
+// The app's own conversion, formatted by the app's own fmt_double, so a reply
+// is an OBSERVATION of what the window would show rather than an echo of the
+// request.
+static void ct_result_line(char *out, int ocap) {
+    const cat_t *c = &CATS[g_cat];
+    const unit_t *uf = &c->units[g_from];
+    const unit_t *ut = &c->units[g_to];
+    char res[40];
+    fmt_double(convert(parse_input(), uf, ut), res, sizeof(res));
+    snprintf(out, (size_t)ocap, "%s %s = %s %s", g_input, uf->abbr, res, ut->abbr);
+}
+
+// ---- the three selectors, backed by the variables the UI itself assigns -----
+static int ct_get_cat(void)  { return g_cat; }
+static int ct_set_cat(int v) {
+    if (v < 0 || v >= NCATS) return -1;
+    select_cat(v);            // the SAME function hit_cat() and Up/Down call
+    return 0;
+}
+// from/to are clamped against the CURRENT category's unit count, not against a
+// constant: U_TEMP has 3 units and U_LEN has 8, and an index of 7 in
+// Temperature would read past the end of the table the draw pass walks.
+static int ct_get_from(void)  { return g_from; }
+static int ct_set_from(int v) { if (v < 0 || v >= CATS[g_cat].n) return -1; g_from = v; return 0; }
+static int ct_get_to(void)    { return g_to; }
+static int ct_set_to(int v)   { if (v < 0 || v >= CATS[g_cat].n) return -1; g_to = v; return 0; }
+
+// One handler for every projected key. The index comes from it->ctx and goes
+// straight to do_key() - the SAME function EVENT_MOUSE_DOWN calls.
+static int ct_key_press(const ct_item_t *it, int argc, char **argv,
+                        char *out, int ocap) {
     (void)argc; (void)argv;
+    if (!it->ctx) return -1;
+    do_key(*(const int *)it->ctx);
+    ct_result_line(out, ocap);
+    return 0;
+}
+
+// Type a decimal value through the app's own editing primitives.
+static int ct_value_action(const ct_item_t *it, int argc, char **argv,
+                           char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0] || !argv[0][0]) {
+        strlcpy(out, "value-needs-a-decimal-number", (size_t)ocap);
+        return -1;
+    }
+    const char *s = argv[0];
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    // Validate BEFORE touching the app's state: a rejected argument must not
+    // leave the display half-edited.
+    int digits = 0, dots = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p >= '0' && *p <= '9') { digits++; continue; }
+        if (*p == '.') { dots++; continue; }
+        strlcpy(out, "value-must-be-decimal", (size_t)ocap);
+        return -1;
+    }
+    if (!digits || dots > 1 || (int)strlen(argv[0]) >= (int)sizeof(g_input)) {
+        strlcpy(out, "value-must-be-decimal", (size_t)ocap);
+        return -1;
+    }
+    input_clear();
+    for (const char *p = s; *p; p++) {
+        if (*p == '.') input_dot(); else input_digit(*p);
+    }
+    if (neg) input_negate();
+    ct_result_line(out, ocap);
+    return 0;
+}
+
+static int convert_project(int idx, ct_item_t *out) {
+    ct_build();
+    ct_refresh_opts();
+    static char desc[128];
+    ct_item_t it;
+    __builtin_memset(&it, 0, sizeof(it));
+
+    if (idx == 0) {
+        it.name = "category"; it.type = CT_ENUM; it.access = CT_RW;
+        it.risk = CT_SAFE; it.cfgkey = 'c';
+        it.lo = 0; it.hi = NCATS - 1; it.options = g_ct_cat_opts;
+        it.getfn = ct_get_cat; it.setfn = ct_set_cat;
+        it.desc = "Unit category, from CATS[]; selecting one resets the two "
+                  "unit columns to that category's defaults";
+        *out = it; return 1;
+    }
+    if (idx == 1 || idx == 2) {
+        const cat_t *c = &CATS[g_cat];
+        it.name = (idx == 1) ? "from_unit" : "to_unit";
+        it.type = CT_ENUM; it.access = CT_RW; it.risk = CT_SAFE;
+        it.cfgkey = (idx == 1) ? 'f' : 't';
+        it.lo = 0; it.hi = c->n - 1; it.options = g_ct_unit_opts;
+        it.getfn = (idx == 1) ? ct_get_from : ct_get_to;
+        it.setfn = (idx == 1) ? ct_set_from : ct_set_to;
+        snprintf(desc, sizeof(desc),
+                 "%s unit within the %s category, from its own unit table",
+                 (idx == 1) ? "Source" : "Target", c->name);
+        it.desc = desc;
+        *out = it; return 1;
+    }
+    if (idx == 3) {
+        it.name = "value"; it.type = CT_ACTION; it.access = CT_WRITE;
+        it.risk = CT_SAFE; it.actfn = ct_value_action;
+        it.desc = "Type a decimal value through the app's own input_digit/"
+                  "input_dot/input_negate, exactly as the keypad does";
+        *out = it; return 1;
+    }
+    int k = idx - 4;
+    if (k < 0 || k >= g_ct_nkey) return 0;
+    int ki = g_ct_key[k];
+    snprintf(desc, sizeof(desc), "Keypad key \"%s\", via do_key()",
+             KEYS[ki].label);
+    it.name   = KEYS[ki].tok;
+    it.type   = CT_ACTION;
+    it.access = CT_WRITE;
+    it.risk   = CT_SAFE;   // editing a number in a converter changes nothing outside the app
+    it.actfn  = ct_key_press;
+    it.ctx    = &g_ct_key[k];
+    it.desc   = desc;
+    *out = it;
+    return 1;
+}
+
+// ---- readable state ---------------------------------------------------------
+static int ct_get_input(char *o, int n)  { strlcpy(o, g_input, (size_t)n); return 0; }
+static int ct_get_result(char *o, int n) {
+    const cat_t *c = &CATS[g_cat];
+    char b[40];
+    fmt_double(convert(parse_input(), &c->units[g_from], &c->units[g_to]), b, sizeof(b));
+    strlcpy(o, b, (size_t)n);
+    return 0;
+}
+static int ct_get_rate(char *o, int n) {
+    const cat_t *c = &CATS[g_cat];
+    char one[40];
+    fmt_double(convert(1.0, &c->units[g_from], &c->units[g_to]), one, sizeof(one));
+    snprintf(o, (size_t)n, "1 %s = %s %s",
+             c->units[g_from].abbr, one, c->units[g_to].abbr);
+    return 0;
+}
+
+static const ct_item_t CONVERT_ITEMS[] = {
+    { "input", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
+      0, 0, 0, 0, ct_get_input, 0, 0,
+      "The typed value shown in the From card" },
+    { "result", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
+      0, 0, 0, 0, ct_get_result, 0, 0,
+      "The converted value shown in the To card, from the same convert()" },
+    { "rate", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
+      0, 0, 0, 0, ct_get_rate, 0, 0,
+      "The 1-unit rate line the window draws under the two cards" },
+};
+
+static const ct_contract_t *convert_contract(void);
+#define CONVERT_CFG        "CONVERT.CFG"
+#define CONVERT_CFG_LEGACY "/CONFIG/CONVERT.CFG"
+
+static void convert_load(void) {
+    // Rows load in TABLE ORDER, and `category` is projected before from/to on
+    // purpose: select_cat() resets both to that category's defaults, so a
+    // category applied afterwards would wipe the saved unit pair.
+    contract_load_cfg(convert_contract(), CONVERT_CFG, CONVERT_CFG_LEGACY);
+}
+static void convert_commit(void) {
+    contract_save_cfg(convert_contract(), CONVERT_CFG);
+}
+
+static const ct_contract_t CONVERT_CONTRACT = {
+    "convert", "Unit Converter",
+    "Categories, units and keys are PROJECTED from CATS[], CATS[g_cat].units[] "
+    "and KEYS[], the same tables the draw pass renders and the click handler "
+    "indexes, so the contract cannot omit one that exists or offer one that "
+    "does not. The two unit rows take their bounds from the SELECTED "
+    "category, so they are never wider than the table behind them.",
+    CONVERT_ITEMS, (int)(sizeof(CONVERT_ITEMS) / sizeof(CONVERT_ITEMS[0])),
+    convert_project,
+    convert_load,
+    convert_commit
+};
+
+static const ct_contract_t *convert_contract(void) { return &CONVERT_CONTRACT; }
+
+int main(int argc, char **argv) {
+    // #233: a contract invocation must never open a window. Answering here,
+    // before win_create(), is what makes the API usable from a headless test
+    // harness and from the AI tool loop without a compositor.
+    if (contract_is_invocation(argc, argv))
+        return contract_cli(argc, argv, &CONVERT_CONTRACT);
 
     g_last_theme = get_theme();
     apply_theme(g_last_theme);
     select_cat(0);
     g_cat = 0; g_from = CATS[0].def_from; g_to = CATS[0].def_to;
+    convert_load();
 
     g_window = win_create("Unit Converter", 180, 90, WIN_W, WIN_H);
     if (g_window < 0) { printf("convert: failed to create window\n"); return 1; }
@@ -559,6 +837,7 @@ int main(int argc, char **argv) {
 
     gui_event_t ev;
     int running = 1;
+    int cfg_hash = contract_hash(&CONVERT_CONTRACT);
     while (running) {
         { int th = get_theme();
           if (th != g_last_theme) { g_last_theme = th; apply_theme(th); draw_all(); } }
@@ -607,6 +886,12 @@ int main(int argc, char **argv) {
                 break;
             default: break;
         }
+        // #239: persist when a PERSISTED row actually changed, using the
+        // contract's own DERIVED change signature rather than a hand-listed set
+        // of "things worth saving". This is what stops the GUI and a
+        // `--contract set` from holding two different ideas of the saved state.
+        { int h = contract_hash(&CONVERT_CONTRACT);
+          if (h != cfg_hash) { cfg_hash = h; convert_commit(); } }
     }
     win_destroy(g_window);
     return 0;

@@ -12,15 +12,15 @@ CFLAGS = -m64 -ffreestanding -fno-builtin -nostdinc -nostdlib \
 # Core sources
 SRCS = string.c userconf.c stdio.c stdio_file.c stdlib.c gui.c gui_scroll.c gui_font.c gui_list.c gui_menu.c compositor_client.c \
        errno.c signal.c fcntl.c unistd.c termios.c dirent.c libc_init.c stack_guard.c \
-       pwd.c grp.c assoc.c aiclient.c aicap.c notify.c math.c pthread.c \
+       pwd.c grp.c assoc.c aiclient.c aicap.c aidev.c escrow.c photorg.c exifdate.c notify.c math.c pthread.c \
        ctype.c scanf.c time.c tz.c settingscfg.c assert.c posixextra.c wallpapers.c sha256.c pkgsig.c gui_theme.c gui_palette.c uiscale.c \
        gui_dock.c gui_confirm.c gui_mods.c \
        startmenu_reg.c pkgdest.c aiguard.c poll.c spawn.c \
-       contract.c ctinvoke.c getopt.c libgen.c ftw.c utime.c locale.c tmpfile.c system.c wctype.c pipeline.c mtool.c proccpu.c
+       contract.c ctinvoke.c ctlive.c getopt.c libgen.c ftw.c utime.c locale.c tmpfile.c system.c wctype.c pipeline.c mtool.c proccpu.c langinfo.c
 OBJS = $(SRCS:.c=.o)
 
 # sys/ sources
-SYS_SRCS = sys/wait.c sys/ioctl.c sys/stat.c sys/socket.c sys/uio.c sys/utsname.c sys/file.c
+SYS_SRCS = sys/wait.c sys/ioctl.c sys/stat.c sys/socket.c sys/uio.c sys/utsname.c sys/file.c sys/random.c
 SYS_OBJS = $(SYS_SRCS:.c=.o)
 
 ASM_OBJS = setjmp.o syscall.o memcpy_fast.o sig_trampoline.o clone_asm.o

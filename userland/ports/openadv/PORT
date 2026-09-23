@@ -1,0 +1,86 @@
+# mports recipe: open-adventure (Eric S. Raymond's modernised Colossal Cave
+# Adventure), tuigames batch (owner request 2026-09-18): "open-adventure
+# (the modern Eric Raymond Colossal Cave Adventure, 'advent')". BSD-2-Clause,
+# dependency closure 2 (libedit -> musl-regex, ncurses).
+#
+# WHAT THIS PORT SHIPS. The canonical open-source Colossal Cave Adventure:
+# a faithful C99 forward-port of the original Crowther/Woods FORTRAN game
+# (version 2.5, "the last version in the main line of Adventure development
+# written by the original authors", who gave permission for this release -
+# see the upstream README), with the puzzle/movement database expressed in
+# adventure.yaml and compiled to dungeon.c/dungeon.h at BUILD TIME by
+# upstream's own make_dungeon.py (see build.sh - this is why build=script,
+# not build=objects: dungeon.c does not exist until that generator runs).
+#
+# HOST DEPENDENCY, STATED RATHER THAN HIDDEN: make_dungeon.py needs
+# `python3 -Wimport yaml` (PyYAML). This is a BUILD-HOST tool dependency
+# (same category as needing gcc/make/sed already), not something compiled
+# into the target binary; installed on the build container with
+# `apt-get install -y python3-yaml`. If a future build container lacks it,
+# `bash mports.sh build openadv` fails LOUDLY at the python3 step (see
+# build.sh's explicit check) rather than silently shipping a stale or empty
+# dungeon.c.
+#
+# The sha256 below is of GitLab's own commit-archive tarball, MEASURED after
+# fetching it with curl and running sha256sum on the bytes on disk, not
+# copied from a web page. Commit e616052 is HEAD of the esr/open-adventure
+# GitLab project (gitlab.com/esr/open-adventure, project id 3339205) at
+# fetch time (2026-09-18), read from the GitLab commits API, not an
+# arbitrarily old or new pin:
+#   curl -sL -o open-adventure.tar.gz \
+#     https://gitlab.com/esr/open-adventure/-/archive/e6160529e70a8c7a06b9a5f190d69aa35c4c62f5/open-adventure-e6160529e70a8c7a06b9a5f190d69aa35c4c62f5.tar.gz
+#   sha256sum open-adventure.tar.gz
+#   -> 7997b8cc8150ff8a9ae4cfa72c199bbeea9ac799a9992055af05fb57ca754ab1 (515,151 bytes)
+
+name=openadv
+version=e616052
+class=C
+homepage=https://gitlab.com/esr/open-adventure
+
+source_url=https://gitlab.com/esr/open-adventure/-/archive/e6160529e70a8c7a06b9a5f190d69aa35c4c62f5/open-adventure-e6160529e70a8c7a06b9a5f190d69aa35c4c62f5.tar.gz
+tarball=open-adventure-e616052.tar.gz
+sha256=7997b8cc8150ff8a9ae4cfa72c199bbeea9ac799a9992055af05fb57ca754ab1
+srcdir=open-adventure-e6160529e70a8c7a06b9a5f190d69aa35c4c62f5
+
+licence=BSD-2-Clause
+licence_files=COPYING
+copyleft=none
+copyleft_note=BSD-2-Clause is permissive; the combined /APPS/ADVENTURE binary (this port + libedit + musl-regex + ncurses + userland/libc, all permissive) carries no copyleft obligation.
+
+# libedit supplies line-editing input (readline()/add_history()), which in
+# turn needs=musl-regex and ncurses (mports.sh resolves this transitively -
+# `bash mports.sh build openadv` builds musl-regex, then ncurses, then
+# libedit, then this port, in that order, same as it already does for the
+# libedit port itself). libc is the shared platform library, not a port.
+
+# THE ADOPTION TEST (owner rule 2): USES. All 8 translation units (7
+# upstream + generated dungeon.c) are ordinary Ring-3 C driven by stdio and
+# libedit's readline()/add_history(). Measured: the 8 objects link against
+# libedit.a + libncurses.a + libregex.a + userland/libc/libc.a with zero
+# undefined symbols. It owns its own command loop (misc.c's read then
+# dispatch) and calls readline() itself; it imposes no event loop or window
+# system on anything else.
+adoption=USES. Measured: the 7 compiled objects (main/actions/init/misc/saveresume/score plus generated dungeon.c; cheat.c is EXCLUDED as upstreams standalone test tool with its own main) link against libedit.a + libncurses.a + libregex.a + userland/libc/libc.a with zero undefined symbols. open-adventure owns its own read-eval command loop and calls readline() itself from misc.c; it imposes no event loop or window system on any other program.
+needs=libc libedit
+
+prepare=none
+patches=0001-actions-read-rename.patch
+
+# build=script: dungeon.c/dungeon.h do not exist in the tarball - they are
+# GENERATED from adventure.yaml by upstream's own make_dungeon.py, the exact
+# same "let upstream's own generator produce it" approach the ncurses port
+# uses for its configure-generated sources. Also adds the editline/readline.h
+# shim (see shim/editline/readline.h) since this tree's libedit port installs
+# only histedit.h.
+build=script
+
+headers=none
+lib=libopenadv.a
+
+# THE ANTI-NO-OP CHECK: main (main.c) and playermove (dungeon.c's own
+# travel-table consumer - actually defined in actions.c, proven below) are
+# not enough on their own to prove the GENERATED half of the build; score
+# (score.c, needs dungeon.h's structures) and the dungeon table itself
+# (travel, the array make_dungeon.py emits into dungeon.c) together prove
+# both the upstream-authored and the generated half compiled and linked.
+symbols=main score travel

@@ -504,23 +504,45 @@ void blk_cache_stats(uint64_t *h, uint64_t *m, int *e) {
 // not reach from a shell, whatever the interpreter does or gets tricked into
 // doing, because the decision is no longer the interpreter's to make.
 //
-// So guestfs_allow() returns "permitted" here NOT because the check is being
-// skipped, but because it has been superseded by a check the guest cannot
-// influence. This is an ARCHITECTURAL claim and it is not taken on trust: see
-// the adversarial test in tools/dosring3-sandbox/, which drives the Ring-3 host
-// at paths outside its drive roots, another user's files and /CONFIG
-// credentials, on BOTH filesystems, and requires a refusal for each.
-// ===========================================================================
-int guestfs_allow(uint32_t slot, const char *native_path, int access, const char *what) {
-    (void)slot; (void)native_path; (void)access; (void)what;
-    return 1;
-}
-// ARMING IS STILL REQUIRED EVEN THOUGH guestfs_allow() IS SUPERSEDED.
+// THAT ARGUMENT WAS RIGHT ABOUT ENFORCEMENT AND WRONG ABOUT AGREEMENT
+// (#dosperm, 2026-09-03).
 //
-// These were no-ops returning success, on the reasoning above that the Ring-3
-// kernel open() is the real gate. That is true of the ENFORCEMENT half and
-// false of the IDENTITY half: the armed slot is also where dos/dosexec.c reads
-// the launching user back from (guestfs_cred_rs), and it is the ONLY place it
+// This file used to end the paragraph above with: "So guestfs_allow() returns
+// permitted here NOT because the check is being skipped, but because it has
+// been superseded by a check the guest cannot influence." Every word of that
+// is true about SAFETY. It is false about BEHAVIOUR, and behaviour is what the
+// guest sees.
+//
+// The gate is not only an enforcement point. It is also the point at which the
+// interpreter learns WHY an operation cannot happen, and int21svc.c turns that
+// into the DOS error code the guest reads. Stubbing the gate open moved the
+// refusal from the gate to the later open(), where the reason is gone:
+//
+//   in-kernel : gate denies -> [GUESTFS-DENY] ... reason=PERMS -> DOS error 5
+//                              (access denied)
+//   Ring 3    : gate allows -> fat_write_file() -> kernel EACCES -> a bare -1
+//               -> [int21:dos] "3Ch create ... FAILED on the medium"
+//               -> DOS error 3 (path not found)
+//
+// MEASURED on the pinned image, Red Alert launched as the default non-root
+// desktop identity (uid 1000) against its own root-owned /DOS/RA: 112,423
+// retries of that create in 150 seconds, 96% of the entire serial log, never
+// terminating. Telling a program a path does not exist, when the truth is that
+// it may not write it, is an invitation to keep trying.
+//
+// So the override is GONE and this host now compiles the kernel's own
+// fs/guestfs.c (see mkgen.sh) over the kernel's own rustkern/guestfs.rs policy,
+// which was already in this binary's crate. The only thing Ring 3 genuinely
+// lacked was a way to CALL perms_check(); that is SYS_ACCESS, and it is
+// implemented in perms_check() below. The enforcement argument above is
+// unaffected: the kernel's open() is still the thing that cannot be talked
+// out of a refusal. This only makes the interpreter's own answer the same on
+// both hosts.
+//
+// The identity half was always required and is unchanged:
+//
+// ARMING IS REQUIRED. The armed slot is where dos/dosexec.c reads the
+// launching user back from (guestfs_cred_rs), and it is the ONLY place it
 // reads it from, deliberately, because inside the guest thread the kernel's
 // own uid is 0 by construction.
 //
@@ -538,12 +560,10 @@ int guestfs_allow(uint32_t slot, const char *native_path, int access, const char
 // there really IS a Ring-3 caller (this process), which is the one case
 // spawn_ident_resolve_rs() accepts without a session lookup, and
 // spawnid_caller_ident() below answers it with this process's own credentials.
-int  guestfs_arm_caller (uint32_t slot) {
-    return guestfs_arm_rs(slot, PROC_AS_CALLER, 0);
-}
-int  guestfs_arm_session(uint32_t slot) {
-    return guestfs_arm_rs(slot, PROC_AS_SESSION, 0);
-}
+// guestfs_arm_caller()/guestfs_arm_session()/guestfs_finish() are NOT
+// defined here any more: gen/fs/guestfs.c supplies them, identically, with
+// the refusal and end-of-run reporting the kernel prints. Two copies of an
+// arm is how the two hosts would drift again.
 
 // THE LAUNCH-TIME ARM, exported across the wall for dosmain.c.
 //
@@ -561,7 +581,6 @@ int  guestfs_arm_session(uint32_t slot) {
 int dosring3_arm_guest_identity(void) {
     return guestfs_arm_caller(GUESTFS_SLOT_DOS);
 }
-void guestfs_finish     (uint32_t slot) { (void)slot; }
 
 // perms_* - the kernel's permission DATABASE. In Ring 3 the authority is the
 // filesystem itself via open(), so these report "no override recorded", which
@@ -569,8 +588,35 @@ void guestfs_finish     (uint32_t slot) { (void)slot; }
 int  perms_get  (const char *p, uint32_t *u, uint32_t *g, uint16_t *m) {
     (void)p; if (u) *u = kb_uid(); if (g) *g = kb_gid(); if (m) *m = 0644; return -1;
 }
+// perms_check() - REAL (#dosperm). It used to return a constant, which is why
+// guestfs_allow() had to be stubbed open: rustkern/guestfs.rs (compiled into
+// this binary, unmodified) calls perms_check() for its decision, and a constant
+// answer is not a decision.
+//
+// It is real without being a SECOND implementation, which is the whole point:
+// SYS_ACCESS hands the question to the kernel's one perms_check() in
+// fs/perms.c, with the #674 POSIX component traversal that goes with it. There
+// is no permission rule written down in this file, and there must never be one:
+// a Ring-3 copy of the rule would be a copy that can disagree with the copy
+// that is actually enforced at open().
+//
+// THE IDENTITY IS THIS PROCESS'S OWN, AND ONLY THAT. guestfs.rs arms
+// PROC_AS_CALLER here, so the (uid, gid) it passes back down is ours. Any other
+// pair is a question this process has no way to answer honestly, so it is
+// refused rather than guessed at: SYS_ACCESS deliberately offers no "check as
+// some other uid" form, because that would be a policy oracle for arbitrary
+// identities.
+//
+// COST, stated: one extra syscall per gated guest filesystem operation (an
+// open, a create, a directory probe). Guest file operations are rare next to
+// guest instructions - the in-kernel arm measured about 10 port accesses per
+// second against roughly 5 million guest instructions per second - so this is
+// not on any hot path. It is not free, and it is worth it for the two hosts
+// agreeing.
 int  perms_check(const char *p, uint32_t uid, uint32_t gid, int access) {
-    (void)p; (void)uid; (void)gid; (void)access; return 1;   // open() is the real check
+    if (!p) return -1;
+    if (uid != kb_uid() || gid != kb_gid()) return -1;   // not ours to answer
+    return kb_access(p, access);                          // 0 allow, -1 deny
 }
 void perms_set  (const char *p, uint32_t u, uint32_t g, uint16_t m) {
     (void)p; (void)u; (void)g; (void)m; ABSENT("perms_set");
@@ -633,6 +679,13 @@ static int sync_slot(const void *key) {
     kb_mutex_unlock(g_sync_guard);
     return idx;
 }
+
+// (dosconcurrency) The DOS per-instance registry (kernel/dos/dosinst.c) keys
+// guest state by the hosting pid. A Ring-3 /APPS/DOSUSER process hosts exactly
+// ONE guest and is already address-space isolated, so a stable nonzero key is
+// the correct identity here: register/lookup round-trip to this process's single
+// g_dos. dos_cur() therefore resolves to g_dos, exactly as before.
+uint32_t proc_current_pid(void) { return 1; }
 
 void spinlock_init_named(spinlock_t *lock, const char *name) {
     (void)name; if (lock) (void)sync_slot(lock);
@@ -705,8 +758,53 @@ volatile int g_dos_scancode_tap = 0;    // written by the DOS layer on focus edg
 int  dos_scancode_get(void)   { return kb_scancode_get(); }
 void dos_scancode_clear(void) { kb_scancode_clear(); }
 
+// (#dosmouse) THE DOS MOUSE, AND THE ONE LINK THAT WAS NEVER MADE.
+//
+// dosexec.c is compiled byte-identically into both DOS paths and reads the
+// host cursor through these three globals (kernel/dos/dosexec.c:760-762),
+// once per interpreter slice in dos_pump_input(). In Ring 0 they are the live
+// PS/2 globals from kernel/drivers/mouse.c:123, written by the mouse ISR. In
+// Ring 3 there is no ISR, so this file defines them - and, until now, NOTHING
+// EVER WROTE THEM. They stayed 0/0/0 for the life of the process.
+//
+// The whole of the reported defect follows from that: dos_pump_input() ran on
+// schedule, mapped the cursor faithfully, latched button edges correctly, and
+// did all of it on a pointer parked at the top-left corner with no buttons
+// pressed. INT 33h answered every query the guest made, consistently, with a
+// mouse that never moves. A guest cannot tell that apart from no mouse at all.
+//
+// This is the SAME SHAPE as the #fmzombie bug in ushim.c: a value written on
+// one side of the shim whose reader on the other side was never connected.
+// Here it is the mirror image - the pump thread in ushim.c had the real state
+// all along in s_mx/s_my/s_mbuttons, and its accessor kb_mouse_state() had
+// ZERO CALLERS anywhere in the tree.
+//
+// NO NEW SYSCALL IS NEEDED, and that is the point worth recording. The
+// keyboard needed one (SYS_WIN_GET_SCANCODES, 416) because raw set-1 scancodes
+// are not carried in gui_event_t and Ring 3 cannot splice the ISR. Mouse
+// position and buttons ARE carried in gui_event_t, on the ordinary per-window
+// event queue the pump already drains for focus and close. That queue is
+// already scoped by the window manager to the window each event was routed to,
+// so this path inherits the same containment the scancode gate had to be built
+// to get: a DOS guest sees the pointer only where the WM aimed it at this
+// window, and sees nothing while the pointer is elsewhere.
 int32_t mouse_x = 0, mouse_y = 0;
 uint8_t mouse_buttons = 0;
+
+// Called by the window-event pump (ushim.c) on every mouse event. ONE writer,
+// on one thread, so there is no update ordering to get wrong. It reads through
+// kb_mouse_state() rather than touching the statics in ushim.c directly: the
+// pump owns that state and kbridge.h already declares the accessor for it.
+void dosring3_mouse_publish(void) {
+    int x = 0, y = 0; unsigned int b = 0;
+    kb_mouse_state(&x, &y, &b);
+    mouse_x = (int32_t)x;
+    mouse_y = (int32_t)y;
+    // dos_pump_input() tests bit 0 (left) and bit 1 (right) and ignores the
+    // rest; mask here so a future middle or extra button cannot reach the
+    // guest as a phantom right-click.
+    mouse_buttons = (uint8_t)(b & 0x03u);
+}
 
 uint32_t keyboard_get_modifiers(void) { return kb_key_modifiers(); }
 
@@ -785,6 +883,11 @@ int win16_host_content_rect(int slot, int *ox, int *oy, int *ow, int *oh) {
 }
 int win16_host_work_area(int *ox, int *oy, int *ow, int *oh) {
     return kb_win_work_area(ox, oy, ow, oh);
+}
+// (dosfullscreen) Route the DOS host slot to the native-fullscreen bypass.
+int win16_host_fullscreen_toggle(int slot) {
+    if (slot < 0 || slot >= HOSTWIN_MAX || !g_hw[slot].used) return -1;
+    return kb_win_fullscreen_toggle(g_hw[slot].handle);
 }
 void win16_host_route_close_to_dos(int slot) { (void)slot; }
 

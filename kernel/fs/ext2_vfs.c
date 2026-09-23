@@ -142,6 +142,26 @@ file_t *ext2_vfs_open(const char *path, int flags) {
     if (!v) return NULL;
     memset(v, 0, sizeof(*v));
     { int i = 0; while (path[i] && i < 255) { v->path[i] = path[i]; i++; } v->path[i] = 0; }
+    // #745: O_CREAT|O_EXCL fails if the name already exists on ext2. Checked
+    // up front so it also covers the O_TRUNC case (which skips the read
+    // below). Returns NULL (this path cannot convey EEXIST; the syscall
+    // open() path in fdlayer.c returns -EEXIST). Atomic on this medium: the
+    // syscall body is not preempted between this test and the create.
+    if ((flags & O_CREAT) && (flags & O_EXCL) && ext2_resolve_path(path) != 0) {
+        kfree(v);
+        return NULL;
+    }
+    // FS CORRECTNESS (opencreatenoent): shell redirection ("cmd > file") reaches
+    // the ext2 backend HERE, not through fdlayer's e2fd branch, and had the same
+    // bug: an O_CREAT of a NEW file under a missing parent allocated a vfile,
+    // marked it dirty and returned a valid handle whose close-time commit then
+    // failed silently. Refuse it up front, only when actually creating (target
+    // absent). Same parent check the fdlayer path uses.
+    if ((flags & O_CREAT) && ext2_resolve_path(path) == 0 &&
+        !ext2_parent_dir_exists(path)) {
+        kfree(v);
+        return NULL;
+    }
     v->writable = (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)) ? 1 : 0;
 
     if (!(flags & O_TRUNC)) {

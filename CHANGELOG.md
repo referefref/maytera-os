@@ -71,7 +71,7 @@ kernel that make that true.
 
 ### Kernel
 
-- **The kernel is single-threaded by construction, and it is now measured.**
+- **Multi-core scheduling is on, but the Big Kernel Lock still serializes almost everything, and it is now measured.**
   With multi-core scheduling on, the Big Kernel Lock is held 96% of wall clock
   at 4 vCPUs, and 85-88% of that hold time is one call site:
   `syscall_entry` takes the lock before dispatch and releases it after, so it
@@ -179,12 +179,10 @@ rather than by reading it.
 
 ### Known gaps
 
-- **Multi-core scheduling (SMP) remains implemented but off by default**
-  (`/SMPSCHED.TXT`). Even with this release's Big Kernel Lock work, enabling
-  it still costs several times the host CPU for less throughput on the
-  workloads measured, because the lock now covers a smaller region rather
-  than none. It should stay off until more of the lock's remaining footprint
-  is narrowed.
+- **Multi-core scheduling (SMP) is now on by default** (opt-out via
+  `/NOSMPSCHED.TXT`). Multiple CPUs come up and user processes are scheduled
+  across them. Scaling is still limited because the Big Kernel Lock covers a
+  large region: narrowing that lock, not toggling SMP, is the ongoing work.
 - The Ring-3 DOS/Win16 sandbox described above is real and measured, but it
   is opt-in. The in-kernel DOS interpreter, with its narrower and
   hand-maintained set of credential checks, remains the default execution

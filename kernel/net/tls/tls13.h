@@ -87,6 +87,10 @@ void x25519_shared_secret(const uint8_t *their_public,
                           const uint8_t *my_private,
                           uint8_t *shared);
 
+// X25519 known-answer self-test (ecdhkat): RFC 7748 5.2 scalar-mult + 6.1 DH
+// agreement + negatives. Returns the count of FAILED checks (0 == all good).
+int x25519_selftest(void);
+
 // =============================================================================
 // TLS 1.3 Key Derivation
 // =============================================================================

@@ -2,6 +2,7 @@
 // Implements sys_shm_create, sys_shm_map, sys_shm_unmap, sys_shm_destroy
 
 #include "shm.h"
+#include "../proc/capgate.h"   // Stage 0: handle-ownership rule
 #include "../proc/process.h"
 #include "../mm/vmm.h"
 #include "../mm/pmm.h"
@@ -143,10 +144,20 @@ int64_t sys_shm_create(size_t size, int flags) {
         return -1;
     }
 
-    // Zero the memory (important for security)
-    // We need to temporarily map it to clear it
-    // For simplicity, use kernel identity mapping if available, or map temporarily
-    void *temp_map = (void *)(phys_addr + 0xFFFF800000000000ULL);  // Kernel direct map
+    // Zero the memory (important for security).
+    //
+    // FIXED (Stage 0, capstage0): this used a Linux higher-half direct-map
+    // offset (phys_addr + 0xFFFF800000000000) that does NOT exist in
+    // MayteraOS. This kernel keeps UEFI identity mapping, so physical ==
+    // virtual in Ring 0 (CLAUDE.md: there is no PHYS_TO_VIRT macro), and the
+    // PMM hands out pages below the 2GB identity cap. The higher-half pointer
+    // was unmapped, so this memset took a kernel page fault and PANICKED on
+    // the first sys_shm_create ever made in anger. It was latent only because
+    // the two shm_create callers that exist (ipc_test, the dead
+    // compositor_client double-buffer path) are not exercised on a normal
+    // boot; the Stage 0 caphole harness is what first tripped it. Zero
+    // through the identity map instead.
+    void *temp_map = (void *)phys_addr;   // identity-mapped: phys == virt in Ring 0
     memset(temp_map, 0, size);
 
     // Initialize the region
@@ -158,8 +169,13 @@ int64_t sys_shm_create(size_t size, int flags) {
     region->ref_count = 0;
     region->mappings = NULL;
 
-    kprintf("[SHM] Created region %d: size=%lu, phys=0x%lx, creator=%u\n",
-            region->id, (uint64_t)size, phys_addr, p->pid);
+    // STAGE 0: stamp the creating thread group through the SAME normaliser the
+    // map check uses, so the stamp and the check cannot drift.
+    region->creator_tgid = capgate_tgid_of_rs(p->pid, p->tgid);
+
+    kprintf("[SHM] Created region %d: size=%lu, phys=0x%lx, creator=%u tgid=%u\n",
+            region->id, (uint64_t)size, phys_addr, p->pid,
+            (unsigned)region->creator_tgid);
 
     return region->id;
 }
@@ -184,6 +200,46 @@ int64_t sys_shm_map(int id, void **addr) {
         kprintf("[SHM] ERROR: sys_shm_map - region %d is not allocated\n", id);
         return -1;
     }
+
+    // ======================================================================
+    // STAGE 0 DEFECT 4 (docs/SYSTEM_CAPABILITY_API.md 1.7, section 12)
+    // ======================================================================
+    // OWNERSHIP. Before this, sys_shm_map() checked range, not-free,
+    // not-already-mapped-by-me and SHM_FLAG_EXCLUSIVE, and NOTHING ELSE. There
+    // was no credential check of any kind, so any Ring-3 process could map any
+    // allocated region 0..63 and READ ANOTHER PROCESS'S MEMORY, and write it
+    // too unless SHM_FLAG_READONLY was set (which only downgrades non-creators
+    // to VMM_USER_RO). A 64-entry table is a loop, not a guess. That is a
+    // straightforward cross-process memory-read primitive, which is why it is
+    // in Stage 0 and not behind a later capability.
+    //
+    // WHY CREATOR-ONLY IS THE RIGHT RULE TODAY, AND WHAT IT WOULD COST IF IT
+    // WERE NOT. Complete census of sys_shm_map() callers in the tree:
+    //   userland/libc/compositor_client.c:283,447  window backing buffers
+    //   userland/apps/ipc_test/main.c:24           the IPC demo
+    // BOTH create the region and then map it THEMSELVES, in the same process.
+    // The compositor never maps a client's region: `shm_id` appears nowhere in
+    // userland/apps/compositor/. So there is no cross-process mapper in this
+    // system today, and a creator-group rule breaks nothing that exists.
+    //
+    // NO SHARE LIST IS ADDED HERE, ON PURPOSE. The design sketched "an explicit
+    // share list for the legitimate cross-process cases"; the census above says
+    // there are none. Principle 7 of that document is that a capability with no
+    // consumer becomes fiction, and this tree has the receipts: SVC_PERM_NET
+    // and SVC_PERM_INPUT were defined, parsed, granted, printed and never
+    // checked. When a real cross-process consumer appears, the share list is a
+    // small addition to THIS function with a caller to justify it.
+    //
+    // A region whose creator_pid is 0 (kernel-created, or a slot allocated but
+    // not yet stamped) is refused to every Ring-3 caller by capgate, so the
+    // default is closed rather than open.
+    if (!capgate_caller_owns(region->creator_pid, region->creator_tgid)) {
+        capgate_note_refusal_rs(CAPGATE_K_SHM_OWNER);
+        kprintf("[SHM] DENY: pid %u may not map region %d (creator %u)\n",
+                p->pid, id, (unsigned)region->creator_pid);
+        return -1;
+    }
+    capgate_note_allowed_rs(CAPGATE_K_SHM_OWNER);
 
     // Check if already mapped by this process
     if (shm_find_mapping(region, p->pid)) {

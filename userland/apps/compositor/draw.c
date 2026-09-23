@@ -13,6 +13,7 @@
 // not the kernel's -mno-sse target, see the design doc section 11.
 #include "../../libc/math.h"
 #include "../../libc/dock_opacity.h"   // #132: shared DOCK_OPACITY_MIN/MAX/DEFAULT/WARN
+#include "wallpaper_anim.h"           // #emfield: WPANIM_OFF for the glass recompute tune
 
 // ============================================================================
 // 8x16 bitmap font (ASCII 32-126)
@@ -1139,6 +1140,11 @@ int text_width_large(const char *text, int scale)
 #define GLASS_BLUR_SKIP_ABOVE   96     // above this opacity the backdrop swings
                                        // only 10/255: skip the blur entirely
 #define GLASS_MIN_RECOMPUTE_MS  100    // at most 10 recomputes/second per surface
+// #emfield: when an animated wallpaper mode is active the desktop backdrop is
+// swirling at WPANIM_FRAME_MIN_MS (50ms) in wallpaper.c; let tier-1 desktop
+// glass recompute at that same cadence so it tracks the swirl instead of
+// lagging by up to 100ms. Keep this in step with WPANIM_FRAME_MIN_MS.
+#define GLASS_ANIM_RECOMPUTE_MS 50
 #define GLASS_DIM_MIX           22     // readable_ink_dim mix on glass (vs 35 opaque)
 
 // The user preference (percent OPAQUE), NOT a theme key.
@@ -1262,12 +1268,15 @@ static glass_surface_t g_glass[GLASS_SURF_COUNT] = {
     { g_glass_modal, GLASS_MODAL_PX, 0,0,0,0, 0,0,0,0,0, 0, 1, 0,0,0, 0 },
 };
 
+static void glass_backdrop_invalidate(void);   // (cfglass) defined with the backdrop plane below
+
 void glass_invalidate_all(void)
 {
     for (int i = 0; i < GLASS_SURF_COUNT; i++) {
         g_glass[i].valid = 0;
         g_glass[i].tier  = 1;
     }
+    glass_backdrop_invalidate();
 }
 
 int glass_perf_get(int surf, uint32_t *cold_n, uint32_t *cold_ms,
@@ -1318,8 +1327,11 @@ static uint32_t glass_sig(int32_t sx0, int32_t sy0, int32_t sw, int32_t sh)
 }
 
 // --- step 2: downsample x4 into three uint16 planes -----------------------
+// (cfglass) Takes the destination planes explicitly so the whole-screen
+// backdrop plane below can share it; the per-surface path passes g_gs_*.
 static void glass_downsample(int32_t sx0, int32_t sy0, int32_t sw, int32_t sh,
-                             int32_t dw, int32_t dh)
+                             int32_t dw, int32_t dh,
+                             uint16_t *pr, uint16_t *pg, uint16_t *pb)
 {
     for (int32_t by = 0; by < dh; by++) {
         int32_t y0 = by * GLASS_DS, y1 = y0 + GLASS_DS;
@@ -1340,15 +1352,15 @@ static void glass_downsample(int32_t sx0, int32_t sy0, int32_t sw, int32_t sh,
             n = (uint32_t)((y1 - y0) * (x1 - x0));
             int32_t i = by * dw + bx;
             if (n == 16) {                    // the overwhelmingly common case
-                g_gs_r[i] = (uint16_t)(ar >> 4);
-                g_gs_g[i] = (uint16_t)(ag >> 4);
-                g_gs_b[i] = (uint16_t)(ab >> 4);
+                pr[i] = (uint16_t)(ar >> 4);
+                pg[i] = (uint16_t)(ag >> 4);
+                pb[i] = (uint16_t)(ab >> 4);
             } else if (n) {
-                g_gs_r[i] = (uint16_t)(ar / n);
-                g_gs_g[i] = (uint16_t)(ag / n);
-                g_gs_b[i] = (uint16_t)(ab / n);
+                pr[i] = (uint16_t)(ar / n);
+                pg[i] = (uint16_t)(ag / n);
+                pb[i] = (uint16_t)(ab / n);
             } else {
-                g_gs_r[i] = g_gs_g[i] = g_gs_b[i] = 0;
+                pr[i] = pg[i] = pb[i] = 0;
             }
         }
     }
@@ -1393,11 +1405,13 @@ static void glass_box_v(const uint16_t *src, uint16_t *dst, int32_t dw, int32_t 
     }
 }
 
-static void glass_blur_plane(uint16_t *plane, int32_t dw, int32_t dh)
+// (cfglass) `tmp` must hold dw*dh cells; the per-surface path passes g_gs_t,
+// the whole-screen backdrop plane passes its own larger ping-pong buffer.
+static void glass_blur_plane(uint16_t *plane, uint16_t *tmp, int32_t dw, int32_t dh)
 {
     for (int p = 0; p < GLASS_PASSES; p++) {
-        glass_box_h(plane, g_gs_t, dw, dh);
-        glass_box_v(g_gs_t, plane, dw, dh);
+        glass_box_h(plane, tmp, dw, dh);
+        glass_box_v(tmp, plane, dw, dh);
     }
 }
 
@@ -1573,7 +1587,21 @@ void glass_render(int32_t x, int32_t y, int32_t w, int32_t h,
     }
 
     uint32_t sig = glass_sig(sx0, sy0, sw, sh);
-    if (geom_same && sig == s->sig) {       // backdrop genuinely unchanged
+    // #glassdyn: glass_sig samples only ~1/64 of the source pixels. Over a
+    // STATIC wallpaper that is the right "did anything move" test and skips a
+    // needless recompute. Over an ANIMATED wallpaper it is WRONG: a subtle or
+    // localised field (EMFIELD away from a window; any slow-evolving mode)
+    // changes real pixels the sparse grid never samples, so sig stays equal and
+    // this early-return pins the frosted surface to a stale strip built from
+    // whatever g_fb held when it was last recomputed - the reported "glass
+    // shows the STATIC wallpaper blurred" bug. When a mode is active, DO NOT
+    // trust the sparse change-detect: fall through to the interval gate below
+    // (already GLASS_ANIM_RECOMPUTE_MS = 50ms for anim; tier 2 still throttled)
+    // and recompute every animated frame from the LIVE g_fb. Non-blocking and
+    // within the existing per-surface budget - the full-frame path that draws
+    // the animated wallpaper already runs this frame (g_glass_live == 1 here).
+    int wp_anim_on = (get_wallpaper_anim() != WPANIM_OFF);
+    if (geom_same && !wp_anim_on && sig == s->sig) {   // static backdrop unchanged
         s->hit_n++;
         glass_blit(s);
         return;
@@ -1586,8 +1614,16 @@ void glass_render(int32_t x, int32_t y, int32_t w, int32_t h,
     // Tier 2 (auto-downgraded) uses a 50x longer interval, so a slow machine
     // gets a flat-costed panel rather than a slow desktop.
     uint64_t now = uptime_ms();
+    // #emfield/#glassdyn: over an animated desktop the sparse-sig skip above is
+    // bypassed (see wp_anim_on), so this interval is the sole rate limit - a
+    // tier-1 surface recomputes every GLASS_ANIM_RECOMPUTE_MS (50ms) to track
+    // the swirl. Over a static wallpaper the sparse-sig skip still absorbs the
+    // no-change case and this 100ms floor bounds the rest. Tier 2 (measured
+    // over budget) keeps the long interval - the perf floor wins.
+    uint64_t base_iv = wp_anim_on
+                       ? (uint64_t)GLASS_ANIM_RECOMPUTE_MS : GLASS_MIN_RECOMPUTE_MS;
     uint64_t interval = (s->tier >= 2) ? (GLASS_MIN_RECOMPUTE_MS * 50)
-                                       : GLASS_MIN_RECOMPUTE_MS;
+                                       : base_iv;
     if (geom_same && s->last_ms != 0 && (now - s->last_ms) < interval) {
         s->hit_n++;
         glass_blit(s);
@@ -1598,10 +1634,10 @@ void glass_render(int32_t x, int32_t y, int32_t w, int32_t h,
     s->x = x; s->y = y; s->w = w; s->h = h;
     s->tint = tint; s->alpha = alpha;
 
-    glass_downsample(sx0, sy0, sw, sh, dw, dh);
-    glass_blur_plane(g_gs_r, dw, dh);
-    glass_blur_plane(g_gs_g, dw, dh);
-    glass_blur_plane(g_gs_b, dw, dh);
+    glass_downsample(sx0, sy0, sw, sh, dw, dh, g_gs_r, g_gs_g, g_gs_b);
+    glass_blur_plane(g_gs_r, g_gs_t, dw, dh);
+    glass_blur_plane(g_gs_g, g_gs_t, dw, dh);
+    glass_blur_plane(g_gs_b, g_gs_t, dw, dh);
     glass_tint_into(s, sx0, sy0, dw, dh, tint, alpha);
 
     uint64_t took = uptime_ms() - now;
@@ -1621,6 +1657,274 @@ void glass_render(int32_t x, int32_t y, int32_t w, int32_t h,
         s->tier = 2;
 
     glass_blit(s);
+}
+
+// ============================================================================
+// (cfglass) THE SHARED BACKDROP PLANE: one blur, N tints.
+//
+// glass_render() above caches one ALREADY-TINTED strip per fixed slot, which
+// is the right shape for four chrome surfaces that each have one geometry
+// and one tint. The Cardfile deck (cardfile_glass.c) is a different shape:
+// a VARIABLE number of translucent panes (rail + N stowed edges + N tab
+// plates + open-card frame + group-pane frames + a popup), every one with
+// its own card-colour tint and its own depth dim, all standing on the SAME
+// backdrop. Feeding that through four fixed slots would thrash them every
+// frame (docs/CARDFILE_ARCHITECTURE.md 2b), and a per-surface LRU keyed on
+// (geometry, tint) would still recompute the SAME blur once per pane.
+//
+// The split that removes the problem: the expensive part (downsample + blur)
+// depends only on the backdrop, so it is done ONCE, for the whole screen, at
+// 1/4 scale, into three uint16 planes kept here; the cheap part (bilinear
+// upscale + tint + sheen + dim) is done PER SURFACE at blit time straight
+// into g_fb. No surface owns a slot; any number of them can be tinted from
+// the one plane; nothing thrashes. The rules glass_render() lives by apply
+// unchanged:
+//   - g_fb is read ONLY under g_glass_live (a full frame). A clipped pass
+//     tints from the plane the last full frame built; if there is none,
+//     the caller gets 0 back and falls back to a flat tint for that frame.
+//   - a sparse signature over the screen skips the recompute when nothing
+//     behind the chrome moved; a 100ms rate limit bounds the worst case; a
+//     measured over-budget recompute downgrades to the 5s tier-2 interval.
+// Cost: the plane is 1920x1080/16 = 129600 cells, about 3.7x the per-surface
+// worst case, so its downgrade threshold is scaled by the same factor. Memory
+// is 4 planes x 129600 x 2 bytes = 1.0 MB of .bss (the four tinted strips
+// above already total 4.8 MB, so this is in keeping).
+//
+// The blur is the same 3-pass box at r=3 as glass_render() (sigma 14px, the
+// spec's "blur(14px)"); the spec's 150-160% saturate() is applied to the
+// blurred planes once (glass_bd_saturate), never per pixel at blit time.
+// ============================================================================
+#define GLASS_BD_W        (MAX_SCREEN_W / GLASS_DS)    // 480
+#define GLASS_BD_H        (MAX_SCREEN_H / GLASS_DS)    // 270
+#define GLASS_BD_CELLS    (GLASS_BD_W * GLASS_BD_H)    // 129600
+#define GLASS_BD_DOWNGRADE_MULT 4                      // 129600 / 35424 rounded up
+
+static uint16_t g_bd_r[GLASS_BD_CELLS];
+static uint16_t g_bd_g[GLASS_BD_CELLS];
+static uint16_t g_bd_b[GLASS_BD_CELLS];
+static uint16_t g_bd_t[GLASS_BD_CELLS];               // ping-pong temp
+
+static struct {
+    int       valid;
+    int32_t   dw, dh;          // plane geometry (cells)
+    int       sat;             // saturation percent the plane was built with
+    uint32_t  sig;
+    uint64_t  last_ms;
+    int       tier;            // 1 = live, 2 = downgraded (5s interval)
+    uint32_t  cold_n, cold_ms, cold_worst, hit_n;
+} g_bd = { 0, 0, 0, 100, 0, 0, 1, 0, 0, 0, 0 };
+
+static void glass_backdrop_invalidate(void)
+{
+    g_bd.valid = 0;
+    g_bd.tier  = 1;
+}
+
+// c' = lum + (c - lum) * sat/100, clamped: the CSS saturate() matrix reduced
+// to its per-channel form, Rec.601 luma weights in 8.8 fixed point.
+static void glass_bd_saturate(int32_t cells, int sat_pct)
+{
+    for (int32_t i = 0; i < cells; i++) {
+        int32_t r = g_bd_r[i], g = g_bd_g[i], b = g_bd_b[i];
+        int32_t lum = (77 * r + 150 * g + 29 * b) >> 8;
+        r = lum + ((r - lum) * sat_pct) / 100;
+        g = lum + ((g - lum) * sat_pct) / 100;
+        b = lum + ((b - lum) * sat_pct) / 100;
+        if (r < 0) r = 0;
+        if (r > 255) r = 255;
+        if (g < 0) g = 0;
+        if (g > 255) g = 255;
+        if (b < 0) b = 0;
+        if (b > 255) b = 255;
+        g_bd_r[i] = (uint16_t)r; g_bd_g[i] = (uint16_t)g; g_bd_b[i] = (uint16_t)b;
+    }
+}
+
+int glass_backdrop_prepare(int sat_pct)
+{
+    if (sat_pct < 100) sat_pct = 100;
+    if (sat_pct > 300) sat_pct = 300;
+    int32_t sw = g_fb_width, sh = g_fb_height;
+    if (sw <= 0 || sh <= 0) return 0;
+    int32_t dw = (sw + GLASS_DS - 1) / GLASS_DS;
+    int32_t dh = (sh + GLASS_DS - 1) / GLASS_DS;
+    if (dw < 2) dw = 2;
+    if (dh < 2) dh = 2;
+    if (dw > GLASS_BD_W || dw * dh > GLASS_BD_CELLS) { g_bd.valid = 0; return 0; }
+
+    int geom_same = (g_bd.valid && g_bd.dw == dw && g_bd.dh == dh && g_bd.sat == sat_pct);
+
+    // THE HARD RULE (see glass_render): every g_fb read is inside this branch.
+    if (!g_glass_live) {
+        if (geom_same) g_bd.hit_n++;
+        return geom_same;
+    }
+
+    uint32_t sig = glass_sig(0, 0, sw, sh);
+    // #glassdyn: see glass_render() - the sparse sig cannot be trusted to detect
+    // a subtle/localised animated backdrop, so skip the change-detect while a
+    // mode is active and let the interval gate recompute every animated frame.
+    int wp_anim_on = (get_wallpaper_anim() != WPANIM_OFF);
+    if (geom_same && !wp_anim_on && sig == g_bd.sig) { g_bd.hit_n++; return 1; }
+
+    uint64_t now = uptime_ms();
+    // #emfield/#glassdyn: same animated-desktop tune as glass_render() above.
+    uint64_t bd_base_iv = wp_anim_on
+                          ? (uint64_t)GLASS_ANIM_RECOMPUTE_MS : GLASS_MIN_RECOMPUTE_MS;
+    uint64_t interval = (g_bd.tier >= 2) ? (GLASS_MIN_RECOMPUTE_MS * 50)
+                                         : bd_base_iv;
+    if (geom_same && g_bd.last_ms != 0 && (now - g_bd.last_ms) < interval) {
+        g_bd.hit_n++;
+        return 1;
+    }
+
+    // ---- cold recompute: whole screen, 1/4 scale, blurred, saturated -------
+    glass_downsample(0, 0, sw, sh, dw, dh, g_bd_r, g_bd_g, g_bd_b);
+    glass_blur_plane(g_bd_r, g_bd_t, dw, dh);
+    glass_blur_plane(g_bd_g, g_bd_t, dw, dh);
+    glass_blur_plane(g_bd_b, g_bd_t, dw, dh);
+    if (sat_pct != 100) glass_bd_saturate(dw * dh, sat_pct);
+
+    uint64_t took = uptime_ms() - now;
+    g_bd.cold_n++;
+    g_bd.cold_ms += (uint32_t)took;
+    if ((uint32_t)took > g_bd.cold_worst) g_bd.cold_worst = (uint32_t)took;
+    if (g_bd.tier == 1 && (int)took >= g_glass_downgrade_ms * GLASS_BD_DOWNGRADE_MULT)
+        g_bd.tier = 2;
+
+    g_bd.dw = dw; g_bd.dh = dh; g_bd.sat = sat_pct;
+    g_bd.sig = sig; g_bd.last_ms = now; g_bd.valid = 1;
+    return 1;
+}
+
+int glass_backdrop_valid(void) { return g_bd.valid; }
+
+int glass_backdrop_perf_get(uint32_t *cold_n, uint32_t *cold_ms,
+                            uint32_t *cold_worst, uint32_t *hit_n, int *tier)
+{
+    if (cold_n)     *cold_n     = g_bd.cold_n;
+    if (cold_ms)    *cold_ms    = g_bd.cold_ms;
+    if (cold_worst) *cold_worst = g_bd.cold_worst;
+    if (hit_n)      *hit_n      = g_bd.hit_n;
+    if (tier)       *tier       = g_bd.tier;
+    return 1;
+}
+
+// x/255 to within one level for x in [0, 65025], no divide: (x+128)*257>>16.
+#define GLASS_DIV255(x) ((uint32_t)(((x) + 128u) * 257u) >> 16)
+
+void glass_backdrop_fill(int32_t x, int32_t y, int32_t w, int32_t h,
+                         const glass_bd_style_t *st)
+{
+    if (!st || w <= 0 || h <= 0) return;
+    int32_t alpha = st->alpha;
+    if (alpha < 0) alpha = 0;
+    if (alpha > 255) alpha = 255;
+    int32_t mul = 256 - (st->dim_x10 * 256) / 1000;      // depth dim as a 8.8 multiplier
+    if (mul < 0) mul = 0;
+    if (mul > 256) mul = 256;
+
+    int32_t x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+    if (x0 < g_clip_x0) x0 = g_clip_x0;
+    if (y0 < g_clip_y0) y0 = g_clip_y0;
+    if (x1 > g_clip_x1) x1 = g_clip_x1;
+    if (y1 > g_clip_y1) y1 = g_clip_y1;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > g_fb_width)  x1 = g_fb_width;
+    if (y1 > g_fb_height) y1 = g_fb_height;
+    if (x0 >= x1 || y0 >= y1) return;
+
+    if (!g_bd.valid) {
+        // No plane yet (first clipped pass after a theme change, or the
+        // screen is larger than the plane): the tint alone, dimmed, over
+        // whatever is behind. Still translucent, never a hole.
+        uint32_t t = st->tint;
+        uint32_t tr = (((t >> 16) & 0xFF) * (uint32_t)mul) >> 8;
+        uint32_t tg = (((t >>  8) & 0xFF) * (uint32_t)mul) >> 8;
+        uint32_t tb = (( t        & 0xFF) * (uint32_t)mul) >> 8;
+        glass_flat(x, y, w, h, 0xFF000000u | (tr << 16) | (tg << 8) | tb, alpha);
+        return;
+    }
+
+    static uint16_t rowr[GLASS_BD_W], rowg[GLASS_BD_W], rowb[GLASS_BD_W];
+    const int32_t dw = g_bd.dw, dh = g_bd.dh;
+    const uint32_t tr = (st->tint >> 16) & 0xFF, tg = (st->tint >> 8) & 0xFF, tb = st->tint & 0xFF;
+    const uint32_t ia = 255u - (uint32_t)alpha;
+
+    // Per-column plane indices for [x0, x1), same mapping as glass_tint_into
+    // (source pixel s -> plane coordinate (s - 1.5)/4, in 8.8: s*64 - 96).
+    for (int32_t ox = x0; ox < x1; ox++) {
+        int32_t pos = ox * 64 - 96;
+        int32_t q0, fx;
+        if (pos < 0) { q0 = 0; fx = 0; }
+        else { q0 = pos >> 8; fx = pos & 255; }
+        if (q0 >= dw - 1) { q0 = dw - 1; fx = 0; }
+        g_gs_q0[ox] = q0;
+        g_gs_q1[ox] = (q0 + 1 < dw) ? q0 + 1 : q0;
+        g_gs_fx[ox] = (uint8_t)fx;
+    }
+    const int32_t cq0 = g_gs_q0[x0], cq1 = g_gs_q1[x1 - 1];
+
+    for (int32_t oy = y0; oy < y1; oy++) {
+        int32_t pos = oy * 64 - 96;
+        int32_t p0, fy;
+        if (pos < 0) { p0 = 0; fy = 0; }
+        else { p0 = pos >> 8; fy = pos & 255; }
+        if (p0 >= dh - 1) { p0 = dh - 1; fy = 0; }
+        int32_t p1 = (p0 + 1 < dh) ? p0 + 1 : p0;
+        int32_t ify = 256 - fy;
+        const uint16_t *a_r = g_bd_r + p0 * dw, *b_r = g_bd_r + p1 * dw;
+        const uint16_t *a_g = g_bd_g + p0 * dw, *b_g = g_bd_g + p1 * dw;
+        const uint16_t *a_b = g_bd_b + p0 * dw, *b_b = g_bd_b + p1 * dw;
+        for (int32_t i = cq0; i <= cq1; i++) {
+            rowr[i] = (uint16_t)(((uint32_t)a_r[i] * ify + (uint32_t)b_r[i] * fy) >> 8);
+            rowg[i] = (uint16_t)(((uint32_t)a_g[i] * ify + (uint32_t)b_g[i] * fy) >> 8);
+            rowb[i] = (uint16_t)(((uint32_t)a_b[i] * ify + (uint32_t)b_b[i] * fy) >> 8);
+        }
+
+        // Vertical sheen: one alpha for the whole row.
+        int32_t sa_row = 0;
+        if (st->sheen_a > 0 && st->sheen_vert) {
+            int32_t d = oy - st->sheen_org;
+            if (d < 0) d = 0;
+            if (st->sheen_len > 0 && d < st->sheen_len)
+                sa_row = st->sheen_a * (st->sheen_len - d) / st->sheen_len;
+        }
+
+        uint32_t *dst = g_fb + (int32_t)oy * g_fb_pitch;
+        for (int32_t ox = x0; ox < x1; ox++) {
+            int32_t q0 = g_gs_q0[ox], q1 = g_gs_q1[ox];
+            uint32_t fx = g_gs_fx[ox], ifx = 256u - fx;
+            uint32_t r = ((uint32_t)rowr[q0] * ifx + (uint32_t)rowr[q1] * fx) >> 8;
+            uint32_t g = ((uint32_t)rowg[q0] * ifx + (uint32_t)rowg[q1] * fx) >> 8;
+            uint32_t b = ((uint32_t)rowb[q0] * ifx + (uint32_t)rowb[q1] * fx) >> 8;
+            // tint OVER the blurred backdrop
+            r = GLASS_DIV255(tr * (uint32_t)alpha + r * ia);
+            g = GLASS_DIV255(tg * (uint32_t)alpha + g * ia);
+            b = GLASS_DIV255(tb * (uint32_t)alpha + b * ia);
+            // sheen: white over the tinted pane, fading from its origin edge
+            int32_t sa = sa_row;
+            if (st->sheen_a > 0 && !st->sheen_vert) {
+                int32_t d = ox - st->sheen_org;
+                if (d < 0) d = 0;
+                sa = (st->sheen_len > 0 && d < st->sheen_len)
+                     ? st->sheen_a * (st->sheen_len - d) / st->sheen_len : 0;
+            }
+            if (sa > 0) {
+                r += ((255u - r) * (uint32_t)sa) >> 8;
+                g += ((255u - g) * (uint32_t)sa) >> 8;
+                b += ((255u - b) * (uint32_t)sa) >> 8;
+            }
+            // depth dim: the whole finished pane steps back
+            if (mul != 256) {
+                r = (r * (uint32_t)mul) >> 8;
+                g = (g * (uint32_t)mul) >> 8;
+                b = (b * (uint32_t)mul) >> 8;
+            }
+            dst[ox] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
 }
 
 // ============================================================================

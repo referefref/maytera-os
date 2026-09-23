@@ -287,6 +287,12 @@ void vmm_destroy_user_space(uint64_t pml4_phys);
 
 // Map a page in a specific address space (not necessarily current)
 int vmm_map_page_in(uint64_t pml4_phys, uint64_t virt_addr, uint64_t phys_addr, uint64_t flags);
+// #305 immutable security core (Stage 5A): make a single kernel 4KB page RO/RW
+// (splits a containing huge page, does the CR0.WP dance kernel page tables need).
+int vmm_protect_kernel_page(uint64_t virt_addr, int writable);
+// #305 (Stage 5A): make a kernel virtual RANGE RO/RW in one WP window + one
+// shootdown (used to seal the enforcement code, kernel .text, read-only).
+int vmm_protect_kernel_range(uint64_t start, uint64_t end, int writable);
 
 // Unmap a page in a specific address space
 void vmm_unmap_page_in(uint64_t pml4_phys, uint64_t virt_addr);

@@ -1,0 +1,60 @@
+# mports recipe: worm, from the bsd-games 2.17 collection (tuigames batch,
+# owner request 2026-09-18). BSD-3-Clause, dependency closure 1 (ncurses).
+# Shares the bsdgames_2.17.orig.tar.gz tarball with hangman/robots/snake/
+# bsdtetris; see userland/ports/hangman/PORT for the full provenance note on
+# why this specific tarball/URL is used instead of NetBSD src directly.
+#
+# WHAT THIS PORT SHIPS. Michael Toy's classic worm/snake-style game: the
+# worm eats numbered prizes on screen and grows one segment per digit. ONE
+# translation unit (worm.c), curses-driven, no scorefile, no dictionary, no
+# runtime data at all - the simplest of the five bsd-games ports in this
+# batch.
+
+name=worm
+version=2.17
+class=C
+homepage=https://tracker.debian.org/pkg/bsdgames
+
+source_url=https://snapshot.debian.org/file/8e48a9808908e2898126fdd285196ab71c9a59c0
+tarball=bsdgames_2.17.orig.tar.gz
+sha256=066f924aef6c1c5ea946f588e36f303021f5dfc093944738f025d8edbc6fff60
+srcdir=bsd-games-2.17/worm
+
+licence=BSD-3-Clause
+licence_files=../COPYING
+copyleft=none
+copyleft_note=BSD-3-Clause is permissive; the combined /APPS/WORM binary (this port + ncurses + userland/libc, all permissive) carries no copyleft obligation.
+
+# THE ADOPTION TEST (owner rule 2): USES. worm.c is one ordinary Ring-3
+# translation unit driven by ncurses screen/input plus libc signal/alarm.
+# Measured: the 2 objects (worm.c + our bsdgame_compat.c) link against
+# libncurses.a + userland/libc/libc.a with zero undefined symbols. It calls
+# getch() itself in its own main loop and owns its own alarm(1)-driven game
+# tick (SIGALRM -> wake()); it imposes no event loop or window system on
+# anything else.
+adoption=USES. Measured: the 2 compiled objects (worm.c plus our bsdgame_compat.c) link against the built libncurses.a + userland/libc/libc.a with zero undefined symbols. worm owns its own alarm(1)/SIGALRM-driven game tick and calls getch() itself; it imposes no event loop or window system on any other program.
+needs=libc ncurses
+
+prepare=none
+
+# ONE PATCH: worm.c drops setgid privileges upstream expected to have
+# (4.3BSD score files were group-games); MayteraOS has no such privilege
+# separation and no scorefile for this game, so the call is removed rather
+# than stubbed, matching the same one-line change applied to hangman/main.c
+# and (for the same reason) to every other bsd-games port in this batch that
+# has it.
+patches=0001-worm-no-setgid.patch
+
+# build=script: adds our own bsdgame_compat.c (err/warn/random - see
+# userland/ports/hangman/PORT for why that needs build=script rather than
+# sources=). No pathnames.h is needed: worm.c hardcodes no _PATH_* macro.
+build=script
+
+headers=none
+lib=libworm.a
+
+# THE ANTI-NO-OP CHECK: main (worm.c) and err (bsdgame_compat.c, ours). Two
+# symbols is thin because this is genuinely a one-file upstream program;
+# nm cannot mistake an empty archive or a mis-patched worm.c for a real build
+# because main would then be missing.
+symbols=main err

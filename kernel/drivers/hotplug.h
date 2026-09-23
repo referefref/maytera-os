@@ -236,6 +236,13 @@ fat_fs_t *hotplug_volume_fat(int index);
 // device it is safe to remove. Returns 0 on success.
 int hotplug_eject_slot(int index);
 
+// #708: how many open file handles a removable volume still has. The AI
+// safe-eject executor consults this (via SYS_VOL_BUSY) to REFUSE, not force, an
+// eject of a busy volume; a user-driven Files/tray eject via hotplug_eject_slot()
+// force-invalidates instead (#250). Implemented in proc/fdlayer.c, which owns
+// the legacy fd table. 0 = not busy (also for a non-readable/image/empty slot).
+int hotplug_vol_busy(int index);
+
 // =============================================================================
 // Debugging
 // =============================================================================

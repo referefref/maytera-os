@@ -604,3 +604,65 @@ void aes_rust_selftest(void) {
                       (unsigned long long)(ratio100 / 100), (unsigned long long)(ratio100 % 100));
     }
 }
+
+// ===========================================================================
+// AES-CMAC (RFC 4493), AES-128. Standard MSB-first ("big-endian") byte order:
+// key, message and mac are plain octet strings as in the RFC. Callers that use
+// a little-endian convention (e.g. Bluetooth SMP LE Secure Connections f4/f5/
+// f6/g2) must swap around this, exactly as bt/pair.c does.
+// Added for #372 (btlesc): the SMP LESC crypto functions are all AES-CMAC based
+// and no CMAC existed in the tree. C (not Rust) because it is a thin wrapper on
+// the existing C AES block cipher and lives beside it; no float, no hot path.
+// ===========================================================================
+static void cmac_shl1(const uint8_t in[16], uint8_t out[16]) {
+    uint8_t carry = 0;
+    for (int i = 15; i >= 0; i--) {
+        uint8_t next = (uint8_t)((in[i] << 1) | carry);
+        carry = (uint8_t)((in[i] & 0x80) ? 1 : 0);
+        out[i] = next;
+    }
+}
+
+void aes_cmac(const uint8_t key[16], const uint8_t *msg, size_t msg_len,
+              uint8_t mac[16]) {
+    aes_ctx_t ctx;
+    aes_set_encrypt_key(&ctx, key, 128);
+
+    // Subkey generation (RFC 4493 6.1).
+    uint8_t zero[16], L[16], K1[16], K2[16];
+    memset(zero, 0, 16);
+    aes_encrypt_block(&ctx, zero, L);
+    cmac_shl1(L, K1);
+    if (L[0] & 0x80) K1[15] ^= 0x87;
+    cmac_shl1(K1, K2);
+    if (K1[0] & 0x80) K2[15] ^= 0x87;
+
+    // Number of blocks and whether the final block is complete (RFC 4493 6.2).
+    size_t n = (msg_len + 15) / 16;
+    int last_complete;
+    if (n == 0) { n = 1; last_complete = 0; }
+    else last_complete = ((msg_len % 16) == 0);
+
+    uint8_t m_last[16];
+    if (last_complete) {
+        for (int i = 0; i < 16; i++) m_last[i] = (uint8_t)(msg[16 * (n - 1) + i] ^ K1[i]);
+    } else {
+        size_t rem = msg_len % 16;   // rem == 0 when msg_len == 0
+        for (size_t i = 0; i < 16; i++) {
+            uint8_t b;
+            if (i < rem)       b = msg[16 * (n - 1) + i];
+            else if (i == rem) b = 0x80;
+            else               b = 0x00;
+            m_last[i] = (uint8_t)(b ^ K2[i]);
+        }
+    }
+
+    uint8_t x[16], y[16];
+    memset(x, 0, 16);
+    for (size_t i = 0; i + 1 < n; i++) {
+        for (int j = 0; j < 16; j++) y[j] = (uint8_t)(x[j] ^ msg[16 * i + j]);
+        aes_encrypt_block(&ctx, y, x);
+    }
+    for (int j = 0; j < 16; j++) y[j] = (uint8_t)(x[j] ^ m_last[j]);
+    aes_encrypt_block(&ctx, y, mac);
+}

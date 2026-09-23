@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- MayteraOS Writer toolbar icon: redo. Original artwork (GPLv2, same as the OS).
+       Authored on a 16-cell pixel grid, 1-cell stroke; the group maps cell k to
+       0.75 + 1.5k so the stroke is 1.5 viewBox units. White on transparent: the
+       toolbar tints it (draw_mico luminance-as-coverage). -->
+  <g transform="translate(0.75 0.75) scale(1.5)" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M10.5 3L14 6.5 10.5 10"/>
+    <path d="M14 6.5H6.5a3.5 3.5 0 0 0 0 7H11"/>
+  </g>
+</svg>

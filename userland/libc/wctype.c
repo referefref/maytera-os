@@ -14,6 +14,45 @@
 #include "ctype.h"
 #include <stddef.h>
 
+// #portstack: these are provided by libc for general use, but a port that
+// ships its own (e.g. the CPython wsupp compat layer) must win at its own
+// link. Marking them weak lets a strong app/port definition override, while
+// libc still serves every app that has none. Fixes CPython relink dup-symbols.
+#pragma weak iswalnum
+#pragma weak iswalpha
+#pragma weak iswblank
+#pragma weak iswcntrl
+#pragma weak iswctype
+#pragma weak iswdigit
+#pragma weak iswgraph
+#pragma weak iswlower
+#pragma weak iswprint
+#pragma weak iswpunct
+#pragma weak iswspace
+#pragma weak iswupper
+#pragma weak iswxdigit
+#pragma weak mbrtowc
+#pragma weak mbsrtowcs
+#pragma weak mbstowcs
+#pragma weak towlower
+#pragma weak towupper
+#pragma weak wcrtomb
+#pragma weak wcschr
+#pragma weak wcscmp
+#pragma weak wcscpy
+#pragma weak wcscspn
+#pragma weak wcslen
+#pragma weak wcsncat
+#pragma weak wcsncmp
+#pragma weak wcsncpy
+#pragma weak wcsstr
+#pragma weak wcstol
+#pragma weak wcstombs
+#pragma weak wctob
+#pragma weak wctype
+#pragma weak wmemcpy
+
+
 int mbtowc(wchar_t *pwc, const char *s, size_t n)
 {
 	// POSIX: a NULL s means "is the encoding state-dependent"; ours is not.
@@ -184,4 +223,195 @@ int iswctype(wint_t c, wctype_t type)
 	case 12: return iswxdigit(c);
 	default: return 0;
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Wide string/conversion helpers added for the libedit port (#745). Every one
+// obeys the byte-transparent C-locale model from wchar.h: a wchar_t in
+// 0x00..0xFF is exactly the byte, and nothing above 0xFF is representable as a
+// multibyte character. These were absent when musl-regex first needed a wide
+// layer (it used only the classification set above); libedit is the first
+// consumer of the string/conversion half, so it is added here once, not forked.
+// ---------------------------------------------------------------------------
+
+size_t wcstombs(char *dst, const wchar_t *src, size_t n)
+{
+	size_t i = 0;
+	for (; i < n; i++) {
+		wchar_t wc = src[i];
+		if (dst)
+			dst[i] = (char)(unsigned char)wc;
+		if (wc == 0)
+			return i;   // POSIX: the terminating null is not counted
+	}
+	return i;
+}
+
+size_t mbstowcs(wchar_t *dst, const char *src, size_t n)
+{
+	size_t i = 0;
+	for (; i < n; i++) {
+		unsigned char b = (unsigned char)src[i];
+		if (dst)
+			dst[i] = (wchar_t)b;
+		if (b == 0)
+			return i;   // terminating null not counted
+	}
+	return i;
+}
+
+size_t wcrtomb(char *s, wchar_t wc, mbstate_t *st)
+{
+	(void)st;
+	// NULL s: return the length of the reset sequence, which for a
+	// stateless encoding is that of L0, i.e. 1.
+	if (!s)
+		return 1;
+	if (wc < 0 || wc > 0xff)
+		return (size_t)-1;
+	*s = (char)(unsigned char)wc;
+	return 1;
+}
+
+int wctob(wint_t c)
+{
+	if (c == WEOF || (unsigned long)c > 0xff)
+		return -1;   // EOF
+	return (int)(unsigned char)c;
+}
+
+int wcwidth(wchar_t c)
+{
+	if (c == 0)
+		return 0;
+	if ((unsigned long)c > 0xff)
+		return -1;
+	return isprint((int)c) ? 1 : -1;
+}
+
+wchar_t *wmemcpy(wchar_t *d, const wchar_t *s, size_t n)
+{
+	for (size_t i = 0; i < n; i++)
+		d[i] = s[i];
+	return d;
+}
+
+wchar_t *wcsncpy(wchar_t *d, const wchar_t *s, size_t n)
+{
+	size_t i = 0;
+	for (; i < n && s[i]; i++)
+		d[i] = s[i];
+	for (; i < n; i++)
+		d[i] = 0;
+	return d;
+}
+
+wchar_t *wcsncat(wchar_t *d, const wchar_t *s, size_t n)
+{
+	wchar_t *r = d;
+	while (*d)
+		d++;
+	size_t i = 0;
+	for (; i < n && s[i]; i++)
+		d[i] = s[i];
+	d[i] = 0;
+	return r;
+}
+
+size_t wcscspn(const wchar_t *s, const wchar_t *reject)
+{
+	const wchar_t *p = s;
+	for (; *p; p++) {
+		const wchar_t *r;
+		for (r = reject; *r; r++)
+			if (*p == *r)
+				return (size_t)(p - s);
+	}
+	return (size_t)(p - s);
+}
+
+wchar_t *wcsstr(const wchar_t *hay, const wchar_t *needle)
+{
+	if (!*needle)
+		return (wchar_t *)hay;
+	for (; *hay; hay++) {
+		const wchar_t *h = hay, *n = needle;
+		while (*h && *n && *h == *n) {
+			h++;
+			n++;
+		}
+		if (!*n)
+			return (wchar_t *)hay;
+	}
+	return NULL;
+}
+
+
+// wcstol: the byte-transparent wide twin of strtol. Written directly rather
+// than by narrowing-then-strtol so that endptr lands inside the wide string.
+long wcstol(const wchar_t *nptr, wchar_t **endptr, int base)
+{
+	const wchar_t *p = nptr;
+	while (iswspace((wint_t)*p))
+		p++;
+	int neg = 0;
+	if (*p == (wchar_t)'+' || *p == (wchar_t)'-') {
+		neg = (*p == (wchar_t)'-');
+		p++;
+	}
+	if ((base == 0 || base == 16) && p[0] == (wchar_t)'0' &&
+	    (p[1] == (wchar_t)'x' || p[1] == (wchar_t)'X')) {
+		p += 2;
+		base = 16;
+	} else if (base == 0 && p[0] == (wchar_t)'0') {
+		base = 8;
+	} else if (base == 0) {
+		base = 10;
+	}
+	long acc = 0;
+	int any = 0;
+	for (;; p++) {
+		int d;
+		wchar_t c = *p;
+		if (c >= (wchar_t)'0' && c <= (wchar_t)'9')
+			d = (int)(c - (wchar_t)'0');
+		else if (c >= (wchar_t)'a' && c <= (wchar_t)'z')
+			d = (int)(c - (wchar_t)'a') + 10;
+		else if (c >= (wchar_t)'A' && c <= (wchar_t)'Z')
+			d = (int)(c - (wchar_t)'A') + 10;
+		else
+			break;
+		if (d >= base)
+			break;
+		acc = acc * base + d;
+		any = 1;
+	}
+	if (endptr)
+		*endptr = (wchar_t *)(any ? p : nptr);
+	return neg ? -acc : acc;
+}
+
+// mbsrtowcs: byte-transparent restartable multibyte->wide conversion, added
+// for the libedit port (#745). One byte is one wide character (see wchar.h).
+size_t mbsrtowcs(wchar_t *dst, const char **src, size_t len, mbstate_t *st)
+{
+	(void)st;
+	const char *s = *src;
+	size_t i = 0;
+	for (;;) {
+		if (dst && i >= len)
+			break;
+		unsigned char b = (unsigned char)*s;
+		if (dst)
+			dst[i] = (wchar_t)b;
+		if (b == 0) {
+			if (dst)
+				*src = (const char *)0;
+			return i;   // terminating null not counted
+		}
+		i++;
+		s++;
+	}
+	*src = s;   // dst full and not at end: leave *src at the next byte
+	return i;
 }

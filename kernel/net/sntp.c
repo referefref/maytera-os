@@ -361,14 +361,24 @@ int sntp_sync(const char *server, uint32_t timeout_ms, sntp_result_t *out) {
 
     if (server && server[0]) return sntp_sync_one(server, timeout_ms, out);
 
-    static const char *const defaults[SNTP_DEFAULT_COUNT] = {
-        SNTP_DEFAULT_SERVER, SNTP_FALLBACK_1, SNTP_FALLBACK_2
+    // #dnsfallback: names first, then the numeric last-resort addresses. See
+    // SNTP_NUMERIC_* in sntp.h for why any resolver-free entry has to exist.
+    static const char *const defaults[SNTP_DEFAULT_COUNT + SNTP_NUMERIC_COUNT] = {
+        SNTP_DEFAULT_SERVER, SNTP_FALLBACK_1, SNTP_FALLBACK_2,
+        SNTP_NUMERIC_1, SNTP_NUMERIC_2
     };
+    const int n_named = SNTP_DEFAULT_COUNT;
+    const int n_total = SNTP_DEFAULT_COUNT + SNTP_NUMERIC_COUNT;
+    // The share is still budget/3, NOT budget/5. Adding the numeric entries
+    // must not shrink the time each server gets, because in the ordinary case
+    // (DNS works, a named server answers) they are never reached at all, and
+    // in the case where they ARE reached the skip below means at most three
+    // servers are tried anyway.
     uint32_t share = timeout_ms / SNTP_DEFAULT_COUNT;
     if (share < 1200u) share = 1200u;
 
     int last = SNTP_E_TIMEOUT;
-    for (int i = 0; i < SNTP_DEFAULT_COUNT; i++) {
+    for (int i = 0; i < n_total; i++) {
         int rc = sntp_sync_one(defaults[i], share, out);
         if (rc == SNTP_OK) return SNTP_OK;
         last = rc;
@@ -378,6 +388,13 @@ int sntp_sync(const char *server, uint32_t timeout_ms, sntp_result_t *out) {
         // moving on from.
         if (rc == SNTP_E_NOLINK || rc == SNTP_E_NONET ||
             rc == SNTP_E_BUSY   || rc == SNTP_E_SELFTEST) break;
+        // #dnsfallback: a name that would not RESOLVE is a fact about DNS, not
+        // about that server, so the remaining NAMES cannot possibly do better.
+        // Jump straight to the numeric entries. Without this the wizard would
+        // spend its whole budget failing to resolve three hostnames in a row
+        // and never reach the addresses that need no resolver - which is the
+        // exact machine this exists for.
+        if (rc == SNTP_E_RESOLVE && i < n_named - 1) i = n_named - 1;
     }
     return last;
 }

@@ -61,6 +61,7 @@ extern int32_t  gfsf_edges(uint32_t node, uint32_t dir, uint64_t now_ms,
                            gfs_edge_view_t *out, uint32_t max);
 extern int32_t  gfsf_nodes(gfs_node_view_t *out, uint32_t max);
 extern int32_t  gfsf_node_state(uint32_t node_id);
+extern uint32_t gfsf_max_local(uint32_t kind);
 extern int32_t  gfsf_stats(gfs_stats_t *out, uint64_t now_ms);
 extern void     gfsf_reset(uint64_t boot_gen, uint32_t degraded);
 extern void     gfsf_set_ready(uint32_t ready);
@@ -321,6 +322,18 @@ int gfs_nodes_list(gfs_node_view_t *out, int max) {
     if (!out || max <= 0) return GFSF_E_ARG;
     uint64_t flags = spinlock_acquire_irqsave(&g_lock);
     int r = gfsf_nodes(out, (uint32_t)max);
+    spinlock_release_irqrestore(&g_lock, flags);
+    return r;
+}
+
+// #246 cross-boot fix: the highest node `local` already taken for `kind` in the
+// fold (live OR retired). Reuses the fold's gfsf_max_local() under the same lock
+// discipline as every other query here (held only across the pure-memory Rust
+// call, never across I/O). The escrow local allocator seeds itself above this at
+// boot so a replayed prior-boot node cannot collide (GFSF_E_DUP_NODE).
+uint32_t gfs_fold_max_local(uint32_t kind) {
+    uint64_t flags = spinlock_acquire_irqsave(&g_lock);
+    uint32_t r = gfsf_max_local(kind);
     spinlock_release_irqrestore(&g_lock, flags);
     return r;
 }

@@ -33,6 +33,11 @@ static const aicap_ent_t g_caps[] = {
     { "weather.current",     "system.info",           AICAP_RISK_LOW  },
     { "storage.free",        "system.info",           AICAP_RISK_LOW  },
     { "system.storage.info", "system.info",           AICAP_RISK_LOW  },
+    // #293: read-only window enumerator so the AI can find a target 'win' handle
+    // by title/app before an injection. Titles/ids only, no injection: LOW risk,
+    // not consent-gated (still audited).
+    { "input.windows",       "system.windows.read",   AICAP_RISK_LOW  },
+    { "windows.list",        "system.windows.read",   AICAP_RISK_LOW  },
     { "settings.get",        "system.settings.read",  AICAP_RISK_LOW  },
     { "settings.get_theme",  "system.settings.read",  AICAP_RISK_LOW  },
     { "settings.open",       "process.launch",        AICAP_RISK_LOW  },
@@ -48,6 +53,14 @@ static const aicap_ent_t g_caps[] = {
     { "files.write",         "fs.write",              AICAP_RISK_HIGH },
     { "fs.delete",           "fs.delete",             AICAP_RISK_HIGH },
     { "files.delete",        "fs.delete",             AICAP_RISK_HIGH },
+    { "fs.mkdir",            "fs.mkdir",              AICAP_RISK_HIGH },
+    { "files.mkdir",         "fs.mkdir",              AICAP_RISK_HIGH },
+    { "fs.move",             "fs.move",               AICAP_RISK_HIGH },
+    { "files.move",          "fs.move",               AICAP_RISK_HIGH },
+    // #712: the high-level escrow-contract photo organiser. HIGH so the user
+    // consents once to the whole device reorganisation; the contract then mints
+    // its own scoped fs.write/move/mkdir grants (no delete) for the actual work.
+    { "photos.organize",     "app.photos.organize",   AICAP_RISK_HIGH },
     { "terminal.execute",    "app.terminal.execute",  AICAP_RISK_HIGH },
     { "python.execute",      "app.python.execute",    AICAP_RISK_HIGH },
     { "taskmanager.kill",    "system.process.kill",   AICAP_RISK_HIGH },
@@ -60,6 +73,24 @@ static const aicap_ent_t g_caps[] = {
     { "net.firewall",        "system.network.firewall", AICAP_RISK_HIGH },
     { "build.compile_app",   "app.build.compile",     AICAP_RISK_HIGH },
     { "build.deploy_app",    "app.build.deploy",      AICAP_RISK_HIGH },
+    // #293 AI SYSTEM-CONTROL tools. screen.capture and the input.inject family
+    // are HIGH-risk here (tool-layer consent + audit), and their executors also
+    // acquire an OS capability grant whose consent prompt the TRUSTED COMPOSITOR
+    // draws (Stage 1/3/4). Two gates on the same call by design, as settings.set.
+    { "screen.capture",     "screen.capture",          AICAP_RISK_HIGH },
+    { "input.type",         "input.inject",            AICAP_RISK_HIGH },
+    { "input.key",          "input.inject",            AICAP_RISK_HIGH },
+    { "input.click",        "input.inject",            AICAP_RISK_HIGH },
+    { "input.mouse",        "input.inject",            AICAP_RISK_HIGH },
+    // #239: Snapshot's capture.* contract rows. A screen capture is a
+    // DISCLOSURE of whatever happens to be on screen - other people's windows,
+    // a password field, a private document - so it sits with the writes rather
+    // than with the reads. It is named here rather than left to the
+    // unknown-tool default (which is also HIGH) so that a refusal says
+    // "snapshot.capture / system.screen.capture" instead of failing closed for
+    // a reason nobody can read; that is the same fault contract-lint check 2
+    // exists to catch on the Settings side.
+    { "snapshot.capture",    "system.screen.capture", AICAP_RISK_HIGH },
 };
 #define NCAPS ((int)(sizeof(g_caps)/sizeof(g_caps[0])))
 
@@ -84,6 +115,12 @@ static aicap_token_t g_tok[MAX_TOKENS];
 static int  g_inited = 0;
 static int  g_mint_seq = 1;
 static aicap_consent_fn g_consent_cb = 0;
+
+// #712: process-lifetime capability denylist (refcounted). A denied capability
+// is refused by the gate regardless of any token or consent. The escrow layer
+// uses this to make the no-delete promise an explicit, enforced policy.
+static struct { char cap[40]; int refs; } g_denied[8];
+static int g_denied_n = 0;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -124,6 +161,15 @@ static int cap_match(const char *tokcap, const char *cap) {
         memcpy(pfx, tokcap, n); pfx[n] = 0;   // "fs.*" -> "fs."
         return ci_starts(cap, pfx);           // matches "fs.write", "fs.read", ...
     }
+    return 0;
+}
+
+// #712: is this capability on the process denylist? Uses the SAME cap_match, so
+// a denied "fs.delete" catches "fs.delete", and a denied "fs.*" would catch any
+// fs.* capability (escrow denies only "fs.delete").
+static int cap_is_denied(const char *cap) {
+    for (int i = 0; i < g_denied_n; i++)
+        if (cap_match(g_denied[i].cap, cap)) return 1;
     return 0;
 }
 
@@ -181,7 +227,12 @@ static int jget(const char *json, const char *key, char *out, int ocap) {
 
 static void target_of(const char *cap, const char *args, char *out, int ocap) {
     out[0] = 0;
-    if (ci_starts(cap, "fs.")) {
+    if (!strcmp(cap, "fs.move")) {
+        // files.move: the CONSUMED/primary operand is the SOURCE. The
+        // DESTINATION is scope-checked separately (both ends) by exec_fs_move
+        // via aicap_path_in_scope(); see aiclient.c.
+        jget(args, "src", out, ocap);
+    } else if (ci_starts(cap, "fs.")) {
         jget(args, "path", out, ocap);
     } else if (!strcmp(cap, "system.settings.write")) {
         char c[48], k[48], val[160];
@@ -195,9 +246,20 @@ static void target_of(const char *cap, const char *args, char *out, int ocap) {
         if (!jget(args, "code", out, ocap)) jget(args, "path", out, ocap);
     } else if (!strcmp(cap, "system.process.kill")) {
         jget(args, "pid", out, ocap);
+    } else if (!strcmp(cap, "app.photos.organize")) {
+        // #712: name the device the escrow contract will reorganise.
+        jget(args, "path", out, ocap);
     } else if (ci_starts(cap, "app.build.")) {
         // #294: the sensitive operand for the userland compiler is the target app.
         jget(args, "app_id", out, ocap);
+    } else if (!strcmp(cap, "screen.capture")) {
+        // The sensitive operand is the destination path (empty => executor default).
+        jget(args, "path", out, ocap);
+    } else if (!strcmp(cap, "input.inject")) {
+        // Name the target window handle the assistant wants to drive.
+        char w[24];
+        if (jget(args, "win", w, sizeof(w)) || jget(args, "target", w, sizeof(w)))
+            snprintf(out, ocap, "window %s", w);
     }
 }
 
@@ -361,10 +423,66 @@ static aicap_token_t *mint(const char *cap, int risk, int max_uses, long ttl,
 }
 
 // ---------------------------------------------------------------------------
+// #712 escrow: public scoped mint / revoke / capability denylist.
+// ---------------------------------------------------------------------------
+const char *aicap_grant_scoped(const char *cap, const char *allowed_paths,
+                               long ttl_secs, int max_uses, const char *tag) {
+    if (!g_inited) aicap_init();
+    if (!cap || !cap[0]) return 0;
+    aicap_token_t *t = mint(cap, AICAP_RISK_HIGH, max_uses, ttl_secs,
+                            allowed_paths, 0 /* not persisted */,
+                            tag ? tag : "escrow-grant");
+    return t ? t->id : 0;
+}
+
+int aicap_revoke_tag(const char *tag) {
+    if (!tag || !tag[0]) return 0;
+    int n = 0;
+    for (int i = 0; i < MAX_TOKENS; i++) {
+        if (g_tok[i].used && ci_eq(g_tok[i].audit_tag, tag)) {
+            g_tok[i].used = 0;
+            n++;
+        }
+    }
+    return n;
+}
+
+void aicap_deny_capability(const char *cap) {
+    if (!cap || !cap[0]) return;
+    for (int i = 0; i < g_denied_n; i++)
+        if (ci_eq(g_denied[i].cap, cap)) { g_denied[i].refs++; return; }
+    if (g_denied_n >= (int)(sizeof(g_denied) / sizeof(g_denied[0]))) return;
+    strlcpy(g_denied[g_denied_n].cap, cap, sizeof(g_denied[0].cap));
+    g_denied[g_denied_n].refs = 1;
+    g_denied_n++;
+}
+
+void aicap_allow_capability(const char *cap) {
+    if (!cap || !cap[0]) return;
+    for (int i = 0; i < g_denied_n; i++) {
+        if (ci_eq(g_denied[i].cap, cap)) {
+            if (--g_denied[i].refs <= 0) {
+                g_denied[i] = g_denied[g_denied_n - 1];   // compact
+                g_denied_n--;
+            }
+            return;
+        }
+    }
+}
+
+int aicap_cap_denied(const char *cap) { return cap ? cap_is_denied(cap) : 0; }
+
+// ---------------------------------------------------------------------------
 // Public init / consent
 // ---------------------------------------------------------------------------
 void aicap_init(void) {
     if (g_inited) return;
+    g_inited = 1;
+    memset(g_tok, 0, sizeof(g_tok));
+    load_tokens();
+}
+
+void aicap_reload(void) {
     g_inited = 1;
     memset(g_tok, 0, sizeof(g_tok));
     load_tokens();
@@ -500,6 +618,14 @@ int aicap_authorize(const char *tool_id, const char *args,
     char cap[40]; int risk = AICAP_RISK_HIGH;
     aicap_classify(tool_id, cap, sizeof(cap), &risk);
 
+    // #712: an explicit process-policy deny overrides any token, consent, or the
+    // low-risk shortcut (e.g. a no-delete escrow forbids fs.delete outright).
+    if (cap_is_denied(cap)) {
+        if (reason_out) snprintf(reason_out, reasoncap,
+            "capability %s is forbidden by an active policy (no-delete escrow)", cap);
+        return AICAP_DENIED;
+    }
+
     if (risk == AICAP_RISK_LOW) {
         if (authmode_out) strlcpy(authmode_out, "low-risk", authmodecap);
         return AICAP_ALLOW;
@@ -564,4 +690,19 @@ int aicap_authorize(const char *tool_id, const char *args,
     if (persist) save_tokens();
     if (authmode_out) snprintf(authmode_out, authmodecap, "consent-granted:%s", nt->id);
     return AICAP_ALLOW;
+}
+
+// Non-consuming scope predicate (#711): is `path` inside the scope a usable
+// token grants for the capability of `tool_id`? Reuses the SAME find_usable()
+// token search and constraints_ok() allowed_paths check as the gate, so the
+// two ends of a move are judged by identical rules. Consumes nothing, mints
+// nothing, prompts nothing, audits nothing.
+int aicap_path_in_scope(const char *tool_id, const char *path) {
+    if (!g_inited) aicap_init();
+    char cap[40]; int risk = AICAP_RISK_HIGH;
+    aicap_classify(tool_id, cap, sizeof(cap), &risk);
+    if (cap_is_denied(cap)) return 0;        // #712: forbidden by policy
+    if (risk == AICAP_RISK_LOW) return 1;    // read-only tier: unrestricted
+    if (!path || !path[0]) return 0;         // no path = nothing authorizable
+    return find_usable(cap, path) != 0;
 }

@@ -29,18 +29,23 @@ int m3d_transport_open(m3d_transport_t *t, m3d_backend_t backend, const char *ta
     }
 
     // ----- real USB CDC-ACM backend (Micro: M3D_BACKEND_USB, Pro: M3D_BACKEND_USB_PRO) -----
-    // Open the printer's USB serial device. The kernel CDC-ACM driver
-    // (drivers/usb_cdc_acm.c, #396) enumerates the printer (Micro 03eb:2404;
-    // Pro 0483:a21e), does the ACM line-coding + DTR|RTS setup at 115200 8N1,
-    // and exposes it as /dev/ttyACM0. The Pro is silent until DTR|RTS is
-    // asserted, which the driver already does on open (PROTOCOL.md #406 sec 5).
-    // sys_open routes /dev/* to the in-kernel dev namespace and installs a
-    // file_t, so sys_read/sys_write dispatch to the driver's bounded bulk-IN/OUT.
-    // `target` is the device path ("/dev/ttyACM0"); default it if empty.
+    // STAGE 2 (serial.port): the printer's serial port is reached through the
+    // MEDIATED GATEWAY, not by opening /dev/ttyACM0 directly. That raw path is
+    // now root-owned 0600 (kernel/fs/perms.c) and refused to the desktop uid; a
+    // userland app names a PORT ("ttyACM0"), never a device path, and the open
+    // is gated by a serial.port grant. So the caller MUST already hold a live
+    // serial.port grant covering "ttyACM0" (obtained via sys_cap_request + the
+    // compositor's consent) before this runs; sys_serial_open then installs a
+    // file_t and sys_read/sys_write dispatch to the driver's bounded bulk-IN/OUT
+    // exactly as before. `target` may name a port; default it to ttyACM0.
     {
-        const char *dev = (target && target[0]) ? target : "/dev/ttyACM0";
-        int fd = sys_open(dev, O_RDWR);
-        if (fd < 0) return -1;   // no printer / driver not present
+        const char *port = (target && target[0]) ? target : "ttyACM0";
+        // Accept a legacy "/dev/ttyACM0" spelling by taking the tail after the
+        // last '/', since the gateway names ports, not paths.
+        const char *slash = port;
+        for (const char *q = port; *q; q++) if (*q == '/') slash = q + 1;
+        int fd = (int)sys_serial_open(slash, O_RDWR);
+        if (fd < 0) return -1;   // no grant, no such port, or no printer present
         t->fd = fd;
         t->open = 1;
         return 0;

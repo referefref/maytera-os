@@ -1,0 +1,152 @@
+# mports recipe: jq 1.8.1. Tier 2 item #10 of
+# docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md: a small MIT-licensed CLI
+# JSON processor, immediately useful to the App Store tooling and the AI
+# tool-contract layer (both traffic in JSON).
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA; the only
+# executable part is ports/jq/build.sh, and mports.sh has no idea what jq is.
+#
+# WHY build=script (full rationale in build.sh header): jq compiles two GENERATED
+# files that are not in the tarball (src/builtin.inc, src/config_opts.inc), and
+# it bundles its regex engine (Oniguruma, under vendor/oniguruma) which this port
+# compiles into the SAME libjq.a. Neither fits a `sources=` list, which mports
+# verifies against the unpacked tarball.
+
+name=jq
+version=1.8.1
+
+# CLASS B ("CLI tool, file I/O: class A plus open/read/write/stat"). jq is pure
+# computation over JSON, but it reads program files (-f), --slurpfile/--rawfile
+# inputs and named input files through <stdio.h>, and main() resolves module
+# search paths with realpath()/getcwd(). That filesystem surface is exactly B;
+# it is nowhere near a process model, sockets or a window. libjq the LIBRARY is
+# class A (pure computation), but the shipped artifact is the CLI, so B is the
+# honest letter for the recipe.
+class=B
+homepage=https://jqlang.org/
+
+# The official GitHub release asset. The sha256 below is of THIS file and was
+# MEASURED on the build container, not copied from a web page:
+#   wget -O jq-1.8.1.tar.gz https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-1.8.1.tar.gz
+#   sha256sum jq-1.8.1.tar.gz
+#   -> 2be64e7129cecb11d5906290eba10af694fb9e3e7f9fc208a311dc33ca837eb0  (2,026,798 bytes)
+# 1.8.1 (1 Jul 2025) is the newest release on the jqlang/jq Releases page, read
+# at port time rather than assumed. The release tarball ships the pre-generated
+# lexer.c/parser.c and the bundled vendor/oniguruma and vendor/decNumber, so no
+# flex, bison or TCL is needed to build it.
+source_url=https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-1.8.1.tar.gz
+tarball=jq-1.8.1.tar.gz
+sha256=2be64e7129cecb11d5906290eba10af694fb9e3e7f9fc208a311dc33ca837eb0
+srcdir=jq-1.8.1
+
+# COMPOUND LICENCE, because this ONE recipe ships THREE third-party works in one
+# archive: jq itself (MIT), the Oniguruma regex engine it bundles under
+# vendor/oniguruma (BSD-2-Clause), and IBM decNumber under vendor/decNumber (the
+# ICU licence, a permissive X-style grant), which jq links when USE_DECNUM is on
+# (it is; see cflags) for exact big-decimal literal preservation. The label is
+# written in the house "-and-" style (cf. AssaultCube's "Zlib-and-BSD-mixed")
+# and MUST equal the components.tsv row for userland/ports/jq exactly, or
+# vendor-attribution-check fails. All three grants are reproduced/pointed to in
+# ATTRIBUTION.md.
+#
+# licence_files names all three grant files, and mports proves each exists in
+# the unpacked tree: jq's is COPYING at the root, Oniguruma's is
+# vendor/oniguruma/COPYING, and decNumber's ICU grant is the header comment at
+# the top of vendor/decNumber/decNumber.c (it ships no separate LICENSE file,
+# exactly as Lua's grant lives at the end of src/lua.h). If a future upstream
+# moves any of them, the build fails rather than shipping it unattributed.
+licence=MIT-and-BSD-2-Clause-and-ICU
+licence_files=COPYING vendor/oniguruma/COPYING vendor/decNumber/decNumber.c
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): does this want to USE a platform layer, or
+# to BE one? Both halves USE. libjq is an embeddable library: the host owns
+# main(), the process and the allocator (jq_init/jq_compile/jq_start/jq_next is
+# the whole contract), and jq reaches the filesystem only through <stdio.h> the
+# host provides. Oniguruma matches bytes in a caller-owned subject buffer with a
+# caller-replaceable allocator. Neither imposes an event loop, a main() or a
+# window system. The jq CLI's own main() lives INSIDE libjq.a so crt0 can pull
+# it (see build.sh), which is why the app is a link-only Makefile.
+adoption=USES. libjq is an embeddable library (jq_init/jq_compile/jq_next); the host owns main(), the process and the allocator, and jq touches the filesystem only through <stdio.h>. Oniguruma matches bytes in a caller-owned buffer with a caller-replaceable allocator. Neither owns a process, event loop or window. The CLI main() is archived in libjq.a so crt0 pulls it; a library consumer with its own main() never does.
+
+# libc is the shared platform library, not a port. The jq port needed FOUR
+# additions to it, all genuine gaps that any future port would also hit and all
+# made in the shared libc rather than forked here: realpath() (module path
+# resolution), isnormal() (the isnormal builtin), and tzset()/tzname[] (jq's
+# bundled strptime %Z/%z fallback; both were DECLARED in time.h since #359 but
+# never defined). jq needs no other port. Oniguruma and decNumber are bundled
+# INTO this recipe, not separate ports.
+needs=libc
+
+# Upstream ships the generated lexer.c/parser.c in the release tarball; there is
+# no configure step to copy a file into place. builtin.inc and config_opts.inc
+# ARE generated, but by build.sh at compile time (they are not in the tarball,
+# so they cannot be a `prepare` copy).
+prepare=none
+
+# No patches. jq and its bundled Oniguruma/decNumber ship byte-for-byte
+# unaltered. The MayteraOS adaptation is entirely (a) the -D option set in
+# cflags below, which jq is designed to be configured by, and (b) the Oniguruma
+# config.h that build.sh writes as data. So there is no patch series to rot at
+# the next version bump.
+patches=none
+
+# build=script: ports/jq/build.sh generates the two .inc files, writes the
+# Oniguruma config.h, compiles Oniguruma + libjq + decNumber + main() and
+# archives them into one libjq.a. See its header for why this cannot be
+# build=objects.
+build=script
+
+# The -D set build.sh applies to jq's own translation units (Oniguruma gets
+# HAVE_CONFIG_H and its config.h instead; see build.sh). Recorded here as DATA:
+#   HAVE_LIBONIG        Compile the real regex builtins against <oniguruma.h>;
+#                       without it test/match/sub/gsub/splits are stubs that
+#                       error. This is the whole reason Oniguruma is bundled.
+#   HAVE_ISATTY         libc has isatty(); jq uses it to auto-enable colour and
+#                       to refuse to read a program from an interactive stdin.
+#   HAVE_SETENV         libc has setenv() (the $ENV/env builtins).
+#   HAVE_GMTIME_R HAVE_LOCALTIME_R HAVE_TIMEGM HAVE_GETTIMEOFDAY HAVE_STRFTIME
+#                       All present in libc; enable jq's date/time builtins
+#                       (now, strftime, gmtime, mktime, todate...).
+#   HAVE_TM_TM_GMT_OFF  struct tm carries tm_gmtoff in this libc's <time.h>, so
+#                       jq's localtime path uses it directly.
+#   HAVE_ALLOCA_H HAVE_ALLOCA  alloca is the compiler builtin via <alloca.h>.
+#   IEEE_8087           jv_dtoa (David Gay's dtoa) selects float byte order at
+#                       compile time and #errors if none is given; x86-64 is
+#                       little-endian, so IEEE_8087.
+#   USE_DECNUM          jq's upstream default: link vendor/decNumber so a huge or
+#                       high-precision number literal is preserved EXACTLY when
+#                       passed through, instead of being flattened to an IEEE
+#                       double. Off would drop decNumber from the archive; on
+#                       matches upstream and is why decNumber is attributed.
+# NOTABLY NOT SET, each a real decision:
+#   NOT HAVE_MEMMEM     libc has no memmem(); jq's util.c ships its own fallback
+#                       under #ifndef HAVE_MEMMEM. Defining it (even to 0!) would
+#                       take the #ifdef branch and reference a missing symbol.
+#   NOT HAVE_STRPTIME   likewise: libc has no strptime(), and jq bundles the
+#                       NetBSD strptime under #ifndef HAVE_STRPTIME (this is what
+#                       pulls tzset/tzname, now added to libc).
+#   NOT HAVE_SETLOCALE  libc declares but does not define setlocale(); jq's
+#                       number formatting is locale-independent (its own dtoa),
+#                       so leaving it off changes no output.
+# The math HAVE_* enable jq's math builtins for exactly the functions libc
+# defines; the rest fall back to a builtin that errors at call time (jq compiles
+# and links regardless).
+cflags=-DHAVE_LIBONIG=1 -DHAVE_ISATTY=1 -DHAVE_SETENV=1 -DHAVE_GMTIME_R=1 -DHAVE_LOCALTIME_R=1 -DHAVE_TIMEGM=1 -DHAVE_GETTIMEOFDAY=1 -DHAVE_STRFTIME=1 -DHAVE_TM_TM_GMT_OFF=1 -DHAVE_ALLOCA_H=1 -DHAVE_ALLOCA=1 -DIEEE_8087=1 -DUSE_DECNUM=1 -DHAVE_ACOS -DHAVE_ACOSH -DHAVE_ASIN -DHAVE_ASINH -DHAVE_ATAN -DHAVE_ATAN2 -DHAVE_ATANH -DHAVE_CBRT -DHAVE_COS -DHAVE_COSH -DHAVE_EXP -DHAVE_EXP2 -DHAVE_FLOOR -DHAVE_HYPOT -DHAVE_LOG -DHAVE_LOG10 -DHAVE_LOG2 -DHAVE_POW -DHAVE_REMAINDER -DHAVE_SIN -DHAVE_SINH -DHAVE_SQRT -DHAVE_TAN -DHAVE_TANH -DHAVE_CEIL -DHAVE_COPYSIGN -DHAVE_EXPM1 -DHAVE_FABS -DHAVE_FDIM -DHAVE_FMAX -DHAVE_FMIN -DHAVE_FMOD -DHAVE_LOG1P -DHAVE_NEARBYINT -DHAVE_RINT -DHAVE_ROUND -DHAVE_TRUNC -DHAVE_LDEXP -DHAVE_MODF -DHAVE_FREXP -DHAVE_SCALBN
+
+# Installed for any future consumer of libjq.a: jq's two public library headers.
+headers=src/jv.h src/jq.h
+
+lib=libjq.a
+
+# THE ANTI-NO-OP CHECK. mports proves with nm that every one of these is a
+# DEFINED symbol in libjq.a. The set is chosen to prove ALL FOUR things that
+# landed in the archive really landed, so a build that dropped any one fails
+# HERE and not at some consumer's confused runtime:
+#   main                         the CLI main() was archived (build.sh);
+#   jq_* jv_*                    jq's own core + value API compiled;
+#   onig_new onig_search onig_match onig_region_new onig_initialize onig_end
+#                                Oniguruma really got compiled into this archive
+#                                (drop the regex engine and these vanish);
+#   decNumber*                   jq's bundled arbitrary-precision decimal landed.
+symbols=main jq_init jq_compile jq_start jq_next jq_teardown jq_set_attr jv_parse jv_parser_new jv_dump jv_object jv_array_append onig_new onig_search onig_match onig_free onig_region_new onig_initialize onig_end decNumberFromString decNumberToString decNumberAdd

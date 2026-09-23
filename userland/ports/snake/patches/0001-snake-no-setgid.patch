@@ -1,0 +1,21 @@
+--- a/snake.c
++++ b/snake.c
+@@ -63,7 +63,9 @@
+ #include <time.h>
+ #include <unistd.h>
+ #include <sys/types.h>
++#include <sys/ttydefaults.h>
+ #include <err.h>
++#include <getopt.h>
+ #include <math.h>
+ #include <signal.h>
+ #include <stdio.h>
+@@ -159,7 +161,7 @@
+ 		warn("fopen %s", _PATH_LOGFILE);
+ 		sleep(2);
+ 	}
+-	setregid(getgid(), getgid());
++	/* MAYTERA CHANGE: no setgid privilege to revoke on this OS; call removed. */
+ 
+ 	(void) time(&tv);
+ 

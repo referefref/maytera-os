@@ -3738,7 +3738,11 @@ STBTT_DEF unsigned char *stbtt_GetGlyphBitmapSubpixel(const stbtt_fontinfo *info
    if (xoff  ) *xoff   = ix0;
    if (yoff  ) *yoff   = iy0;
 
-   if (gbm.w && gbm.h) {
+   // #diskusefix defense-in-depth: a glyph bitmap can never legitimately be
+   // this large. A corrupted scale (see kernel/gui/ttf.c SMP note) once reached
+   // here with gbm.w*gbm.h ~= 1.8 GB and exhausted the kernel heap -> #GP panic.
+   // Refuse an insane/negative box: render nothing rather than kmalloc(garbage).
+   if (gbm.w > 0 && gbm.h > 0 && gbm.w <= 4096 && gbm.h <= 4096) {
       gbm.pixels = (unsigned char *) STBTT_malloc(gbm.w * gbm.h, info->userdata);
       if (gbm.pixels) {
          gbm.stride = gbm.w;

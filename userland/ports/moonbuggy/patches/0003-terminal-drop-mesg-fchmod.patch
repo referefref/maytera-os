@@ -1,0 +1,105 @@
+0003-terminal-drop-mesg-fchmod.patch
+
+terminal.c term_prepare()/term_restore() do two host-specific things:
+  1. If the -m ("mesg n") option is set, fchmod() the controlling tty to drop
+     group/other write permission (so other users cannot write to your
+     terminal mid-game), restoring it on exit.
+  2. Disable C-s/C-q (IXON) flow control via termios, restoring it on exit.
+
+Neither applies to the MayteraOS Terminal: it is single user with no other
+writers to the tty, and ncurses raw mode (cbreak/noecho, set in
+prepare_screen()) already governs C-s. More concretely, fchmod() is not part of
+this platform's libc (only chmod() is), so the fchmod() reference would fail to
+link even though the -m path is off by default; and driving termios records on
+the pty is unnecessary here. HAVE_TERMIOS_H is left undefined in this port's
+config.h, so the IXON block already compiles out; this patch additionally
+removes the fchmod()/fstat() "mesg n" path, reducing term_prepare() to the
+isatty() guard and term_restore() to a no-op. The game's screen setup is
+unaffected (initscr/cbreak/noecho happen in main.c prepare_screen()).
+
+--- a/terminal.c	2026-09-08 14:53:44.658252339 +0000
++++ b/terminal.c	2026-09-08 14:53:44.659100888 +0000
+@@ -36,73 +36,21 @@
+ void
+ term_prepare (int mesg_n_flag)
+ /* Prepare the terminal for game play.
+- * This tries to disable the C-s key and, if MESG_N_FLAG is set,
+- * restricts write access to the terminal as "mesg n" would do.  */
++ *
++ * MayteraOS port: the original also honoured a "mesg n" request by fchmod()ing
++ * the controlling tty, and disabled C-s/IXON flow control via termios.  Under
++ * the MayteraOS Terminal neither is needed (single user, no other writers to
++ * the tty; ncurses raw mode already governs C-s) and fchmod()/tty record
++ * control are not part of this platform's libc, so this is a deliberate no-op.
++ * ncurses owns the terminal from here.  */
+ {
+-  struct stat  st;
+-#if HAVE_TERMIOS_H
+-  struct termios  settings;
+-#endif
+-  int  res;
+-  
+-  assert (! term_mode_valid);
++  (void) mesg_n_flag;
+   if ( ! isatty (0) )  return;
+-
+-  if (mesg_n_flag) {
+-    res = fstat (0, &st);
+-    if (res < 0)
+-      fatal ("Cannot get terminal attributes: %s", strerror (errno));
+-    
+-    term_mode = st.st_mode;
+-    term_mode_valid = 1;
+-    
+-    st.st_mode &= ~(S_IWGRP|S_IWOTH);
+-    res = fchmod (0, st.st_mode);
+-    if (res < 0)
+-      fatal ("Cannot set terminal permissions: %s", strerror (errno));
+-  }
+-
+-#if HAVE_TERMIOS_H
+-  res = tcgetattr (0, &settings);
+-  if (res < 0)
+-    fatal ("Cannot get terminal attributes: %s", strerror (errno));
+-
+-  if (settings.c_iflag & IXON) {
+-    settings.c_iflag &= ~IXON;
+-    res = tcsetattr (0, TCSANOW, &settings);
+-    if (res < 0)
+-      fatal ("Cannot set terminal attributes: %s", strerror (errno));
+-    attributes_changed = 1;
+-  }
+-#endif
+ }
+ 
+ void
+ term_restore (void)
+-/* Restore the terminal's original access mode.  */
++/* Restore the terminal's original state.  MayteraOS port: nothing to undo,
++ * since term_prepare() changes nothing (see the comment there).  */
+ {
+-#if HAVE_TERMIOS_H
+-  struct termios  settings;
+-#endif
+-  int  res;
+-  
+-#if HAVE_TERMIOS_H
+-  if (attributes_changed) {
+-    res = tcgetattr (0, &settings);
+-    if (res < 0)
+-      fatal ("Cannot get terminal attributes: %s", strerror (errno));
+-    
+-    settings.c_iflag |= IXON;
+-    res = tcsetattr (0, TCSANOW, &settings);
+-    if (res < 0)
+-      fatal ("Cannot set terminal attributes: %s", strerror (errno));
+-  }
+-#endif
+-
+-  if (term_mode_valid) {
+-    res = fchmod (0, term_mode);
+-    if (res < 0)
+-      fatal ("Cannot restore terminal permissions: %s", strerror (errno));
+-    term_mode_valid = 0;
+-  }
+ }

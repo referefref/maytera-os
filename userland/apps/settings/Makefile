@@ -20,8 +20,10 @@ LDFLAGS = -pie --no-dynamic-linker -z notext -nostdlib -z max-page-size=0x1000 -
 # Output
 TARGET = settings
 
-# Objects
-OBJS = main.o
+# Objects. (btui) bt_client.o is the REAL Bluetooth client (SYS_BT); it lives in
+# libc/ but is linked only here, so the compositor keeps its own stub with no
+# duplicate-symbol clash (libc.a does not include bt_client.o).
+OBJS = main.o bt_client.o
 
 # Libraries
 CRT0 = $(LIBC_DIR)/crt0.o
@@ -43,6 +45,11 @@ $(LIBHELP):
 
 # Compile C source
 %.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# (btui) bt_client.c lives in libc/ but is compiled with THIS app's flags so it
+# matches main.o (-fPIE) in the PIE settings binary.
+bt_client.o: $(LIBC_DIR)/bt_client.c $(LIBC_DIR)/bt_client.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Clean

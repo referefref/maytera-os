@@ -203,6 +203,12 @@ static uint64_t uaccess_fixup_lookup(uint64_t rip) {
 
 void page_fault_handler(interrupt_frame_t *frame) {
     uint64_t cr2 = read_cr2();
+    // #smpreval2: THIS is the only point at which CR2 still belongs to this
+    // fault. Everything below can fault again on this CPU - mm_fault() walks
+    // page tables, deliver_segv_handler() writes a signal frame to the USER
+    // stack - and each such fault overwrites CR2. Record it before any of that
+    // runs, so the crash report quotes the address that was actually faulted on.
+    exception_note_cr2(cr2);
     uint64_t err = frame->error_code;
     process_t *p = proc_current();
 
@@ -229,6 +235,19 @@ void page_fault_handler(interrupt_frame_t *frame) {
 
     // 2. Unrecoverable. A user fault becomes SIGSEGV.
     int from_user = (frame->cs & 0x3) != 0;
+
+    // #dosmem: SAY WHY, BEFORE ANYTHING ELSE ON THIS PATH RUNS.
+    //
+    // Ordering is load-bearing and is the same lesson f6865391 paid for two
+    // days ago. Below this point deliver_segv_handler() writes a signal frame
+    // to the USER STACK and can take and RESOLVE a page fault of its own; that
+    // nested fault calls mm_fault(), which would overwrite this core's reason
+    // slot exactly as it overwrote CR2. Report first, then deliver.
+    //
+    // Only for a fault the kernel has already decided it cannot fix, so a
+    // healthy machine pays nothing: every resolvable fault returned at step 1.
+    if (p) mm_fault_report(p, cr2, err);
+
     if (from_user && p) {
         if (deliver_segv_handler(p, frame, cr2) == 0) {
             return;  // caught by the process's SIGSEGV handler

@@ -1,10 +1,20 @@
 # Python for MayteraOS
 
-This directory contains the Python 3 interpreter implementation for MayteraOS.
+> **SUPERSEDED (docs refresh, 2026-09-23).** The shipping Python is **CPython
+> 3.11.9**, cross-compiled freestanding for MayteraOS and installed as
+> `/APPS/PYTHON.ELF`. The port layer that produces it is `userland/apps/python/`
+> (see `userland/apps/python/port/README.md`). This directory's `micropython/`
+> tree and the "minimal hand-written interpreter" described below are NOT what
+> ships; they are earlier/experimental work. Do not describe the shipping Python
+> as minimal, and do not point users at the paths below as the current
+> interpreter. Note for attribution: CPython is under the Python Software
+> Foundation License, not MIT; keep that distinct from the MicroPython port glue.
 
-## Overview
+This directory contains an earlier, experimental Python interpreter effort for MayteraOS. It is not the shipping interpreter.
 
-MayteraOS includes a minimal but functional Python interpreter that supports:
+## Overview (historical)
+
+This earlier interpreter supported:
 
 - Variables, expressions, and basic arithmetic
 - Strings with concatenation and indexing

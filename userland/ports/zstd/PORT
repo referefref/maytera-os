@@ -1,0 +1,71 @@
+# mports recipe: Zstandard (zstd) 1.5.6, library only, single-threaded.
+# Item 5 of the 2026-09 library-ports batch. zstd is a high-ratio, fast
+# compression codec: better ratio than LZ4 at comparable speed on many inputs,
+# with dictionary support. Useful for on-device asset/package compression and
+# App Store payloads.
+#
+# LICENCE. The zstd repository is dual-licensed: BSD-3-Clause (LICENSE at the
+# root) OR GPLv2 (COPYING). This recipe TAKES THE BSD GRANT; licence_files
+# points at the root LICENSE (BSD-3). No GPL obligation is incurred.
+#
+# SINGLE-THREADED. ZSTD_MULTITHREAD is NOT defined, so the build is
+# single-threaded (zstdmt_compress.c and threading.c compile as the standard
+# no-op stubs). No pthread dependency is introduced.
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA.
+
+name=zstd
+version=1.5.6
+class=A
+homepage=https://facebook.github.io/zstd/
+
+# The official GitHub release asset for tag v1.5.6. sha256 below is of THIS file
+# and was MEASURED on the build container, not copied from a web page:
+#   wget -O zstd-1.5.6.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz
+#   sha256sum -> 8c29e06cf42aacc1eafc4077ae2ec6c6fcb96a626157e0593d5e82a34fd403c1
+source_url=https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz
+tarball=zstd-1.5.6.tar.gz
+sha256=8c29e06cf42aacc1eafc4077ae2ec6c6fcb96a626157e0593d5e82a34fd403c1
+srcdir=zstd-1.5.6
+
+licence=BSD-3-Clause
+licence_files=LICENSE
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): USES. zstd is pure computation over
+# caller-supplied buffers (simple one-shot API) or caller-driven streaming
+# contexts. The only platform surface the files we build touch is
+# malloc/calloc/free and memcpy/memmove/memset. No event loop, no main(), no
+# filesystem model (the CLI under programs/ is not built), no threads.
+adoption=USES. Pure buffer-in/buffer-out compression over caller-supplied memory and caller-driven contexts; the only platform surface is malloc/calloc/free and memcpy/memmove/memset. Single-threaded, no event loop, never wants to own the process.
+
+needs=libc
+
+prepare=none
+patches=none
+
+build=objects
+
+# The library: common + compress + decompress. Excludes legacy/ (old format
+# decoders), deprecated/ (the old buffered API) and dictBuilder/ (COVER dictionary
+# training), none of which the core compress/decompress path needs. The x86-64
+# BMI2 assembly (lib/decompress/huf_decompress_amd64.S) is NOT built; -DZSTD_DISABLE_ASM
+# in cflags routes huf_decompress.c to its portable C path instead.
+sources=lib/common/debug.c lib/common/entropy_common.c lib/common/error_private.c lib/common/fse_decompress.c lib/common/pool.c lib/common/threading.c lib/common/xxhash.c lib/common/zstd_common.c lib/compress/fse_compress.c lib/compress/hist.c lib/compress/huf_compress.c lib/compress/zstd_compress.c lib/compress/zstd_compress_literals.c lib/compress/zstd_compress_sequences.c lib/compress/zstd_compress_superblock.c lib/compress/zstd_double_fast.c lib/compress/zstd_fast.c lib/compress/zstd_lazy.c lib/compress/zstd_ldm.c lib/compress/zstd_opt.c lib/compress/zstdmt_compress.c lib/decompress/huf_decompress.c lib/decompress/zstd_ddict.c lib/decompress/zstd_decompress.c lib/decompress/zstd_decompress_block.c
+
+exclude=lib/decompress/huf_decompress_amd64.S
+exclude_reason=The x86-64 BMI2 Huffman-decode assembly. -DZSTD_DISABLE_ASM in cflags makes lib/decompress/huf_decompress.c use its portable C fallback, so the .S is not needed. Excluded by name because build=objects compiles the C source list only, and shipping an unbuilt .S alongside a C path that ignores it would be misleading.
+
+# -Ilib* so the internal cross-directory includes resolve; -DZSTD_DISABLE_ASM
+# forces the C Huffman decode (no .S); -DXXH_NAMESPACE=ZSTD_ is upstream's own
+# default, prefixing the bundled xxHash symbols so they never clash with another
+# xxHash (e.g. the one inside liblz4.a) in a consumer that links both.
+cflags=-Ilib -Ilib/common -Ilib/compress -Ilib/decompress -DZSTD_DISABLE_ASM=1 -DXXH_NAMESPACE=ZSTD_
+
+headers=lib/zstd.h lib/zstd_errors.h
+lib=libzstd.a
+
+# THE ANTI-NO-OP CHECK. Proven defined in libzstd.a by nm: the version query,
+# the simple one-shot compress/decompress + bound + error/size helpers, and the
+# context lifecycle for the streaming/advanced API.
+symbols=ZSTD_versionNumber ZSTD_compress ZSTD_decompress ZSTD_compressBound ZSTD_isError ZSTD_getFrameContentSize ZSTD_maxCLevel ZSTD_createCCtx ZSTD_freeCCtx ZSTD_createDCtx ZSTD_freeDCtx

@@ -6,7 +6,7 @@
 // #162 asks for volume up / volume down / mute to work as system-global
 // hotkeys. Before designing anything, the question "which transport actually
 // delivers a byte for those keys today?" was settled by reading the code and
-// the owner's own real-hardware capture (<workspace>
+// the owner's own real-hardware capture (/root/imac-hw-capture-20260814/
 // USBLOG.TXT, iMac14,4). The answer was NONE OF THEM:
 //
 //   PS/2      cpu/isr.c's extended-make switch has cases for the arrows, the

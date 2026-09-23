@@ -114,6 +114,16 @@ pub const SCPROF_BY_MAX: i32 = 1;
 /// disagree, and #118 proved that mattered: the site with the highest mean hold
 /// there would never have appeared in a maximum ranking.
 pub const SCPROF_BY_UNBRK: i32 = 2;
+/// Rank by unbrk_total_us descending: the largest CUMULATIVE unbroken BKL
+/// hold, summed over every unbroken call of a syscall number. This is the
+/// ranking the #168 BKL-decomposition plan sequences its per-syscall
+/// narrowing on (docs/BKL_DECOMPOSITION_PLAN.md section 0.3): a rare one-off
+/// with a high unbrk_max_us can outrank the syscall that actually consumed
+/// the most BKL time under SCPROF_BY_UNBRK, so that ranking's #0 is not the
+/// biggest holder. This one's #0 is. Both are published because they answer
+/// different questions (worst single latency spike vs largest total share)
+/// and #118 proved a max ranking and a total ranking disagree.
+pub const SCPROF_BY_UNBRK_TOTAL: i32 = 3;
 
 /// Record one completed syscall.
 ///
@@ -207,6 +217,7 @@ pub unsafe extern "C" fn scprof_top(
             let key = match by {
                 SCPROF_BY_TOTAL => t[i].total_us,
                 SCPROF_BY_UNBRK => t[i].unbrk_max_us,
+                SCPROF_BY_UNBRK_TOTAL => t[i].unbrk_total_us,
                 _ => t[i].max_us,
             };
             if key == 0 {

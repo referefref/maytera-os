@@ -40,6 +40,11 @@ void term_reply(const char *b, int n);
 // the whole reason a program uses it.
 void term_soft_reset(void);
 
+// #745 DEC line-drawing charset (ESC(0 / SO / SI). Reset to ASCII on RIS.
+void term_charset_reset(void);
+void term_charset_designate(char slot, char final);
+void term_charset_shift(int to_g1);
+
 // The last title an application asked for via OSC 0/2. RECORDED, NOT APPLIED:
 // window chrome for a kernel-WM window is drawn by the kernel and there is no
 // set-title syscall for it. The valuable half of OSC support is that the title

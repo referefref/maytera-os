@@ -46,6 +46,43 @@
 #define SNTP_FALLBACK_2      "time.nist.gov"
 #define SNTP_DEFAULT_COUNT   3
 
+// #dnsfallback: NUMERIC LAST RESORT, BECAUSE THE TWO FAULTS PROTECT EACH OTHER.
+//
+// MEASURED on the owner's real iMac14,4 (golden 2353, 2026-08-31): his RTC read
+// 2026-08-30 against a kernel built 2026-09-03, four days slow, and every TLS
+// handshake failed on it - [NETFETCH] ... phase=TLS-handshake
+// why=TLS-FAILED-BECAUSE-SYSTEM-CLOCK-IS-WRONG(2026). At the same time his
+// DHCP-supplied resolver answered nothing at all across 41 queries.
+//
+// So the clock could not be fixed, because every entry in the list above is a
+// NAME and needs a resolver; and the resolver problem was the thing making the
+// clock matter. A wrong clock and dead DNS each block the repair of the other,
+// and the machine cannot bootstrap out of it. That deadlock is broken by having
+// at least one entry in this list that needs no resolver.
+//
+// sntp_sync() has ALWAYS accepted a dotted quad (sntp_parse_ipv4() at the top
+// of sntp_sync_one() short-circuits dns_resolve()), so the capability was there
+// the whole time. What was missing was any DEFAULT that used it: every caller
+// that does not name a server - syscall 147, which is what BOTH the Settings
+// "Sync now" button and its "Set time automatically" toggle call - went through
+// three hostnames and stopped.
+//
+// THESE ARE ANYCAST ADDRESSES AND THEY ARE A LAST RESORT, NOT A PREFERENCE.
+// They are tried only after the names, so a machine with working DNS still uses
+// the vendor-neutral pool and still gets a geographically sensible server. A
+// hardcoded address can be re-homed by its operator without warning, which is
+// exactly why it must not be the first choice; it is here so that "no resolver"
+// is survivable, not so that it is normal.
+//   162.159.200.123 - Cloudflare, one of the two published time.cloudflare.com
+//                     anycast addresses.
+//   216.239.35.0    - Google, one of the four published time.google.com anycast
+//                     addresses.
+// Two different operators on purpose: one address from one vendor would make
+// this fallback exactly as single-pointed as the failure it exists to survive.
+#define SNTP_NUMERIC_1       "162.159.200.123"
+#define SNTP_NUMERIC_2       "216.239.35.0"
+#define SNTP_NUMERIC_COUNT   2
+
 // Default budget for the whole exchange, including DNS. Chosen so a user
 // staring at the wizard gets an answer rather than a stall; see sntp_sync().
 #define SNTP_DEFAULT_TIMEOUT_MS  5000u

@@ -1,0 +1,25 @@
+tcc-native-guard.patch - MayteraOS target adaptation for TinyCC tcc.h.
+
+WHY. tcc.h derives TCC_IS_NATIVE from the host compiler predefining __x86_64__
+(the cross gcc always does), so tcc would build as a NATIVE compiler with its
+-run path: tccrun.c #includes <sys/mman.h> (absent in the MayteraOS freestanding
+userland), maps executable memory, and installs a SIGSEGV/ucontext backtrace
+handler; CONFIG_TCC_BCHECK is switched on too. None of that runtime exists here.
+This patch adds "!defined MAYTERAOS &&" to the single #if that gates native
+detection, so -DMAYTERAOS (in the recipe cflags) builds tcc as a CROSS-style
+compiler that only writes files, with the -run machinery #ifdef-ed out.
+
+A target adaptation, not a bug fix: the compiler source is otherwise byte-for-
+byte unaltered, so there is no patch series to rot at the next version bump.
+
+--- a/tcc.h
++++ b/tcc.h
+@@ -150,7 +150,7 @@
+ #endif
+ 
+ /* only native compiler supports -run */
+-#if defined _WIN32 == defined TCC_TARGET_PE
++#if !defined MAYTERAOS && (defined _WIN32 == defined TCC_TARGET_PE)
+ # if (defined __i386__ || defined _X86_) && defined TCC_TARGET_I386
+ #  define TCC_IS_NATIVE
+ # elif (defined __x86_64__ || defined _AMD64_) && defined TCC_TARGET_X86_64

@@ -197,6 +197,29 @@ rk_chown_route
 # ---------------------------------------------------------------------------
 perms_path_check_rs
 perms_canon_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/accesssys.rs - #dosperm: SYS_ACCESS (POSIX access(2)). Makes the
+# ONE perms_check() decision reachable from Ring 3 without attempting the
+# operation, so the Ring-3 DOS host can run the same #708 guest gate as the
+# in-kernel one instead of a stub that always allows.
+# ---------------------------------------------------------------------------
+rk_access
+
+# ---------------------------------------------------------------------------
+# rustkern/dosstate.rs - #dosperm: the no-entry permission default for the
+# /DOS game tree. A DOS-era game keeps its state beside its executable, and
+# the root-owned 0755 default made every shipped title unwritable for every
+# non-root account. Program-shaped names keep 0755.
+# ---------------------------------------------------------------------------
+dos_state_writable_rs
+dosstate_selftest_rs
+# #word6blank (2026-09-12): the identical no-entry-default rule extended to
+# /WIN16. A Win16 app (Word 6) keeps its state beside its own binary the same
+# way a DOS game does; shares writable_under_prefix() with the rule above
+# rather than forking a copy of it. See fs/perms.c's perms_check_leaf().
+win16_state_writable_rs
+win16state_selftest_rs
 # #58: relative paths resolve against process_t::cwd. The JOIN lives beside the
 # canonicalizer it shares with perms_check()/sys_chdir, so the string that is
 # checked stays the object that is opened. Self-test runs at boot.
@@ -728,6 +751,21 @@ tick_permille_rs
 tick_synth_decide_rs
 tick_watch_selftest_rs
 
+# rustkern/tickack.rs - #tickdead: WHERE an interrupt is acknowledged. The
+# EOI for every vector was sent on the far side of isr_handler()'s
+# bkl_acquire(), so a contended lock switched the 250 Hz clock OFF: the 8259
+# will not deliver IRQ0 again until its in-service bit is cleared, and the
+# clearing sat below the wait. These own the scope decision (which vectors may
+# be acknowledged early and why the device vectors may not), the rate-relative
+# lateness threshold, and the BLOCKED-vs-ABSENT blame rule that separates a
+# timer we failed to acknowledge from one that was never delivered. The two
+# produce an IDENTICAL 8259 register shape, which is why the previous
+# attribution could not tell them apart.
+tick_ack_kind_rs
+tick_ack_is_late_rs
+tick_blame_rs
+tick_ack_selftest_rs
+
 # ---------------------------------------------------------------------------
 # rustkern/seccore.rs - #624 CPU security core. Owns the CPUID feature decode
 # (bounds-checked against the max supported leaf, which the C it replaces did
@@ -787,6 +825,7 @@ gfsf_grant_check
 gfsf_edges
 gfsf_nodes
 gfsf_node_state
+gfsf_max_local
 gfsf_stats
 gfsf_reset
 gfsf_set_ready
@@ -979,6 +1018,12 @@ dosprof_add_rs
 dosprof_add_publish_bytes_rs
 dosprof_report_rs
 dosprof_selftest_rs
+dosprof_durable_note_rs
+dosprof_durable_reset_rs
+dosprof_durable_selftest_rs
+dosprof_hitch_note_rs
+dosprof_hitch_reset_rs
+dosprof_hitch_selftest_rs
 
 # rustkern/dosdisp.rs (no-ticket) - do not compute a DOS frame the compositor
 # has not shown yet. Back pressure on g_fb_flip_count, not a timer: the right
@@ -987,6 +1032,19 @@ dosprof_selftest_rs
 dosdisp_reset_rs
 dosdisp_should_present_rs
 dosdisp_selftest_rs
+
+# rustkern/dostick.rs (#ravideo) - a guest's timer-interrupt rate must not
+# be a function of the host's burst size. dos4gw_timebase() could deliver at
+# most four IRQ0 per run-loop pass and dropped the rest, so the ceiling on a
+# DOS/4GW guest's clock was 4 x passes/s - a host pacing number. Bounding the
+# burst by the next tick deadline removes the coupling; the accounting is
+# what turns 'the guest is not getting its timer' into a measurement.
+dostick_reset_rs
+dostick_note_rs
+dostick_note_bounded_rs
+dostick_budget_rs
+dostick_per_s_x10_rs
+dostick_selftest_rs
 dos_aspect_apply_rs
 dos_view_parse_rs
 dos_view_selftest_rs
@@ -1248,6 +1306,87 @@ netattach_take_detach_rs
 netattach_stats_rs
 netattach_selftest_rs
 
+# ---------------------------------------------------------------------------
+# rustkern/netbread.rs - #imacnet: durable network breadcrumbs + DNS resolver
+# failover. New code, not a port: no _c twin and no -DRUST_* flag.
+#
+# If netbread_dns_note_timeout_rs or netbread_dns_set_dhcp_rs ever goes MISSING
+# here, a machine pinned to an unreachable resolver silently returns to having
+# NO way back, which is the exact defect this module exists to remove.
+# ---------------------------------------------------------------------------
+netbread_dns_set_preferred_rs
+netbread_dns_set_dhcp_rs
+netbread_dns_set_gateway_rs
+netbread_dns_active_rs
+netbread_dns_preferred_rs
+netbread_dns_note_sent_rs
+netbread_dns_note_answer_rs
+netbread_dns_note_timeout_rs
+netbread_dns_counters_rs
+# #dnsfallback: the escalation ladder can now leave the local network, because
+# on a Windows ICS segment the preferred, DHCP-offered and gateway resolvers are
+# all the SAME silent host and the old {DHCP, gateway} candidate pair had
+# nowhere to go. hedge_candidate/is_public/ladder/learned are that ladder's
+# surface. If netbread_dns_hedge_candidate_rs goes MISSING, dns.c stops hedging
+# and a machine on that topology resolves nothing at all.
+netbread_dns_hedge_candidate_rs
+netbread_dns_is_public_rs
+netbread_dns_ladder_rs
+netbread_dns_learned_rs
+netbread_strhash_rs
+netbread_fetch_should_log_rs
+netbread_fetch_stats_rs
+netbread_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/dnstx.rs - #httpdns: the DNS transaction table. New code, not a
+# port: no _c twin and no -DRUST_* flag.
+#
+# If dnstx_match_rs or dnstx_alloc_rs ever goes MISSING here, DNS is back to
+# ONE in-flight query for the whole machine and two overlapping lookups
+# cross-wire each other answers again. MEASURED 2026-09-03: six concurrent
+# fetches produced eight cross-wires and two wrong fetches on a healthy LAN.
+# ---------------------------------------------------------------------------
+dnstx_alloc_rs
+dnstx_id_rs
+dnstx_rearm_rs
+dnstx_touch_rs
+dnstx_match_rs
+dnstx_host_copy_rs
+dnstx_complete_rs
+dnstx_done_rs
+dnstx_result_rs
+dnstx_free_rs
+dnstx_owner_slot_rs
+dnstx_note_server_rs
+dnstx_servers_rs
+dnstx_note_answered_by_rs
+dnstx_answered_by_rs
+dnstx_stats_rs
+dnstx_selftest_rs
+
+# rustkern/netfail.rs - #netfix2: WHY a fetch failed, in one word, plus the
+# system-clock plausibility verdict.
+#
+# EVERY ONE OF THESE MATTERS AT A DIFFERENT LAYER, and a MISSING symbol here
+# would not break the build, it would break the diagnosis: the fetch chokepoint
+# would print why=UNRECORDED for every failure and the browser would go back to
+# saying "Fetch failed", which is the exact state this change exists to end.
+# netfail_note_weak_rs is the one that looks redundant and is not: without it
+# every DNS fault in the OS is relabelled as a TCP fault by the layer above.
+netfail_note_rs
+netfail_note_weak_rs
+netfail_take_rs
+netfail_clear_rs
+netfail_name_rs
+netfail_phase_rs
+netfail_counters_rs
+netfail_clock_set_build_rs
+netfail_clock_check_rs
+netfail_publish_rs
+netfail_published_rs
+netfail_selftest_rs
+
 # rustkern/netstat.rs - #745 OOBE Network page: structured live IPv4 status
 # (SYS_NET_STATUS 371) and the non-blocking probe (SYS_NET_PROBE 372).
 # New code, not a port: no _c twin and no -DRUST_* flag.
@@ -1329,6 +1468,53 @@ fbown_reset_rs
 fbown_stats_rs
 fbown_selftest_rs
 
+# rustkern/capgate.rs - Stage 0 of the system capability API
+# (docs/SYSTEM_CAPABILITY_API.md section 12). The ONE definition of the two
+# access rules Stage 0 closes its five ungated cross-process holes with:
+# "is the caller the latched compositor" (non-claiming, unlike
+# gui/fb_syscall.c is_compositor) and "does this Ring-3 caller own this
+# raw-index handle" (thread-group aware, ported from drivers/audio_pcm.c).
+# Consumed by proc/syscall.c, proc/fdlayer.c, ipc/shm.c and net/tcp.c.
+capgate_is_compositor_rs
+capgate_owner_ok_rs
+capgate_tgid_of_rs
+capgate_note_refusal_rs
+capgate_note_allowed_rs
+capgate_refusals_rs
+capgate_stats_rs
+capgate_selftest_rs
+
+# rustkern/caps.rs - Stage 1 of the system capability API
+# (docs/SYSTEM_CAPABILITY_API.md sections 4-8). The grant model (find/issue/
+# cover/consume/revoke/query on process_t.cap_grants), the syscall->capability
+# REQUIREMENT TABLE read at the dispatcher chokepoint, and the consent state
+# machine (elevate.rs single-slot shape for a capability decision). Consumed by
+# proc/caps.c and proc/syscall.c.
+cap_required_for_syscall
+cap_is_issuable
+cap_scope_valid
+cap_find_live
+cap_covers_path
+cap_covers_port
+cap_find_scope
+cap_covers_window_target
+cap_issue
+cap_consume_use
+cap_revoke
+cap_query
+cap_ledger_note
+cap_ledger_get
+cap_req_open_rs
+cap_req_view_rs
+cap_req_state_rs
+cap_req_owner_pid_rs
+cap_req_busy_rs
+cap_req_approve_info_rs
+cap_req_resolve_rs
+cap_req_reap_rs
+cap_req_tick_rs
+caps_selftest_rs
+
 # rustkern/procreap.rs - #745 (task 37) zombie process-slot reclaim policy.
 # The async-fetch worker's zombie was never reclaimable because its ppid
 # named the Ring 3 caller, so 41 fetches filled the 64-entry process table
@@ -1368,6 +1554,10 @@ sys_poll_rs
 poll_bits_match_rs
 pollsys_selftest_rs
 
+# rustkern/getrandom.rs - SYS_GETRANDOM: user buffer <- kernel CSPRNG
+sys_getrandom_rs
+getrandom_selftest_rs
+
 # rustkern/winbuf.rs - #137: how big a window content buffer may be, and how
 # many bytes it needs. Owner: proc/syscall.c (sys_win_create, win16_host_create,
 # the nochrome-panel path, sys_win_blit growth, sys_win_draw_image). Before this
@@ -1391,6 +1581,14 @@ winstate_bits_rs
 # through copy_from_user first.
 winblit_plan_rs
 winblit_scale_row_rs
+
+# rustkern/wm_bounds.rs - #404 (cfhost): SYS_WM_SET_BOUNDS placement policy for
+# Cardfile window hosting. NEW code, no <fn>_c twin, no -DRUST_* flag. Owner:
+# gui/window.c (sys_wm_set_bounds), which does the window-list lookup and applies
+# the plan; the pure flag/geometry decision is wm_bounds_plan_rs. The selftest is
+# host-runnable and proves the four state transitions.
+wm_bounds_plan_rs
+wm_bounds_selftest_rs
 
 # rustkern/le.rs - #740: LE (Linear Executable) parse, relocate and load for
 # DOS/4GW. NEW code, so there is no `<fn>_c` twin and no -DRUST_LE flag: the
@@ -1776,3 +1974,71 @@ blkhist_sectors_per_xfer_x10_rs
 blkhist_kbps_rs
 blkhist_projected_ms_rs
 blkhist_selftest_rs
+
+# rustkern/advlock.rs - #404 Stage 6: POSIX (fcntl) + BSD (flock) advisory file
+# locking manager (lock table, range-overlap math, conflict detection, POSIX
+# merge/split/replace, wait-for cycle deadlock check). New logic, no C twin, so
+# Rust with no strangler flag; the C glue is proc/advlock.c.
+advlock_fileid_rs
+advlock_try_rs
+advlock_setw_step_rs
+advlock_grantable_locked_rs
+advlock_wait_end_rs
+advlock_unlock_rs
+advlock_getlk_rs
+advlock_flock_try_rs
+advlock_flock_grantable_locked_rs
+advlock_release_fdslot_rs
+advlock_release_owner_file_rs
+advlock_release_owner_all_rs
+advlock_stat_rs
+advlock_capacity_rs
+advlock_selftest_rs
+
+# rustkern/capdev.rs - #246/#305 Stage 4 CAP_SCOPE_DEVICE: the PURE device-
+# identity policy (fingerprint derivation, logical-device key, confidence class,
+# trust-on-first-use verdict). New logic, no C twin, so Rust with no strangler
+# flag; the C state + hotplug glue is fs/escrow_device.c.
+cap_device_fp_rs
+cap_device_logical_rs
+cap_device_confidence_rs
+cap_tofu_verdict_rs
+cap_device_selftest_rs
+
+# rustkern/escrowundo.rs - #246/#305 Stage 5B: the PURE reversibility policy
+# for the escrow rollback/undo engine (is-reversible + inverse-action + a
+# self-test of that mapping). New logic, no C twin, so Rust with no strangler
+# flag; the C state + FS glue is fs/escrow_undo.c.
+escu_is_reversible_rs
+escu_inverse_rs
+escu_policy_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/blkmgr.rs (#404 disk-mgr) - synthetic scratch block device, unified
+# SYS_BLK_ENUM, gated raw SYS_BLK_READ/WRITE, two-phase SYS_PART_PREPARE/WRITE.
+# Owner: device-driver / disk-manager. See fs/blkmgr.h.
+# ---------------------------------------------------------------------------
+blk_enum_rs
+sys_blk_read_rs
+sys_blk_write_rs
+sys_part_prepare_rs
+sys_part_write_rs
+blkmgr_scratch_init_rs
+blkmgr_scratch_present_rs
+blkmgr_selftest_rs
+sys_mkfs_rs
+blkmgr_mkfs_selftest_rs
+blkmgr_mkfs_dump_rs
+sys_mount_list_rs
+sys_mount_rs
+sys_umount_rs
+blkmgr_mount_selftest_rs
+# #404 Stage 4b: VFS resolver + ext2 write-mount (aux mounts under /MNT).
+blkmgr_mount_scratch_c
+blkmgr_umount_kernel_c
+blkmgr_vfs_scratch_prep_rs
+blkmgr_dev_rw_c
+blkmgr_aux_resolve_c
+blkmgr_aux_fat_read_c
+blkmgr_aux_fat_write_c
+blkmgr_aux_fat_readdir_c

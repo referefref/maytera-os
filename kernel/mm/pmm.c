@@ -7,6 +7,7 @@
 #include "../boot_info.h"
 #include "../cpu/scprof.h"    // #121: allocator phase attribution
 #include "../serial.h"
+#include "mmlog.h"   // #dosmem: mm anomalies must reach a serial-less machine
 
 // Linker-provided symbols for kernel memory bounds
 extern char __text_start, __rodata_end, __bss_end, __kernel_end;
@@ -65,7 +66,7 @@ static uint64_t g_phys_limit = 0;   // one past the highest address in the map
 // halted - which is why "the owner stops taking interrupts" and "a core halted
 // holding the lock" were both the wrong picture.
 //
-// MEASURED, build 1878 on throwaway VM <vmid>, gate ON, six QMP samples over
+// MEASURED, build 1878 on throwaway VM 2690, gate ON, six QMP samples over
 // 30 s with every value identical:
 //   bkl_owner=1 bkl_depth=1 bkl_word=1        (cpu1 owns the BKL)
 //   cpu0 RIP=0x45d9c2 -> bkl_take_locked   cpu/smp.c:1112   HLT=0 IF=1
@@ -326,6 +327,72 @@ static void pmm_live_check(uint64_t pa, uint64_t count, uint64_t ret) {
 
 // Allocate a single physical page
 static uint64_t pmm_alloc_page_inner(void);
+// ===========================================================================
+// #dosmem: SAY THE MACHINE IS RUNNING OUT OF PHYSICAL MEMORY WHILE IT STILL
+// CAN, instead of only at the instant it has none left.
+//
+// THE CASE THIS EXISTS FOR. Every DOS guest on the owner's iMac14,4 dies with
+// `[EXCEPTION] Page Fault USER err=0x6 CR2=0x8040dee000` inside memset, 14.6 MB
+// into the libc heap. err=0x6 is write / user / NOT PRESENT, and there are only
+// three ways mm_fault() can refuse such a fault: no VMA covers it, the VMA
+// forbids the write, or the demand allocation FAILED. The third is
+// indistinguishable from the other two in the report, and it is the one that
+// says "this machine is out of memory" rather than "this kernel has a paging
+// bug". Getting that wrong sends the next reader after a defect that is not
+// there - which has already happened once on this exact fault (blame.md,
+// 2026-09-03, CR2 read at print time).
+//
+// mm_fault()'s report now names the reason, and pmm_alloc_page()'s failure path
+// says so too. But BOTH of those only speak at the moment of failure, by which
+// point the process is dying. This says it on the way down.
+//
+// MEASURED, and it is why the threshold ladder is shaped the way it is: a
+// 4-vCPU / 4 GB VM booted to a compositing desktop reports pmmfreeKB=951532,
+// i.e. 929 MB free of the PMM's 2 GB managed window, and a Ring-3 app then
+// wrote and byte-verified a 64 MB buffer with no fault at all. Both known
+// failures (COMPCEIL at 27.82 MB, DOSUSER at 1 MB into a 14.6 MB heap) happened
+// on memory-heavy systems. So the interesting region is not "zero", it is the
+// approach, and a report at 50% is early enough to be actionable while being
+// rare enough to cost nothing on a healthy boot.
+//
+// COST: one compare against a static on the SUCCESS path of pmm_alloc_page(),
+// outside the lock (see below), and at most five lines for the life of the
+// boot. It is deliberately not a percentage recomputed per call: that would be
+// a 64-bit divide in the hottest allocator in the kernel.
+//
+// OUTSIDE THE LOCK, DELIBERATELY. This is called after pmm_release_lock(), so
+// the MM_ANOMALY -> bootlog_fault_write path never runs with the PMM lock held.
+// free_pages is read without the lock, so the value can be one or two
+// allocations stale; for a threshold crossing that is irrelevant, and it is
+// strictly better than holding the allocator's lock across a formatted write.
+static uint64_t g_pmm_low_next = 0;   // 0 = not armed yet (set on first call)
+
+static void pmm_lowwater_check(void) {
+    uint64_t total = total_pages;
+    if (total == 0) return;
+
+    if (g_pmm_low_next == 0) {
+        // Arm at 50% on the first allocation, once total_pages is known.
+        g_pmm_low_next = total / 2;
+        if (g_pmm_low_next == 0) return;
+    }
+    if (free_pages > g_pmm_low_next) return;
+
+    uint64_t at = g_pmm_low_next;
+    // Next rung: 50 -> 25 -> 10 -> 5 -> 1 percent, then stop.
+    if      (at == total / 2)   g_pmm_low_next = total / 4;
+    else if (at == total / 4)   g_pmm_low_next = total / 10;
+    else if (at == total / 10)  g_pmm_low_next = total / 20;
+    else if (at == total / 20)  g_pmm_low_next = total / 100;
+    else                        g_pmm_low_next = 0xFFFFFFFFFFFFFFFFULL;  // silent from here
+
+    MM_ANOMALY("[PMM] LOW WATER: %lu of %lu pages free (%lu MB of %lu MB). "
+               "At zero, every demand page fails and Ring 3 sees a SIGSEGV "
+               "mid-write, not a NULL from malloc.",
+               free_pages, total,
+               (free_pages * PMM_PAGE_SIZE) >> 20, (total * PMM_PAGE_SIZE) >> 20);
+}
+
 uint64_t pmm_alloc_page(void) {
     scp_span_t __sp = scp_begin();   // #121
     uint64_t __r = pmm_alloc_page_inner();
@@ -334,7 +401,7 @@ uint64_t pmm_alloc_page(void) {
 }
 // #121: START THE SCAN WHERE THE LAST ONE FINISHED.
 //
-// MEASURED on build 1899, VM <vmid>, one 300 s run to DESKTOP_READY: the single
+// MEASURED on build 1899, VM 2681, one 300 s run to DESKTOP_READY: the single
 // longest UNBROKEN syscall in the system is SYS_SPAWN at 450207 us, and
 // 423261 us of it - 94% - is inside this function. #118 reported that hold as a
 // 446 ms Big Kernel Lock hold and #121 was opened to narrow the lock; the lock
@@ -397,11 +464,15 @@ static uint64_t pmm_alloc_page_inner(void) {
                             pa, live_va, (uint64_t)__builtin_return_address(0));
                 }
             }
+            pmm_lowwater_check();
             return pa;
         }
     }
 
     pmm_release_lock(irqf);
+    MM_ANOMALY("[PMM] OUT OF PHYSICAL MEMORY (free=%lu/%lu pages). Every lazy page, "
+               "page table and kernel allocation from here on will fail.",
+               free_pages, total_pages);
     kprintf("[PMM] ERROR: Out of physical memory!\n");
     return 0;
 }
@@ -443,6 +514,9 @@ uint64_t pmm_alloc_pages(uint64_t count) {
     }
 
     pmm_release_lock(irqf);
+    MM_ANOMALY("[PMM] cannot allocate %lu CONTIGUOUS pages (free=%lu/%lu, so this is "
+               "FRAGMENTATION, not exhaustion, whenever free >= count)",
+               count, free_pages, total_pages);
     kprintf("[PMM] ERROR: Cannot allocate %lu contiguous pages!\n", count);
     return 0;
 }
@@ -452,6 +526,8 @@ void pmm_free_page(uint64_t phys_addr) {
     uint64_t page = phys_addr / PMM_PAGE_SIZE;
 
     if (page < memory_start || page >= memory_end) {
+        MM_ANOMALY("[PMM] free of an INVALID page 0x%lx (outside the managed range or "
+                   "misaligned): a pointer bug upstream, not a memory shortage", phys_addr);
         kprintf("[PMM] WARNING: Attempt to free invalid page 0x%lx\n", phys_addr);
         return;
     }

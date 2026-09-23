@@ -1,0 +1,228 @@
+# mports recipe: Angband 4.2.6. Tier 3 item #15 of
+# docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md: "Same class [as NetHack],
+# cleaner licence, and it has a long history of non-curses frontends, which
+# lowers the risk if #2 [ncurses] slips." ncurses landed (userland/ports/
+# ncurses), so this is the second real consumer of it after ncurses's own test
+# program, and the first real exercise of mports' cross-port `needs=` ordering
+# on a shipping port rather than the self-test's synthetic pair.
+#
+# WHY build=objects, NOT build=script. Angband ships a real ./configure
+# (configure.ac + autogen.sh), but nothing it would probe needs a genuine
+# autotools run: without HAVE_CONFIG_H, src/h-basic.h SELF-DETECTS a generic
+# Unix target (`#define UNIX`, HAVE_STAT, HAVE_FCNTL_H, HAVE_MKDIR all follow
+# automatically from "not WINDOWS/GAMEBOY/NDS"), which is exactly the
+# environment a cross build without a working `configure` link-test needs.
+# src/Makefile.src's ANGFILES0+ZFILES lists are a fixed, versioned object
+# list (not autotools-generated), so `sources=` below is that list read
+# straight off Makefile.src, plus buildid.c (deliberately NOT part of
+# ANGFILES0: see `ANGFILES = $(ANGFILES0) buildid.o`), main.c, main-gcu.c
+# (the GCU/ncurses frontend; SYS_x11/SYS_sdl/SYS_sdl2/SYS_stats/SYS_spoil are
+# all left out, per docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md section
+# 2.6, "no X11, GTK, Qt, or SDL"), and our own mayteraos-curses-compat.c (see
+# the patch below).
+#
+# THREE REAL GAPS THIS PORT FOUND AND CLOSED, in order of how they surfaced:
+#
+# 1. main.c requires UTF-8: `if (setlocale(LC_CTYPE, "")) { if
+#    (!streq(nl_langinfo(CODESET), "UTF-8")) quit(...); }`. userland/libc had
+#    setlocale() (locale.h/.c) but no <langinfo.h> at all (a MEASURED absent
+#    header per the assessment's section 2.2). Added userland/libc/langinfo.h
+#    + langinfo.c to the SHARED libc per docs/MPORTS.md owner rule 1: any
+#    future setlocale()+nl_langinfo() idiom (the standard UTF-8-detection
+#    idiom in a huge fraction of ported C programs) hits this identically.
+#    nl_langinfo(CODESET) honestly returns "UTF-8": this is not a locale claim
+#    (locale.h is explicit MayteraOS has exactly one locale, the C locale) but
+#    a transport-encoding one, and the terminal's real encoding IS UTF-8
+#    (term_parse.c is a real VT220/xterm-class parser that maps DEC
+#    special-graphics to Unicode, and text is rendered through antialiased
+#    TrueType glyphs, not an 8-bit bitmap font).
+# 2. z-file.c's file_lock()/file_unlock() build a `struct flock` and call
+#    fcntl(F_SETLKW/F_SETLK, ...) unconditionally under `#if
+#    defined(HAVE_FCNTL_H) && defined(UNIX)` (both true here) and NEVER CHECK
+#    THE RETURN VALUE (advisory locking is best-effort even on real POSIX).
+#    userland/libc/fcntl.h had no lock constants or `struct flock` at all.
+#    Added them for SOURCE COMPATIBILITY only: MayteraOS has no multi-process
+#    advisory record locking (matching the O_EXCL gap the assessment's 2.5
+#    already recorded), so fcntl.c forwards these commands to SYS_FCNTL like
+#    any other, the kernel does not recognise them, and every caller in the
+#    tree already ignores the return value. Same honest single-writer
+#    contract as the SQLite port's custom VFS decision.
+# 3. main.c calls `umask(0)` unconditionally before create_needed_dirs().
+#    Added `mode_t umask(mode_t)` to userland/libc/sys/stat.h + sys/stat.c:
+#    process-local bookkeeping only, since MayteraOS's mkdir()/open(O_CREAT)
+#    apply the caller's explicit mode directly with no mask consulted
+#    anywhere in the kernel path, so there is nothing for a "real" umask to
+#    mask; storing/returning the previous value keeps the POSIX read-back
+#    contract without pretending to enforce a kernel behaviour that does not
+#    exist.
+#
+# THE ONE REAL BLOCKER, AND THE PATCH THAT ANSWERS IT. main-gcu.c's ONLY
+# glyph-drawing function, Term_text_gcu(), calls mvwaddnwstr() UNCONDITIONALLY
+# (there is no narrow-curses fallback left in this Angband version; the
+# `-lcurses -ltermcap` line in Makefile.std is vestigial and no longer
+# compiles against a real narrow curses). mvwaddnwstr is an ncursesw
+# (wide-character) entry point, and userland/ports/ncurses is deliberately
+# built --disable-widec ("the emulator and this milestone are 8-bit/UTF-8-
+# passthrough"). Rebuilding a second, wide copy of ncurses for one caller
+# would be a disproportionate answer: with no tile graphics (USE_GRAPHICS
+# off), every glyph the GCU frontend ever draws is a plain code point under
+# 256. patches/0001 adds src/mayteraos-curses-compat.{h,c} (FIRST-PARTY
+# MayteraOS glue inside the fetched tree, same shape as
+# userland/ports/musl-regex/patches/0004's gnuregex.h/gnu_compat.c: one copy,
+# where the one copy belongs) implementing mvwaddnwstr on top of the narrow
+# waddch() our libncurses.a actually has, and patches main-gcu.c to include
+# its header. mvwaddnwstr is listed in `symbols=` below, so a patch that stops
+# applying fails the build loudly instead of shipping a binary that cannot
+# link.
+#
+# RUNTIME DATA PATH. Angband needs its lib/ tree (edit files, help text,
+# screens, customize/prefs) on disk at ANGBAND_DIR_* paths computed from
+# DEFAULT_CONFIG_PATH/DEFAULT_LIB_PATH/DEFAULT_DATA_PATH (src/config.h),
+# overridden below to "/ANGBAND/" (mirrors upstream's own default of pointing
+# all three at one "./lib/" tree). build/build-golden.sh overlays the
+# read-only lib/ tree onto ext2 /ANGBAND, parallel to the existing /TERMINFO
+# overlay for mports ncurses.
+#
+# THE SAVE/SCORE/PANIC PATH IS NOT "~/.angband", AND THIS WAS MEASURED, NOT
+# ASSUMED. -DUSE_PRIVATE_PATHS keeps save/score/panic out of the shared
+# read-only /ANGBAND tree; the upstream UNIX default for WHERE (PRIVATE_
+# USER_PATH="~/.angband") resolves through z-file.c's real
+# getpwuid(getuid())->pw_dir (userland/libc/pwd.c reads /CONFIG/PASSWD; not a
+# stub), which is elegant and per-user WHEN /CONFIG/PASSWD exists. MEASURED
+# on golden 2414 booted with NO first-boot setup wizard run yet (no
+# /CONFIG/PASSWD on disk at all, the normal state before OOBE completes): the
+# tilde expansion has no passwd entry to resolve against and quietly produces
+# a mangled path, and Angband's own create_needed_dirs() then fails outright
+# with "Cannot create '<mangled path>'" before the game ever starts. Every
+# shipped image bottoms out at this state until OOBE runs, so the elegant
+# per-user answer is not a safe DEFAULT.
+#
+# PRIVATE_USER_PATH is therefore overridden below to the fixed, absolute
+# "/GAMES/ANGBAND" (no tilde, no getpwuid dependency), the same
+# machine-wide-writable-directory shape as the existing NetHack/SimCity
+# entries in kernel/fs/perms.c's perms_shared_state_seed[] table (this port
+# adds the matching "/GAMES/ANGBAND" 0777 row there) and build-golden.sh
+# creates the directory on ext2, same as GAMES/NETHACK. HONEST LIMIT: this is
+# a SINGLE SHARED save location, not per-user; per-user isolation via
+# %HOME%/GAMES/ANGBAND (the users_make_home_skeleton() pattern SimCity's
+# per-user half uses) is a documented follow-up once every shipped image is
+# guaranteed to have completed OOBE.
+#
+# VERIFIED END TO END with the getpwuid failure reproduced and then routed
+# around: on a throwaway VM (golden 2414, pre-OOBE), Angband failed exactly
+# as measured above with the tilde-based default; pointed at a machine-wide
+# 0777 directory (proven with the ALREADY-SEEDED /GAMES/SIMCITY as a stand-in,
+# since the running kernel predates this port's new perms.c row), Angband's
+# own create_needed_dirs() succeeded, and the game reached its splash screen,
+# then interactive race/class character-creation menus, with keyboard input
+# live-updating the displayed stats. The shipped "/GAMES/ANGBAND" row takes
+# effect on the next kernel build; the MECHANISM is proven, not assumed.
+name=angband
+version=4.2.6
+class=C
+homepage=https://rephial.org/
+
+# The git tag source archive (angband/angband is the canonical upstream repo;
+# rephial.org is the project's site, which links there). No separate release
+# tarball is published for 4.2.6 beyond OS-specific binaries (osx .dmg,
+# windows .exe), matched by checking the GitHub release assets directly at
+# port time. sha256 below is of THIS file, MEASURED on the build container:
+#   wget -O angband-4.2.6.tar.gz \
+#     https://github.com/angband/angband/archive/refs/tags/4.2.6.tar.gz
+#   sha256sum angband-4.2.6.tar.gz
+#   -> 64091eb98e1b08c4d69a9ca94802ea797aef09daaaf335e450bc64f80ee56911 (25,964,779 bytes)
+source_url=https://github.com/angband/angband/archive/refs/tags/4.2.6.tar.gz
+tarball=angband-4.2.6.tar.gz
+sha256=64091eb98e1b08c4d69a9ca94802ea797aef09daaaf335e450bc64f80ee56911
+srcdir=angband-4.2.6
+
+# GPL-2.0-only. Every source file (src/main.c, src/main-gcu.c, src/buildid.c,
+# ...) carries the identical dual grant, reproduced verbatim in
+# ATTRIBUTION.md and copied out of THIS tarball (there is no standalone
+# COPYING/LICENSE file upstream, confirmed against both the release tarball
+# and the GitHub license-detection API, which reports none): "(a) the GNU
+# General Public License as published by the Free Software Foundation,
+# version 2, or (b) the 'Angband licence' [a permissive-ish, non-standard,
+# non-OSI-approved educational/research/not-for-profit grant]". We
+# redistribute under option (a), the well-understood, unambiguous choice,
+# matching the assessment's own GPL-2.0-only classification.
+licence=GPL-2.0-only
+licence_files=src/main.c src/main-gcu.c src/buildid.c
+copyleft=aggregate
+copyleft_note=Angband ships as a standalone /APPS/ANGBAND binary with its own corresponding-source obligation (this PORT file + patches/ + the exact upstream tarball are the source); it links userland/libc (MIT) and userland/ports/ncurses (X11-style permissive), neither copyleft, so nothing GPL flows into either of those. Same shape as VI's GPLv2 busybox in ATTRIBUTION.md, minus the LGPL regex complication (VI needed GPLv3 because it also links LGPLv3 GNU regex; Angband links nothing copyleft besides itself).
+
+# THE ADOPTION TEST (owner rule 2): does this want to USE a platform layer, or
+# to BE one? Angband USES. It is an ordinary Ring-3 program: it opens files
+# under its ANGBAND_DIR_* paths, reads/writes a savefile, and draws through
+# ncurses' terminal model. It owns no event loop anyone else must adopt, no
+# window system, no service. The GCU frontend's only "own the process" moment
+# is main()'s top-level game loop, exactly like every other curses program
+# already ported (see ncurses' own adoption note): it calls INTO ncurses'
+# getch()/refresh(), never the reverse.
+adoption=USES. Angband is a self-contained Ring-3 curses program: it reads its lib/ data files and writes a savefile through ordinary libc file I/O, and draws through ncurses' terminal model (getch()/refresh()), never the reverse. It imposes no event loop, window system or service model on anything else; it is a leaf consumer of the platform and of the ncurses port, not a would-be platform.
+
+# The first shipping port to exercise mports' `needs=` on a REAL dependency
+# (the self-test's aaa/zzz pair being the only prior exercise, per
+# docs/MPORTS.md's "Known limitations"). ncurses installs curses.h et al into
+# out/include and libncurses.a into out/lib; both are required for main-gcu.c
+# and the final link.
+needs=libc ncurses
+
+prepare=none
+
+# See the port header above: adds src/mayteraos-curses-compat.{h,c} (a narrow-
+# curses mvwaddnwstr()) and one #include line in src/main-gcu.c.
+patches=0001-mvwaddnwstr-narrow-curses-compat.patch
+
+build=objects
+sources=src/borg/borg-attack-munchkin.c src/borg/borg-caution.c src/borg/borg-cave-light.c src/borg/borg-cave-util.c src/borg/borg-cave-view.c src/borg/borg-cave.c src/borg/borg-danger.c src/borg/borg-escape.c src/borg/borg-fight-attack.c src/borg/borg-fight-defend.c src/borg/borg-fight-perm.c src/borg/borg-flow-dark.c src/borg/borg-flow-glyph.c src/borg/borg-flow-kill.c src/borg/borg-flow-misc.c src/borg/borg-flow-stairs.c src/borg/borg-flow-take.c src/borg/borg-flow.c src/borg/borg-formulas-calc.c src/borg/borg-formulas.c src/borg/borg-home-notice.c src/borg/borg-home-power.c src/borg/borg-init.c src/borg/borg-inventory.c src/borg/borg-io.c src/borg/borg-item-activation.c src/borg/borg-item-analyze.c src/borg/borg-item-decurse.c src/borg/borg-item-enchant.c src/borg/borg-item-id.c src/borg/borg-item-use.c src/borg/borg-item-val.c src/borg/borg-item-wear.c src/borg/borg-item.c src/borg/borg-junk.c src/borg/borg-light.c src/borg/borg-log.c src/borg/borg-magic-play.c src/borg/borg-magic.c src/borg/borg-messages-react.c src/borg/borg-messages.c src/borg/borg-power.c src/borg/borg-prepared.c src/borg/borg-projection.c src/borg/borg-recover.c src/borg/borg-reincarnate.c src/borg/borg-store-buy.c src/borg/borg-store-sell.c src/borg/borg-store.c src/borg/borg-think-dungeon-util.c src/borg/borg-think-dungeon.c src/borg/borg-think-store.c src/borg/borg-think.c src/borg/borg-trait-swap.c src/borg/borg-trait.c src/borg/borg-update.c src/borg/borg-util.c src/borg/borg.c src/cave-map.c src/cave-square.c src/cave-view.c src/cave.c src/cmd-cave.c src/cmd-core.c src/cmd-misc.c src/cmd-obj.c src/cmd-pickup.c src/cmd-spoil.c src/cmd-wizard.c src/datafile.c src/debug.c src/effect-handler-attack.c src/effect-handler-general.c src/effects-info.c src/effects.c src/game-event.c src/game-input.c src/game-world.c src/gen-cave.c src/gen-chunk.c src/gen-monster.c src/gen-room.c src/gen-util.c src/generate.c src/grafmode.c src/guid.c src/init.c src/load.c src/message.c src/mon-attack.c src/mon-blows.c src/mon-desc.c src/mon-group.c src/mon-init.c src/mon-list.c src/mon-lore.c src/mon-make.c src/mon-move.c src/mon-msg.c src/mon-predicate.c src/mon-spell.c src/mon-summon.c src/mon-timed.c src/mon-util.c src/obj-chest.c src/obj-curse.c src/obj-desc.c src/obj-gear.c src/obj-ignore.c src/obj-info.c src/obj-init.c src/obj-knowledge.c src/obj-list.c src/obj-make.c src/obj-pile.c src/obj-power.c src/obj-properties.c src/obj-randart.c src/obj-slays.c src/obj-tval.c src/obj-util.c src/option.c src/parser.c src/player-attack.c src/player-birth.c src/player-calcs.c src/player-class.c src/player-history.c src/player-path.c src/player-properties.c src/player-quest.c src/player-race.c src/player-spell.c src/player-timed.c src/player-util.c src/player.c src/project-feat.c src/project-mon.c src/project-obj.c src/project-player.c src/project.c src/randname.c src/save-charoutput.c src/save.c src/savefile.c src/score-util.c src/score.c src/sound-core.c src/source.c src/store.c src/target.c src/trap.c src/ui-birth.c src/ui-command.c src/ui-context.c src/ui-curse.c src/ui-death.c src/ui-display.c src/ui-effect.c src/ui-entry-combiner.c src/ui-entry-renderers.c src/ui-entry.c src/ui-equip-cmp.c src/ui-event.c src/ui-game.c src/ui-help.c src/ui-history.c src/ui-init.c src/ui-input.c src/ui-keymap.c src/ui-knowledge.c src/ui-map.c src/ui-menu.c src/ui-mon-list.c src/ui-mon-lore.c src/ui-obj-list.c src/ui-object.c src/ui-options.c src/ui-output.c src/ui-player-properties.c src/ui-player.c src/ui-prefs.c src/ui-score.c src/ui-signals.c src/ui-spell.c src/ui-spoil.c src/ui-store.c src/ui-target.c src/ui-term.c src/ui-visuals.c src/ui-wizard.c src/wiz-debug.c src/wiz-spoil.c src/wiz-stats.c src/z-bitflag.c src/z-color.c src/z-dice.c src/z-expression.c src/z-file.c src/z-form.c src/z-quark.c src/z-queue.c src/z-rand.c src/z-textblock.c src/z-type.c src/z-util.c src/z-virt.c src/buildid.c src/main.c src/main-gcu.c src/mayteraos-curses-compat.c
+
+# -DUSE_GCU: build the ncurses/GCU frontend only (main-gcu.o); the modules[]
+#   table in main.c then has exactly one entry, "gcu", so main() selects it
+#   with no -m flag needed. X11/SDL/SDL2/stats/spoil/win are all left
+#   unbuilt (not in `sources=` at all): this OS has none of those toolkits
+#   (docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md section 2.6).
+# -DALLOW_BORG: upstream's own Makefile.std default (BORG_FLAGS). The borg/*.c
+#   files are unconditionally part of ANGFILES0 either way (they compile with
+#   or without this macro); it only gates whether the in-game "activate the
+#   Borg autoplayer" wizard command is reachable. Left matching upstream
+#   default rather than silently narrowing behaviour with no OS-specific
+#   reason to.
+# -DUSE_PRIVATE_PATHS, -DDEFAULT_CONFIG_PATH/-DDEFAULT_LIB_PATH/
+#   -DDEFAULT_DATA_PATH: see the port header above (runtime data path).
+cflags=-Isrc -DUSE_GCU -DALLOW_BORG -DUSE_PRIVATE_PATHS -DPRIVATE_USER_PATH="/GAMES/ANGBAND" -DDEFAULT_CONFIG_PATH="/ANGBAND/" -DDEFAULT_LIB_PATH="/ANGBAND/" -DDEFAULT_DATA_PATH="/ANGBAND/"
+
+# A program installs no public header, like darkhttpd (the headers=none
+
+# THE RUNTIME DATA PATH (see the port header comment above). Angband's own
+# lib/ tree has FOUR directories a text/GCU build actually reads: gamedata
+# (object/monster/spell/vault definitions, 1.3M/46 files), customize
+# (default .prf colour/keymap/option files, 68K/12 files), help (in-game
+# help text, 32K/6 files) and screens (splash/death ASCII art, 24K/5 files).
+# fonts/tiles/sounds/icons (~24MB combined) are SDL/win-frontend-only assets
+# this build never opens (-DUSE_GCU, no USE_GRAPHICS/SOUND) and lib/user is
+# upstream's own optional sample override content, unrelated to our real
+# real save path (/GAMES/ANGBAND, see USE_PRIVATE_PATHS above); both are
+# deliberately left off the image. build/build-golden.sh overlays
+# /data/angband/* onto ext2 /ANGBAND/*, parallel to the existing
+# /TERMINFO overlay for the ncurses port.
+install_data=lib/gamedata:angband/gamedata lib/customize:angband/customize lib/help:angband/help lib/screens:angband/screens
+# literal).
+headers=none
+
+# THE PRIMARY LIBRARY. Same shape as darkhttpd: main() lives inside this
+# archive (from main.c), and it exists to be linked by exactly ONE consumer,
+# userland/apps/angband, which pulls main() out of it via crt0.
+lib=libangband.a
+
+# THE ANTI-NO-OP CHECK. `main` proves main.c compiled with a real entry
+# point; `init_gcu` proves the GCU frontend module compiled and is the one
+# main.c's modules[] table will select; `play_game` proves the actual game
+# loop (game-world.c/ui-game.c) is in the archive, not stubbed; `quit` proves
+# z-util.c's core error/exit path is present (nearly everything calls it);
+# `mvwaddnwstr` proves patches/0001 actually applied (a patch that silently
+# stopped applying would otherwise ship a binary that fails to LINK, but
+# checking the symbol here catches it even if some other code path happened
+# to satisfy the link some other way). Measured with `nm --defined-only` on
+# the compiled objects before this recipe was written.
+symbols=main init_gcu play_game quit mvwaddnwstr

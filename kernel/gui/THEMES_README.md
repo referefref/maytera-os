@@ -1,5 +1,14 @@
 # MayteraOS Desktop Theming System
 
+> **SUPERSEDED (docs refresh, 2026-09-23).** This document describes the old
+> per-directory `INI` theme engine (`/THEMES/<name>/theme.ini`,
+> `theme_load`/`theme_save`). That engine is dead code (#565/#711): it still
+> compiles but has zero live callers. The live theme format is **mtheme v2**, a
+> single-file `.mtheme` YAML per theme, parsed by `kernel/gui/themes.c`. See
+> `docs/THEMES.md` for the current format and `kernel/themes_example/README.md`
+> for how the dead `theme.ini` engine was confirmed inert. Do not write a theme
+> against the `theme.ini` format below; it is kept only as historical reference.
+
 ## Overview
 
 The MayteraOS theming system provides comprehensive desktop customization similar to KDE Plasma or LiteStep. It supports both built-in themes and custom user themes loaded from INI files.

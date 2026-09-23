@@ -54,17 +54,32 @@ fix. See Releases below.
 - **Kernel** - long-mode paging with demand paging and copy-on-write, a
   preemptive scheduler, ELF and PE loaders, signals, futexes, and a
   wait-queue-based blocking layer.
-- **SMP is implemented but off by default in this release.** `smp_init()` runs
-  and the LAPIC is brought up, and per-cpu run queues plus a safe
-  context-switch handoff are in the tree, but `kernel/cpu/smp.c` ships
-  `g_smp_user_sched = 0` and `kernel/main.c` starts application processors only
-  when that flag is set. So on a stock build **no application processor is
-  started and the whole system, kernel work included, runs on the bootstrap
-  processor**. Drop an empty `/SMPSCHED.TXT` at the root of the ESP to enable
-  it for one boot with no rebuild. The default is 0 because the failure it
-  guards is a silent scheduler wedge rather than a crash; the comment block at
-  the top of `kernel/cpu/smp.c` records what went wrong and what the bar for
-  changing the default is.
+- **SMP is ON by default.** `smp_init()` runs, the LAPIC is brought up,
+  per-cpu run queues and a safe context-switch handoff are in the tree, and
+  `kernel/cpu/smp.c` ships `g_smp_user_sched = 1`: on a stock build every
+  detected application processor is started and takes user work, not just
+  the bootstrap processor. This is a product requirement, not a tunable -
+  it is not offered as a toggle to try, it is what MayteraOS ships.
+  Two gate files exist for the rare case where a specific machine needs to
+  override it for one boot with no rebuild: an empty `/NOSMPSCHED.TXT` at
+  the root of the ESP forces AP user scheduling OFF (only the bootstrap
+  processor runs user work), and an empty `/SMPSCHED.TXT` forces it back ON
+  (the default behaviour, stated explicitly). MEASURED across 18 cold boots
+  (18/18 clean) in all three reachable states: `4 of 4 core(s) online, AP
+  user scheduling LIVE (defaulted ON (no gate file))`, the same with
+  `/SMPSCHED.TXT` present, and `1 of 4 core(s) online, AP user scheduling
+  OFF (forced OFF by /NOSMPSCHED.TXT)`.
+  **This is not yet a performance win, and it is not described as one.** On
+  the project's own measurement rig, SMP-on trails the SMP-off arm by about
+  26% in present-ticks/second (26.0 vs 35.0), because of Big Kernel Lock
+  contention: about 17% of BKL acquires contend and roughly 19 million
+  pause-spins/second occur at 4 cores, against 0% and 0 with SMP off. That
+  the historical monotonic THROUGHPUT COLLAPSE with core count is gone (it
+  used to be 46/15/10/7 present ticks/s at 1/2/4/8 cores; it is now flat in
+  the 24-29.5 range) is real progress, but the BKL is still the ceiling and
+  is being narrowed as its own piece of work, not hidden behind a disabled
+  default. See the comment block at the top of `kernel/cpu/smp.c` for the
+  current state of that effort.
 - **Graphics + desktop** - a framebuffer compositor with damage-tracked
   redraw, drop shadows, TTF text, a themeable style engine, desktop widgets,
   and five selectable panel layouts (classic taskbar, Lumina, a CDE/Motif-style

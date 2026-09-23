@@ -11,10 +11,12 @@
 
 #include "ahci.h"
 #include "pci.h"
+#include "../fs/bootlog.h"
 #include "../serial.h"
 #include "../string.h"
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
+#include "../cpu/mono.h"   // #507: shared calibrated monotonic busy-delay
 
 // Global AHCI state
 static ahci_hba_t ahci_hba = {0};
@@ -41,12 +43,17 @@ static inline void memory_barrier(void) {
     __asm__ volatile("mfence" ::: "memory");
 }
 
-// Small delay
+// Small delay. #507/ahciclk: spend it on the shared calibrated monotonic
+// busy-delay (rustkern mono) rather than counting 20,000 outb-0x80 round
+// trips per unit, each a VM exit under virtualization. mono_init() runs at
+// main.c:1700, before ata_init()/ahci probe at main.c:1836, so the TSC clock
+// is already calibrated at every remaining caller (mono_busy_delay also falls
+// back to a direct PIT read before calibration). This is a delay-MECHANISM
+// swap: the real settle duration is unchanged. ahci_delay(1) stays ~20ms of
+// real time (the old 20,000 io_wait() were ~1us each), so every hard-cap
+// annotation on the boot-probe callers below still holds.
 static void ahci_delay(uint32_t ms) {
-    // Simple busy-wait delay (not accurate, but functional)
-    for (uint32_t i = 0; i < ms * 20000; i++) {
-        io_wait();
-    }
+    mono_busy_delay_us((uint64_t)ms * 20000ull);
 }
 
 // #287/#426: RDTSC helper, hoisted here so the ERROR-RECOVERY waits below can
@@ -734,6 +741,7 @@ int ahci_init(void) {
     kprintf("[AHCI] Initializing AHCI driver...\n");
     int dev_count = pci_get_device_count();
     int any = 0;
+    int controllers = 0;
     for (int i = 0; i < dev_count; i++) {
         pci_device_t *dev = pci_get_device(i);
         if (!dev) continue;
@@ -743,15 +751,42 @@ int ahci_init(void) {
             continue;
         }
         any = 1;
+        controllers++;
         pci_enable_bus_master(dev);
         int found = ahci_init_one(dev);
         if (found > 0) {
+            // #imacnic: SAY SO IN THE CLAIMED-BY COLUMN. pci_mark_claimed() is
+            // what makes /DEVLOG.TXT and the [PCI] UNCLAIMED report truthful;
+            // without it a working AHCI controller reads as "(none)" and looks
+            // exactly like a controller with no driver, which is the one
+            // distinction that report exists to make.
+            pci_mark_claimed(dev, "ahci");
+            bootlog_write("[AHCI] controller %02x:%02x.%x %04x:%04x is UP with %d "
+                          "SATA disk(s) attached; this is the one being used.",
+                          dev->bus, dev->slot, dev->func,
+                          dev->vendor_id, dev->device_id, found);
             return 0;
         }
+        bootlog_write("[AHCI] controller %02x:%02x.%x %04x:%04x initialised but has "
+                      "NO attached SATA disk; trying the next controller if there "
+                      "is one.",
+                      dev->bus, dev->slot, dev->func,
+                      dev->vendor_id, dev->device_id);
         memset(&ahci_hba, 0, sizeof(ahci_hba));
     }
     if (!any) kprintf("[AHCI] No AHCI controller found\n");
     else      kprintf("[AHCI] No AHCI controller had an attached SATA disk\n");
+    // #imacnic: DURABLE, because boot stage 22 produced not one line in
+    // /BOOTLOG.TXT on the owner's iMac14,4 - every [AHCI] line was kprintf, and
+    // that machine has no serial port. "Does this kernel see the internal SATA
+    // disk" is a question its own boot log could not answer, and it is exactly
+    // the question that decides whether the machine could boot from its internal
+    // drive instead of occupying a USB port with the boot stick.
+    bootlog_write("[AHCI] no usable controller: %d AHCI function(s) on the PCI bus, "
+                  "%d of them probed, none had an attached SATA disk. If this "
+                  "machine does have an internal drive, it is NOT visible to this "
+                  "kernel through AHCI.",
+                  any ? controllers : 0, controllers);
     return -1;
 }
 

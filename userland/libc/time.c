@@ -163,6 +163,14 @@ done:
     return o;
 }
 
+// MAYTERA_WEAK_TZ (#745, libarchive port): the `timezone` global was declared
+// in time.h but defined nowhere, so libarchive's ISO9660 writer failed to link.
+// It is defined WEAKLY here (UTC, no DST): a plain app gets this default, while
+// any port carrying its own STRONG definition still overrides it, so no
+// multiple-definition occurs. `tzset()` is intentionally NOT defined here - the
+// jq port's userland/libc/tz.c already provides a strong no-op tzset().
+long timezone __attribute__((weak)) = 0;
+
 // #359 Phase 3a: timezone/daylight/tzname/tzset() are declared in time.h (for
 // CPython's timemodule.c) but DEFINED in the CPython port's miscsupp
 // supplement (compatsupp/../miscsupp/misc.c already has UTC-only stubs from

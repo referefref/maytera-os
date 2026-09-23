@@ -249,7 +249,7 @@ static int launch_userspace_app(const char *path) {
     // holds ~29 MB of address space, a 64 KB kernel stack and a table slot, and
     // while every session app the teardown just SIGKILLed is still fully alive
     // (session_end_teardown() does not wait; they die at their next syscall
-    // return). MEASURED on the owner's VM <vmid>, golden 2054: the compositor
+    // return). MEASURED on the owner's a test VM, golden 2054: the compositor
     // faulted after 8.8 h and this call returned -1, leaving the machine on the
     // in-kernel fallback desktop until reboot.
     //
@@ -263,7 +263,7 @@ static int launch_userspace_app(const char *path) {
         //
         // It is how much PHYSICAL memory the reap actually gave back, differenced
         // across the one call that destroys dead processes' address spaces.
-        // MEASURED 2026-08-26 on VM <vmid>: reaping NINE zombie slots, one of them
+        // MEASURED 2026-08-26 on VM 2992: reaping NINE zombie slots, one of them
         // a compositor whose image alone is 29 MB, returned pmmreturnedKB=2048.
         // Two megabytes. A dead user process's pages are very nearly not returned
         // at all, and the free-page count fell by ~29 MB on every subsequent
@@ -373,7 +373,7 @@ int fm_launch_synth(void) {
     //
     // Both halves were individually right. Only the JOIN was wrong, and it was
     // only wrong on a machine without an audio device, which is not the machine
-    // anyone would think to test. Measured on VM <vmid>, build 2001.
+    // anyone would think to test. Measured on VM 2782, build 2001.
     if (!uac_is_ready() && !audio_is_available()) {
         kprintf("[dos] (#182) no audio sink on this machine (no USB DAC, no HDA/AC97): "
                 "NOT launching the FM synthesiser, and the OPL2 will truthfully "
@@ -3133,8 +3133,8 @@ static int session_end_teardown(uint32_t leader) {
         // an already-empty wait queue) - see its definition for why calling
         // it with nothing running is a safe no-op.
         if (strcmp(p->name, "dos") == 0) {
-            extern void dos_request_close(void);
-            dos_request_close();
+            extern void dos_request_close_pid(uint32_t);
+            dos_request_close_pid(p->pid);
             bootlog_write("[SESSION] teardown: pid %u is the DOS kernel worker; "
                           "also sent dos_request_close() (SIGKILL alone cannot "
                           "stop a Ring-0 worker, see #compkill)", p->pid);
@@ -3209,6 +3209,24 @@ void desktop_run(void) {
         // no AI-Chat pegging the CPU) - the test gets a clean core and its
         // "PTTEST:" output goes straight to the serial log. Marker absent on
         // normal boots => behavior is completely unchanged.
+        {
+            // #404 Stage 6 verification gate: if /ADVLKTST.RUN exists on the FAT
+            // ESP, launch the advisory-lock end-to-end test INSTEAD of the
+            // compositor, on the same steady-state-safe spawn site as the
+            // #430 PTTEST gate. Its "ADVLK:" output goes straight to serial.
+            // Marker absent on normal boots => behavior is completely unchanged.
+            extern fat_fs_t g_fat_fs;
+            uint32_t __al_sz = 0;
+            void *__al_mark = fat_read_file(&g_fat_fs, "/ADVLKTST.RUN", &__al_sz);
+            if (__al_mark) {
+                kfree(__al_mark);
+                kprintf("[Desktop] #404 ADVLKTST.RUN present: running "
+                        "/APPS/ADVLKTST instead of the compositor\n");
+                int apid = launch_userspace_app("/APPS/ADVLKTST");
+                kprintf("[Desktop] #404 advlktst launched pid=%d\n", apid);
+                goto pttest_after_launch;
+            }
+        }
         {
             extern fat_fs_t g_fat_fs;
             uint32_t __pt_sz = 0;
@@ -3447,7 +3465,7 @@ pttest_after_launch:;   // #430: gate jumps here, skipping the compositor path
                 // kernel (Ring 0, no privilege boundary at all - more
                 // privileged than "root") desktop permanent for the rest of
                 // the session after just 3 attempts spread over 6 seconds.
-                // MEASURED on VM <vmid>, golden 2277: a compositor generation
+                // MEASURED on a test VM, golden 2277: a compositor generation
                 // that died into a near-exhausted PMM (pmmfreeKB=0..4028)
                 // hit this branch and the machine ran its GUI in Ring 0 for
                 // the remaining 13+ hours of that boot, because ordinary
@@ -3584,6 +3602,14 @@ pttest_after_launch:;   // #430: gate jumps here, skipping the compositor path
                         gfx_boot_release_display();
                         bootlog_write("[BOOT] #157 compositor first frame seen; "
                                       "boot console released the display");
+                        // #imachang: THIS is the point at which a boot has
+                        // demonstrably succeeded - the display is handed over
+                        // and a real UI is on screen. Stamping it durably here
+                        // is what lets the NEXT boot tell "the log I am about
+                        // to overwrite was a healthy boot" from "it was a hang
+                        // whose only record is this file". See
+                        // bootlog_rotate_previous() in fs/bootlog.c.
+                        bootlog_mark_boot_complete();
                     }
                 } else if (!s_gave_up) {
                     uint32_t hz = g_timer_hz ? g_timer_hz : 100;

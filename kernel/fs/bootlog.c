@@ -135,7 +135,33 @@ int      bootlog_last_persist_rc(void)  { return g_last_persist_rc; }
 
 #define BOOTLOG_BUF_CAP  (96 * 1024)
 #define BOOTLOG_PATH     "/BOOTLOG.TXT"
-#define BOOTLOG_LINE_MAX 256
+#define BOOTLOG_PREV_PATH "/BOOTLOG.PRV"
+
+// #imachang: the sentinel a boot writes ONCE it has handed the display over to
+// the compositor, i.e. once it has reached a usable desktop. Its ABSENCE from a
+// /BOOTLOG.TXT is what makes that log worth carrying across the next boot.
+#define BOOTLOG_OK_MARK  "[BOOTOK]"
+// #imacnet: 640, not 256. MEASURED, not defensive. The owner's iMac
+// /BOOTLOG.TXT from golden 2334 ends five of its [NETDIAG] lines with a
+// "~CUT 25~" stamp and carries its own audit line saying "7 line(s) TRUNCATED,
+// 246 byte(s) lost". [NETDIAG] is THE durable network line - main.c made it
+// durable precisely because the machine it matters on has no serial port - and
+// it is built into a 512-byte _ndbuf, so with a 256-byte cap here roughly half
+// of it was thrown away on every write. What got thrown away was the TAIL,
+// which is where every counter lives (rx/tx/txfail and the whole USB-Ethernet
+// pipeline). So the one diagnostic written specifically to survive on a
+// serial-less machine was arriving with its answers cut off.
+//
+// 640 = the largest producer (a 512-byte body plus its "[NETDIAG] " tag) with
+// headroom, so no current caller can be clipped at all. The cost is 384 more
+// bytes of stack in bootlog_write(), which runs only in process context (the
+// header above forbids calling it from a fault handler; that path has its own
+// 2048-byte ring), so there is no constrained stack to blow.
+//
+// The truncation DETECTOR is not at fault and was working: it stamped every cut
+// line and reported the byte loss. It was read as a curiosity rather than as
+// the data loss it was announcing.
+#define BOOTLOG_LINE_MAX 640
 
 // NOTE: /BOOTLOG.TXT is a plain root-level path (deliberately, for easy
 // discovery when the user plugs the USB stick into another computer), so on
@@ -244,9 +270,21 @@ static uint32_t g_bootlog_persisted = 0;   // #748: bytes of g_bootlog_buf on di
 //     the #348 live-USB image is single-FAT by design, so on FAT this stays a
 //     whole-file rewrite exactly as before. Nothing regresses; ext2-root
 //     (every golden) gets the O(n) path.
+// #fmhang / #426: defined after the guard globals below; declared here because
+// bootlog_persist() is the first thing in the file that must consult it.
+static int bl_noblock_should_defer(void *ra);
+
 static int bootlog_persist(const char *path, const char *buf, uint32_t len,
                            uint32_t *persisted, int buf_full) {
     if (!g_bootlog_armed || !g_bootlog_fs) return 0;
+
+    // #fmhang / #426: NEVER enter the storage stack from a no-block context.
+    // This is the ONE chokepoint every persistent sink (bootlog/usblog/audiolog/
+    // heartbeat) funnels through, so guarding it here fixes audiolog_write()
+    // reaching ext2_lock_at under proc_exit() cli() (the #fmhang ASUS hang) and
+    // any future sink at once. The bytes stay in RAM+serial; *persisted is left
+    // behind so the next persist from a blockable context writes the whole tail.
+    if (bl_noblock_should_defer(__builtin_return_address(0))) return 0;
 
     if (persisted) {
         if (*persisted > len) *persisted = 0;   // buffer rewound: replace it
@@ -466,6 +504,34 @@ uint64_t g_bootlog_noblock_ra = 0;
 void bootlog_defer_begin(void) { g_bl_defer++; }
 void bootlog_defer_end(void)   { if (g_bl_defer > 0) g_bl_defer--; }
 
+// #fmhang / #426: ONE definition of "must not enter the storage stack from
+// here". bootlog_persist() appends to (or rewrites) a file, which on the ext2
+// root takes ext2_lock (a sleeping ticket lock: ext2_lock_at -> wait_event,
+// fs/ext2.c:200) and on a USB-MSC root can spin in msc_cmd_lock()s unbounded
+// no-block fallback. From a context with interrupts off and the scheduler live
+// (WQ_NB_IRQ_OFF, so contention is real) that is the #426 deadlock, not
+// slowness: the ext2 lock holder needs a core this one spins away under the
+// BKL. MEASURED on the owner ASUS (golden 2363): dos_fm_proc_exit() ->
+// audiolog_write() -> bootlog_persist() reached ext2_lock_at under
+// proc_exit()s cli(), pid 88 FMSYNTH, caller 0x4ef5a3, pegging 6/8 cores.
+// bootlog_write() already refused this for itself (#745/#69); this makes the
+// refusal the shared rule so a new log sink cannot reintroduce the bug.
+static int bl_noblock_should_defer(void *ra) {
+    uint32_t nb = wq_noblock_reason();
+    if ((nb & WQ_NB_IRQ_OFF) && !(nb & WQ_NB_NO_SCHED)) {
+        if (g_bootlog_noblock_defers++ == 0) {
+            g_bootlog_noblock_ra = (uint64_t)ra;
+            // Serial only, and once: we are inside somebody cli region.
+            kprintf("[BLGNB] #fmhang/#426: log device write declined - caller "
+                    "has IRQs off (ra=%p). The line is in RAM+serial and persists "
+                    "from the next safe context. This guard is NOT dead code.\n", ra);
+        }
+        g_bootlog_flushes_deferred++;
+        return 1;
+    }
+    return 0;
+}
+
 // ===========================================================================
 // #134 FAULT-CONTEXT LOGGING: a lock-free ring a later safe context flushes.
 // ===========================================================================
@@ -509,6 +575,17 @@ static char              g_fault_buf[BL_FAULT_CAP];
 static volatile uint32_t g_fault_len  = 0;
 static volatile uint32_t g_fault_lost = 0;
 uint32_t bootlog_fault_lost(void) { return g_fault_lost; }
+
+// #dosmem: read side only, no lock, safe from the panic path. See bootlog.h.
+// g_fault_len is allowed to run PAST the cap by the lock-free reservation, so
+// clamp it here exactly as the drain does; a caller must never be handed a
+// length that walks off the buffer.
+uint32_t bootlog_fault_ring(const char **out) {
+    uint32_t n = g_fault_len;
+    if (n > BL_FAULT_CAP) n = BL_FAULT_CAP;
+    if (out) *out = g_fault_buf;
+    return n;
+}
 
 void bootlog_fault_write(const char *fmt, ...) {
     char line[BOOTLOG_LINE_MAX];
@@ -740,6 +817,79 @@ uint32_t bootlog_heartbeat_ring(const char **out) {
     return g_hb_len;
 }
 
+// #dosmem: ONE ring-append implementation.
+//
+// bootlog_heartbeat() made room for a beat by dropping whole oldest lines off
+// the front; the LATE-BEAT anomaly note a few lines further down open-coded a
+// second version that made no room at all and SILENTLY DROPPED itself when the
+// ring happened to be full. That is the anomaly record the whole file exists to
+// capture, discarded by its own writer at exactly the moment the ring is
+// fullest. Both callers, and the new note below, now go through this.
+static void hb_ring_append(const char *s, uint32_t n) {
+    if (!s || !n) return;
+    if (n > HB_RING_CAP - 2) n = HB_RING_CAP - 2;
+    if (g_hb_len + n + 1 >= HB_RING_CAP) {
+        uint32_t drop = 0;
+        while (drop < g_hb_len && (g_hb_len - drop) + n + 1 >= HB_RING_CAP) {
+            while (drop < g_hb_len && g_hb_ring[drop] != '\n') drop++;
+            if (drop < g_hb_len) drop++;   // consume the newline too
+        }
+        if (drop >= g_hb_len) g_hb_len = 0;
+        else { memmove(g_hb_ring, g_hb_ring + drop, g_hb_len - drop);
+               g_hb_len -= drop; }
+    }
+    memcpy(g_hb_ring + g_hb_len, s, n);
+    g_hb_len += n;
+    g_hb_ring[g_hb_len++] = '\n';
+    g_hb_dirty = 1;
+}
+
+// #dosmem: the ISR-safe hand-off slot. See the contract in bootlog.h.
+// 768, not 512: the [SCHEDSTAT] producer's own worst case (28 unsigned-long
+// fields) is 710 bytes. A slot that fits the TYPICAL record and silently cuts
+// the pathological one cuts it exactly when the numbers are large, i.e. when
+// the machine is in trouble - which is the [NETDIAG] fault (a 256-byte line
+// buffer holding a 512-byte payload, counters in the discarded half) repeated
+// one level down.
+#define HB_NOTE_CAP  768u
+static char              g_hb_note[HB_NOTE_CAP];
+static volatile uint32_t g_hb_note_len  = 0;   // 0 = empty
+static volatile uint64_t g_hb_note_drop = 0;   // records overwritten unread
+
+void bootlog_heartbeat_note(const char *line) {
+    if (!line) return;
+    uint32_t n = (uint32_t)strlen(line);
+    if (n >= HB_NOTE_CAP) n = HB_NOTE_CAP - 1;
+    // A slot that already holds an unread record is being overwritten. Count
+    // it; a periodic snapshot legitimately wants the newest window, but a
+    // consumer that has STOPPED draining must be visible rather than inferred
+    // from a gap in the file.
+    if (g_hb_note_len) g_hb_note_drop++;
+    g_hb_note_len = 0;             // no half-published record is ever readable
+    memcpy(g_hb_note, line, n);
+    g_hb_note[n] = '\0';
+    // Published LAST: a consumer that reads a non-zero length is then
+    // guaranteed to see the bytes it describes.
+    __sync_synchronize();
+    g_hb_note_len = n;
+}
+
+// Move a published note into the ring. SAFE CONTEXTS ONLY: it is called from
+// bootlog_heartbeat(), i.e. the heartbeat kernel thread with interrupts on.
+static void hb_drain_note(void) {
+    uint32_t n = g_hb_note_len;
+    if (!n) return;
+    char tmp[HB_NOTE_CAP + 48];
+    uint64_t drops = g_hb_note_drop;
+    int k = snprintf(tmp, sizeof(tmp), "%s notedrop=%lu",
+                     g_hb_note, (unsigned long)drops);
+    g_hb_note_len = 0;             // consumed; a racing producer may refill
+    if (k > 0) {
+        hb_ring_append(tmp, (uint32_t)k);
+        kprintf("[HBLOG] %s\n", tmp);
+    }
+}
+
 void bootlog_heartbeat(const char *line) {
     if (!line) return;
     // #134: the heartbeat is an ordinary kernel thread with interrupts on, and
@@ -747,34 +897,20 @@ void bootlog_heartbeat(const char *line) {
     // right safe context to get a fault record onto the medium promptly when
     // nothing else happens to log.
     if (g_fault_len) (void)bootlog_fault_flush();
-    uint32_t n = (uint32_t)strlen(line);
-    if (n > HB_RING_CAP - 2) n = HB_RING_CAP - 2;
 
-    // If appending would overflow the fixed ring, drop WHOLE oldest lines from
-    // the front until it fits. The ring therefore stays a small constant size
-    // (the last ~30 beats), keeping the on-disk write constant-cost forever.
-    if (g_hb_len + n + 1 >= HB_RING_CAP) {
-        uint32_t drop = 0;
-        while (drop < g_hb_len && (g_hb_len - drop) + n + 1 >= HB_RING_CAP) {
-            while (drop < g_hb_len && g_hb_ring[drop] != '\n') drop++;
-            if (drop < g_hb_len) drop++;   // consume the newline too
-        }
-        if (drop >= g_hb_len) {
-            g_hb_len = 0;
-        } else {
-            memmove(g_hb_ring, g_hb_ring + drop, g_hb_len - drop);
-            g_hb_len -= drop;
-        }
-    }
-
-    memcpy(g_hb_ring + g_hb_len, line, n);
-    g_hb_len += n;
-    g_hb_ring[g_hb_len++] = '\n';
+    // The ring drops WHOLE oldest lines off the front to make room, so it stays
+    // a small constant size and the on-disk write stays constant-cost forever.
+    hb_ring_append(line, (uint32_t)strlen(line));
 
     // Always mirror to serial (proves liveness even if the on-disk write wedges).
     kprintf("[HBLOG] %s\n", line);
-    g_hb_dirty = 1;
     g_hb_beats++;
+
+    // #dosmem: carry whatever an ISR-context producer published since the last
+    // beat. This is the ONLY consumer, and it runs here rather than on a timer
+    // of its own so a counters record costs no device write of its own: it
+    // rides the ring the [HB] line already pays for.
+    hb_drain_note();
 
     // #748: decide whether this beat is worth a device write. See the block
     // comment above HB_FLUSH_MS for why these three cases and no others.
@@ -804,12 +940,11 @@ void bootlog_heartbeat(const char *line) {
                           (unsigned long long)(now - g_hb_last_beat_ms));
         if (nn > 0) {
             kprintf("%s\n", note);
-            uint32_t nl = (uint32_t)nn;
-            if (nl < HB_RING_CAP - g_hb_len - 1) {
-                memcpy(g_hb_ring + g_hb_len, note, nl);
-                g_hb_len += nl;
-                g_hb_ring[g_hb_len++] = '\n';
-            }
+            // #dosmem: through the shared helper. This used to append only
+            // `if (nl < HB_RING_CAP - g_hb_len - 1)`, i.e. it made no room and
+            // silently discarded the LATE-BEAT record precisely when the ring
+            // was full - the one record this file exists to preserve.
+            hb_ring_append(note, (uint32_t)nn);
         }
         g_hb_last_anom_ms = now;
         due = 1;
@@ -942,10 +1077,110 @@ void audiolog_end_batch(void) {
     }
 }
 
+// ===========================================================================
+// #imachang: CARRY A HUNG BOOT'S LOG ACROSS THE REBOOT YOU MAKE TO READ IT.
+// ===========================================================================
+// This file's whole reason to exist is stated at the top: the iMac14,4 has no
+// serial and no SSH, so /BOOTLOG.TXT "is the only telemetry there is", to be
+// retrieved "by plugging the USB stick into another computer after a failed
+// boot". Every line is durable the moment it is written, and that half works.
+//
+// THE HALF THAT DID NOT. bootlog_arm() runs with g_bootlog_persisted == 0, and
+// bootlog_persist() reads *persisted == 0 as "first write, REPLACE the whole
+// file" (see its ext2-append guard). So the FIRST bootlog_write() of every boot
+// overwrites /BOOTLOG.TXT in full, and nothing anywhere in the tree ever copied
+// it aside. The evidence therefore survives exactly as long as nobody turns the
+// machine on again - and the one thing a person whose machine just hung will
+// certainly do is turn it on again.
+//
+// MEASURED CONSEQUENCE, not a hypothetical: on 2026-09-02 the owner booted a
+// real iMac14,4 three times on golden 2334. Boot 1 hung after "[BOOT] Preemptive
+// multitasking enabled", boot 2 hung at "waiting for its first frame", boot 3
+// reached the desktop. Both failing boots had already written a fine-grained
+// durable trace here (~20 lines inside the first hang's window alone, plus the
+// [HB] records that name the CPU hogs and the idle-enqueue refusals). Boot 3
+// destroyed all of it. Two irreplaceable captures of an intermittent
+// real-hardware hang were lost to the success that followed them.
+//
+// THE RULE THIS ENCODES: a post-mortem channel that the post-mortem destroys is
+// not a post-mortem channel. So before the first write of a boot, the previous
+// boot's file is preserved as /BOOTLOG.PRV.
+//
+// AND IT IS CONDITIONAL, because writes are what this medium is expensive at
+// (blame.md records 4-27 SECONDS per write on a USB-MSC root, and #373 was a
+// machine starved to death by a repeated full-buffer rewrite). A boot that
+// reached a usable desktop wrote BOOTLOG_OK_MARK; its log is the healthy
+// baseline and is NOT worth a second whole-file write on every subsequent boot.
+// A boot WITHOUT the mark stopped early, and that is precisely the record worth
+// paying for. So a healthy machine pays one READ per boot and no write at all;
+// the write is paid exactly once, on the boot after a bad one.
+static void bootlog_rotate_previous(void) {
+    extern void kfree(void *ptr);
+    if (!g_bootlog_fs) return;
+
+    uint32_t sz = 0;
+    void *prev = fat_read_file(g_bootlog_fs, BOOTLOG_PATH, &sz);
+    if (!prev) return;                 // no previous boot on this medium
+    if (sz == 0) { kfree(prev); return; }
+
+    // Did the previous boot reach a usable desktop? Scan for the sentinel.
+    // Bounded by sz (<= BOOTLOG_BUF_CAP), so this is a bounded scan of at most
+    // 96 KB of RAM, with no lock and no device access.
+    int complete = 0;
+    {
+        const char *b = (const char *)prev;
+        const uint32_t n = (uint32_t)(sizeof(BOOTLOG_OK_MARK) - 1);
+        if (sz >= n) {
+            for (uint32_t i = 0; i + n <= sz; i++) {
+                if (memcmp(b + i, BOOTLOG_OK_MARK, n) == 0) { complete = 1; break; }
+            }
+        }
+    }
+
+    if (complete) {
+        kprintf("[BOOTLOG] previous boot reached the desktop (%s present); "
+                "not rotating (saves a whole-file write on every healthy boot)\n",
+                BOOTLOG_OK_MARK);
+        kfree(prev);
+        return;
+    }
+
+    // The previous boot did NOT reach a desktop. Keep its log.
+    int rc = fat_write_file(g_bootlog_fs, BOOTLOG_PREV_PATH, prev, sz);
+    if (rc == 0) {
+        kprintf("[BOOTLOG] *** the PREVIOUS boot did not reach a desktop. Its "
+                "log (%u bytes) has been preserved as %s before this boot "
+                "overwrites %s. READ THAT FILE. ***\n",
+                (unsigned)sz, BOOTLOG_PREV_PATH, BOOTLOG_PATH);
+    } else {
+        // Loud, and only to serial + the RAM buffer: we are inside arm() and
+        // the medium has just refused a write, so re-entering it would be the
+        // recursion this file is built to avoid.
+        kprintf("[BOOTLOG] *** FAILED to preserve the previous boot's log to %s "
+                "(rc=%d). It is about to be overwritten and will be LOST. ***\n",
+                BOOTLOG_PREV_PATH, rc);
+    }
+    kfree(prev);
+}
+
+// #imachang: called once, from the point where the kernel hands the display to
+// the compositor (gui/desktop.c). Writing it through bootlog_write() means it
+// is durable like every other line, so the NEXT boot can read it back and
+// decide whether this boot's log is worth keeping.
+void bootlog_mark_boot_complete(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    bootlog_write("%s boot reached a usable desktop; this log is a healthy "
+                  "baseline and the next boot may overwrite it",
+                  BOOTLOG_OK_MARK);
+}
+
 void bootlog_arm(fat_fs_t *fs) {
     if (g_bootlog_armed || !fs) return;
     g_bootlog_fs = fs;
     g_bootlog_armed = 1;
+    bootlog_rotate_previous();   // #imachang: BEFORE the first persist
     // Flush everything logged since early boot (xHCI/USB enumeration, MSC
     // root-mount probing, etc.) in one shot; bootlog_write() stays live from
     // here on.
@@ -1023,3 +1258,51 @@ static void bootlog_write_esp_map(void) {
     if (rc != 0)
         kprintf("[BOOTLOG] /boot/LOGS.TXT partition-map note not written (rc=%d)\n", rc);
 }
+
+#ifdef FMHANGTEST
+// ===========================================================================
+// #fmhang / #426: NEGATIVE CONTROL for the storage-stack-under-cli deadlock.
+// ===========================================================================
+// The owner ASUS (golden 2363) pegged 6/8 cores when a DOS title with music
+// closed: dos_fm_proc_exit() -> audiolog_write() -> bootlog_persist() reached
+// ext2_lock_at (wait_event, fs/ext2.c:200) under proc_exit() cli(). The field
+// BOOTLOG named caller 0x4ef5a3, which addr2line resolves to ext2_lock_at.
+// This reproduces that exact context on purpose: a spinlock held with IRQs off
+// (so wq_noblock_reason() reports WQ_NB_IRQ_OFF, scheduler live) around one
+// audiolog_write().
+//   GREEN (with the bootlog_persist() guard): the device write is DECLINED,
+//     g_bootlog_noblock_defers moves by >=1, nothing blocks, and under
+//     NOBLOCKPANIC=1 there is NO panic because wait_event is never reached.
+//   RED (without the guard): audiolog_write() enters the storage stack under
+//     cli()+spinlock; with NOBLOCKPANIC=1 it kpanic()s inside it (ext2_lock_at
+//     or the block-DMA wait) - the bug the owner hit.
+#include "../sync/spinlock.h"
+extern void proc_sleep(uint32_t ms);
+extern void proc_exit(int code);
+static spinlock_t g_fmhang_lock = SPINLOCK_INIT;
+void fmhang_selftest_worker(void *arg) {
+    (void)arg;
+    // Reach steady state (desktop up, bootlog armed) so the audiolog buffer is
+    // real and wq_noblock_reason() is fully live.
+    proc_sleep(300);
+
+    uint64_t defers0 = g_bootlog_noblock_defers;
+    uint64_t viol0   = g_wq_noblock_violations;
+
+    // EXACTLY the dos_fm_proc_exit() context: IRQs off with a spinlock held.
+    uint64_t fl = spinlock_acquire_irqsave(&g_fmhang_lock);
+    audiolog_write("[FMHANGTEST] forced no-block audiolog_write reproducing the "
+                   "dos_fm_proc_exit()->ext2_lock_at path (#fmhang/#426)");
+    spinlock_release_irqrestore(&g_fmhang_lock, fl);
+
+    // Blockable again: report the verdict durably (BOOTLOG, not just serial).
+    uint64_t d_defers = g_bootlog_noblock_defers - defers0;
+    uint64_t d_viol   = g_wq_noblock_violations   - viol0;
+    bootlog_write("[FMHANGTEST] IRQ-off audiolog_write: bldef +%lu wqviol +%lu -> %s",
+                  (unsigned long)d_defers, (unsigned long)d_viol,
+                  (d_defers >= 1 && d_viol == 0)
+                      ? "PASS (device write declined from a no-block context, nothing blocked)"
+                      : "FAIL (the storage stack was entered from a no-block context)");
+    proc_exit(0);
+}
+#endif

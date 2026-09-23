@@ -95,5 +95,7 @@ void icmp_handle(uint32_t src_ip, const void *data, uint16_t length);
 
 // Get ping statistics
 int icmp_get_ping_reply(uint32_t *src_ip, uint16_t *seq, uint16_t *time_ms);
+// #netpolls: non-consuming peek of the reply flag (wait_event condition).
+int icmp_ping_reply_pending(void);
 
 #endif // ICMP_H

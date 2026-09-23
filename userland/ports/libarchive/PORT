@@ -1,0 +1,96 @@
+# mports recipe: libarchive. Tier 2 item #9 of
+# docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md: real multi-format archive
+# READING (tar, cpio, zip, 7zip, and more) for the Files app and the App Store,
+# alongside the OS's own limited userland/libarchive/arc.c (which is NOT removed).
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA.
+#
+# WHY THIS PORT DOES NOT RUN ./configure. libarchive is an autotools project, so
+# it would normally generate config.h by probing the build host. That host is
+# Linux/glibc, not the MayteraOS userland target (freestanding, SSE2 hardware
+# float, the small libc under userland/libc). Running configure would bake the
+# HOST's capabilities into the build. Instead patch 0001 adds a FIRST-PARTY
+# config.h whose every HAVE_* was selected by measurement against userland/libc,
+# and we compile with -DHAVE_CONFIG_H. This is build=objects, not build=script:
+# an explicit source list, symbol-gated, exactly like the other ports.
+
+name=libarchive
+version=3.8.9
+
+# CLASS B ("CLI tool, file I/O: class A plus open/read/write/stat"). The read
+# path is mostly computation over caller buffers, but reading from a named
+# archive uses open/read/lseek/close/stat, so B is the honest letter. It is
+# nowhere near a process model of its own, argv, sockets or a window.
+class=B
+homepage=https://www.libarchive.org/
+
+# The GitHub release asset. The sha256 below is of THIS file and was MEASURED on
+# the build container with sha256sum, not copied from a web page:
+#   wget -O libarchive-3.8.9.tar.gz https://github.com/libarchive/libarchive/releases/download/v3.8.9/libarchive-3.8.9.tar.gz
+#   sha256sum libarchive-3.8.9.tar.gz
+#   -> f5a6539059cf5e597dbeda37bfa4874b1e8dea063c8d93bf85a2b44af90a5bd4  (9,118,107 bytes)
+source_url=https://github.com/libarchive/libarchive/releases/download/v3.8.9/libarchive-3.8.9.tar.gz
+tarball=libarchive-3.8.9.tar.gz
+sha256=f5a6539059cf5e597dbeda37bfa4874b1e8dea063c8d93bf85a2b44af90a5bd4
+srcdir=libarchive-3.8.9
+
+# BSD-2-Clause. Upstream ships the text in COPYING (the bsdtar/bsdcpio front-end
+# code carries a couple of 3-clause and public-domain files, but the LIBRARY we
+# build - libarchive/*.c - and the project as a whole are 2-clause; COPYING is
+# the canonical grant). This string must equal the components.tsv row exactly.
+licence=BSD-2-Clause
+licence_files=COPYING
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): does this library want to USE a platform
+# layer, or to BE one? libarchive USES. It is an embedded library: the host owns
+# main(), the process and the allocator; libarchive reads bytes from a
+# caller-supplied callback / fd / filename / memory buffer and hands back entry
+# metadata and data blocks. It imposes no event loop, no main() and no window
+# system. Measured: with the excludes below, the archive leaves NO symbol
+# undefined against userland/libc + the ported libz (nm -u is empty).
+adoption=USES. Embedded library: the host owns main(), the process and the allocator. libarchive reads an archive from a caller-supplied fd/filename/memory buffer through a callback and returns entry metadata plus data blocks; it owns no event loop, no main() and no window. Measured: zero unresolved symbols against userland/libc + userland/ports/zlib.
+
+# zlib is a REAL dependency (gzip and zip DEFLATE go through it), and mports
+# builds it first because of this line. libc is the shared platform library.
+needs=libc zlib
+
+# No pre-configure copies: the config.h that configure would generate is added
+# as first-party code by patch 0001 instead (see the header comment).
+prepare=none
+
+# Patch 0001 CREATES libarchive/config.h (first-party MayteraOS code, MIT, added
+# into the upstream tree - the musl-regex pattern). It is load-bearing: without
+# it archive_platform.h hits its "No config.h" #error and nothing compiles, so
+# the symbol gate below cannot pass if the patch stops applying.
+patches=0001-add-maytera-config-h.patch
+
+build=objects
+
+# -DHAVE_CONFIG_H makes archive_platform.h include the config.h patch 0001 adds;
+# -Ilibarchive puts that config.h and libarchive's private headers on the search
+# path from the srcdir root (where mports runs the compile). Userland is REAL
+# SSE2 hardware float, so nothing here fights -mno-sse (a kernel-only flag).
+cflags=-DHAVE_CONFIG_H -Ilibarchive
+
+# The FULL library minus the platform-entangled files (see exclude below). This
+# is upstream's libarchive/*.c, enumerated - not globbed - so a version bump is
+# a readable diff.
+sources=libarchive/archive_acl.c libarchive/archive_blake2s_ref.c libarchive/archive_blake2sp_ref.c libarchive/archive_check_magic.c libarchive/archive_cmdline.c libarchive/archive_cryptor.c libarchive/archive_digest.c libarchive/archive_entry.c libarchive/archive_entry_copy_bhfi.c libarchive/archive_entry_copy_stat.c libarchive/archive_entry_link_resolver.c libarchive/archive_entry_sparse.c libarchive/archive_entry_stat.c libarchive/archive_entry_strmode.c libarchive/archive_entry_xattr.c libarchive/archive_hmac.c libarchive/archive_match.c libarchive/archive_options.c libarchive/archive_pack_dev.c libarchive/archive_parse_date.c libarchive/archive_pathmatch.c libarchive/archive_ppmd7.c libarchive/archive_ppmd8.c libarchive/archive_random.c libarchive/archive_rb.c libarchive/archive_read.c libarchive/archive_read_add_passphrase.c libarchive/archive_read_append_filter.c libarchive/archive_read_data_into_fd.c libarchive/archive_read_open_fd.c libarchive/archive_read_open_file.c libarchive/archive_read_open_filename.c libarchive/archive_read_open_memory.c libarchive/archive_read_set_format.c libarchive/archive_read_set_options.c libarchive/archive_read_support_filter_all.c libarchive/archive_read_support_filter_by_code.c libarchive/archive_read_support_filter_bzip2.c libarchive/archive_read_support_filter_compress.c libarchive/archive_read_support_filter_grzip.c libarchive/archive_read_support_filter_gzip.c libarchive/archive_read_support_filter_lrzip.c libarchive/archive_read_support_filter_lz4.c libarchive/archive_read_support_filter_lzop.c libarchive/archive_read_support_filter_none.c libarchive/archive_read_support_filter_program.c libarchive/archive_read_support_filter_rpm.c libarchive/archive_read_support_filter_uu.c libarchive/archive_read_support_filter_xz.c libarchive/archive_read_support_filter_zstd.c libarchive/archive_read_support_format_7zip.c libarchive/archive_read_support_format_all.c libarchive/archive_read_support_format_ar.c libarchive/archive_read_support_format_by_code.c libarchive/archive_read_support_format_cab.c libarchive/archive_read_support_format_cpio.c libarchive/archive_read_support_format_empty.c libarchive/archive_read_support_format_iso9660.c libarchive/archive_read_support_format_lha.c libarchive/archive_read_support_format_mtree.c libarchive/archive_read_support_format_rar.c libarchive/archive_read_support_format_rar5.c libarchive/archive_read_support_format_raw.c libarchive/archive_read_support_format_tar.c libarchive/archive_read_support_format_warc.c libarchive/archive_read_support_format_xar.c libarchive/archive_read_support_format_zip.c libarchive/archive_string.c libarchive/archive_string_sprintf.c libarchive/archive_time.c libarchive/archive_util.c libarchive/archive_version_details.c libarchive/archive_virtual.c libarchive/archive_write.c libarchive/archive_write_add_filter.c libarchive/archive_write_add_filter_b64encode.c libarchive/archive_write_add_filter_by_name.c libarchive/archive_write_add_filter_bzip2.c libarchive/archive_write_add_filter_compress.c libarchive/archive_write_add_filter_grzip.c libarchive/archive_write_add_filter_gzip.c libarchive/archive_write_add_filter_lrzip.c libarchive/archive_write_add_filter_lz4.c libarchive/archive_write_add_filter_lzop.c libarchive/archive_write_add_filter_none.c libarchive/archive_write_add_filter_program.c libarchive/archive_write_add_filter_uuencode.c libarchive/archive_write_add_filter_xz.c libarchive/archive_write_add_filter_zstd.c libarchive/archive_write_open_fd.c libarchive/archive_write_open_file.c libarchive/archive_write_open_filename.c libarchive/archive_write_open_memory.c libarchive/archive_write_set_format.c libarchive/archive_write_set_format_7zip.c libarchive/archive_write_set_format_ar.c libarchive/archive_write_set_format_by_name.c libarchive/archive_write_set_format_cpio.c libarchive/archive_write_set_format_cpio_binary.c libarchive/archive_write_set_format_cpio_newc.c libarchive/archive_write_set_format_cpio_odc.c libarchive/archive_write_set_format_filter_by_ext.c libarchive/archive_write_set_format_gnutar.c libarchive/archive_write_set_format_iso9660.c libarchive/archive_write_set_format_mtree.c libarchive/archive_write_set_format_pax.c libarchive/archive_write_set_format_raw.c libarchive/archive_write_set_format_shar.c libarchive/archive_write_set_format_ustar.c libarchive/archive_write_set_format_v7tar.c libarchive/archive_write_set_format_warc.c libarchive/archive_write_set_format_xar.c libarchive/archive_write_set_format_zip.c libarchive/archive_write_set_options.c libarchive/archive_write_set_passphrase.c libarchive/filter_fork_posix.c libarchive/xxhash.c
+
+exclude=libarchive/archive_disk_acl_darwin.c libarchive/archive_disk_acl_freebsd.c libarchive/archive_disk_acl_linux.c libarchive/archive_disk_acl_sunos.c libarchive/archive_read_disk_entry_from_file.c libarchive/archive_read_disk_posix.c libarchive/archive_read_disk_set_standard_lookup.c libarchive/archive_read_disk_windows.c libarchive/archive_read_extract.c libarchive/archive_read_extract2.c libarchive/archive_windows.c libarchive/archive_write_disk_posix.c libarchive/archive_write_disk_set_standard_lookup.c libarchive/archive_write_disk_windows.c libarchive/filter_fork_windows.c
+exclude_reason=Not built. The *_windows.c files are the Win32 backend. The read_disk_*/write_disk_* files (and archive_read_extract/extract2, which drive write_disk) walk and mutate the REAL filesystem - opendir/fstatat, and mknod/chown/symlink/lchown/mkfifo/futimens for extraction - which is heavy OS surface userland/libc does not yet expose; the READ-into-memory path this port targets does not need them, and extract-to-disk is a documented follow-up. The archive_disk_acl_*.c files apply on-disk ACLs and belong to that same excluded disk path (archive_acl.c, the in-archive ACL metadata, IS built). Excluding these leaves the archive with zero unresolved symbols; nothing built references them.
+
+# archive.h and archive_entry.h are the two public headers a consumer includes.
+headers=libarchive/archive.h libarchive/archive_entry.h
+lib=libarchive.a
+
+# THE ANTI-NO-OP CHECK. Each name was read out of the built archive with nm.
+# The read API proper (new/open/next_header/data/free), the format registrations
+# (tar/cpio/zip/7zip/ar/iso9660/raw/empty + the "all" dispatcher), the filter
+# registrations that actually work (gzip via zlib, compress/.Z, none), the entry
+# accessors, a representative slice of the write API, and the error/version
+# helpers. archive_read_support_format_xar and archive_read_support_filter_program
+# are listed ON PURPOSE: they are the honest stubs, and requiring them proves
+# those translation units were really compiled rather than silently dropped.
+symbols=archive_read_new archive_read_support_format_all archive_read_support_format_tar archive_read_support_format_cpio archive_read_support_format_zip archive_read_support_format_7zip archive_read_support_format_ar archive_read_support_format_iso9660 archive_read_support_format_raw archive_read_support_format_empty archive_read_support_format_xar archive_read_support_filter_all archive_read_support_filter_gzip archive_read_support_filter_compress archive_read_support_filter_none archive_read_support_filter_program archive_read_open_filename archive_read_open_memory archive_read_next_header archive_read_data archive_read_data_block archive_read_close archive_read_free archive_entry_new archive_entry_free archive_entry_pathname archive_entry_size archive_entry_filetype archive_entry_mtime archive_write_new archive_write_set_format_ustar archive_write_set_format_pax archive_write_set_format_zip archive_write_set_format_cpio archive_write_add_filter_gzip archive_write_open_filename archive_write_header archive_write_data archive_write_free archive_error_string archive_errno archive_version_string

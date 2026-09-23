@@ -614,6 +614,19 @@ void seclog_report_io_boundary(unsigned int pid, const char *detail) {
     security_audit(AUDIT_IO_BOUNDARY, (uint32_t)pid, detail);
 }
 
+/* Stage 1 capability API: a capability grant, refusal or revocation. Same
+ * narrow-producer shape as the elevation/io-boundary reporters, so proc/caps.c
+ * needs no security.h include and the audit ordinal stays in one place. Every
+ * request, grant, deny, revoke and gated-use refusal goes through here, so
+ * /CONFIG/SECURITY.LOG carries the actor pid and the outcome, and the record is
+ * mirrored into the GraphFS journal for attestation (seclog.c). INFO severity
+ * (default arm), because a per-use refusal in a hot loop is rate-limited into
+ * the log rather than toasted; the durable grant/revoke EDGE records go
+ * straight into the journal from proc/caps.c. Non-blocking by construction. */
+void seclog_report_capability(unsigned int pid, const char *detail) {
+    security_audit(AUDIT_CAPABILITY, (uint32_t)pid, detail);
+}
+
 uint64_t security_audit_seq(void) {
     return g_audit_count;
 }

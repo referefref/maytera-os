@@ -2,9 +2,29 @@
 // Part of Task #25 (Threading with clone() syscall)
 
 #include "thread.h"
+#include "../fs/bootlog.h"
+// #dosmem: FAILURES ONLY, AND EVERY ONE OF THEM RATE-LIMITED.
+//
+// This file had 22 kprintf sites and zero persistent ones, so on a
+// machine with no serial port a process that could not get a thread, or
+// a stack, was indistinguishable from one that simply did nothing. The
+// #153 shape ("an app launches and instantly dies, leaving no record")
+// is exactly this.
+//
+// What is promoted: resource exhaustion, allocation failure, state
+// corruption, and the two silently-dropped user writes. What is NOT:
+// subsystem init lines, per-thread create/exit lifecycle, and the shell
+// dump commands, which are interactive and whose reader is already at a
+// console. Promoting those would cost a whole-file /BOOTLOG.TXT rewrite
+// per thread on the FAT ESP, and a log that is all chatter answers
+// nothing.
+//
+// Every promoted site is capped, because all of them can repeat under
+// memory pressure and an unbounded anomaly line is the #373 mechanism.
 #include "../cpu/sse.h"   // #446: fxsave_area_t for the FPU-area init
 #include "process.h"
 #include "../mm/heap.h"
+#include "../mm/kstack.h"   // #stackguard: guard-paged Ring-0 stacks
 #include "../security/validate.h"   // #503: deferred-write validation (clear_child_tid)
 #include "../mm/vmm.h"
 #include "../mm/pmm.h"
@@ -156,6 +176,10 @@ static thread_t *remove_from_ready_queue_internal(void) {
 static void thread_wrapper(void) {
     thread_t *self = current_thread;
     if (!self || !self->entry_fn) {
+        {   static unsigned s_n = 0;
+            if (s_n < 4) { s_n++;
+                bootlog_write("[THREAD] ERROR: invalid thread state in the entry "
+                              "wrapper; this thread is corrupt before it ran"); } }
         kprintf("[THREAD] Error: invalid thread state in wrapper\n");
         thread_exit(-1);
     }
@@ -243,6 +267,12 @@ int thread_create(uint32_t flags, void *stack, uint32_t *parent_tid,
     // Allocate thread slot
     thread_t *thread = alloc_thread_slot();
     if (!thread) {
+        {   static unsigned s_n = 0;
+            if (s_n < 8) { s_n++;
+                bootlog_write("[THREAD] no free thread slots (max %d per "
+                              "process); pthread_create is failing for every "
+                              "caller from here on%s", MAX_THREADS_PER_PROCESS,
+                              s_n == 8 ? " (further occurrences serial only)" : ""); } }
         kprintf("[THREAD] No free thread slots\n");
         return -1;
     }
@@ -265,8 +295,13 @@ int thread_create(uint32_t flags, void *stack, uint32_t *parent_tid,
     }
 
     // Allocate kernel stack
-    thread->stack_base = kmalloc(THREAD_STACK_SIZE);
+    thread->stack_base = kstack_alloc(THREAD_STACK_SIZE);   // #stackguard
     if (!thread->stack_base) {
+        {   static unsigned s_n = 0;
+            if (s_n < 8) { s_n++;
+                bootlog_write("[THREAD] FAILED to allocate a stack for TID %u; "
+                              "out of kernel memory%s", thread->tid,
+                              s_n == 8 ? " (further occurrences serial only)" : ""); } }
         kprintf("[THREAD] Failed to allocate stack for TID %u\n", thread->tid);
         free_thread_slot(thread);
         return -1;
@@ -365,6 +400,10 @@ int thread_create_kernel(const char *name, void (*entry)(void *), void *arg,
     // Allocate thread slot
     thread_t *thread = alloc_thread_slot();
     if (!thread) {
+        {   static unsigned s_n = 0;
+            if (s_n < 8) { s_n++;
+                bootlog_write("[THREAD] no free thread slots for a KERNEL "
+                              "thread; a kernel worker did not start"); } }
         kprintf("[THREAD] No free thread slots for kernel thread\n");
         return -1;
     }
@@ -375,8 +414,12 @@ int thread_create_kernel(const char *name, void (*entry)(void *), void *arg,
     thread->entry_arg = arg;
 
     // Allocate kernel stack
-    thread->stack_base = kmalloc(THREAD_STACK_SIZE);
+    thread->stack_base = kstack_alloc(THREAD_STACK_SIZE);   // #stackguard
     if (!thread->stack_base) {
+        {   static unsigned s_n = 0;
+            if (s_n < 8) { s_n++;
+                bootlog_write("[THREAD] FAILED to allocate a stack for a KERNEL "
+                              "thread; a kernel worker did not start"); } }
         kprintf("[THREAD] Failed to allocate stack for kernel thread\n");
         free_thread_slot(thread);
         return -1;
@@ -489,7 +532,7 @@ void thread_exit(int exit_code) {
     if (self->detached) {
         // Free resources
         if (self->stack_base) {
-            kfree(self->stack_base);
+            kstack_free(self->stack_base, THREAD_STACK_SIZE);
             self->stack_base = NULL;
         }
         if (self->tls_base) {
@@ -545,7 +588,7 @@ int thread_join(uint32_t tid, int *exit_code) {
 
     // Clean up target thread
     if (target->stack_base) {
-        kfree(target->stack_base);
+        kstack_free(target->stack_base, THREAD_STACK_SIZE);
         target->stack_base = NULL;
     }
     if (target->tls_base) {
@@ -572,7 +615,7 @@ int thread_detach(uint32_t tid) {
     // If already zombie, clean up now
     if (target->state == THREAD_STATE_ZOMBIE) {
         if (target->stack_base) {
-            kfree(target->stack_base);
+            kstack_free(target->stack_base, THREAD_STACK_SIZE);
             target->stack_base = NULL;
         }
         if (target->tls_base) {

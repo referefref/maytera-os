@@ -1,7 +1,7 @@
 // doc.c - Maytera Studio document/layer engine (see studio.h for the module
 // contract). Owns the g_doc global: layer stack, the full GIMP 2.10/3
 // blend-mode set, mask-aware compositing, saved-selection channels, the
-// full-document snapshot undo/redo system, and the histogram.
+// sealed-delta undo/redo journal (see the Undo section), and the histogram.
 //
 // Layer order convention: layer[0] is the BOTTOM of the stack,
 // layer[nlayers-1] is the TOP. layer_move(dir=+1) moves a layer up in z.
@@ -53,162 +53,372 @@ static void hsl2rgb(int h, int s, int l, int *R, int *G, int *B) {
 }
 
 // ---------------------------------------------------------------------------
-// Undo/redo snapshots. Full-document copies: layer topology + every layer's
-// pixels + masks + the selection. The comp buffer is a derived cache and is
-// not snapshotted. Channels (saved selections) are NOT snapshotted.
+// Undo/redo: a sealed delta journal (Studio plan P7, "a real command-stack
+// history"; paintp7).
+//
+// undo_push(label) is still called BEFORE a mutation and still takes ONE full
+// baseline copy of the document (every layer's pixels + mask, the selection),
+// the same copy the old 4-deep snapshot stack took. What changes is what
+// happens next: the baseline is held as the single PENDING entry and is
+// SEALED lazily, once the mutation is known to be complete (the next push /
+// undo / redo / reset, or undo_seal() from ui_tick() while no stroke is in
+// progress). Sealing diffs the baseline against the live document and keeps
+// only what changed: per layer and per plane (pixels, mask) the changed
+// bounding rectangle, the small layer headers, and the selection plane's
+// changed rectangle. A mutation that changed nothing is dropped, so a click
+// that painted nothing is not a history step. A topology change (canvas size
+// or layer count) keeps the whole baseline as a FULL entry.
+//
+// Entries are SWAP deltas: applying one exchanges its saved pixels with the
+// live ones inside the rectangle, so after an undo the same entry describes
+// the redo. Both stacks hold the same type, and the depth is bounded by
+// STUDIO_MAX_UNDO steps and STUDIO_UNDO_BUDGET payload bytes (oldest dropped
+// first) instead of by four whole-document copies. Entries are malloc'd (the
+// stacks are pointer arrays): no large statics, blame #444. The comp buffer
+// is a derived cache and is never journaled. Channels (saved selections) are
+// NOT journaled.
 // ---------------------------------------------------------------------------
+enum { UK_FULL = 0, UK_DELTA = 1 };
+
 typedef struct {
-    int      w, h;
-    int      nlayers, active;
-    layer_t  layer[STUDIO_MAX_LAYERS];   // px/mask pointers own malloc'd copies
-    uint8_t *sel;
-    int      sel_active;
-    char     label[STUDIO_NAME_LEN];
-} snapshot_t;
+    int       x, y, w, h;        // changed pixel rect (w == 0: pixels unchanged)
+    uint32_t *px;                // w*h saved pixels inside the rect, or NULL
+    int       mx, my, mw, mh;    // changed mask rect
+    uint8_t  *mask;              // mw*mh saved mask bytes, or NULL
+    int       mask_swap_valid;   // 1: mask PRESENCE differed; swap the whole plane by pointer
+    uint8_t  *mask_swap;         // the other state's whole mask plane (may be NULL = "had none")
+} udelta_t;
 
-static snapshot_t s_undo[STUDIO_MAX_UNDO];
-static int        s_undo_n = 0;
-static snapshot_t s_redo[STUDIO_MAX_UNDO];
-static int        s_redo_n = 0;
+typedef struct {
+    int       kind;                      // UK_FULL / UK_DELTA
+    char      label[STUDIO_NAME_LEN];
+    size_t    bytes;                     // pixel payload accounted against the budget
+    // Document scalars + layer headers: both kinds, swapped whole.
+    int       w, h, nlayers, active, sel_active;
+    layer_t   hdr[STUDIO_MAX_LAYERS];    // px/mask are NULL: header fields only
+    // UK_DELTA payload
+    udelta_t  d[STUDIO_MAX_LAYERS];
+    int       sx, sy, sw, sh;            // selection rect delta
+    uint8_t  *sel;
+    int       sel_swap_valid;            // selection PRESENCE differed: swap by pointer
+    uint8_t  *sel_swap;
+    // UK_FULL payload: whole planes, owned
+    uint32_t *fpx[STUDIO_MAX_LAYERS];
+    uint8_t  *fmask[STUDIO_MAX_LAYERS];
+    uint8_t  *fsel;
+} uentry_t;
 
-static void snap_free(snapshot_t *s) {
-    for (int i = 0; i < s->nlayers; i++) {
-        if (s->layer[i].px) free(s->layer[i].px);
-        if (s->layer[i].mask) free(s->layer[i].mask);
-        s->layer[i].px = NULL; s->layer[i].mask = NULL;
+static uentry_t *s_undo[STUDIO_MAX_UNDO];
+static int       s_undo_n = 0;
+static uentry_t *s_redo[STUDIO_MAX_UNDO];
+static int       s_redo_n = 0;
+static uentry_t *s_pending = NULL;       // the baseline taken by the last undo_push
+static size_t    s_total_bytes = 0;      // payload of both stacks (not the pending baseline)
+
+static void uentry_free(uentry_t *e) {
+    if (!e) return;
+    for (int i = 0; i < STUDIO_MAX_LAYERS; i++) {
+        if (e->d[i].px) free(e->d[i].px);
+        if (e->d[i].mask) free(e->d[i].mask);
+        if (e->d[i].mask_swap) free(e->d[i].mask_swap);
+        if (e->fpx[i]) free(e->fpx[i]);
+        if (e->fmask[i]) free(e->fmask[i]);
     }
-    if (s->sel) free(s->sel);
-    memset(s, 0, sizeof(*s));
+    if (e->sel) free(e->sel);
+    if (e->sel_swap) free(e->sel_swap);
+    if (e->fsel) free(e->fsel);
+    free(e);
 }
 
-static void stack_drop_oldest(snapshot_t *st, int *n) {
-    if (*n <= 0) return;
-    snap_free(&st[0]);
-    memmove(&st[0], &st[1], (size_t)(*n - 1) * sizeof(snapshot_t));
-    (*n)--;
-    memset(&st[*n], 0, sizeof(snapshot_t));
+// Header copy of a live layer: every field except the two plane pointers.
+static layer_t hdr_of(const layer_t *L) {
+    layer_t h = *L; h.px = NULL; h.mask = NULL; return h;
 }
 
-static int snap_capture(snapshot_t *s, const char *label) {
-    memset(s, 0, sizeof(*s));
-    s->w = g_doc.w; s->h = g_doc.h;
-    s->nlayers = g_doc.nlayers; s->active = g_doc.active;
-    s->sel_active = g_doc.sel_active;
-    strlcpy(s->label, label ? label : "edit", sizeof(s->label));
-
+// Full baseline of the live document. Returns NULL if a malloc fails (the
+// caller drops the oldest history and retries once, as before).
+static uentry_t *baseline_capture(const char *label) {
+    uentry_t *e = (uentry_t *)malloc(sizeof(uentry_t));
+    if (!e) return NULL;
+    memset(e, 0, sizeof(*e));
+    e->kind = UK_FULL;
+    e->w = g_doc.w; e->h = g_doc.h;
+    e->nlayers = g_doc.nlayers; e->active = g_doc.active;
+    e->sel_active = g_doc.sel_active;
+    strlcpy(e->label, label ? label : "edit", sizeof(e->label));
     size_t npx = (size_t)g_doc.w * (size_t)g_doc.h;
     for (int i = 0; i < g_doc.nlayers; i++) {
-        s->layer[i] = g_doc.layer[i];          // copies name/opacity/flags + ptrs
-        s->layer[i].px = (uint32_t *)malloc(npx * 4);
-        s->layer[i].mask = NULL;
-        if (!s->layer[i].px) { s->nlayers = i; snap_free(s); return -1; }
-        memcpy(s->layer[i].px, g_doc.layer[i].px, npx * 4);
+        e->hdr[i] = hdr_of(&g_doc.layer[i]);
+        e->fpx[i] = (uint32_t *)malloc(npx * 4);
+        if (!e->fpx[i]) { uentry_free(e); return NULL; }
+        memcpy(e->fpx[i], g_doc.layer[i].px, npx * 4);
+        e->bytes += npx * 4;
         if (g_doc.layer[i].mask) {
-            s->layer[i].mask = (uint8_t *)malloc(npx);
-            if (!s->layer[i].mask) { s->nlayers = i + 1; snap_free(s); return -1; }
-            memcpy(s->layer[i].mask, g_doc.layer[i].mask, npx);
+            e->fmask[i] = (uint8_t *)malloc(npx);
+            if (!e->fmask[i]) { uentry_free(e); return NULL; }
+            memcpy(e->fmask[i], g_doc.layer[i].mask, npx);
+            e->bytes += npx;
         }
     }
     if (g_doc.sel) {
-        s->sel = (uint8_t *)malloc(npx);
-        if (!s->sel) { snap_free(s); return -1; }
-        memcpy(s->sel, g_doc.sel, npx);
+        e->fsel = (uint8_t *)malloc(npx);
+        if (!e->fsel) { uentry_free(e); return NULL; }
+        memcpy(e->fsel, g_doc.sel, npx);
+        e->bytes += npx;
     }
-    return 0;
+    return e;
 }
 
-static void snap_steal_current(snapshot_t *s, const char *label) {
-    memset(s, 0, sizeof(*s));
-    s->w = g_doc.w; s->h = g_doc.h;
-    s->nlayers = g_doc.nlayers; s->active = g_doc.active;
-    s->sel_active = g_doc.sel_active;
-    strlcpy(s->label, label ? label : "edit", sizeof(s->label));
-    for (int i = 0; i < g_doc.nlayers; i++) {
-        s->layer[i] = g_doc.layer[i];
-        g_doc.layer[i].px = NULL;
-        g_doc.layer[i].mask = NULL;
+// Changed bounding rect of two planes (bpp 4 or 1). Returns 0 if identical.
+static int rect_diff(const void *a, const void *b, int w, int h, int bpp,
+                     int *rx, int *ry, int *rw, int *rh) {
+    const uint8_t *A = (const uint8_t *)a, *B = (const uint8_t *)b;
+    size_t row = (size_t)w * (size_t)bpp;
+    int y0 = -1, y1 = -1;
+    for (int y = 0; y < h; y++) if (memcmp(A + y * row, B + y * row, row) != 0) { y0 = y; break; }
+    if (y0 < 0) return 0;
+    for (int y = h - 1; y >= y0; y--) if (memcmp(A + y * row, B + y * row, row) != 0) { y1 = y; break; }
+    int x0 = w, x1 = -1;
+    for (int y = y0; y <= y1; y++) {
+        const uint8_t *ra = A + y * row, *rb = B + y * row;
+        if (bpp == 4) {
+            const uint32_t *pa = (const uint32_t *)ra, *pb = (const uint32_t *)rb;
+            for (int x = 0; x < x0; x++) if (pa[x] != pb[x]) { x0 = x; break; }
+            for (int x = w - 1; x > x1; x--) if (pa[x] != pb[x]) { x1 = x; break; }
+        } else {
+            for (int x = 0; x < x0; x++) if (ra[x] != rb[x]) { x0 = x; break; }
+            for (int x = w - 1; x > x1; x--) if (ra[x] != rb[x]) { x1 = x; break; }
+        }
     }
-    s->sel = g_doc.sel;
-    g_doc.sel = NULL;
+    if (x1 < x0) return 0;   // cannot happen when a row differed; defensive
+    *rx = x0; *ry = y0; *rw = x1 - x0 + 1; *rh = y1 - y0 + 1;
+    return 1;
 }
 
-static void snap_restore(snapshot_t *s) {
-    for (int i = 0; i < g_doc.nlayers; i++) {
-        if (g_doc.layer[i].px) free(g_doc.layer[i].px);
-        if (g_doc.layer[i].mask) free(g_doc.layer[i].mask);
-        g_doc.layer[i].px = NULL; g_doc.layer[i].mask = NULL;
-    }
-    if (g_doc.sel) { free(g_doc.sel); g_doc.sel = NULL; }
+// malloc'd crop of `src` (plane w wide) at rect; NULL on OOM.
+static void *rect_crop(const void *src, int w, int bpp, int rx, int ry, int rw, int rh) {
+    uint8_t *out = (uint8_t *)malloc((size_t)rw * (size_t)rh * (size_t)bpp);
+    if (!out) return NULL;
+    const uint8_t *S = (const uint8_t *)src;
+    for (int y = 0; y < rh; y++)
+        memcpy(out + (size_t)y * rw * bpp, S + ((size_t)(ry + y) * w + rx) * bpp, (size_t)rw * bpp);
+    return out;
+}
 
-    int resized = (g_doc.w != s->w) || (g_doc.h != s->h);
-    g_doc.w = s->w; g_doc.h = s->h;
-    g_doc.nlayers = s->nlayers; g_doc.active = s->active;
-    g_doc.sel_active = s->sel_active;
-    for (int i = 0; i < s->nlayers; i++) {
-        g_doc.layer[i] = s->layer[i];
-        s->layer[i].px = NULL; s->layer[i].mask = NULL;
+// Exchange the rect between the saved crop and the live plane (both directions
+// at once: that is what makes one entry serve undo and redo).
+static void rect_swap(void *crop, void *live, int w, int bpp, int rx, int ry, int rw, int rh) {
+    uint8_t *C = (uint8_t *)crop, *L = (uint8_t *)live;
+    size_t rb = (size_t)rw * (size_t)bpp;
+    uint8_t tmp[1024];
+    for (int y = 0; y < rh; y++) {
+        uint8_t *c = C + (size_t)y * rb, *l = L + ((size_t)(ry + y) * w + rx) * bpp;
+        size_t left = rb;
+        while (left) {
+            size_t n = left > sizeof tmp ? sizeof tmp : left;
+            memcpy(tmp, c, n); memcpy(c, l, n); memcpy(l, tmp, n);
+            c += n; l += n; left -= n;
+        }
     }
-    for (int i = s->nlayers; i < STUDIO_MAX_LAYERS; i++)
-        memset(&g_doc.layer[i], 0, sizeof(layer_t));
-    g_doc.sel = s->sel; s->sel = NULL;
+}
 
-    if (resized || !g_doc.comp) {
-        if (g_doc.comp) free(g_doc.comp);
-        g_doc.comp = (uint32_t *)malloc((size_t)g_doc.w * (size_t)g_doc.h * 4);
+static int hdr_differs(const layer_t *a, const layer_t *b) {
+    layer_t x = hdr_of(a), y = hdr_of(b);
+    return memcmp(&x, &y, sizeof(layer_t)) != 0;
+}
+
+static void stack_drop_oldest(uentry_t **st, int *n) {
+    if (*n <= 0) return;
+    s_total_bytes -= st[0]->bytes;
+    uentry_free(st[0]);
+    memmove(&st[0], &st[1], (size_t)(*n - 1) * sizeof(uentry_t *));
+    (*n)--;
+    st[*n] = NULL;
+}
+
+// Compact the pending baseline against the live document into a journal entry
+// and push it. Returns 1 if the history changed (an entry landed or an empty
+// step was dropped), 0 if there was nothing pending.
+int undo_seal(void) {
+    uentry_t *e = s_pending;
+    if (!e) return 0;
+    s_pending = NULL;
+    int topo = (e->w != g_doc.w) || (e->h != g_doc.h) || (e->nlayers != g_doc.nlayers);
+    if (!topo) {
+        int changed = (e->active != g_doc.active) || (e->sel_active != g_doc.sel_active);
+        size_t bytes = 0;
+        int w = g_doc.w, h = g_doc.h;
+        for (int i = 0; i < g_doc.nlayers; i++) {
+            layer_t *L = &g_doc.layer[i];
+            udelta_t *d = &e->d[i];
+            int rx, ry, rw, rh;
+            if (hdr_differs(&e->hdr[i], L)) changed = 1;
+            if (rect_diff(e->fpx[i], L->px, w, h, 4, &rx, &ry, &rw, &rh)) {
+                d->px = (uint32_t *)rect_crop(e->fpx[i], w, 4, rx, ry, rw, rh);
+                if (!d->px) { uentry_free(e); return 1; }   // OOM: the step is lost, never the document
+                d->x = rx; d->y = ry; d->w = rw; d->h = rh;
+                bytes += (size_t)rw * rh * 4; changed = 1;
+            }
+            free(e->fpx[i]); e->fpx[i] = NULL;
+            int had = e->fmask[i] != NULL, has = L->mask != NULL;
+            if (had != has) {
+                d->mask_swap_valid = 1; d->mask_swap = e->fmask[i]; e->fmask[i] = NULL;
+                if (d->mask_swap) bytes += (size_t)w * h;
+                changed = 1;
+            } else if (had && has) {
+                if (rect_diff(e->fmask[i], L->mask, w, h, 1, &rx, &ry, &rw, &rh)) {
+                    d->mask = (uint8_t *)rect_crop(e->fmask[i], w, 1, rx, ry, rw, rh);
+                    if (!d->mask) { uentry_free(e); return 1; }
+                    d->mx = rx; d->my = ry; d->mw = rw; d->mh = rh;
+                    bytes += (size_t)rw * rh; changed = 1;
+                }
+                free(e->fmask[i]); e->fmask[i] = NULL;
+            }
+        }
+        int had = e->fsel != NULL, has = g_doc.sel != NULL;
+        if (had != has) {
+            e->sel_swap_valid = 1; e->sel_swap = e->fsel; e->fsel = NULL;
+            if (e->sel_swap) bytes += (size_t)w * h;
+            changed = 1;
+        } else if (had && has) {
+            int rx, ry, rw, rh;
+            if (rect_diff(e->fsel, g_doc.sel, w, h, 1, &rx, &ry, &rw, &rh)) {
+                e->sel = (uint8_t *)rect_crop(e->fsel, w, 1, rx, ry, rw, rh);
+                if (!e->sel) { uentry_free(e); return 1; }
+                e->sx = rx; e->sy = ry; e->sw = rw; e->sh = rh;
+                bytes += (size_t)rw * rh; changed = 1;
+            }
+            free(e->fsel); e->fsel = NULL;
+        }
+        if (!changed) { uentry_free(e); return 1; }      // a no-op step is not history
+        e->kind = UK_DELTA; e->bytes = bytes;
     }
-    g_doc.comp_dirty = 1; g_doc.modified = 1;
-    memset(s, 0, sizeof(*s));
+    // Land it: depth cap, then the byte budget (oldest first, never the new one).
+    if (s_undo_n == STUDIO_MAX_UNDO) stack_drop_oldest(s_undo, &s_undo_n);
+    while (s_undo_n > 0 && s_total_bytes + e->bytes > (size_t)STUDIO_UNDO_BUDGET)
+        stack_drop_oldest(s_undo, &s_undo_n);
+    s_undo[s_undo_n++] = e;
+    s_total_bytes += e->bytes;
+    return 1;
 }
 
 static void undo_reset(void) {
+    if (s_pending) { uentry_free(s_pending); s_pending = NULL; }
     while (s_undo_n > 0) stack_drop_oldest(s_undo, &s_undo_n);
     while (s_redo_n > 0) stack_drop_oldest(s_redo, &s_redo_n);
+    s_total_bytes = 0;
 }
 
 void undo_push(const char *label) {
     if (!g_doc.nlayers) return;
-    snapshot_t snap;
-    if (snap_capture(&snap, label) != 0) {
+    undo_seal();                                   // the previous step is complete by definition
+    uentry_t *e = baseline_capture(label);
+    if (!e) {
         stack_drop_oldest(s_undo, &s_undo_n);
-        if (snap_capture(&snap, label) != 0) return;
+        e = baseline_capture(label);
+        if (!e) return;
     }
-    if (s_undo_n == STUDIO_MAX_UNDO) stack_drop_oldest(s_undo, &s_undo_n);
-    s_undo[s_undo_n++] = snap;
+    s_pending = e;
     while (s_redo_n > 0) stack_drop_oldest(s_redo, &s_redo_n);
 }
 
+// Apply an entry against the live document by exchange. After this the entry
+// describes the state it just replaced.
+static void uentry_apply(uentry_t *e) {
+    if (e->kind == UK_FULL) {
+        int resized = (g_doc.w != e->w) || (g_doc.h != e->h);
+        // Steal the live planes + headers into a temp, install the entry's, keep the live ones in the entry.
+        uint32_t *tpx[STUDIO_MAX_LAYERS]; uint8_t *tmask[STUDIO_MAX_LAYERS]; layer_t thdr[STUDIO_MAX_LAYERS];
+        int tn = g_doc.nlayers, tw = g_doc.w, th = g_doc.h, ta = g_doc.active, tsa = g_doc.sel_active;
+        uint8_t *tsel = g_doc.sel;
+        for (int i = 0; i < tn; i++) { tpx[i] = g_doc.layer[i].px; tmask[i] = g_doc.layer[i].mask; thdr[i] = hdr_of(&g_doc.layer[i]); }
+        g_doc.w = e->w; g_doc.h = e->h; g_doc.nlayers = e->nlayers; g_doc.active = e->active; g_doc.sel_active = e->sel_active;
+        for (int i = 0; i < e->nlayers; i++) { g_doc.layer[i] = e->hdr[i]; g_doc.layer[i].px = e->fpx[i]; g_doc.layer[i].mask = e->fmask[i]; }
+        for (int i = e->nlayers; i < STUDIO_MAX_LAYERS; i++) memset(&g_doc.layer[i], 0, sizeof(layer_t));
+        g_doc.sel = e->fsel;
+        memset(e->fpx, 0, sizeof e->fpx); memset(e->fmask, 0, sizeof e->fmask); memset(e->hdr, 0, sizeof e->hdr);
+        e->w = tw; e->h = th; e->nlayers = tn; e->active = ta; e->sel_active = tsa; e->fsel = tsel;
+        for (int i = 0; i < tn; i++) { e->fpx[i] = tpx[i]; e->fmask[i] = tmask[i]; e->hdr[i] = thdr[i]; }
+        if (resized || !g_doc.comp) {
+            if (g_doc.comp) free(g_doc.comp);
+            g_doc.comp = (uint32_t *)malloc((size_t)g_doc.w * (size_t)g_doc.h * 4);
+        }
+    } else {
+        int w = g_doc.w;
+        for (int i = 0; i < g_doc.nlayers; i++) {
+            layer_t *L = &g_doc.layer[i];
+            udelta_t *d = &e->d[i];
+            layer_t live = hdr_of(L), inst = e->hdr[i];
+            inst.px = L->px; inst.mask = L->mask; *L = inst; e->hdr[i] = live;
+            if (d->px) rect_swap(d->px, L->px, w, 4, d->x, d->y, d->w, d->h);
+            if (d->mask_swap_valid) { uint8_t *t = L->mask; L->mask = d->mask_swap; d->mask_swap = t; }
+            else if (d->mask && L->mask) rect_swap(d->mask, L->mask, w, 1, d->mx, d->my, d->mw, d->mh);
+        }
+        if (e->sel_swap_valid) { uint8_t *t = g_doc.sel; g_doc.sel = e->sel_swap; e->sel_swap = t; }
+        else if (e->sel && g_doc.sel) rect_swap(e->sel, g_doc.sel, w, 1, e->sx, e->sy, e->sw, e->sh);
+        int t = g_doc.active; g_doc.active = e->active; e->active = t;
+        t = g_doc.sel_active; g_doc.sel_active = e->sel_active; e->sel_active = t;
+        if (g_doc.active < 0 || g_doc.active >= g_doc.nlayers) g_doc.active = g_doc.nlayers - 1;
+    }
+    g_doc.comp_dirty = 1; g_doc.modified = 1;
+}
+
 int undo_undo(void) {
+    undo_seal();
     if (s_undo_n <= 0) return 0;
-    snapshot_t prev = s_undo[--s_undo_n];
-    memset(&s_undo[s_undo_n], 0, sizeof(snapshot_t));
-    snapshot_t cur; snap_steal_current(&cur, prev.label);
-    if (s_redo_n == STUDIO_MAX_UNDO) stack_drop_oldest(s_redo, &s_redo_n);
-    s_redo[s_redo_n++] = cur;
-    snap_restore(&prev);
+    uentry_t *e = s_undo[--s_undo_n]; s_undo[s_undo_n] = NULL;
+    uentry_apply(e);
+    if (s_redo_n == STUDIO_MAX_UNDO) stack_drop_oldest(s_redo, &s_redo_n);   // cannot happen: sizes match
+    s_redo[s_redo_n++] = e;
     return 1;
 }
 
 int undo_redo(void) {
+    undo_seal();
     if (s_redo_n <= 0) return 0;
-    snapshot_t next = s_redo[--s_redo_n];
-    memset(&s_redo[s_redo_n], 0, sizeof(snapshot_t));
-    snapshot_t cur; snap_steal_current(&cur, next.label);
+    uentry_t *e = s_redo[--s_redo_n]; s_redo[s_redo_n] = NULL;
+    uentry_apply(e);
     if (s_undo_n == STUDIO_MAX_UNDO) stack_drop_oldest(s_undo, &s_undo_n);
-    s_undo[s_undo_n++] = cur;
-    snap_restore(&next);
+    s_undo[s_undo_n++] = e;
     return 1;
 }
 
-int undo_count(void) { return s_undo_n; }
-const char *undo_label(int i) {
-    if (i < 0 || i >= s_undo_n) return "";
-    return s_undo[i].label;
+int undo_goto(int target) {
+    int moved = 0;
+    undo_seal();
+    while (s_undo_n > target && s_undo_n > 0) { if (!undo_undo()) break; moved++; }
+    while (s_undo_n < target && s_redo_n > 0) { if (!undo_redo()) break; moved++; }
+    return moved;
 }
+
+// Queries. The pending baseline counts as the newest step so the panel shows
+// an edit the moment it starts; it is compacted on the next tick.
+int undo_count(void) { return s_undo_n + (s_pending ? 1 : 0); }
+int undo_redo_count(void) { return s_redo_n; }
+const char *undo_label(int i) {
+    if (i < 0 || i >= undo_count()) return "";
+    if (i == s_undo_n) return s_pending->label;
+    return s_undo[i]->label;
+}
+const char *redo_label(int i) {
+    if (i < 0 || i >= s_redo_n) return "";
+    return s_redo[s_redo_n - 1 - i]->label;
+}
+size_t undo_bytes(int i) {
+    if (i < 0 || i >= undo_count()) return 0;
+    if (i == s_undo_n) return s_pending->bytes;
+    return s_undo[i]->bytes;
+}
+size_t redo_bytes(int i) {
+    if (i < 0 || i >= s_redo_n) return 0;
+    return s_redo[s_redo_n - 1 - i]->bytes;
+}
+size_t undo_mem_total(void) { return s_total_bytes + (s_pending ? s_pending->bytes : 0); }
 // Menu-driven queries: is undo/redo available, and what would the next one do.
-int undo_can_undo(void) { return s_undo_n > 0; }
+int undo_can_undo(void) { return undo_count() > 0; }
 int undo_can_redo(void) { return s_redo_n > 0; }
-const char *undo_next_label(void) { return s_undo_n > 0 ? s_undo[s_undo_n - 1].label : ""; }
-const char *redo_next_label(void) { return s_redo_n > 0 ? s_redo[s_redo_n - 1].label : ""; }
+const char *undo_next_label(void) { return undo_count() > 0 ? undo_label(undo_count() - 1) : ""; }
+const char *redo_next_label(void) { return s_redo_n > 0 ? s_redo[s_redo_n - 1]->label : ""; }
 
 // ---------------------------------------------------------------------------
 // Blending - the full GIMP 2.10/3 mode set.
@@ -337,6 +547,31 @@ const char *blend_name(blend_t b) {
 #define CHECKER_B 0xFF999999u
 #define CHECKER_SZ 8
 
+// The one layer walk. Blends every visible layer (mask-aware) in z order onto
+// whatever `dst` already holds. doc_composite() seeds `dst` with the
+// transparency checker for the on-screen view; doc_flatten_to() seeds it with
+// a solid ground for exports whose format carries no alpha (JPEG). One
+// implementation, two grounds, so the view and the export can never disagree
+// about how layers stack.
+static void composite_layers_into(uint32_t *dst) {
+    size_t npx = (size_t)g_doc.w * (size_t)g_doc.h;
+    for (int li = 0; li < g_doc.nlayers; li++) {
+        layer_t *L = &g_doc.layer[li];
+        if (!L->visible || !L->px || L->opacity <= 0) continue;
+        if (L->mask) {
+            for (size_t i = 0; i < npx; i++) {
+                uint32_t s = L->px[i];
+                int a = MUL255(px_a(s), L->mask[i]);
+                s = (s & 0x00FFFFFFu) | ((uint32_t)a << 24);
+                dst[i] = blend_px(dst[i], s, L->blend, L->opacity);
+            }
+        } else {
+            for (size_t i = 0; i < npx; i++)
+                dst[i] = blend_px(dst[i], L->px[i], L->blend, L->opacity);
+        }
+    }
+}
+
 void doc_composite(void) {
     if (!g_doc.nlayers) return;
     if (!g_doc.comp) {
@@ -353,23 +588,17 @@ void doc_composite(void) {
         for (int x = 0; x < w; x++)
             row[x] = (((x / CHECKER_SZ) & 1) ^ yb) ? CHECKER_B : CHECKER_A;
     }
-    size_t npx = (size_t)w * (size_t)h;
-    for (int li = 0; li < g_doc.nlayers; li++) {
-        layer_t *L = &g_doc.layer[li];
-        if (!L->visible || !L->px || L->opacity <= 0) continue;
-        if (L->mask) {
-            for (size_t i = 0; i < npx; i++) {
-                uint32_t s = L->px[i];
-                int a = MUL255(px_a(s), L->mask[i]);
-                s = (s & 0x00FFFFFFu) | ((uint32_t)a << 24);
-                g_doc.comp[i] = blend_px(g_doc.comp[i], s, L->blend, L->opacity);
-            }
-        } else {
-            for (size_t i = 0; i < npx; i++)
-                g_doc.comp[i] = blend_px(g_doc.comp[i], L->px[i], L->blend, L->opacity);
-        }
-    }
+    composite_layers_into(g_doc.comp);
     g_doc.comp_dirty = 0;
+}
+
+int doc_flatten_to(uint32_t *out, uint32_t bg) {
+    if (!out || !g_doc.nlayers) return -1;
+    size_t npx = (size_t)g_doc.w * (size_t)g_doc.h;
+    uint32_t ground = bg | 0xFF000000u;
+    for (size_t i = 0; i < npx; i++) out[i] = ground;
+    composite_layers_into(out);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------

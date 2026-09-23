@@ -1,0 +1,109 @@
+# mports recipe: hangman, from the bsd-games 2.17 collection. Part of the
+# #745-style tuigames batch (owner request 2026-09-18): "bsd-games selection
+# ... e.g. tetris, snake, worm, hangman, robots, wump; SKIP anything needing
+# curses features we lack or X". BSD-3-clause (Regents of the University of
+# California), dependency closure 1 (ncurses), same shape as myman/ninvaders/
+# moon-buggy.
+#
+# WHAT THIS PORT SHIPS. The classic 4.3BSD "hangman" guessing game: 9 small
+# translation units (main/setup/playgame/getword/getguess/endgame/prdata/
+# prman/prword/extern), ncurses-driven, no data files at runtime (see below).
+#
+# WHY THE bsd-games 2.17 TARBALL, NOT NetBSD src directly. NetBSD's own game
+# directories are not separately tarballed; the only way to get one as a
+# `source_url` a fresh machine can actually re-fetch is either the whole
+# NetBSD src monorepo (gigabytes, and its top-level layout does not match a
+# per-game `srcdir=`) or an already-packaged per-game tarball. Debian's
+# bsd-games source package repackages the same NetBSD-derived per-game trees
+# (confirmed by diffing hangman/*.c against NetBSD's games/hangman: identical
+# BSD-licensed C, same Copyright/Redistribution header) as one tarball, kept
+# indefinitely on snapshot.debian.org by content hash. srcdir= below points at
+# just the hangman/ subdirectory of that one shared tarball; the other four
+# bsd-games ports in this batch (robots, worm, snake, bsdtetris) declare the
+# IDENTICAL tarball+sha256, so mports.sh's cache-hit path (fetch once, reuse
+# for all five) is what actually happens, not five downloads.
+#
+# The sha256 below is of the tarball itself, MEASURED after fetching it from
+# the URL below with curl and running sha256sum on the bytes on disk, not
+# copied from a web page. The upstream sha1 (8e48a980...) is also published
+# by snapshot.debian.org's own file-hash index for this exact artefact, which
+# is how the URL was found in the first place:
+#   curl -sL -o bsdgames_2.17.orig.tar.gz \
+#     https://snapshot.debian.org/file/8e48a9808908e2898126fdd285196ab71c9a59c0
+#   sha256sum bsdgames_2.17.orig.tar.gz
+#   -> 066f924aef6c1c5ea946f588e36f303021f5dfc093944738f025d8edbc6fff60 (2,563,311 bytes)
+
+name=hangman
+version=2.17
+class=C
+homepage=https://tracker.debian.org/pkg/bsdgames
+
+source_url=https://snapshot.debian.org/file/8e48a9808908e2898126fdd285196ab71c9a59c0
+tarball=bsdgames_2.17.orig.tar.gz
+sha256=066f924aef6c1c5ea946f588e36f303021f5dfc093944738f025d8edbc6fff60
+srcdir=bsd-games-2.17/hangman
+
+# BSD-3-Clause (the "Regents of the University of California" 1983/1993
+# licence block at the top of every .c file in this directory, unmodified
+# from the University of California's 4.3BSD original). The tarball's own
+# top-level COPYING is a survey of all bsd-games licences; the per-file
+# header IS the licence that actually governs this directory, and it is the
+# permissive 3-clause BSD text, not the GPL text that also appears in
+# COPYING for OTHER games in the same collection (e.g. wtf/battlestar are
+# GPL - not touched by this port).
+licence=BSD-3-Clause
+licence_files=../COPYING
+copyleft=none
+copyleft_note=BSD-3-Clause is permissive; the combined /APPS/HANGMAN binary (this port + ncurses + userland/libc, all permissive) carries no copyleft obligation.
+
+# ncurses supplies the whole screen/input model. libc is the shared platform
+# library, not a port.
+
+# THE ADOPTION TEST (owner rule 2): does this want to USE a platform layer,
+# or to BE one? hangman USES. It is an ordinary Ring-3 program driven by
+# ncurses screen/input calls plus stdio/stdlib/string/rand. Measured: the 11
+# objects (9 upstream + our 2 own files) link against libncurses.a +
+# userland/libc/libc.a with ZERO undefined symbols. It owns its own game
+# state and calls getch() itself from playgame(); it imposes no event loop,
+# host main(), or window system on anything else.
+adoption=USES. Measured: the 11 compiled objects (9 upstream translation units plus bsdgame_compat.c and bsdgame_words.c, both ours) link against the built libncurses.a + userland/libc/libc.a with zero undefined symbols. hangman owns its own game state and calls getch() itself from playgame() in playgame.c; it imposes no event loop, host main(), or window system on any other program.
+needs=libc ncurses
+
+prepare=none
+
+# TWO PATCHES, both documented at their own top:
+#   0001 - setup.c no longer fopen()s an on-disk dictionary (MayteraOS ships
+#          none; see 0002's header comment for why a built-in list replaces
+#          it rather than a vendored /usr/share/dict/words).
+#   0002 - getword.c picks a word from bsdgame_words[] (ours, see
+#          bsdgame_words.c) instead of a random-byte-offset file seek.
+# Neither patch touches sys/cdefs.h or err.h usage elsewhere in this
+# directory: those resolve via -Ishim (see build.sh), which is why this
+# port needs no patch for the eight other `#include <sys/cdefs.h>` lines in
+# the remaining seven translation units.
+patches=0001-setup-no-dict-file.patch 0002-getword-builtin-wordlist.patch 0003-main-include-getopt.patch
+
+# build=script: this port adds two of its own files (bsdgame_compat.c for
+# err/warn/random, bsdgame_words.c for the word list) which cannot appear in
+# a `sources=` list (mports.sh requires every `sources=` entry to already
+# exist inside the unpacked upstream tree). Same reason the tcc and sqlite
+# ports use build=script for their own maytera_compat.c / maytera_vfs.c.
+# See build.sh for the exact compile/link steps: writes pathnames.h (no
+# @scorefile@ substitution needed - hangman has no scorefile, only
+# _PATH_DICT, and that macro is no longer referenced after the patches
+# above), then compiles the 9 upstream .c files plus our 2 with -Ishim on
+# the front of the search path so `#include <sys/cdefs.h>` and
+# `#include <err.h>` resolve to shim/ instead of failing outright.
+build=script
+
+headers=none
+lib=libhangman.a
+
+# THE ANTI-NO-OP CHECK. One symbol per upstream translation unit (9 files),
+# proven DEFINED in the archive with nm: main.c (main), setup.c (setup),
+# playgame.c (playgame), getword.c (getword, the file the patches actually
+# rewrite), getguess.c (getguess), endgame.c (endgame), prman.c (prman),
+# prword.c (prword), plus our own err (bsdgame_compat.c). A build that
+# compiled the wrong source list, or lost a file to a bad patch, cannot
+# define all eight.
+symbols=main setup playgame getword getguess endgame prman prword err

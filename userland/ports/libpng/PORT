@@ -1,0 +1,59 @@
+# mports recipe: libpng 1.6.44, the reference PNG codec, for userland PNG decode
+# and encode. Item 7 of the 2026-09 library-ports batch. This is the FIRST real
+# cross-port dependency user: libpng needs the already-ported zlib
+# (needs=libc zlib), so mports builds zlib first and libpng compiles against the
+# zlib.h it installs into out/include.
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA.
+
+name=libpng
+version=1.6.44
+class=A
+homepage=http://www.libpng.org/pub/png/libpng.html
+
+# The official release tarball. sha256 below is of THIS file and was MEASURED on
+# the build container, not copied from a web page:
+#   wget -O libpng-1.6.44.tar.gz https://downloads.sourceforge.net/project/libpng/libpng16/1.6.44/libpng-1.6.44.tar.gz
+#   sha256sum -> 8c25a7792099a0089fa1cc76c94260d0bb3f1ec52b93671b572f8bb61577b732
+source_url=https://downloads.sourceforge.net/project/libpng/libpng16/1.6.44/libpng-1.6.44.tar.gz
+tarball=libpng-1.6.44.tar.gz
+sha256=8c25a7792099a0089fa1cc76c94260d0bb3f1ec52b93671b572f8bb61577b732
+srcdir=libpng-1.6.44
+
+licence=libpng-2.0
+licence_files=LICENSE
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): USES. libpng is pure computation over
+# caller-supplied buffers (or caller read/write callbacks); the simplified API
+# decodes a memory buffer straight to a pixel buffer. The only platform surface
+# is malloc/free, memcpy/memset and setjmp/longjmp (its error model), plus zlib
+# (a ported library, not a platform layer). No event loop, no main(), no window.
+adoption=USES. PNG codec over caller-supplied memory buffers or caller read/write callbacks; the only platform surface is malloc/free, memcpy/memset and setjmp/longjmp, plus the ported zlib. It never wants to own the process.
+
+# THE FIRST REAL needs= EDGE (docs/MPORTS.md noted needs had only the self-test's
+# synthetic pair as a user). libpng genuinely needs zlib's DEFLATE for IDAT.
+needs=libc zlib
+
+# Upstream ships scripts/pnglibconf.h.prebuilt precisely so a packager can build
+# without running configure: copy it to pnglibconf.h (which pngconf.h includes).
+# It enables the C code paths with no CPU-SIMD (no PNG_INTEL_SSE), which is why
+# no SIMD .c is in sources.
+prepare=scripts/pnglibconf.h.prebuilt:pnglibconf.h
+patches=none
+
+build=objects
+
+# The fifteen core library translation units (read + write + transforms + IO).
+sources=png.c pngerror.c pngget.c pngmem.c pngpread.c pngread.c pngrio.c pngrtran.c pngrutil.c pngset.c pngtrans.c pngwio.c pngwrite.c pngwtran.c pngwutil.c
+
+exclude=example.c pngtest.c
+exclude_reason=example.c is documentation sample code and pngtest.c is the standalone test PROGRAM (it carries main()); neither belongs in the library archive. The CPU-SIMD sources under arm/, intel/, mips/, powerpc/ are not built because the prebuilt pnglibconf.h enables no SIMD path, so png.c never references their init symbols.
+
+headers=png.h pngconf.h pnglibconf.h
+lib=libpng.a
+
+# THE ANTI-NO-OP CHECK. Proven defined in libpng.a by nm: the version accessors,
+# the classic read struct lifecycle + info, IHDR query, and the 1.6 simplified
+# read API this port's consumer uses.
+symbols=png_access_version_number png_get_libpng_ver png_create_read_struct png_create_info_struct png_destroy_read_struct png_read_info png_get_IHDR png_get_image_width png_get_image_height png_image_begin_read_from_memory png_image_finish_read

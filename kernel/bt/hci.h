@@ -43,9 +43,12 @@ typedef struct {
     uint8_t   addr_type;   // LE: 0 public, 1 random
     uint8_t   is_le;       // 1 = BLE, 0 = classic BR/EDR
     int8_t    rssi;        // dBm (0 unknown)
-    uint8_t   is_hid;      // advertises HID service 0x1812 / HID appearance
+    uint8_t   is_hid;      // advertises HID service (LE 0x1812 / classic 0x1124)
+                           // or HID appearance / Peripheral Class-of-Device
     uint8_t   appearance;  // 1 = keyboard, 2 = mouse, 0 = other/unknown
-    uint8_t   adv_type;    // LE adv event type (0x00 = connectable undirected)
+    uint8_t   adv_type;    // LE adv event type (0x00 = connectable undirected);
+                           // 0xFF for a classic BR/EDR inquiry result (not LE)
+    uint32_t  cod;         // classic Class-of-Device (24-bit, 0 for LE / unknown)
     char      name[32];
 } hci_disc_dev_t;
 
@@ -55,6 +58,22 @@ void hci_start_bringup(void); // begins the async controller bring-up (called by
                               // the transport once firmware, if any, is loaded)
 void hci_poll(void);   // pump: drains pending events, advances reset sequence
 int  hci_is_ready(void);
+
+// --- Classic BR/EDR discovery / connect (used by bt_ctrl / gatt auto-target) ---
+// hci_classic_inquiry() issues a General-Inquiry (GIAC) so a DISCOVERABLE-only
+// classic device (a fresh-sync keyboard/mouse that does not page us) is found;
+// results land in the shared disc cache. hci_classic_connect() pages a discovered
+// device (Create_Connection); the resulting Connection Complete drives the same
+// auth/SSP/encryption/HID path as an inbound classic link. Event-driven, no wait.
+int  hci_classic_inquiry(void);
+// hci_classic_inquiry_cancel() sends Inquiry_Cancel (0x0402) so a Stop request
+// actually halts the classic inquiry window instead of letting it run to its
+// own ~10.24s Inquiry_Length regardless of the caller (#bt-settings-ux). Safe
+// to call when no inquiry is running: the controller answers Command Disallowed,
+// which we do not treat as an error.
+int  hci_classic_inquiry_cancel(void);
+int  hci_classic_connect(const bt_addr_t *addr);
+int  hci_remote_name_req(const bt_addr_t *addr);   // optional: log a device name
 
 // --- LE scan / connect / encryption (used by bt_ctrl / gatt) ---
 int  hci_le_scan(int enable);                 // active LE scan on/off

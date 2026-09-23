@@ -1,0 +1,15 @@
+--- a/ncurses/tinfo/lib_setup.c
++++ b/ncurses/tinfo/lib_setup.c
+@@ -859,10 +859,8 @@
+ 	if (!NonEmpty(tname))
+ 	    tname = "unknown";
+ #else
+-	if (!NonEmpty(tname)) {
+-	    T(("Failure with TERM=%s", NonNull(tname)));
+-	    ret_error0(TGETENT_ERR, "TERM environment variable not set.\n");
+-	}
++	if (!NonEmpty(tname))
++	    tname = "maytera";	/* MayteraOS #745: a pty-spawned child has no environ; default TERM */
+ #endif
+     }
+     myname = strdup(tname);

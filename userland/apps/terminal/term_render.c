@@ -108,7 +108,7 @@ static uint32_t blend_rgb(uint32_t a, uint32_t b, int num, int den) {
 //    OLD ink that lay outside its own box behind forever, because the only
 //    thing that would have erased it was the neighbour's background fill.
 //
-//    MEASURED on VM <vmid>, golden 2066, 80x24 pane (build with the kernel text
+//    MEASURED on VM 2333, golden 2066, 80x24 pane (build with the kernel text
 //    path + damage tracking): after `help` twice, PageUp then PageDown left 42
 //    pixels differing from the same screen painted in full, and the count was
 //    still exactly 42 after five more cycles - a stable residue, not a
@@ -297,7 +297,7 @@ static void compose_cell(uint32_t *buf, int bw, int bh, int dx, int dy,
 //   - win_invalidate() is not a flag. sys_win_invalidate() calls
 //     uw_commit_content(), a memcpy of the WHOLE content_width*content_height
 //     buffer, and window_invalidate() -> window_draw() runs synchronously in
-//     the caller's own context. MEASURED (blame.md, VM <vmid>, golden 1025):
+//     the caller's own context. MEASURED (blame.md, VM 2955, golden 1025):
 //     83.4 us for one small draw plus one invalidate, against 134 ns for a
 //     bare syscall. The present is the most expensive thing in the loop.
 //   - Worse, the NON-ASCII cell path self-commits. sys_win_draw_image()

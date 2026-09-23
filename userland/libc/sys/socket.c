@@ -112,3 +112,32 @@ int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
 int shutdown(int fd, int how) {
     return (int)sk_ret(syscall2(SYS_SOCK_SHUTDOWN, fd, how));
 }
+
+// getsockname - MayteraOS has no SYS_SOCK_GETSOCKNAME (net/socket.c exposes
+// bind/connect/listen/accept/... but not getsockname). Report the honest
+// answer, -1/ENOSYS, rather than returning success with a buffer we did not
+// fill. Callers such as darkhttpd already hold the address they bound with and
+// are patched to tolerate this failure. #745 darkhttpd port.
+int getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen) {
+    (void)fd; (void)addr; (void)addrlen;
+    errno = ENOSYS;
+    return -1;
+}
+
+// inet_ntoa - network-order struct in_addr -> dotted-quad in a static buffer.
+// Not reentrant, per POSIX. Formatted by hand to avoid a <stdio.h> dependency
+// in this translation unit (0=48, .=46). #745 darkhttpd port.
+char *inet_ntoa(struct in_addr in) {
+    static char buf[16];
+    const unsigned char *p = (const unsigned char *)&in.s_addr;
+    char *o = buf;
+    for (int i = 0; i < 4; i++) {
+        unsigned v = p[i];
+        if (v >= 100) { *o++ = (char)(48 + v / 100); v %= 100; *o++ = (char)(48 + v / 10); v %= 10; }
+        else if (v >= 10) { *o++ = (char)(48 + v / 10); v %= 10; }
+        *o++ = (char)(48 + v);
+        if (i < 3) *o++ = (char)46;
+    }
+    *o = 0;
+    return buf;
+}

@@ -3,6 +3,7 @@
 // Note: No floating point - uses integer math only
 
 #include "wget.h"
+#include "netfail.h"   // #netfix2: record WHY a fetch failed
 #include "tcp.h"
 #include "ip.h"
 #include "dns.h"
@@ -627,6 +628,7 @@ static int wget_redirect_allowed(const char *from_url, const char *to_url, int o
     }
     char host[WGET_MAX_HOST]; char path[WGET_MAX_PATH]; uint16_t port;
     if (wget_parse_url(to_url, host, path, &port) < 0) {
+        NETFAIL(NF_HTTP_REDIRECT_BLOCKED, 0);   // #netfix2
         kprintf("[HTTP] Redirect blocked (invalid target): %s\n", to_url);
         return 0;
     }
@@ -1204,6 +1206,8 @@ static int http_request_once(http_request_t *req, http_response_t *resp,
 
     // Check network
     if (ip_get_address() == 0) {
+        extern int nic_link_up(void);
+        NETFAIL(nic_link_up() ? NF_NO_ADDRESS : NF_NO_CARRIER, 0);   // #netfix2
         kprintf("[HTTP] Error: No network address configured\n");
         return WGET_ERR_NO_NETWORK;
     }
@@ -1221,11 +1225,12 @@ static int http_request_once(http_request_t *req, http_response_t *resp,
     } else {
         int dns_result = dns_resolve(req->host, &ip);
         if (dns_result != 0) {
+            NETFAIL_WEAK(NF_DNS_SILENT, dns_result);   // #netfix2 (dns.c is more specific)
             kprintf("[HTTP] Error: Cannot resolve host '%s': error %d\n", req->host, dns_result);
             return WGET_ERR_DNS_FAILED;
         }
     }
-    if (ip == 0) { kprintf("[HTTP] host '%s' -> 0\n", req->host); return WGET_ERR_DNS_FAILED; }
+    if (ip == 0) { NETFAIL(NF_DNS_NO_A, 0); kprintf("[HTTP] host '%s' -> 0\n", req->host); return WGET_ERR_DNS_FAILED; }   // #netfix2
 
     kprintf("[HTTP] %s %s://%s:%d%s\n", req->method,
            (req->port == 443) ? "https" : "http", req->host, req->port, req->path);
@@ -1237,8 +1242,10 @@ static int http_request_once(http_request_t *req, http_response_t *resp,
     int was_reused = 0;
     sock = http_get_connection_ex(req->host, req->port, ip, &was_reused);
     if (sock < 0) {
+        NETFAIL_WEAK(NF_TCP_FAILED, sock);   // #netfix2
         return sock;  // Error code
     }
+    netfail_clear();   // #netfix2: connected, so nothing below owes a stale reason
     if (reused) *reused = was_reused;
     pool_connection = true;
 
@@ -1252,6 +1259,7 @@ static int http_request_once(http_request_t *req, http_response_t *resp,
     // Send request headers
     int sent = send_all(sock, request_buf, req_len);
     if (sent < 0) {
+        NETFAIL(NF_HTTP_SEND, sent);   // #netfix2
         kprintf("[HTTP] Send failed: %d\n", sent);
         result = WGET_ERR_SEND_FAILED;
         goto cleanup;
@@ -1261,6 +1269,7 @@ static int http_request_once(http_request_t *req, http_response_t *resp,
     if (req->body && req->body_length > 0) {
         sent = send_all(sock, req->body, req->body_length);
         if (sent < 0) {
+            NETFAIL(NF_HTTP_SEND, sent);   // #netfix2
             kprintf("[HTTP] Send body failed: %d\n", sent);
             result = WGET_ERR_SEND_FAILED;
             goto cleanup;
@@ -1325,6 +1334,9 @@ static int http_request_once(http_request_t *req, http_response_t *resp,
         header_end = find_header_end(recv_buf, recv_len);
 
         if (chunk_received == 0 && header_end < 0) {
+            // #netfix2: this IS the #333 "no status (len=0)" shape seen from
+            // the plaintext side: the peer closed with no status line at all.
+            NETFAIL(NF_HTTP_NO_STATUS, 0);
             kprintf("[HTTP] Connection closed before headers complete\n");
             result = WGET_ERR_HTTP_ERROR;
             goto cleanup;
@@ -1399,6 +1411,7 @@ static int http_request_once(http_request_t *req, http_response_t *resp,
             net_progress_bytes((uint32_t)(recv_len - header_end));   // #25
         }
         if (cc != 1) {
+            NETFAIL(NF_HTTP_TRUNCATED, 0);   // #netfix2
             kprintf("[HTTP] Truncated/malformed chunked body (ended before terminating chunk)\n");
             result = WGET_ERR_TRUNCATED;
             goto cleanup;
@@ -1407,6 +1420,7 @@ static int http_request_once(http_request_t *req, http_response_t *resp,
         // Decode chunked data in place
         ssize_t decoded_len = http_decode_chunked(recv_buf + header_end, recv_len - header_end);
         if (decoded_len < 0) {
+            NETFAIL(NF_HTTP_CHUNKED, 0);   // #netfix2
             kprintf("[HTTP] Chunked decode error\n");
             result = WGET_ERR_HTTP_ERROR;
             goto cleanup;
@@ -1435,6 +1449,7 @@ static int http_request_once(http_request_t *req, http_response_t *resp,
         // Returning that as WGET_SUCCESS silently corrupted JSON callers
         // (HA /api/states, pip metadata) that only check the status code.
         if (body_in_buffer < resp->content_length) {
+            NETFAIL(NF_HTTP_TRUNCATED, 0);   // #netfix2
             kprintf("[HTTP] Truncated body: got %u of %u advertised bytes\n",
                     (unsigned)body_in_buffer, (unsigned)resp->content_length);
             result = WGET_ERR_TRUNCATED;
@@ -1566,6 +1581,7 @@ static int wget_execute_with_redirects(const char *url, const char *save_path,
     http_request_init(&req);
 
     if (http_parse_url(url, &req) < 0) {
+        NETFAIL(NF_BAD_URL, 0);   // #netfix2
         kprintf("[WGET] Error: Invalid URL\n");
         return WGET_ERR_INVALID_URL;
     }

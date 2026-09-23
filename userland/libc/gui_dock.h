@@ -33,7 +33,19 @@
 
 // Must equal DOCK_COUNT in userland/apps/compositor/compositor.h.
 // build/dock-name-gate.sh fails the build if the two ever differ.
-#define GUI_DOCK_COUNT 5
+// (cfsettings) 5 -> 6: DOCK_CARDFILE = 5, the Rolodex card-deck shell
+// (docs/CARDFILE_ARCHITECTURE.md). The compositor side landed first (DOCK_COUNT
+// went to 6 in compositor.h and profile.c's clamp to 6), which left this at 5
+// and the gate RED until the user-facing entry caught up.
+#define GUI_DOCK_COUNT 6
+
+// (cfsettings) The one index Settings needs by VALUE rather than by name: the
+// Cardfile shell has no taskbar or dock, so the Dock panel's opacity / height /
+// zoom controls do not apply to it and the panel says so when it is selected.
+// Same tradeoff as GUI_DOCK_COUNT: compositor.h's DOCK_CARDFILE cannot be
+// included from Settings, so this is a matching literal, gated by
+// build/dock-name-gate.sh alongside the count.
+#define GUI_DOCK_CARDFILE 5
 
 // The array itself, for a caller that needs a `const char *const *` (the
 // Settings dropdown widget takes one).

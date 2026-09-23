@@ -14,7 +14,8 @@
 extern void pic_enable_irq(uint8_t irq);
 extern void pic_send_eoi(uint8_t irq);
 extern int  fat_cache_flush(void *fs);   // flush dirty FAT readahead cache
-extern void ata_flush_all(void);         // issue CACHE FLUSH to all ATA drives
+extern void ata_flush_all(void);         // issue CACHE FLUSH to all ATA/AHCI drives
+extern void blk_flush_root_usb(void);    // #wallpersist2: SYNCHRONIZE CACHE on a USB MSC root
 
 // ACPI global state
 static acpi_state_t acpi_state = {0};
@@ -376,7 +377,6 @@ int acpi_init(void) {
 // readahead cache and the ATA drive write caches still benefit from a flush.
 void acpi_shutdown_flush(void) {
     fat_cache_flush(0);   // flush any dirty FAT readahead blocks
-    ata_flush_all();      // tell each ATA drive to commit its write cache
     // #610: mark the ext2 volume CLEAN. This is the whole point of the dirty
     // flag: without a write here, a graceful "qm shutdown" and a yanked USB
     // stick are indistinguishable on the next boot, and they must not be.
@@ -386,6 +386,21 @@ void acpi_shutdown_flush(void) {
         extern void ext2_mark_clean(void);
         ext2_mark_clean();
     }
+    // #wallpersist2: the physical-medium cache flushes run LAST, after every
+    // OS-level write above (including the clean-bit superblock write just
+    // above) has actually been issued. They used to run BEFORE
+    // ext2_mark_clean(), which left that one write - the very write that
+    // decides whether the NEXT boot thinks it was shut down cleanly -
+    // uncovered by the flush that follows it. ata_flush_all() now also
+    // covers AHCI-backed drives (real hardware, and q35 VMs), and
+    // blk_flush_root_usb() covers a USB-MSC root (a real USB stick, and
+    // a test VM's own usb-storage boot device) - neither backend was reached
+    // by the original ATA-only, pre-ext2_mark_clean() call here. See
+    // ata_flush_all()'s comment in drivers/ata.c and blk_flush_root_usb()'s
+    // in fs/blockdev.c for why a physical drive's own onboard write cache
+    // needs an explicit command, not just an OS-level write-through.
+    ata_flush_all();       // tell each ATA/AHCI drive to commit its write cache
+    blk_flush_root_usb();  // tell a USB MSC root stick to commit its write cache
 }
 
 // #298: SCI interrupt handler. QEMU/Proxmox "qm shutdown" presses the virtual

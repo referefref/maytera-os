@@ -956,8 +956,13 @@ properties_result_t properties_run(properties_dialog_t *dlg) {
         properties_draw(dlg);
         fb_swap_buffers();
         
-        // Small delay
-        for (volatile int i = 0; i < 100000; i++);
+        // #102/#180 (matches desktop.c): sleep the idle redraw wait instead of
+        // burning a volatile busy-count with no sleep or yield, which pegs the
+        // kernel desktop thread at 100% for the whole life of the dialog and
+        // starves the taskbar, other windows and that thread's net_poll. Input
+        // is polled every iteration above, so responsiveness is unchanged.
+        extern void proc_sleep(uint32_t ms);
+        proc_sleep(16);
     }
     
     return dlg->result;

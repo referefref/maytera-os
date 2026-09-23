@@ -54,4 +54,8 @@ void seclog_report_ai_injection(unsigned int pid, const char *detail);
 // target and the reason for each one.
 void seclog_report_io_boundary(unsigned int pid, const char *detail);
 
+// Stage 1 capability API: narrow producer for capability grants, refusals and
+// revocations, so proc/caps.c needs no security.h include. See security.c.
+void seclog_report_capability(unsigned int pid, const char *detail);
+
 #endif // SECLOG_H

@@ -4,7 +4,7 @@ Status: PARTIALLY IMPLEMENTED. Sections 1.1 (no default credentials in a
 shipping image) + 4.1 step 2 (first-boot create-account flow) are implemented in
 `kernel/proc/users.c` (`users_create_first_admin`, `users_count_active`, the
 `MAYTERA_SHIP_DEFAULT_ACCOUNTS`-gated `create_defaults`) and `kernel/gui/login.c`
-(`LOGIN_STATE_CREATE_ACCOUNT`), verified on VM <vmid> build 855 (#568). The initial
+(`LOGIN_STATE_CREATE_ACCOUNT`), verified on VM 2410 build 855 (#568). The initial
 administrator is created as uid 0 via the #566 PBKDF2 path; a fresh install with no
 accounts on disk forces creation, while an internal image that ships accounts +
 `/CONFIG/LOGIN.CFG autologin=<user>` still boots straight to the desktop. Other

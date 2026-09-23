@@ -1,0 +1,138 @@
+# mports recipe: QuickJS-ng 0.16.2. Tier 2 item #8 of
+# docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md: a modern ES2023 JavaScript
+# engine, MIT, closure 0, pure computation.
+#
+# WHICH QuickJS. There are two live lines: Fabrice Bellard's original quickjs
+# and the community fork quickjs-ng, which is the ACTIVELY MAINTAINED one (the
+# original ships infrequently and lags the ES spec). We pin quickjs-ng, tag
+# v0.16.2, the newest release read off the quickjs-ng/quickjs Releases page at
+# port time (not assumed). Both are MIT; this recipe records that it is the -ng
+# fork so a future reader is not surprised by the extra files (dtoa.c, the -ng
+# atom set) that upstream quickjs does not have.
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA; the only
+# executable part is ports/quickjs/build.sh.
+#
+# WHAT THIS PORT DELIVERS AND WHAT IT DOES NOT. It builds libquickjs.a (the
+# engine: dtoa.c + libregexp.c + libunicode.c + quickjs.c) plus quickjs.h, and
+# the /APPS/QJS CLI (userland/apps/qjs) links against it. It deliberately does
+# NOT build quickjs-libc.c (the std/os module surface: os.exec, popen, readdir,
+# worker threads), which would drag in the process-model / OS surface this port
+# has no reason to touch: the engine itself is PURE COMPUTATION and that is the
+# whole point of item #8. See the FOLLOW-UPS note at the foot of this file.
+
+name=quickjs
+version=0.16.2
+
+# CLASS A ("pure computation: no syscalls beyond malloc/free/abort"). The engine
+# library reaches nothing but libc's allocator, string/mem routines, math, a few
+# stdio print helpers, and a gettimeofday/clock for Date/Math.random seeding. It
+# has no filesystem, no process model, no sockets and no window. The CLI app
+# that consumes it reads a .js file, which is class B surface, but the LIBRARY
+# this recipe ships is class A, and A is the honest letter for the port.
+class=A
+homepage=https://github.com/quickjs-ng/quickjs
+
+# The GitHub source tarball for tag v0.16.2. The sha256 below is of THIS file
+# and was MEASURED on the build container, not copied from a web page:
+#   wget -O quickjs-ng-0.16.2.tar.gz \
+#     https://github.com/quickjs-ng/quickjs/archive/refs/tags/v0.16.2.tar.gz
+#   sha256sum quickjs-ng-0.16.2.tar.gz
+#   -> 97c80625b26775a4c7ca618c004d4ea24cf99cbf867e4eba78bd927a8b23d106  (901,847 bytes)
+# The archive unpacks to quickjs-0.16.2/ (GitHub strips the -ng from the tag
+# archive's top directory). It ships the generated tables (libunicode-table.h,
+# the *-atoms headers) pre-built, so no code generation, TCL or CMake is needed
+# to compile the four engine files.
+source_url=https://github.com/quickjs-ng/quickjs/archive/refs/tags/v0.16.2.tar.gz
+tarball=quickjs-ng-0.16.2.tar.gz
+sha256=97c80625b26775a4c7ca618c004d4ea24cf99cbf867e4eba78bd927a8b23d106
+srcdir=quickjs-0.16.2
+
+# MIT. The full grant is at the root LICENSE of the tarball (Fabrice Bellard,
+# Charlie Gordon, Ben Noordhuis, Saul Ibarra Corretge). mports proves it exists
+# in the unpacked tree; if a future upstream moves it, the build fails rather
+# than shipping unattributed. The label MUST equal the components.tsv row for
+# userland/ports/quickjs exactly, or vendor-attribution-check fails.
+licence=MIT
+licence_files=LICENSE
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): does this want to USE a platform layer, or
+# to BE one? QuickJS USES. It is an embeddable engine: the host owns main(), the
+# process and the allocator (JS_NewRuntime/JS_NewContext/JS_Eval is the whole
+# contract), and the engine core touches nothing but libc. It imposes no event
+# loop, no main() and no window system. Textbook USES.
+adoption=USES. An embeddable engine: the host owns main(), the process and the allocator (JS_NewRuntime/JS_NewContext/JS_Eval), and the engine core reaches nothing but libc's malloc/string/math/print helpers. It imposes no event loop, main() or window system. The std/os OS-binding module (quickjs-libc.c) is deliberately NOT built, keeping the shipped library pure computation.
+
+# libc is the shared platform library, not a port. Against the current libc.a
+# the four engine files needed EXACTLY ONE symbol libc does not define,
+# pthread_condattr_setclock (referenced by cutils.h's js_cond_init, which the
+# Atomics.wait path uses). Rather than extend the SHARED libc for one caller,
+# this port supplies its own WEAK definition in maytera_compat.c (see build.sh),
+# so a future libc that grows a real one wins and no other app is affected. Every
+# other symbol (the full math set, string/mem, snprintf/vfprintf/putchar,
+# clock_gettime/gettimeofday/localtime_r, the pthread mutex/cond/once family) is
+# already in libc. quickjs needs no other port.
+needs=libc
+
+# Nothing to copy into place before patching; the tarball ships the generated
+# tables it needs.
+prepare=none
+
+# ONE patch, cutils-maytera.patch, and it is a target adaptation, not a bug fix.
+# cutils.h picks its allocator header by platform: because we cross-compile as
+# x86_64-linux-gnu the __linux__ branch would #include <malloc.h> (for
+# malloc_usable_size), which the MayteraOS freestanding libc does not have. The
+# patch adds a MAYTERAOS branch (selected by -DMAYTERAOS in cflags) that skips
+# malloc.h and makes js__malloc_usable_size return 0 (the same value the generic
+# fallback returns, which quickjs already handles: it just declines the in-place
+# string-concat optimisation and reports 0 in memory stats). Two tiny hunks; the
+# upstream engine source is otherwise byte-for-byte unaltered, so there is no
+# patch series to rot at the next version bump.
+patches=cutils-maytera.patch
+
+# build=script: ports/quickjs/build.sh compiles the four engine files plus our
+# maytera_compat.c into one libquickjs.a. It cannot be build=objects because
+# maytera_compat.c is OUR file (tracked beside this recipe), not upstream source,
+# so it cannot appear in a `sources=` list, which mports verifies against the
+# unpacked tarball. Same structural reason as the sqlite port's maytera_vfs.c.
+build=script
+
+# -DMAYTERAOS selects the cutils.h branch the patch adds (see patches above).
+# -Dalloca=__builtin_alloca because the build is -fno-builtin and several files
+# call alloca() without a declaration in scope; without this the implicit
+# declaration returns int and the truncated pointer would crash at the first
+# C-function call. __builtin_alloca is a true builtin that -fno-builtin does not
+# disable.
+cflags=-DMAYTERAOS -Dalloca=__builtin_alloca
+
+# The one public header a consumer of libquickjs.a compiles against.
+headers=quickjs.h
+
+lib=libquickjs.a
+
+# THE ANTI-NO-OP CHECK. mports proves with nm that every one of these is a
+# DEFINED symbol in libquickjs.a. The set proves ALL FIVE translation units
+# really landed, so a build that dropped any one fails HERE and not at a
+# consumer's confused runtime:
+#   quickjs.c   JS_NewRuntime JS_NewContext JS_Eval JS_GetGlobalObject
+#               JS_ToCStringLen2 JS_FreeCString JS_NewCFunction2
+#               JS_SetPropertyStr JS_GetException JS_FreeContext JS_FreeRuntime
+#   dtoa.c      js_dtoa js_atod              (number <-> string formatting)
+#   libregexp.c lre_compile lre_exec         (the regex engine)
+#   libunicode.c unicode_normalize unicode_prop
+#   maytera_compat.c pthread_condattr_setclock  (our weak libc shim landed)
+# JS_NewCFunction is a static-inline wrapper in the header, so it is NOT in the
+# archive; JS_NewCFunction2 (the JS_EXTERN it calls) is, and is what is named.
+symbols=JS_NewRuntime JS_NewContext JS_Eval JS_GetGlobalObject JS_ToCStringLen2 JS_FreeCString JS_NewCFunction2 JS_SetPropertyStr JS_GetException JS_FreeContext JS_FreeRuntime js_dtoa js_atod lre_compile lre_exec unicode_normalize unicode_prop pthread_condattr_setclock
+
+# ---------------------------------------------------------------------------
+# FOLLOW-UPS (deliberately NOT in this port, recorded so they are not lost):
+#  1. quickjs-libc (std/os modules): the OS-binding surface (os.exec, popen,
+#     readdir, worker threads, signals). Building it is a separate, larger job
+#     because it pulls in the process-model / OS syscall surface this pure
+#     computation port has no reason to touch.
+#  2. Replacing Duktape in the #245 browser engine with QuickJS is a separate,
+#     LARGER job (DOM bindings, the fetch/event integration) and is explicitly
+#     out of scope here per the task brief. This port is the engine + CLI only.
+# ---------------------------------------------------------------------------

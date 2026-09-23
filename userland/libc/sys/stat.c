@@ -114,3 +114,12 @@ int fstat(int fd, struct stat *st) {
 int lstat(const char *path, struct stat *st) {
     return stat(path, st);
 }
+
+// umask() - see sys/stat.h for why this is bookkeeping-only on MayteraOS.
+static mode_t g_umask = 022;
+
+mode_t umask(mode_t mask) {
+    mode_t old = g_umask;
+    g_umask = mask & 0777;
+    return old;
+}

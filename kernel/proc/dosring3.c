@@ -74,42 +74,68 @@ static void dosring3_entry(void *arg) {
     kprintf("[DOSRING3] %s read OK on attempt %d (%u bytes)\n",
             DOSRING3_CFG, attempts, sz);
 
-    char guest[256];
-    int n = 0;
-    const char *p = (const char *)cfg;
-    for (uint32_t i = 0; i < sz && n < (int)sizeof(guest) - 1; i++) {
-        char ch = p[i];
-        if (ch == '\r' || ch == '\n') break;
-        guest[n++] = ch;
+    // (dosconc5, Stage 5) One Ring-3 DOS host PER NON-EMPTY LINE of the config,
+    // up to DOSROUTE_MAX_RING3 (dosroute_spawn_ring3 enforces the cap, so this
+    // loop cannot exceed it). WAS a single line -> a single host; a one-line
+    // config is byte-identical (exactly one spawn, then the same census). This is
+    // the deterministic, GUI-click-free way to demonstrate concurrent guests on a
+    // headless VM: each Ring-3 host is its own address space, so their guest state
+    // is isolated by construction, and input/audio follow compositor focus.
+    int started = 0;
+    int first_pid = -1;
+    {
+        char guest[256];
+        uint32_t i = 0;
+        const char *p = (const char *)cfg;
+        while (i < sz) {
+            int n = 0;
+            while (i < sz && p[i] != '\r' && p[i] != '\n' &&
+                   n < (int)sizeof(guest) - 1) {
+                guest[n++] = p[i++];
+            }
+            while (i < sz && p[i] != '\r' && p[i] != '\n') i++;   // drop overflow
+            while (i < sz && (p[i] == '\r' || p[i] == '\n')) i++; // eat EOL(s)
+            guest[n] = '\0';
+            while (n > 0 && (guest[n - 1] == ' ' || guest[n - 1] == '\t'))
+                guest[--n] = '\0';
+            int s = 0;
+            while (s < n && (guest[s] == ' ' || guest[s] == '\t')) s++;
+            const char *line = guest + s;
+            if (!line[0]) continue;   // blank / whitespace-only line
+            // #692: spawn AS THE SESSION (proc_as_session), like the desktop
+            // launcher, so the guest runs with the logged-in user's credentials
+            // and every file it opens is checked by the kernel against them. The
+            // ROUTED SYS_DOS_RUN path passes proc_as_caller() instead, because
+            // there a real Ring-3 process asked for the guest.
+            kprintf("[DOSRING3] launching Ring-3 DOS host: %s '%s'\n",
+                    DOSRING3_APP, line);
+            bootlog_write("[DOSRING3] launching %s '%s'", DOSRING3_APP, line);
+            int lpid = dosroute_spawn_ring3(line, proc_as_session());
+            if (lpid > 0) {
+                kprintf("[DOSRING3] Ring-3 DOS host started as pid %d\n", lpid);
+                bootlog_write("[DOSRING3] host pid %d", lpid);
+                if (first_pid < 0) first_pid = lpid;
+                started++;
+                // Let the compositor create this host's window before the next
+                // one launches, so two same-tick window creates cannot race the
+                // slot allocator. Bounded, one-shot, only BETWEEN launches, so a
+                // lone guest never reaches it (timing byte-identical).
+                proc_sleep(1500);
+            } else {
+                kprintf("[DOSRING3] a Ring-3 host did NOT start (rc=%d) for '%s'\n",
+                        lpid, line);
+                bootlog_write("[DOSRING3] spawn REFUSED rc=%d", lpid);
+            }
+        }
     }
-    guest[n] = '\0';
-    while (n > 0 && (guest[n - 1] == ' ' || guest[n - 1] == '\t')) guest[--n] = '\0';
     kfree(cfg);
-    if (n == 0) {
-        kprintf("[DOSRING3] %s is empty; nothing to launch\n", DOSRING3_CFG);
+    if (started == 0) {
+        kprintf("[DOSRING3] %s named no launchable guest; nothing started\n",
+                DOSRING3_CFG);
         return;
     }
-
-    // (#67/#168) ONE definition of "spawn /APPS/DOSUSER", shared with the
-    // routed SYS_DOS_RUN path (proc/dosroute.c). This used to be an inline
-    // copy of the read-ELF / build-argv / proc_create_user_as sequence, and a
-    // second copy of it was about to be written for the routing layer. #172 is
-    // the ticket that exists because two copies of "what a DOS launch means"
-    // drifted apart; this is the same shape, so it gets the same answer.
-    //
-    // #692: spawn AS THE SESSION, exactly as the desktop launcher does. This is
-    // the whole security argument for the Ring-3 move: the guest runs with the
-    // logged-in user's real credentials, so every file it opens is checked by
-    // the kernel against those credentials. It cannot reach anything its user
-    // could not reach from a shell, whatever the interpreter does, which is a
-    // stronger boundary than a Ring-0 DOS thread policing itself with a
-    // synthesised uid. The ROUTED path passes proc_as_caller() instead, because
-    // there a real Ring-3 process asked for the guest.
-    kprintf("[DOSRING3] launching Ring-3 DOS host: %s '%s'\n",
-            DOSRING3_APP, guest);
-    bootlog_write("[DOSRING3] launching %s '%s'", DOSRING3_APP, guest);
-
-    int pid = dosroute_spawn_ring3(guest, proc_as_session());
+    kprintf("[DOSRING3] %d Ring-3 DOS host(s) launched concurrently\n", started);
+    int pid = first_pid;
 
     if (pid > 0) {
         kprintf("[DOSRING3] Ring-3 DOS host started as pid %d\n", pid);

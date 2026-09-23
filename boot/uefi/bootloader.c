@@ -1712,6 +1712,11 @@ done:
 // file someone deliberately put there can.
 
 
+// #remotedeploy: set when the backup kernel was booted because the primary
+// was missing or invalid. Passed to the kernel in boot_info so the running
+// system can say so rather than silently running the wrong build.
+static int g_booted_backup = 0;
+
 static int marker_present(EFI_FILE_PROTOCOL *root, CHAR16 *name) {
     EFI_FILE_PROTOCOL *file = NULL;
     EFI_STATUS status = uefi_call_wrapper(root->Open, 5, root, &file, name,
@@ -1730,7 +1735,158 @@ static void read_boot_markers(EFI_HANDLE ImageHandle) {
     uefi_call_wrapper(root->Close, 1, root);
 }
 
+// ---------------------------------------------------------------------------
+// #remotedeploy: TORN-WRITE SURVIVAL. Load a kernel, VALIDATE it, and fall back
+// to the backup if the primary is unusable.
+//
+// WHY THIS EXISTS. The running kernel can now replace its own boot kernel over
+// the network (kernel/proc/selfupdate.c). That write is brick-safe against
+// every failure the KERNEL can observe: it verifies sha256 and an RSA signature
+// before writing, reads every path back, and restores from an in-RAM copy if a
+// write or verify fails. It cannot be safe against POWER LOSS, because
+// fat_write_file() is delete-then-recreate (kernel/fs/fat.c:3530-3540, and
+// kernel/fs/panic.c:1-4 says so explicitly): for the whole multi-megabyte write
+// there is a window in which \boot\kernel.elf does not exist, or exists
+// truncated. Lose power there and the firmware has nothing to load. On a
+// machine in another room that is a brick, recoverable only by carrying a USB
+// stick to it, which is the exact cost the remote-deploy work exists to remove.
+//
+// selfupdate.c ALREADY writes \boot\kernel.elf.bak before it touches anything,
+// and NOTHING has ever read it. This is the reader. The backup is the kernel
+// that was booting successfully moments earlier, so it is a known-good target.
+//
+// WHY A MAGIC CHECK IS NOT ENOUGH. A torn write leaves the FILE HEAD intact,
+// because the head is written first, so a truncated kernel still has valid
+// "\x7fELF" magic and a valid class byte. Truncation is precisely the shape a
+// power loss produces, so the check that matters is a LENGTH check: every
+// structure the loader is about to dereference must lie inside the bytes we
+// actually have. That is what kernel_image_valid() below does, and it is cheap
+// (no hashing of several megabytes at boot).
+static int kernel_image_valid(void *buf, UINTN size) {
+    Elf64_Ehdr *eh;
+    UINT64 pht_end;
+    if (!buf || size < sizeof(Elf64_Ehdr)) return 0;
+    eh = (Elf64_Ehdr *)buf;
+    if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E' ||
+        eh->e_ident[2] != 'L'  || eh->e_ident[3] != 'F') return 0;
+    if (eh->e_ident[EI_CLASS] != ELFCLASS64) return 0;
+    if (eh->e_phnum == 0 || eh->e_phentsize < sizeof(Elf64_Phdr)) return 0;
+    // The program-header table itself must be inside the file.
+    pht_end = (UINT64)eh->e_phoff +
+              (UINT64)eh->e_phnum * (UINT64)eh->e_phentsize;
+    if (pht_end > (UINT64)size) return 0;
+    // Every PT_LOAD's file-backed bytes must be inside the file. This is the
+    // check that a truncated image fails.
+    {
+        Elf64_Phdr *ph = (Elf64_Phdr *)((UINT8 *)buf + eh->e_phoff);
+        int i;
+        for (i = 0; i < eh->e_phnum; i++) {
+            if (ph[i].p_type != PT_LOAD) continue;
+            if ((UINT64)ph[i].p_offset + (UINT64)ph[i].p_filesz > (UINT64)size)
+                return 0;
+            if (ph[i].p_filesz > ph[i].p_memsz) return 0;
+        }
+    }
+    if (eh->e_entry == 0) return 0;
+    return 1;
+}
+
+// Try \boot\kernel.elf, then \boot\kernel.elf.bak. Returns EFI_SUCCESS with
+// *buffer/*size set to a VALIDATED image, or an error if neither is usable.
+// A fallback is reported with Print(), not DPRINT(), because booting the
+// PREVIOUS kernel is something the operator must be told about even on a quiet
+// boot: the machine is running, but not what was just installed on it.
+static EFI_STATUS load_kernel_with_fallback(EFI_FILE_PROTOCOL *root,
+                                            void **buffer, UINTN *size,
+                                            int *used_backup) {
+    EFI_STATUS status;
+    *used_backup = 0;
+    *buffer = NULL; *size = 0;
+
+    status = load_file(root, L"boot\\kernel.elf", buffer, size);
+    if (!EFI_ERROR(status) && kernel_image_valid(*buffer, *size)) return EFI_SUCCESS;
+
+    if (EFI_ERROR(status)) {
+        Print(L"WARNING: \\boot\\kernel.elf could not be read (0x%x)\r\n", status);
+    } else {
+        Print(L"WARNING: \\boot\\kernel.elf is NOT a usable kernel image (%d bytes)\r\n", *size);
+        Print(L"         This is what an interrupted update looks like.\r\n");
+        uefi_call_wrapper(BS->FreePool, 1, *buffer);
+    }
+    *buffer = NULL; *size = 0;
+
+    Print(L"         Falling back to \\boot\\kernel.elf.bak ...\r\n");
+    status = load_file(root, L"boot\\kernel.elf.bak", buffer, size);
+    if (EFI_ERROR(status)) {
+        Print(L"ERROR:   no usable backup kernel either (0x%x)\r\n", status);
+        if (*buffer) { uefi_call_wrapper(BS->FreePool, 1, *buffer); *buffer = NULL; }
+        return EFI_NOT_FOUND;
+    }
+    if (!kernel_image_valid(*buffer, *size)) {
+        Print(L"ERROR:   backup kernel is also invalid (%d bytes)\r\n", *size);
+        uefi_call_wrapper(BS->FreePool, 1, *buffer); *buffer = NULL; *size = 0;
+        return EFI_LOAD_ERROR;
+    }
+    Print(L"NOTICE:  BOOTING THE BACKUP KERNEL (\\boot\\kernel.elf.bak).\r\n");
+    Print(L"         The kernel that was installed last did not survive the write.\r\n");
+    *used_backup = 1;
+    return EFI_SUCCESS;
+}
+
 // Main UEFI entry point
+// #bootdiag hardening (mechanism, not instance). The #bootfix change loads a
+// PT_LOAD segment AT its linked p_vaddr when AllocatePages(AllocateAddress)
+// fails, because an identity-mapped kernel MUST live at its linked physical
+// address (a relocated segment reads back as zeroes there: dead .rodata / .text,
+// then a pre-serial panic). Loading in place is only safe if the range that
+// AllocateAddress refused is CLAIMABLE RAM the kernel owns after
+// ExitBootServices (transient BootServices / Loader / Conventional memory). If
+// it were ever genuinely reserved (ACPI, firmware runtime, MMIO) loading in
+// place would silently corrupt firmware. This probe classifies the range
+// against the UEFI memory map so the load-in-place decision is VERIFIED, not
+// assumed, and reports the actual type either way.
+//
+// Returns TRUE if every 4K page in [base, base+size) is claimable. Sets *worst
+// to a representative type: the first NON-claimable convert_memory_type() found
+// when unsafe, else the type of the base page for logging. A page described by
+// no descriptor counts as reserved (fail-closed).
+static BOOLEAN seg_range_is_claimable(EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
+                                      UINTN desc_size, UINT64 base, UINT64 size,
+                                      UINT32 *worst) {
+    UINT64 seg_start = base & ~0xFFFULL;
+    UINT64 seg_end   = (base + size + 0xFFFULL) & ~0xFFFULL;
+    UINT32 first_type = MEMORY_TYPE_RESERVED;
+    UINT32 bad_type = 0;
+    BOOLEAN have_first = FALSE;
+    BOOLEAN all_claimable = TRUE;
+    UINT8 *ptr = (UINT8 *)map;
+    for (UINT64 pg = seg_start; pg < seg_end; pg += 4096) {
+        BOOLEAN covered = FALSE;
+        for (UINTN off = 0; off + desc_size <= map_size; off += desc_size) {
+            EFI_MEMORY_DESCRIPTOR *d = (EFI_MEMORY_DESCRIPTOR *)(ptr + off);
+            UINT64 d_start = d->PhysicalStart;
+            UINT64 d_end   = d_start + (UINT64)d->NumberOfPages * 4096ULL;
+            if (pg >= d_start && pg < d_end) {
+                UINT32 t = convert_memory_type(d->Type);
+                covered = TRUE;
+                if (!have_first) { first_type = t; have_first = TRUE; }
+                if (t != MEMORY_TYPE_USABLE && t != MEMORY_TYPE_BOOTLOADER) {
+                    all_claimable = FALSE;
+                    bad_type = t;
+                }
+                break;
+            }
+        }
+        if (!covered) {
+            all_claimable = FALSE;
+            bad_type = MEMORY_TYPE_RESERVED;
+        }
+        if (!all_claimable) break;
+    }
+    if (worst) *worst = all_claimable ? first_type : bad_type;
+    return all_claimable;
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_STATUS status;
     EFI_FILE_PROTOCOL *root;
@@ -1830,17 +1986,29 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     // it can see with its OWN FAT driver once the ESP is mounted. Two independent
     // readers still disagree loudly if the hand-off breaks; what was dropped was
     // a third statement of the same fact, on the one channel that scrolls away.
-    g_boot_info.diag_flags = g_diag_console ? 0x1ULL : 0ULL;   // BOOT_DIAG_SCREEN
+    // #remotedeploy: bit 1 says the BACKUP kernel was booted because the
+    // primary was missing or failed validation. It rides in diag_flags rather
+    // than a new struct member ON PURPOSE: boot_info_t is duplicated between
+    // uefi/bootloader.c and kernel/boot_info.h and must stay byte-identical,
+    // and every reserved slot is already spent. Setting one more bit of an
+    // existing UINT64 changes no offsets, and the kernel masks the bits it
+    // knows (main.c tests BOOT_DIAG_SCREEN explicitly), so an older kernel
+    // paired with this loader simply ignores it.
+    g_boot_info.diag_flags = (g_diag_console ? 0x1ULL : 0ULL)     // BOOT_DIAG_SCREEN
+                           | (g_booted_backup ? 0x2ULL : 0ULL);   // BOOT_DIAG_BACKUP_KERNEL
     DPRINT(L"      Boot diagnostics: %s\r\n\r\n",
            g_diag_console ? L"ARMED (\\boot\\DIAG.TXT present)"
                           : L"quiet (no \\boot\\DIAG.TXT)");
 
-    // Load kernel file
+    // Load kernel file. #remotedeploy: validated, with a fallback to
+    // \boot\kernel.elf.bak so an update interrupted by power loss cannot leave
+    // the machine unbootable. See load_kernel_with_fallback() above.
     DPRINT(L"[2/8] Loading /boot/kernel.elf...\r\n");
-    status = load_file(root, L"boot\\kernel.elf", &kernel_buffer, &kernel_size);
+    status = load_kernel_with_fallback(root, &kernel_buffer, &kernel_size,
+                                       &g_booted_backup);
     if (EFI_ERROR(status)) {
-        Print(L"ERROR: Failed to load kernel.elf (0x%x)\r\n", status);
-        Print(L"       Make sure /boot/kernel.elf exists on the disk\r\n");
+        Print(L"ERROR: Failed to load a usable kernel (0x%x)\r\n", status);
+        Print(L"       Neither /boot/kernel.elf nor /boot/kernel.elf.bak is valid\r\n");
         goto error;
     }
     DPRINT(L"      Kernel loaded: %d bytes\r\n\r\n", kernel_size);
@@ -1873,6 +2041,35 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     DPRINT(L"[4/8] Loading kernel segments...\r\n");
     program_headers = (Elf64_Phdr*)((UINT8*)kernel_buffer + elf_header->e_phoff);
 
+    // #bootdiag: obtain a throwaway MEMORY-MAP PROBE before loading segments so
+    // the load-in-place path below can verify a busy target range is claimable
+    // RAM, not reserved/MMIO. The real map for the kernel is fetched again just
+    // before ExitBootServices; this snapshot is freed after the loop.
+    EFI_MEMORY_DESCRIPTOR *seg_probe_map = NULL;
+    UINTN seg_probe_size = 0, seg_probe_key = 0, seg_probe_dsize = 0;
+    UINT32 seg_probe_dver = 0;
+    {
+        EFI_STATUS pst = uefi_call_wrapper(BS->GetMemoryMap, 5, &seg_probe_size,
+                                           seg_probe_map, &seg_probe_key,
+                                           &seg_probe_dsize, &seg_probe_dver);
+        if (pst == EFI_BUFFER_TOO_SMALL) {
+            seg_probe_size += 4 * seg_probe_dsize;
+            pst = uefi_call_wrapper(BS->AllocatePool, 3, EfiLoaderData,
+                                    seg_probe_size, (void **)&seg_probe_map);
+            if (!EFI_ERROR(pst)) {
+                pst = uefi_call_wrapper(BS->GetMemoryMap, 5, &seg_probe_size,
+                                        seg_probe_map, &seg_probe_key,
+                                        &seg_probe_dsize, &seg_probe_dver);
+            }
+        }
+        if (EFI_ERROR(pst)) {
+            if (seg_probe_map) { uefi_call_wrapper(BS->FreePool, 1, seg_probe_map); }
+            seg_probe_map = NULL;
+            Print(L"      (warning: memory-map probe unavailable; a load-in-place "
+                  L"cannot be range-verified)\r\n");
+        }
+    }
+
     UINT64 kernel_min_addr = 0xFFFFFFFFFFFFFFFF;
     UINT64 kernel_max_addr = 0;
 
@@ -1895,14 +2092,37 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAddress,
                                       EfiLoaderData, pages, &phys_addr);
             if (EFI_ERROR(status)) {
-                // Try allocating anywhere
-                status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages,
-                                          EfiLoaderData, pages, &phys_addr);
-                if (EFI_ERROR(status)) {
-                    Print(L"ERROR: Failed to allocate memory for segment\r\n");
-                    goto error;
+                // #bootfix: DO NOT relocate. An identity-mapped kernel runs at
+                // its linked physical address; a relocated segment is read back
+                // as zeroes there (dead .rodata / .text) and the kernel panics
+                // pre-serial. AllocateAddress only failed because a transient
+                // boot-services / loader allocation currently overlaps this
+                // segment page range; that RAM belongs to the kernel after
+                // ExitBootServices. Load the segment AT its p_vaddr regardless.
+                phys_addr = vaddr;
+                // #bootdiag: VERIFY the busy range is claimable before clobbering
+                // it, so this can never silently corrupt reserved memory under a
+                // future layout. Report the actual type either way.
+                UINT32 rtype = MEMORY_TYPE_RESERVED;
+                if (seg_probe_map) {
+                    if (!seg_range_is_claimable(seg_probe_map, seg_probe_size,
+                                                seg_probe_dsize, vaddr, memsz, &rtype)) {
+                        Print(L"FATAL: segment %d at 0x%lx (%d bytes) overlaps NON-"
+                              L"claimable memory (type %d); refusing to load in place "
+                              L"and corrupt it.\r\n", i, vaddr, memsz, rtype);
+                        Print(L"       Kernel cannot be placed at its linked address on "
+                              L"this firmware. Halting instead of booting corrupted.\r\n");
+                        uefi_call_wrapper(BS->FreePool, 1, seg_probe_map);
+                        seg_probe_map = NULL;
+                        status = EFI_LOAD_ERROR;
+                        goto error;
+                    }
+                    Print(L"      (segment %d at 0x%lx loaded in place; AllocateAddress "
+                          L"busy, range type %d claimable)\r\n", i, phys_addr, rtype);
+                } else {
+                    Print(L"      (segment %d at 0x%lx loaded in place; AllocateAddress "
+                          L"busy, range UNVERIFIED)\r\n", i, phys_addr);
                 }
-                Print(L"      (Allocated at 0x%lx instead)\r\n", phys_addr);
             }
 
             // Copy segment data
@@ -1913,6 +2133,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 SetMem((void*)(phys_addr + filesz), memsz - filesz, 0);
             }
         }
+    }
+
+    if (seg_probe_map) {
+        uefi_call_wrapper(BS->FreePool, 1, seg_probe_map);
+        seg_probe_map = NULL;
     }
 
     g_boot_info.kernel_physical_base = kernel_min_addr;

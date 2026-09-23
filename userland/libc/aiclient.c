@@ -17,9 +17,12 @@
 #include "fcntl.h"
 #include "aiclient.h"
 #include "aicap.h"      // #293 capability tokens + consent + audit
+#include "aidev.h"      // #708 per-device AI capability manifest
 #include "aiguard.h"    // #745 prompt-injection screen (kernel-owned ruleset)
 #include "userconf.h"   // #684: per-user protected AI settings
 #include "contract.h"   // #235: THE settings surface, asked not re-described
+#include "keys.h"       // #293: GUI_KEY_* names for input.inject
+#include "photorg.h"    // #712: escrow-contract photo organiser (photos.organize)
 
 // ===========================================================================
 // #684: THE AI KEY IS PROVISIONED, NOT READ FROM /etc
@@ -83,6 +86,28 @@ typedef ai_msg_t msg_t;
 
 static char g_toollist[TOOLLIST_MAX];
 static int  g_have_tools = 0;
+
+enum { LK_GUI = 0, LK_WIN16 = 1, LK_DOS = 2 };
+
+#define LAUNCH_MAX      160
+#define LAUNCH_ID_MAX   48
+#define LAUNCH_PATH_MAX 192
+#define LAUNCH_NAME_MAX 64
+#define APPLIST_MAX     6144
+#define SM_LINE_MAX     1024   // matches startmenu.c SM_FRAG_LINE bound
+
+typedef struct {
+    char id[LAUNCH_ID_MAX];      // primary id: slug of the display name ("Game Boy" -> gameboy)
+    char alt[LAUNCH_ID_MAX];     // alternate id: slug of the exec basename ("/APPS/gbemu" -> gbemu); "" if equal
+    char path[LAUNCH_PATH_MAX];  // full exec line (may carry args for win16/dos)
+    char name[LAUNCH_NAME_MAX];  // display name
+    int  kind;                   // LK_GUI / LK_WIN16 / LK_DOS
+} launch_ent_t;
+
+static launch_ent_t g_launch[LAUNCH_MAX];
+static int  g_launch_n = 0;
+static char g_applist[APPLIST_MAX];
+static int  g_have_applist = 0;
 static char g_apikey[256];
 static int  g_have_key = 0;
 
@@ -588,7 +613,7 @@ static void load_tools(void) {
 // Stored as the first (role 3 = system) message in the history so it is sent on
 // every request but never rendered in the transcript.
 static const char *system_prompt(void) {
-    static char sp[TOOLLIST_MAX + APPGEN_MAX + 2048];
+    static char sp[TOOLLIST_MAX + APPGEN_MAX + APPLIST_MAX + 2048];
     int sl = snprintf(sp, sizeof(sp),
         "You are Maytera AI, the built-in assistant for MayteraOS. You can call OS tools "
         "to read the filesystem, the weather, settings, disk usage, and to launch "
@@ -602,9 +627,15 @@ static const char *system_prompt(void) {
         "give the user a final plain-language answer (no ACTION line). Use at most "
         "%d tools per question. Only use a tool when it helps; otherwise just "
         "answer.\n"
-        "To launch ANY app or game (native apps, DOOM, and Win16 games like SkiFree, "
-        "FreeCell, Tetris, Chips) use app.launch with a lowercase app_id, e.g. "
-        "ACTION app.launch {\"app_id\":\"doom\"} or {\"app_id\":\"skifree\"}.\n"
+        "To launch any app or game use app.launch with the app id from the "
+        "INSTALLED APPS list below (ids are lowercase), e.g. "
+        "ACTION app.launch {\"app_id\":\"doom\"}. That list is generated from the "
+        "live system app manifest, so it is the current complete set - use only "
+        "ids that appear there. Some apps take an argument: the Game Boy app plays "
+        "Game Boy ROMs, so to play a specific title pass a rom name, e.g. "
+        "ACTION app.launch {\"app_id\":\"gbemu\",\"rom\":\"pokemon\"} and the OS finds a "
+        "matching ROM in /ROMS (if none matches it opens the ROM picker). You may "
+        "also pass {\"arg\":\"...\"} to give a native app one argument.\n"
         "For disk space use storage.free (no args). For reading settings use "
         "settings.get {\"key\":\"theme\"}. Setting keys are the Settings app's own "
         "contract names, e.g. clock.use_24hour, display.brightness, "
@@ -614,12 +645,68 @@ static const char *system_prompt(void) {
         "not guess a second time.\n"
         "Some tools are HIGH-RISK and permission-gated by the OS: settings.set "
         "(change a setting), fs.write {\"path\":\"/HOME/X.TXT\",\"content\":\"...\"} "
-        "(write a file), and fs.delete. Just call them directly with the final "
+        "(write a file), fs.delete, files.mkdir {\"path\":\"/HOME/PHOTOS\"} "
+        "(create a folder), and files.move {\"src\":\"/HOME/A.TXT\","
+        "\"dst\":\"/HOME/PHOTOS/A.TXT\"} (RELOCATE a file or folder WITHOUT "
+        "deleting it - both the source and the destination must be inside the "
+        "folder you were granted). Just call them directly with the final "
         "arguments. The OPERATING SYSTEM will show the user a consent dialog and "
         "either grant or deny; you do NOT run your own yes/no handshake. If the "
         "OBSERVATION is an error with CAPABILITY_DENIED, TOKEN_EXPIRED, or "
         "TOKEN_EXHAUSTED, tell the user the action was not permitted and stop; do "
         "not retry the same action.\n"
+        "To ORGANISE the photos on a removable drive into date folders, use the "
+        "one high-level tool photos.organize {\"path\":\"/MEDIA/USB\","
+        "\"group_by\":\"YYYY-MM\"} (group_by may be YYYY, YYYY-MM or YYYY-MM-DD; "
+        "default YYYY-MM). Do NOT script this yourself with many files.mkdir / "
+        "files.move calls. This one tool runs an ESCROW CONTRACT: it takes a "
+        "write+move+mkdir permission SCOPED to that device with NO delete, "
+        "time-boxed to 1 hour, carrying a PROMISE that the date folders are "
+        "created, every photo is MOVED (not copied) into its folder, and NOTHING "
+        "is deleted. It then VERIFIES the promise and closes EARLY if it was "
+        "kept. The OBSERVATION reports the verdict (FULFILLED/PARTIAL) and a "
+        "human summary you should relay to the user, including that it is a "
+        "userland-advisory contract. It is permission-gated like the tools "
+        "above.\n"
+        "You can also SAFELY EJECT a removable drive (USB stick, memory card). "
+        "First discover what is present with ACTION device.list {} (read-only, no "
+        "consent prompt): it returns each removable device's mount path, name and "
+        "whether it is busy. Then ACTION device.block.eject {\"mount\":\"/USB0\"} "
+        "(you may pass {\"name\":\"...\"} instead) flushes cached writes, "
+        "unmounts the volume and tells the device it is safe to remove. It is "
+        "permission-gated by the per-device manifest the same way (the OS may show "
+        "a consent dialog), and it REFUSES cleanly with no action if the device is "
+        "BUSY (has open files), if no such removable device is found, or if the "
+        "name is ambiguous - it never forces a busy device. It ONLY targets "
+        "removable devices; the system and boot disks are not in device.list and "
+        "can never be ejected. Do not attempt to eject or format the system disk.\n"
+        "You can also SEE and CONTROL the screen, permission-gated the same way. "
+        "ACTION screen.capture {} saves a screenshot of the whole screen to a BMP "
+        "file and returns its path and pixel size; pass {\"path\":\"/HOME/NAME.BMP\"} "
+        "to choose the file. You cannot view that image yourself unless the user "
+        "runs a vision-capable model; the OBSERVATION tells you whether it was "
+        "attached, so do not claim to see it otherwise. To drive another app, "
+        "SELF-DRIVE it in three steps: (a) app.launch it; (b) ACTION input.windows "
+        "{} to list the open windows (read-only, no consent prompt) and pick the "
+        "target's WINDOW HANDLE from the returned 'win' field by matching its "
+        "'title' or 'app'; (c) send synthetic input to that handle. ACTION "
+        "input.type {\"win\":3,\"text\":\"hello\"} types a string; ACTION input.key "
+        "{\"win\":3,\"key\":\"enter\"} presses one key (names: enter, tab, esc, space, "
+        "backspace, up, down, left, right, home, end, pgup, pgdn, delete, f1..f12, "
+        "or a single character; or a numeric \"keycode\"); ACTION input.click "
+        "{\"win\":3,\"x\":40,\"y\":20} clicks a content-relative point (add "
+        "\"button\":\"right\", or \"type\":\"down\"/\"up\"/\"move\"). input.windows is "
+        "read-only and NOT gated, but input.type/input.key/input.click and "
+        "screen.capture DO prompt the user: the OS shows a consent dialog naming "
+        "the target window or file, and you stop on CAPABILITY_DENIED as above.\n"
+        "When an app COOPERATES (declares a contract) you can drive it by a NAMED "
+        "action on its LIVE document instead of guessing pixels, which is more "
+        "reliable. ACTION app.action {\"app\":\"paint\",\"name\":\"invert\"} runs a "
+        "contract action against the running app (add \"args\":\"...\" for a call "
+        "with arguments, or \"verb\":\"get\"/\"set\" with \"name\" and \"value\" to "
+        "read or write live state). These actions are permission-gated by the app "
+        "the same way: stop on CAPABILITY_DENIED. Prefer app.action over synthetic "
+        "input for an app that has the action you need.\n"
         "You can REBUILD an existing userland app OR CREATE A BRAND-NEW APP from a "
         "chat description (#294/#327). When the user DESCRIBES an app they want "
         "(\"build me a tip calculator\", \"make a stopwatch\", \"a digital clock\"), "
@@ -638,8 +725,11 @@ static const char *system_prompt(void) {
         "The build service creates the new app directory and a correct Makefile "
         "automatically; you only supply main.c. These build tools are HIGH-RISK and "
         "the OS will ask the user to consent first.\n"
+        "Installed apps you can launch with app.launch (id: name):\n%s"
         "Available tools (id: what it does):\n%s",
-        MAX_ACTIONS, g_have_tools ? g_toollist : "  (none loaded)");
+        MAX_ACTIONS,
+        g_have_applist ? g_applist : "  (app manifest unavailable)\n",
+        g_have_tools ? g_toollist : "  (none loaded)");
     // #327: append the app-generation RAG corpus so the model writes against the
     // REAL API. Only injected when present (aichat/terminal both benefit).
     if (g_have_appgen && sl > 0 && sl < (int)sizeof(sp) - 64) {
@@ -836,6 +926,194 @@ static void exec_fs_delete(const char *args, char *obs, int ocap) {
     snprintf(obs, ocap, "{\"status\":\"success\",\"deleted\":\"%s\"}", path);
 }
 
+// --- HIGH-risk: create a directory (#711). Gated by aicap before dispatch. ---
+// args: {"path":"/HOME/PHOTOS"}. Uses the shared libc sys_mkdir() wrapper; the
+// path is scope-checked against the token's allowed_paths by aicap_authorize().
+static void exec_fs_mkdir(const char *args, char *obs, int ocap) {
+    char path[256];
+    if (!json_get_str(args, "path", path, sizeof(path)) || !path[0]) {
+        strlcpy(obs, "{\"error\":\"missing path\"}", ocap); return;
+    }
+    int r = sys_mkdir(path, 0755);
+    if (r < 0) { snprintf(obs, ocap, "{\"error\":\"mkdir-failed\",\"path\":\"%s\"}", path); return; }
+    snprintf(obs, ocap, "{\"status\":\"success\",\"created\":\"%s\"}", path);
+}
+
+// --- HIGH-risk: MOVE (relocate) a file or directory (#711). Gated by aicap
+// before dispatch. This RELOCATES via the shared sys_rename() wrapper; it does
+// NOT copy+delete, so the file is never destroyed and re-created (the future
+// no-delete guarantee rests on move being a pure rename). aicap_authorize() has
+// already gated and scope-checked the SOURCE (and consumed the use); here we
+// ALSO require the DESTINATION to sit inside the granted allowed_paths, so a
+// scoped grant can never relocate a file OUT of the approved area.
+// args: {"src":"/HOME/A.TXT","dst":"/HOME/PHOTOS/A.TXT"}
+static void exec_fs_move(const char *args, char *obs, int ocap) {
+    char src[256], dst[256];
+    if (!json_get_str(args, "src", src, sizeof(src)) || !src[0]) {
+        strlcpy(obs, "{\"error\":\"missing src\"}", ocap); return;
+    }
+    if (!json_get_str(args, "dst", dst, sizeof(dst)) || !dst[0]) {
+        strlcpy(obs, "{\"error\":\"missing dst\"}", ocap); return;
+    }
+    // BOTH-ENDS scope enforcement: refuse, with NO filesystem change, when the
+    // destination is outside the granted scope (the source was already checked
+    // by aicap_authorize()).
+    if (!aicap_path_in_scope("files.move", dst)) {
+        snprintf(obs, ocap,
+            "{\"error\":\"CAPABILITY_DENIED\",\"reason\":\"destination '%s' is "
+            "outside the granted scope\"}", dst);
+        return;
+    }
+    int r = sys_rename(src, dst);
+    if (r < 0) {
+        snprintf(obs, ocap, "{\"error\":\"move-failed\",\"src\":\"%s\",\"dst\":\"%s\"}", src, dst);
+        return;
+    }
+    snprintf(obs, ocap, "{\"status\":\"success\",\"moved\":\"%s\",\"to\":\"%s\"}", src, dst);
+}
+
+// --- HIGH-risk: run the whole AI ESCROW CONTRACT that organises a removable
+// device's photos into date folders (#712). One tool call encapsulates the
+// entire contract: escrow_request (mint a scoped fs.write+fs.move+fs.mkdir grant
+// scoped to the device, forbid fs.delete, snapshot for the delete counter) ->
+// plan + declare the promise (date folders + bytes-intact moves + zero deletes)
+// -> execute via the SAME capability-gated files.mkdir/files.move tools -> verify
+// the promise -> close EARLY on fulfilment (revoke the grant before the 1-hour
+// time box). The OBSERVATION carries the verdict and a human summary. The
+// contract is USERLAND-ADVISORY (see escrow.h): a Ring-3 uid-0 process could
+// bypass it; the kernel-enforced version is the deferred #246/#305 follow-on.
+// args: {"path":"/MEDIA/USB","group_by":"YYYY-MM"}
+static void exec_photos_organize(const char *args, char *obs, int ocap) {
+    char path[256], gb[40];
+    if (!json_get_str(args, "path", path, sizeof(path)) || !path[0]) {
+        strlcpy(obs, "{\"error\":\"missing path\"}", ocap); return;
+    }
+    if (!json_get_str(args, "group_by", gb, sizeof(gb))) gb[0] = 0;
+    static char summary[2048];
+    int verdict = photorg_organize(path, gb, summary, sizeof(summary));
+    int o = 0;
+    o = str_append(obs, o, ocap, "{\"verdict\":\"");
+    o = str_append(obs, o, ocap, verdict == ESCROW_FULFILLED ? "FULFILLED"
+                                 : (verdict == ESCROW_PARTIAL ? "PARTIAL" : "ERROR"));
+    o = str_append(obs, o, ocap, "\",\"advisory\":true,\"summary\":\"");
+    o = obs_escape(obs, o, ocap, summary);
+    o = str_append(obs, o, ocap, "\"}");
+}
+
+// --- READ-ONLY: list the removable devices the AI may act on (#708). NOT a
+// device ACTION, so it is not manifest-gated (mirrors input.windows): it only
+// enumerates what SYS_VOL_LIST already exposes to the Files UI, so the model can
+// discover a device's mount path / name before asking to eject it. The boot and
+// system disks are NEVER in this list (they are not hot-plug removable volumes),
+// which is a structural reason an eject can never target them.
+static void exec_device_list(const char *args, char *obs, int ocap) {
+    (void)args;
+    sc_volume_t vols[SC_VOL_MAX];
+    int n = vol_list(vols, SC_VOL_MAX);
+    int o = 0;
+    o = str_append(obs, o, ocap, "{\"removable_devices\":[");
+    int emitted = 0;
+    for (int i = 0; i < n && i < SC_VOL_MAX; i++) {
+        if (!(vols[i].flags & MOSVOL_REMOVABLE)) continue;   // never a system disk
+        if (emitted++) o = str_append(obs, o, ocap, ",");
+        o = str_append(obs, o, ocap, "{\"mount\":\"");
+        o = obs_escape(obs, o, ocap, vols[i].mount);
+        o = str_append(obs, o, ocap, "\",\"name\":\"");
+        o = obs_escape(obs, o, ocap, vols[i].name);
+        o = str_append(obs, o, ocap, "\",\"fs\":\"");
+        o = obs_escape(obs, o, ocap, vols[i].fsname);
+        char tail[40];
+        snprintf(tail, sizeof(tail), "\",\"busy\":%d}", vol_busy(vols[i].index));
+        o = str_append(obs, o, ocap, tail);
+    }
+    str_append(obs, o, ocap, "]}");
+}
+
+// --- HIGH-risk: the FIRST real AI DEVICE executor (#708) - SAFE-EJECT a
+// removable volume. Reached ONLY after aidev_authorize_tool() has passed the
+// per-device capability manifest (a FORBID verb is refused BEFORE any prompt)
+// AND, for a CONSENT verb, the aicap consent+audit gate. It does NOT hand-roll
+// device teardown: it reuses the SAME kernel safe-eject the Files/tray UI uses
+// (SYS_VOL_EJECT -> hotplug_eject: flush caches -> unmount -> SCSI SYNCHRONIZE
+// CACHE + STOP UNIT). It resolves the target from the tool JSON (a mount path
+// like "/USB0" or the device name), targets ONLY MOSVOL_REMOVABLE volumes so a
+// non-removable / system / boot disk can never be a target (those are not in the
+// removable list at all), and REFUSES cleanly - with NO device action - when the
+// device is BUSY (still has open handles), not found, or ambiguous. Unlike a
+// user-driven eject, which deliberately force-invalidates open handles (#250), an
+// AI-initiated eject must never surprise-invalidate a file a user still has open,
+// so BUSY is a clean refusal here, not a forced teardown.
+// args: {"mount":"/USB0"} or {"device":"/USB0"} or {"name":"SanDisk Cruzer"}.
+static void exec_device_eject(const char *args, char *obs, int ocap) {
+    char want[128];
+    if (!json_get_str(args, "mount",  want, sizeof(want)) &&
+        !json_get_str(args, "path",   want, sizeof(want)) &&
+        !json_get_str(args, "device", want, sizeof(want)) &&
+        !json_get_str(args, "dev",    want, sizeof(want)) &&
+        !json_get_str(args, "name",   want, sizeof(want)) &&
+        !json_get_str(args, "id",     want, sizeof(want)))
+        want[0] = 0;
+    if (!want[0]) {
+        strlcpy(obs, "{\"error\":\"missing-device\",\"note\":\"name the removable "
+                "device to eject by its mount path (e.g. /USB0) or name\"}", ocap);
+        return;
+    }
+
+    sc_volume_t vols[SC_VOL_MAX];
+    int n = vol_list(vols, SC_VOL_MAX);
+    if (n <= 0) {
+        strlcpy(obs, "{\"error\":\"no-removable-volumes\",\"note\":\"no removable "
+                "device is present to eject\"}", ocap);
+        return;
+    }
+
+    int match = -1, matches = 0;
+    for (int i = 0; i < n && i < SC_VOL_MAX; i++) {
+        if (!(vols[i].flags & MOSVOL_REMOVABLE)) continue;   // never a system/boot disk
+        if (!strcasecmp(want, vols[i].mount) || !strcasecmp(want, vols[i].name)) {
+            if (matches++ == 0) match = i;
+        }
+    }
+    if (matches == 0) {
+        snprintf(obs, ocap, "{\"error\":\"device-not-found\",\"target\":\"%s\","
+                 "\"note\":\"no removable volume matches; use its mount path "
+                 "(e.g. /USB0) or exact name\"}", want);
+        return;
+    }
+    if (matches > 1) {
+        snprintf(obs, ocap, "{\"error\":\"ambiguous-device\",\"target\":\"%s\","
+                 "\"note\":\"more than one removable volume matches; name the "
+                 "exact mount path\"}", want);
+        return;
+    }
+
+    // SAFETY: refuse cleanly if the volume is BUSY (open file handles). Do NOT
+    // force it: an AI-initiated eject must not surprise-invalidate a file a user
+    // still has open. (A user-driven Files/tray eject force-invalidates, #250;
+    // the AI is held to the stricter rule.)
+    int busy = vol_busy(vols[match].index);
+    if (busy > 0) {
+        snprintf(obs, ocap, "{\"error\":\"device-busy\",\"device\":\"%s\","
+                 "\"mount\":\"%s\",\"open_handles\":%d,\"note\":\"%d file "
+                 "handle(s) still open on this volume; close them first. Eject "
+                 "refused (not forced).\"}",
+                 vols[match].name, vols[match].mount, busy, busy);
+        return;
+    }
+
+    // Perform the real safe-eject: flush + unmount + stop. Reuses SYS_VOL_EJECT.
+    char nm[64]; strlcpy(nm, vols[match].name, sizeof(nm));
+    char mp[32]; strlcpy(mp, vols[match].mount, sizeof(mp));
+    int r = vol_eject(vols[match].index);
+    if (r != 0) {
+        snprintf(obs, ocap, "{\"error\":\"eject-failed\",\"device\":\"%s\","
+                 "\"mount\":\"%s\"}", nm, mp);
+        return;
+    }
+    snprintf(obs, ocap, "{\"status\":\"ejected\",\"device\":\"%s\",\"mount\":\"%s\","
+             "\"note\":\"flushed, unmounted and stopped; safe to remove\"}", nm, mp);
+}
+
 static void exec_web_open(const char *args, char *obs, int ocap) {
     char url[480];
     if (!json_get_str(args, "url", url, sizeof(url)) || !url[0]) {
@@ -917,50 +1195,28 @@ static void exec_calc_open(const char *args, char *obs, int ocap) {
 }
 
 // --- Generic app launcher (#292) -----------------------------------------
-// Maps an app_id -> (on-disk path, launch kind) exactly as the compositor start
-// menu does, then dispatches via the correct verb:
-//   gui   -> sys_spawn(path)   (native ELF, incl. DOOM at /APPS/DOOM.ELF)
-//   win16 -> win16_run(path)   (Win16 NE .EXE: SkiFree, FreeCell, Chips, Tetris)
-//   dos   -> dos_run(path)     (MS-DOS .EXE: Tim, Commander Keen)
-// This is the same launch mechanism the start menu uses, so games and Win16 apps
-// start correctly (the old per-app executors blind-spawned /APPS/<name>, which is
-// why DOOM and SkiFree failed).
-enum { LK_GUI = 0, LK_WIN16 = 1, LK_DOS = 2 };
-typedef struct { const char *id; const char *path; int kind; const char *name; } launch_ent_t;
-
-// Table mirrors compositor/startmenu.c (LAUNCH_NATIVE/WIN16/DOS). Keep in sync.
-static const launch_ent_t g_launch_tbl[] = {
-    // --- native GUI apps + native games ---
-    { "files",     "/APPS/FILES",       LK_GUI,   "Files" },
-    { "terminal",  "/APPS/TERMINAL",    LK_GUI,   "Terminal" },
-    { "calc",      "/APPS/CALC",        LK_GUI,   "Calculator" },
-    { "calculator","/APPS/CALC",        LK_GUI,   "Calculator" },
-    { "editor",    "/APPS/EDITOR",      LK_GUI,   "Text Editor" },
-    { "settings",  "/APPS/SETTINGS",    LK_GUI,   "Settings" },
-    { "browser",   "/APPS/BROWSER",     LK_GUI,   "Browser" },
-    { "python",    "/APPS/PYTHON.ELF",  LK_GUI,   "Python" },
-    { "doom",      "/GAMES/DOOM/DOOM.ELF", LK_GUI, "DOOM" },
-    { "lemmings",  "/APPS/lemmings",    LK_GUI,   "Lemmings" },
-    { "solitaire", "/APPS/SOLITAIRE",      LK_GUI,   "Solitaire" },
-    { "solitr",    "/APPS/SOLITAIRE",      LK_GUI,   "Solitaire" },
-    { "pong",      "/APPS/pong",        LK_GUI,   "Pong" },
-    { "hello",     "/APPS/HELLO",       LK_GUI,   "Hello" },
-    { "aidemo",    "/APPS/AIDEMO",      LK_GUI,   "AI Demo" },
-    // --- Win16 NE apps (run by the Win16 interpreter) ---
-    { "skifree",   "/WIN16/EP3/SKI.EXE",        LK_WIN16, "SkiFree" },
-    { "tetris",    "/WIN16/MSEP/TETRIS.EXE",    LK_WIN16, "Tetris" },
-    { "chips",     "/WIN16/MSEP/CHIPS.EXE",     LK_WIN16, "Chip's Challenge" },
-    { "freecell",  "/WIN16/MSEP/FREECELL.EXE",  LK_WIN16, "FreeCell" },
-    { "golf",      "/WIN16/MSEP/GOLF.EXE",      LK_WIN16, "Golf" },
-    { "jezzball",  "/WIN16/MSEP/JEZZBALL.EXE",  LK_WIN16, "JezzBall" },
-    { "tetravex",  "/WIN16/MSEP/TETRAVEX.EXE",  LK_WIN16, "TetraVex" },
-    { "rodent",    "/WIN16/MSEP/RODENT.EXE",    LK_WIN16, "Rodent's Revenge" },
-    { "tutstomb",  "/WIN16/MSEP/TUTSTOMB.EXE",  LK_WIN16, "Tut's Tomb" },
-    // --- DOS games (run by the DOS emulator) ---
-    { "tim",       "/DOS/TIM/TIM.EXE",          LK_DOS,   "The Incredible Machine" },
-    { "keen5",     "/DOS/KEEN5/KEEN5E.EXE",     LK_DOS,   "Commander Keen 5" },
-};
-#define LAUNCH_TBL_N ((int)(sizeof(g_launch_tbl)/sizeof(g_launch_tbl[0])))
+// DYNAMIC launch registry, built at init from the SAME on-device app manifest
+// the Start menu uses: the shipped/installed .MENU fragments under
+// /CONFIG/STARTMENU/SYSTEM.D (userland/apps/compositor/startmenu.c feeds the
+// exact same files). There is now ONE list, not a hand-synced C table: adding
+// an app to the manifest (build/assets/startmenu/system.d/*.MENU, or an App
+// Store install writing a fragment via libc/startmenu_reg.c) makes it BOTH
+// visible in the Start menu AND launchable by the AI, with no code change here.
+//
+// This mirrors the compositor's .MENU line format EXACTLY (it cannot share the
+// compositor's Rust parser: that parser lives in the compositor app binary, not
+// in libc). Format, per startmenu_model.rs:
+//   item: <Display Name> | <exec path [args]> | icon=<name> [| type=native|win16|dos] ...
+// The launch KIND is the explicit `type=` field (absent => native), and the
+// exec path's prefix (/WIN16 , /DOS , /APPS) already agrees with it.
+//
+// Dispatch verb by kind, matching startmenu.c's do_launch():
+//   gui   -> sys_spawn(path)   (native ELF; DOOM, Files, gbemu, ...)
+//   win16 -> win16_run(path)   (Win16 NE .EXE: SkiFree, FreeCell, Chips, ...)
+//   dos   -> dos_run(path)     (MS-DOS .EXE/.COM: TIM, Commander Keen, ...)
+// The exec string is passed VERBATIM to win16_run/dos_run (args and all) because
+// the kernel re-splits it, exactly as the compositor does.
+// (launch registry types + globals are declared up near g_toollist)
 
 // case-insensitive id match (model may say "DOOM" / "SkiFree")
 static int id_eq_ci(const char *a, const char *b) {
@@ -973,6 +1229,254 @@ static int id_eq_ci(const char *a, const char *b) {
     }
 }
 
+// Slugify: lowercase, keep [a-z0-9] only. "The Incredible Machine" -> theincrediblemachine
+static void slugify_ascii(const char *src, char *dst, int cap) {
+    int o = 0;
+    for (const char *s = src; *s && o < cap - 1; s++) {
+        char c = *s;
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) dst[o++] = c;
+    }
+    dst[o] = 0;
+}
+
+// Slug of the exec basename: take the FIRST whitespace-delimited token of the
+// exec line, its final path component, strip a trailing .EXT, then slugify.
+// "/GAMES/DOOM/DOOM.ELF" -> doom ; "/DOS/STUNTS/LOAD.EXE /u MCGA" -> load
+static void basename_slug(const char *path, char *dst, int cap) {
+    char tok[LAUNCH_PATH_MAX];
+    int o = 0;
+    for (const char *s = path; *s && *s != ' ' && *s != '\t' && o < (int)sizeof(tok) - 1; s++)
+        tok[o++] = *s;
+    tok[o] = 0;
+    const char *base = tok;
+    for (const char *p = tok; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
+    char stem[LAUNCH_PATH_MAX];
+    int so = 0;
+    for (const char *p = base; *p && so < (int)sizeof(stem) - 1; p++) stem[so++] = *p;
+    stem[so] = 0;
+    for (int k = so - 1; k > 0; k--) { if (stem[k] == '.') { stem[k] = 0; break; } }
+    slugify_ascii(stem, dst, cap);
+}
+
+// First whitespace-delimited token of an exec line (the bare binary path).
+static void first_token(const char *path, char *dst, int cap) {
+    int o = 0;
+    for (const char *s = path; *s && *s != ' ' && *s != '\t' && o < cap - 1; s++) dst[o++] = *s;
+    dst[o] = 0;
+}
+
+// Parse ONE manifest line. Only `item:` lines contribute a launchable app; we
+// ignore category:/rename:/hide: (the AI list is the union of launchable apps).
+// Last-write-wins by primary id, so a later fragment overriding an app updates
+// the same entry rather than duplicating it.
+static void launch_parse_line(const char *line) {
+    int p = 0; while (line[p] == ' ' || line[p] == '\t') p++;
+    if (strncmp(line + p, "item:", 5) != 0) return;
+    const char *rest = line + p + 5;
+
+    // field 0 = name, field 1 = exec line, remaining = key=value
+    char name[LAUNCH_NAME_MAX], exec[LAUNCH_PATH_MAX];
+    int kind = LK_GUI;
+
+    // split on '|'
+    const char *f = rest;
+    int fi = 0;
+    name[0] = 0; exec[0] = 0;
+    while (fi < 8) {
+        const char *bar = f;
+        while (*bar && *bar != '|') bar++;
+        // trim field [f, bar)
+        const char *a = f; const char *b = bar;
+        while (a < b && (*a == ' ' || *a == '\t')) a++;
+        while (b > a && (b[-1] == ' ' || b[-1] == '\t')) b--;
+        int len = (int)(b - a);
+        if (fi == 0) {
+            if (len > LAUNCH_NAME_MAX - 1) len = LAUNCH_NAME_MAX - 1;
+            memcpy(name, a, len); name[len] = 0;
+        } else if (fi == 1) {
+            if (len > LAUNCH_PATH_MAX - 1) len = LAUNCH_PATH_MAX - 1;
+            memcpy(exec, a, len); exec[len] = 0;
+        } else {
+            // key=value (only type= matters for the launch verb)
+            if (len >= 5 && !strncmp(a, "type=", 5)) {
+                const char *v = a + 5;
+                if      (!strncmp(v, "win16", 5)) kind = LK_WIN16;
+                else if (!strncmp(v, "dos", 3))   kind = LK_DOS;
+                else                              kind = LK_GUI; // native/anything else
+            }
+        }
+        fi++;
+        if (!*bar) break;
+        f = bar + 1;
+    }
+    if (!name[0] || !exec[0]) return;
+
+    char id[LAUNCH_ID_MAX], alt[LAUNCH_ID_MAX];
+    slugify_ascii(name, id, sizeof(id));
+    basename_slug(exec, alt, sizeof(alt));
+    if (!id[0]) { if (!alt[0]) return; strlcpy(id, alt, sizeof(id)); }
+    if (id_eq_ci(id, alt)) alt[0] = 0;   // no distinct alternate
+
+    // last-write-wins by primary id
+    launch_ent_t *e = 0;
+    for (int i = 0; i < g_launch_n; i++)
+        if (id_eq_ci(g_launch[i].id, id)) { e = &g_launch[i]; break; }
+    if (!e) {
+        if (g_launch_n >= LAUNCH_MAX) return;
+        e = &g_launch[g_launch_n++];
+    }
+    strlcpy(e->id, id, sizeof(e->id));
+    strlcpy(e->alt, alt, sizeof(e->alt));
+    strlcpy(e->path, exec, sizeof(e->path));
+    strlcpy(e->name, name, sizeof(e->name));
+    e->kind = kind;
+}
+
+// Feed one .MENU file, streamed a line at a time (no whole-file buffer, so no
+// size limit to outgrow: the games fragment is ~29KB). Mirrors sm_feed_file().
+static void launch_parse_fd(int fd) {
+    static char chunk[2048];
+    char line[SM_LINE_MAX]; int lp = 0;
+    long n;
+    while ((n = sys_read(fd, chunk, sizeof(chunk))) > 0) {
+        for (long k = 0; k < n; k++) {
+            char c = chunk[k];
+            if (c == '\n' || c == '\r') {
+                line[lp] = 0;
+                if (lp) launch_parse_line(line);
+                lp = 0;
+            } else if (lp < SM_LINE_MAX - 1) {
+                line[lp++] = c;
+            }
+        }
+    }
+    if (lp) { line[lp] = 0; launch_parse_line(line); }
+}
+
+// Scan one SYSTEM.D directory for *.MENU fragments and parse each.
+static void launch_scan_dir(const char *dir) {
+    int dfd = sys_open(dir, 0);
+    if (dfd < 0) return;
+    dirent_t e;
+    int guard = 0;
+    while (guard++ < 256) {
+        int r = (int)syscall2(SYS_READDIR, dfd, (long)&e);
+        if (r != 0 || e.name[0] == 0) break;
+        int l = 0; while (e.name[l]) l++;
+        if (l < 6) continue;
+        // ".MENU" suffix, case-tolerant (FAT 8.3 exposes uppercase)
+        const char *suf = e.name + l - 5;
+        if (!(suf[0]=='.' &&
+              (suf[1]=='M'||suf[1]=='m') && (suf[2]=='E'||suf[2]=='e') &&
+              (suf[3]=='N'||suf[3]=='n') && (suf[4]=='U'||suf[4]=='u'))) continue;
+        char path[256];
+        snprintf(path, sizeof(path), "%s/%s", dir, e.name);
+        int ffd = sys_open(path, O_RDONLY);
+        if (ffd < 0) continue;
+        launch_parse_fd(ffd);
+        sys_close(ffd);
+    }
+    sys_close(dfd);
+}
+
+// Tiny hardcoded FALLBACK, used ONLY when the manifest is unreadable (no
+// SYSTEM.D on this image). Not the source of truth: it exists so the AI is not
+// entirely unable to launch anything on a broken image, and is deliberately
+// minimal. The real list is the .MENU manifest above.
+static void launch_seed_fallback(void) {
+    static const struct { const char *nm, *pt; int k; } fb[] = {
+        { "Files",     "/APPS/FILES",          LK_GUI },
+        { "Terminal",  "/APPS/TERMINAL",       LK_GUI },
+        { "Settings",  "/APPS/SETTINGS",       LK_GUI },
+        { "Browser",   "/APPS/BROWSER",        LK_GUI },
+        { "Calculator","/APPS/CALC",           LK_GUI },
+        { "DOOM",      "/GAMES/DOOM/DOOM.ELF",  LK_GUI },
+        { "Game Boy",  "/APPS/gbemu",           LK_GUI },
+    };
+    for (unsigned i = 0; i < sizeof(fb)/sizeof(fb[0]) && g_launch_n < LAUNCH_MAX; i++) {
+        launch_ent_t *e = &g_launch[g_launch_n++];
+        slugify_ascii(fb[i].nm, e->id, sizeof(e->id));
+        basename_slug(fb[i].pt, e->alt, sizeof(e->alt));
+        if (id_eq_ci(e->id, e->alt)) e->alt[0] = 0;
+        strlcpy(e->path, fb[i].pt, sizeof(e->path));
+        strlcpy(e->name, fb[i].nm, sizeof(e->name));
+        e->kind = fb[i].k;
+    }
+}
+
+// Build the model-facing "Installed apps" list from the dynamic registry, so
+// the model is told the REAL current set by id + name. gbemu appears here the
+// moment its .MENU item does, with no code change (directive #292).
+static void launch_build_applist(void) {
+    int o = 0;
+    for (int i = 0; i < g_launch_n; i++) {
+        launch_ent_t *e = &g_launch[i];
+        // "  <id>[ (<alt>)]: <Name>\n"
+        int need = (int)strlen(e->id) + (int)strlen(e->name) +
+                   (e->alt[0] ? (int)strlen(e->alt) + 4 : 0) + 8;
+        if (o + need >= APPLIST_MAX - 1) break;
+        o += snprintf(g_applist + o, APPLIST_MAX - o, "  %s", e->id);
+        if (e->alt[0]) o += snprintf(g_applist + o, APPLIST_MAX - o, " (%s)", e->alt);
+        o += snprintf(g_applist + o, APPLIST_MAX - o, ": %s\n", e->name);
+    }
+    g_applist[o] = 0;
+    g_have_applist = (g_launch_n > 0);
+}
+
+// Load the launch manifest + model-facing app list. Called from aiclient_init().
+static void load_launch_manifest(void) {
+    g_launch_n = 0;
+    g_applist[0] = 0;
+    g_have_applist = 0;
+    // Same directories the compositor's sm_feed_system_layer() feeds.
+    launch_scan_dir("/CONFIG/STARTMENU/SYSTEM.D");
+    launch_scan_dir("/ext2/CONFIG/STARTMENU/SYSTEM.D");
+    if (g_launch_n == 0) launch_seed_fallback();
+    launch_build_applist();
+}
+
+// case-insensitive substring test (needle within haystack).
+static int substr_ci(const char *hay, const char *needle) {
+    if (!needle[0]) return 0;
+    for (const char *h = hay; *h; h++) {
+        const char *a = h, *b = needle;
+        for (;;) {
+            char cb = *b;
+            if (!cb) return 1;
+            char ca = *a;
+            if (!ca) break;
+            if (ca >= 'A' && ca <= 'Z') ca += 32;
+            if (cb >= 'A' && cb <= 'Z') cb += 32;
+            if (ca != cb) break;
+            a++; b++;
+        }
+    }
+    return 0;
+}
+
+// Resolve a ROM name to a /ROMS path by case-insensitive substring match.
+// "pokemon" -> "/ROMS/POKEMON_YELLOW.GB" (whatever is present). Returns 1 on hit.
+static int resolve_rom(const char *query, char *out, int cap) {
+    int dfd = sys_open("/ROMS", 0);
+    if (dfd < 0) return 0;
+    dirent_t e;
+    int hit = 0, guard = 0;
+    while (guard++ < 1024) {
+        int r = (int)syscall2(SYS_READDIR, dfd, (long)&e);
+        if (r != 0 || e.name[0] == 0) break;
+        if (!strcmp(e.name, ".") || !strcmp(e.name, "..")) continue;
+        if (DIRENT_IS_DIR(e)) continue;
+        if (substr_ci(e.name, query)) {
+            snprintf(out, cap, "/ROMS/%s", e.name);
+            hit = 1;
+            break;
+        }
+    }
+    sys_close(dfd);
+    return hit;
+}
+
 static void exec_app_launch(const char *args, char *obs, int ocap) {
     char id[64];
     if (!json_get_str(args, "app_id", id, sizeof(id)) || !id[0]) {
@@ -982,19 +1486,68 @@ static void exec_app_launch(const char *args, char *obs, int ocap) {
                 strlcpy(obs, "{\"error\":\"missing app_id\"}", ocap); return;
             }
     }
+    if (g_launch_n == 0) load_launch_manifest();   // lazy-load if init was skipped
+
+    // Match against the primary id (name-slug) OR the alternate (exec basename),
+    // so "gameboy" and "gbemu" both reach the Game Boy app - no per-app code.
     const launch_ent_t *e = 0;
-    for (int i = 0; i < LAUNCH_TBL_N; i++)
-        if (id_eq_ci(g_launch_tbl[i].id, id)) { e = &g_launch_tbl[i]; break; }
+    for (int i = 0; i < g_launch_n; i++)
+        if (id_eq_ci(g_launch[i].id, id) ||
+            (g_launch[i].alt[0] && id_eq_ci(g_launch[i].alt, id))) { e = &g_launch[i]; break; }
     if (!e) {
         snprintf(obs, ocap, "{\"error\":\"unknown-app\",\"app_id\":\"%s\"}", id);
         return;
     }
+
+    // Optional argument: {"rom":"..."} resolves against /ROMS (Game Boy etc.);
+    // {"arg":"..."} passes one argument verbatim. Both apply to NATIVE apps
+    // (win16/dos exec strings carry their own args in the manifest). This is
+    // keyed off the PRESENCE of the field, not off any hardcoded app id.
+    char rom[128] = {0}, arg[192] = {0};
+    int have_rom = json_get_str(args, "rom", rom, sizeof(rom)) && rom[0];
+    if (!have_rom) have_rom = json_get_str(args, "game", rom, sizeof(rom)) && rom[0];
+    int have_arg = json_get_str(args, "arg", arg, sizeof(arg)) && arg[0];
+
     int rc;
     const char *kind;
     switch (e->kind) {
         case LK_WIN16: kind = "win16"; rc = win16_run(e->path); break;
         case LK_DOS:   kind = "dos";   rc = dos_run(e->path);   break;
-        default:       kind = "gui";   rc = sys_spawn(e->path); break;
+        default: {
+            kind = "gui";
+            char bin[LAUNCH_PATH_MAX];
+            first_token(e->path, bin, sizeof(bin));
+            if (have_rom) {
+                char rompath[160];
+                if (resolve_rom(rom, rompath, sizeof(rompath))) {
+                    char *argv[2] = { bin, rompath };
+                    rc = sys_spawn_args(bin, argv, 2);
+                    if (rc >= 0) {
+                        snprintf(obs, ocap,
+                            "{\"launched\":\"%s\",\"name\":\"%s\",\"kind\":\"gui\","
+                            "\"path\":\"%s\",\"rom\":\"%s\",\"rc\":%d}",
+                            e->id, e->name, bin, rompath, rc);
+                        return;
+                    }
+                } else {
+                    // No ROM matched: launch bare so the app shows its own picker.
+                    rc = sys_spawn(bin);
+                    if (rc >= 0) {
+                        snprintf(obs, ocap,
+                            "{\"launched\":\"%s\",\"name\":\"%s\",\"kind\":\"gui\","
+                            "\"path\":\"%s\",\"rom_query\":\"%s\",\"rom\":\"no-match\",\"rc\":%d}",
+                            e->id, e->name, bin, rom, rc);
+                        return;
+                    }
+                }
+            } else if (have_arg) {
+                char *argv[2] = { bin, arg };
+                rc = sys_spawn_args(bin, argv, 2);
+            } else {
+                rc = sys_spawn(bin);
+            }
+            break;
+        }
     }
     if (rc < 0)
         snprintf(obs, ocap, "{\"error\":\"launch-failed\",\"app_id\":\"%s\",\"path\":\"%s\",\"rc\":%d}",
@@ -1553,6 +2106,431 @@ static void exec_build_deploy(const char *args, char *obs, int ocap) {
              app, path, pid);
 }
 
+// ===========================================================================
+// #293 AI SYSTEM-CONTROL TOOLS: screen.capture + the input.inject family.
+//
+// These ride the Stage 1/3/4 OS capability API (docs/SYSTEM_CAPABILITY_API.md).
+// The aicap gate above has already classified them HIGH-risk and (first use)
+// shown the tool-layer consent; here the executor additionally obtains the
+// KERNEL-ENFORCED grant, whose consent prompt is drawn by the TRUSTED COMPOSITOR
+// (an app cannot spoof it or synthesise the Allow). The compositor prompt names
+// the exact scope: the destination path for a capture, the target window's OWN
+// title for an injection. Nothing here bypasses consent; it drives the same path
+// captest and injtest2 demonstrate. We try the privileged syscall first and only
+// raise the consent prompt if the kernel says no grant covers it, so a second
+// call within the granted window does not re-prompt.
+// ===========================================================================
+
+static const char *cap_err_str(long e) {
+    switch (e) {
+        case CAP_ENOINPUT:   return "no recent user input to authorize the request";
+        case CAP_EBUSY:      return "a consent prompt is already open or the screen is locked";
+        case CAP_ESCOPE:     return "the target window or scope was rejected";
+        case CAP_ENOCONSENT: return "no compositor is available to ask the user";
+        case CAP_EPOLICY:    return "refused by policy";
+        case CAP_EDENIED:    return "the user denied the request";
+        case CAP_EMAX:       return "the capability grant table is full";
+        default:             return "the request was refused";
+    }
+}
+
+static int ai_is_denial(long e) {
+    return e == (long)CAP_EDENIED   || e == (long)CAP_ESCOPE ||
+           e == (long)CAP_ENOINPUT  || e == (long)CAP_EBUSY  ||
+           e == (long)CAP_ENOCONSENT|| e == (long)CAP_EPOLICY||
+           e == (long)CAP_EMAX;
+}
+
+// Raise the trusted compositor consent prompt for a capability and wait, bounded
+// (~3 min), for the user's verdict. The compositor (not this app) draws and
+// resolves it; sys_sleep is the wait, and the wake source is a human answering a
+// modal, outside our control, so a timeout is the correct semantics rather than
+// a masked wake. Always issues a fresh request (a grant held for a DIFFERENT
+// path/window would not cover this one). Returns 0 on grant, else a negative
+// CAP_E*.
+static long ai_cap_acquire(unsigned int cap, unsigned int scope_kind,
+                           const char *scope, const char *reason) {
+    cap_req_t r; memset(&r, 0, sizeof(r));
+    r.cap = cap;
+    r.duration_ms = 120000;                 // 2 min window; unlimited uses within
+    r.scope_kind = scope_kind;
+    strlcpy(r.reason, reason, sizeof(r.reason));
+    r.reason_len = (unsigned int)strlen(r.reason);
+    strlcpy(r.scope, scope, sizeof(r.scope));
+    long seq = sys_cap_request(&r);
+    if (seq <= 0) return (seq < 0) ? seq : (long)CAP_EDENIED;
+    long stt = CAP_ST_OPEN;
+    for (int i = 0; i < 1800 && stt == (long)CAP_ST_OPEN; i++) {
+        sys_sleep(100);
+        stt = sys_cap_status((unsigned long long)seq);
+    }
+    return (stt == (long)CAP_ST_GRANTED) ? 0 : (long)CAP_EDENIED;
+}
+
+// Wait (bounded) for a file to appear and its size to settle. The compositor
+// writes the capture asynchronously on its next frame, so a fresh request has no
+// bytes yet. Returns the settled size in bytes, or the last size seen (<=0) on
+// timeout. No busy-spin: sys_sleep is the wait and the loop is bounded.
+static long ai_wait_file(const char *path, int max_ms) {
+    long last = 0;
+    for (int waited = 0; waited <= max_ms; waited += 100) {
+        int fd = sys_open(path, O_RDONLY);
+        if (fd >= 0) {
+            long sz = sys_seek(fd, 0, 2 /* SEEK_END */);
+            sys_close(fd);
+            if (sz > 0 && sz == last) return sz;   // two equal reads => settled
+            last = sz;
+        }
+        sys_sleep(100);
+    }
+    return last;
+}
+
+// Read width/height out of a BMP (BITMAPINFOHEADER) file. Best-effort.
+static void ai_bmp_dims(const char *path, int *w, int *h) {
+    *w = 0; *h = 0;
+    int fd = sys_open(path, O_RDONLY);
+    if (fd < 0) return;
+    unsigned char hd[26];
+    long n = sys_read(fd, hd, sizeof(hd));
+    sys_close(fd);
+    if (n < 26 || hd[0] != 'B' || hd[1] != 'M') return;
+    *w = (int)(hd[18] | (hd[19] << 8) | (hd[20] << 16) | (hd[21] << 24));
+    int hh = (int)(hd[22] | (hd[23] << 8) | (hd[24] << 16) | (hd[25] << 24));
+    *h = hh < 0 ? -hh : hh;   // a top-down BMP stores a negative height
+}
+
+static int ai_parse_int(const char *s) {
+    int v = 0, any = 0;
+    while (*s == ' ' || *s == '\t') s++;
+    while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); any = 1; s++; }
+    return any ? v : -1;
+}
+
+// The target window HANDLE (an integer) the model named. There is no window
+// enumerator exposed to Ring 3, so the model must be given the handle; a title
+// string cannot be resolved here.
+static int ai_target_win(const char *args) {
+    char w[24];
+    if (json_get_str(args, "win", w, sizeof(w)) && w[0] >= '0' && w[0] <= '9')
+        return ai_parse_int(w);
+    if (json_get_str(args, "target", w, sizeof(w)) && w[0] >= '0' && w[0] <= '9')
+        return ai_parse_int(w);
+    return -1;
+}
+
+// A non-negative numeric JSON value for key (unquoted or quoted). def if absent.
+static int ai_json_num(const char *json, const char *key, int def) {
+    char pat[48]; snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *k = strstr(json, pat);
+    if (!k) return def;
+    const char *v = k + strlen(pat);
+    while (*v && *v != ':') v++;
+    if (*v != ':') return def;
+    v++;
+    while (*v == ' ' || *v == '\t' || *v == '"') v++;
+    if (*v < '0' || *v > '9') return def;
+    int val = 0;
+    while (*v >= '0' && *v <= '9') { val = val * 10 + (*v - '0'); v++; }
+    return val;
+}
+
+static int ai_ci_eq(const char *a, const char *b) {
+    for (;; a++, b++) {
+        char ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return 0;
+        if (!ca) return 1;
+    }
+}
+
+// Map a "key" name (or numeric "keycode") to the GUI_KEY_* / ASCII code the
+// window event queue delivers. -1 if none/unknown.
+static int ai_keycode(const char *args) {
+    int kc = ai_json_num(args, "keycode", -1);
+    if (kc >= 0) return kc;
+    char key[32];
+    if (!json_get_str(args, "key", key, sizeof(key)) || !key[0]) return -1;
+    if (key[1] == 0) return (unsigned char)key[0];             // single character
+    if (ai_ci_eq(key, "enter") || ai_ci_eq(key, "return")) return GUI_KEY_ENTER;
+    if (ai_ci_eq(key, "tab"))                               return GUI_KEY_TAB;
+    if (ai_ci_eq(key, "esc") || ai_ci_eq(key, "escape"))   return GUI_KEY_ESC;
+    if (ai_ci_eq(key, "space"))                             return ' ';
+    if (ai_ci_eq(key, "backspace") || ai_ci_eq(key, "bksp"))return GUI_KEY_BKSP;
+    if (ai_ci_eq(key, "up"))     return GUI_KEY_UP;
+    if (ai_ci_eq(key, "down"))   return GUI_KEY_DOWN;
+    if (ai_ci_eq(key, "left"))   return GUI_KEY_LEFT;
+    if (ai_ci_eq(key, "right"))  return GUI_KEY_RIGHT;
+    if (ai_ci_eq(key, "home"))   return GUI_KEY_HOME;
+    if (ai_ci_eq(key, "end"))    return GUI_KEY_END;
+    if (ai_ci_eq(key, "pgup"))   return GUI_KEY_PGUP;
+    if (ai_ci_eq(key, "pgdn"))   return GUI_KEY_PGDN;
+    if (ai_ci_eq(key, "delete") || ai_ci_eq(key, "del")) return GUI_KEY_DEL;
+    if ((key[0] == 'f' || key[0] == 'F') && key[1] >= '1' && key[1] <= '9') {
+        switch (ai_parse_int(key + 1)) {
+            case 1:  return GUI_KEY_F1;  case 2:  return GUI_KEY_F2;
+            case 3:  return GUI_KEY_F3;  case 4:  return GUI_KEY_F4;
+            case 5:  return GUI_KEY_F5;  case 6:  return GUI_KEY_F6;
+            case 7:  return GUI_KEY_F7;  case 8:  return GUI_KEY_F8;
+            case 9:  return GUI_KEY_F9;  case 10: return GUI_KEY_F10;
+            case 11: return GUI_KEY_F11; case 12: return GUI_KEY_F12;
+        }
+    }
+    return -1;
+}
+
+// Inject one key into win, obtaining the WINDOW_TARGET grant on first refusal.
+static long ai_inject_key_gated(int win, int code) {
+    long r = sys_cap_inject_key(win, code);
+    if (r == (long)CAP_EDENIED || r == (long)CAP_ESCOPE) {
+        char scope[24]; snprintf(scope, sizeof(scope), "%d", win);
+        long g = ai_cap_acquire(CAP_INPUT_INJECT, CAP_SCOPE_WINDOW_TARGET, scope,
+                                "Maytera AI wants to send input to this window");
+        if (g != 0) return g;
+        r = sys_cap_inject_key(win, code);
+    }
+    return r;
+}
+
+// --- LOW-risk (read-only, NOT consent-gated): enumerate the current windows so
+// the model can find a target 'win' handle by matching title/app before it
+// injects (#293). This is the self-driving half of app control: app.launch,
+// then input.windows to find the new window's id, then input.type/key/click.
+// Only drivable windows (visible and not minimized) are reported.
+static void exec_input_windows(const char *args, char *obs, int ocap) {
+    (void)args;
+    static wm_window_info_t wins[48];
+    int n = wm_get_windows(wins, (int)(sizeof(wins) / sizeof(wins[0])));
+    if (n < 0) n = 0;
+    int o = 0;
+    o = str_append(obs, o, ocap, "{\"windows\":[");
+    int first = 1;
+    for (int i = 0; i < n; i++) {
+        if (!wins[i].visible || wins[i].minimized) continue;
+        char row[96];
+        snprintf(row, sizeof(row), "%s{\"win\":%d,\"title\":\"", first ? "" : ",", wins[i].id);
+        o = str_append(obs, o, ocap, row);
+        o = obs_escape(obs, o, ocap, wins[i].title);
+        o = str_append(obs, o, ocap, "\",\"app\":\"");
+        o = obs_escape(obs, o, ocap, wins[i].app_id);
+        snprintf(row, sizeof(row), "\",\"focused\":%d,\"visible\":%d,\"minimized\":%d}",
+                 wins[i].focused ? 1 : 0, wins[i].visible ? 1 : 0, wins[i].minimized ? 1 : 0);
+        o = str_append(obs, o, ocap, row);
+        first = 0;
+        if (o > ocap - 160) break;   // cap to the buffer; stop cleanly
+    }
+    str_append(obs, o, ocap, "]}");
+}
+
+// --- HIGH-risk: capture the composited screen to a BMP (#293). Stage 1
+// screen.capture: the trusted compositor draws consent, the kernel binds the
+// grant to the exact path, and the compositor writes the BMP asynchronously.
+// args: {} or {"path":"/HOME/NAME.BMP"}.
+static void exec_screen_capture(const char *args, char *obs, int ocap) {
+    char path[160];
+    if (!json_get_str(args, "path", path, sizeof(path)) || !path[0]) {
+        if (userhome_path(NULL, "SCREENSHOT.BMP", path, sizeof(path)) != 0)
+            strlcpy(path, "/HOME/SCREENSHOT.BMP", sizeof(path));
+    }
+    long r = sys_screenshot_request(path);
+    if (r == (long)CAP_EDENIED) {
+        long g = ai_cap_acquire(CAP_SCREEN_CAPTURE, CAP_SCOPE_PATH, path,
+                                "Maytera AI wants to capture the screen");
+        if (g != 0) {
+            snprintf(obs, ocap,
+                "{\"error\":\"%s\",\"capability\":\"screen.capture\",\"path\":\"%s\",\"reason\":\"%s\"}",
+                ai_is_denial(g) ? "CAPABILITY_DENIED" : "capture-failed", path, cap_err_str(g));
+            return;
+        }
+        r = sys_screenshot_request(path);
+    }
+    if (r != 0) {
+        snprintf(obs, ocap, "{\"error\":\"capture-failed\",\"rc\":%ld,\"path\":\"%s\"}", r, path);
+        return;
+    }
+    long sz = ai_wait_file(path, 5000);
+    int w = 0, h = 0; ai_bmp_dims(path, &w, &h);
+    // VISION: the default endpoint (Kimi) is text-only, so the image is saved
+    // but NOT sent to the model. Even an Anthropic-style endpoint cannot take
+    // this capture as-is: it is a BMP, and the image API accepts only PNG/JPEG/
+    // GIF/WebP. Be honest either way; never claim the model can see it.
+    const char *vnote = (g_api_style == AI_STYLE_ANTHROPIC)
+        ? "endpoint is vision-capable but the capture is BMP, which the image API does not accept, so it was not attached"
+        : "the active model is text-only, so the image was not attached; a vision-capable model is needed to analyze it";
+    if (sz <= 0)
+        snprintf(obs, ocap,
+            "{\"status\":\"requested\",\"path\":\"%s\",\"note\":\"capture queued; file not confirmed yet\",\"vision\":\"%s\"}",
+            path, vnote);
+    else
+        snprintf(obs, ocap,
+            "{\"status\":\"captured\",\"path\":\"%s\",\"width\":%d,\"height\":%d,\"bytes\":%ld,\"vision\":\"%s\"}",
+            path, w, h, sz, vnote);
+}
+
+// --- HIGH-risk: type a string into a target window (#293). input.inject.
+// args: {"win":<handle>,"text":"..."}.
+static void exec_input_type(const char *args, char *obs, int ocap) {
+    int win = ai_target_win(args);
+    if (win < 0) { strlcpy(obs, "{\"error\":\"missing target window handle 'win'\"}", ocap); return; }
+    static char text[1024];
+    if (!json_get_str(args, "text", text, sizeof(text)) || !text[0]) {
+        strlcpy(obs, "{\"error\":\"missing 'text'\"}", ocap); return;
+    }
+    long first = ai_inject_key_gated(win, (unsigned char)text[0]);
+    if (first != 0) {
+        snprintf(obs, ocap,
+            "{\"error\":\"%s\",\"capability\":\"input.inject\",\"target\":%d,\"reason\":\"%s\"}",
+            ai_is_denial(first) ? "CAPABILITY_DENIED" : "inject-failed", win, cap_err_str(first));
+        return;
+    }
+    int nkeys = 1;
+    for (int i = 1; text[i]; i++) {
+        if (sys_cap_inject_key(win, (unsigned char)text[i]) == 0) nkeys++;
+        sys_sleep(12);
+    }
+    snprintf(obs, ocap, "{\"status\":\"typed\",\"target\":%d,\"keys_sent\":%d}", win, nkeys);
+}
+
+// --- HIGH-risk: press one key in a target window (#293). input.inject.
+// args: {"win":<handle>,"key":"enter"} or {"win":<handle>,"keycode":N}.
+static void exec_input_key(const char *args, char *obs, int ocap) {
+    int win = ai_target_win(args);
+    if (win < 0) { strlcpy(obs, "{\"error\":\"missing target window handle 'win'\"}", ocap); return; }
+    int code = ai_keycode(args);
+    if (code < 0) { strlcpy(obs, "{\"error\":\"missing or unknown 'key'/'keycode'\"}", ocap); return; }
+    long r = ai_inject_key_gated(win, code);
+    if (r != 0) {
+        snprintf(obs, ocap,
+            "{\"error\":\"%s\",\"capability\":\"input.inject\",\"target\":%d,\"reason\":\"%s\"}",
+            ai_is_denial(r) ? "CAPABILITY_DENIED" : "inject-failed", win, cap_err_str(r));
+        return;
+    }
+    snprintf(obs, ocap, "{\"status\":\"key-sent\",\"target\":%d,\"keycode\":%d}", win, code);
+}
+
+// --- HIGH-risk: pointer input into a target window (#293). input.inject.
+// args: {"win":<h>,"x":X,"y":Y[,"button":"left|right"][,"type":"click|down|up|move"]}.
+// Coordinates are content-relative (the same space the target hit-tests in).
+static void exec_input_click(const char *args, char *obs, int ocap) {
+    int win = ai_target_win(args);
+    if (win < 0) { strlcpy(obs, "{\"error\":\"missing target window handle 'win'\"}", ocap); return; }
+    int x = ai_json_num(args, "x", -1);
+    int y = ai_json_num(args, "y", -1);
+    if (x < 0 || y < 0) { strlcpy(obs, "{\"error\":\"missing 'x'/'y' (content-relative)\"}", ocap); return; }
+    char btns[16]; int button = 0;
+    if (json_get_str(args, "button", btns, sizeof(btns)) && (btns[0] == 'r' || btns[0] == 'R')) button = 2;
+    char act[16]; if (!json_get_str(args, "type", act, sizeof(act))) act[0] = 0;
+    int do_down = 1, do_up = 1;
+    if      (ai_ci_eq(act, "down")) do_up = 0;
+    else if (ai_ci_eq(act, "up"))   do_down = 0;
+    else if (ai_ci_eq(act, "move")) { do_down = 0; do_up = 0; }
+    // A harmless move both positions the pointer and probes the grant.
+    long probe = sys_cap_inject_mouse(win, x, y, 0 /*move*/, (unsigned)button);
+    if (probe == (long)CAP_EDENIED || probe == (long)CAP_ESCOPE) {
+        char scope[24]; snprintf(scope, sizeof(scope), "%d", win);
+        long g = ai_cap_acquire(CAP_INPUT_INJECT, CAP_SCOPE_WINDOW_TARGET, scope,
+                                "Maytera AI wants to control the pointer in this window");
+        if (g != 0) {
+            snprintf(obs, ocap,
+                "{\"error\":\"%s\",\"capability\":\"input.inject\",\"target\":%d,\"reason\":\"%s\"}",
+                ai_is_denial(g) ? "CAPABILITY_DENIED" : "inject-failed", win, cap_err_str(g));
+            return;
+        }
+        probe = sys_cap_inject_mouse(win, x, y, 0, (unsigned)button);
+    }
+    long rd = 0, ru = 0;
+    if (do_down) rd = sys_cap_inject_mouse(win, x, y, 1, (unsigned)button);
+    if (do_up)   ru = sys_cap_inject_mouse(win, x, y, 2, (unsigned)button);
+    long worst = (!do_down && !do_up) ? probe : (rd ? rd : ru);
+    if (worst != 0) {
+        snprintf(obs, ocap,
+            "{\"error\":\"%s\",\"capability\":\"input.inject\",\"target\":%d,\"reason\":\"%s\"}",
+            ai_is_denial(worst) ? "CAPABILITY_DENIED" : "inject-failed", win, cap_err_str(worst));
+        return;
+    }
+    snprintf(obs, ocap,
+        "{\"status\":\"%s\",\"target\":%d,\"x\":%d,\"y\":%d,\"button\":\"%s\"}",
+        (do_down && do_up) ? "clicked" : (do_down ? "pressed" : (do_up ? "released" : "moved")),
+        win, x, y, button == 2 ? "right" : "left");
+}
+
+// --- The GENERIC live-app action tool (tier 2 wire, #<config-ref>).
+// ONE executor for EVERY contracted app, not one per app: it resolves the app
+// through the same contract path `ctl` uses and delivers the verb to the app's
+// RUNNING instance so it touches the live document, falling back to a spawn
+// (stateless) only when no instance is listening. The per-ACTION capability
+// gate (app.paint.edit, ...) is applied by the RECEIVING app through
+// contract_authorize()->aicap_authorize(), the SAME gate the CLI applies, so
+// there is no second policy here; the AI-loop's own aicap gate on "app.action"
+// (aiclient_run_action) bounds what the AI may attempt before this runs.
+//
+// args: {"app":"paint","name":"invert"} calls an action;
+//       add "args":"a b c" (space separated) for a call with arguments;
+//       {"app":X,"verb":"get","name":"doc.layers"} reads live state;
+//       {"app":X,"verb":"set","name":N,"value":V} writes one setting.
+static void exec_app_action(const char *args, char *obs, int ocap) {
+    char app[40], name[80], verb[12], argstr[256], value[80];
+    if (!json_get_str(args, "app", app, sizeof(app)) || !app[0]) {
+        strlcpy(obs, "{\"error\":\"missing 'app'\"}", ocap); return;
+    }
+    if (!json_get_str(args, "verb", verb, sizeof(verb)) || !verb[0])
+        strlcpy(verb, "call", sizeof(verb));
+    if (!json_get_str(args, "name", name, sizeof(name)) || !name[0]) {
+        strlcpy(obs, "{\"error\":\"missing 'name' (the action or item)\"}", ocap); return;
+    }
+    if (!json_get_str(args, "args", argstr, sizeof(argstr))) argstr[0] = 0;
+    if (!json_get_str(args, "value", value, sizeof(value)))  value[0] = 0;
+
+    // Build the contract argv: verb, name, then either the value (set) or the
+    // space-split args (call). One arg per token; v1 does not split quoted
+    // spans, which the current actions do not need.
+    char *av[16]; int ac = 0;
+    av[ac++] = verb;
+    av[ac++] = name;
+    if (!strcmp(verb, "set") && value[0]) {
+        av[ac++] = value;
+    } else if (argstr[0]) {
+        char *p = argstr;
+        while (*p && ac < 15) {
+            while (*p == ' ' || *p == '\t') p++;
+            if (!*p) break;
+            av[ac++] = p;
+            while (*p && *p != ' ' && *p != '\t') p++;
+            if (*p) *p++ = 0;
+        }
+    }
+
+    static char reply[1024];
+    int rc = contract_invoke_live(app, ac, av, reply, (int)sizeof(reply));
+    const char *delivery = "live";
+    if (rc == CT_LIVE_NONE || rc == CT_LIVE_TIMEOUT) {
+        // No running instance answered: fall back to a stateless spawn (works
+        // for get/describe and for actions that need no live document).
+        delivery = "spawn";
+        rc = contract_invoke(app, ac, av, reply, (int)sizeof(reply));
+    }
+    // Trim a trailing newline the app emitted so the JSON stays one line.
+    int rl = (int)strlen(reply);
+    while (rl > 0 && (reply[rl - 1] == '\n' || reply[rl - 1] == '\r')) reply[--rl] = 0;
+
+    int denied = (strstr(reply, "capability-denied") != 0);
+    int err = (strncmp(reply, "err", 3) == 0);
+    int o = 0;
+    o = str_append(obs, o, ocap, "{\"app\":\"");
+    o = obs_escape(obs, o, ocap, app);
+    o = str_append(obs, o, ocap, "\",\"delivery\":\"");
+    o = str_append(obs, o, ocap, delivery);
+    o = str_append(obs, o, ocap, "\",");
+    if (denied)
+        o = str_append(obs, o, ocap, "\"error\":\"CAPABILITY_DENIED\",");
+    else if (err)
+        o = str_append(obs, o, ocap, "\"error\":\"CONTRACT_ERROR\",");
+    o = str_append(obs, o, ocap, "\"reply\":\"");
+    o = obs_escape(obs, o, ocap, reply);
+    str_append(obs, o, ocap, "\"}");
+}
+
 static int dispatch_tool(const char *id, const char *args, char *obs, int ocap) {
     if      (!strcmp(id, "files.list"))        exec_files_list(args, obs, ocap);
     else if (!strcmp(id, "files.read"))        exec_files_read(args, obs, ocap);
@@ -1565,6 +2543,7 @@ static int dispatch_tool(const char *id, const char *args, char *obs, int ocap) 
     else if (!strcmp(id, "calc.open"))         exec_calc_open(args, obs, ocap);
     else if (!strcmp(id, "calc.eval"))         exec_calc_eval(args, obs, ocap);
     else if (!strcmp(id, "app.launch"))        exec_app_launch(args, obs, ocap);
+    else if (!strcmp(id, "app.action"))        exec_app_action(args, obs, ocap);
     else if (!strcmp(id, "storage.free") ||
              !strcmp(id, "system.storage.info")) exec_storage_info(args, obs, ocap);
     else if (!strcmp(id, "settings.get"))      exec_settings_get(args, obs, ocap);
@@ -1573,6 +2552,18 @@ static int dispatch_tool(const char *id, const char *args, char *obs, int ocap) 
              !strcmp(id, "files.write"))       exec_fs_write(args, obs, ocap);
     else if (!strcmp(id, "fs.delete") ||
              !strcmp(id, "files.delete"))      exec_fs_delete(args, obs, ocap);
+    else if (!strcmp(id, "fs.mkdir") ||
+             !strcmp(id, "files.mkdir"))       exec_fs_mkdir(args, obs, ocap);
+    else if (!strcmp(id, "fs.move") ||
+             !strcmp(id, "files.move"))        exec_fs_move(args, obs, ocap);
+    else if (!strcmp(id, "photos.organize"))   exec_photos_organize(args, obs, ocap);
+    else if (!strcmp(id, "input.windows") ||
+             !strcmp(id, "windows.list"))      exec_input_windows(args, obs, ocap);
+    else if (!strcmp(id, "screen.capture"))    exec_screen_capture(args, obs, ocap);
+    else if (!strcmp(id, "input.type"))        exec_input_type(args, obs, ocap);
+    else if (!strcmp(id, "input.key"))         exec_input_key(args, obs, ocap);
+    else if (!strcmp(id, "input.click") ||
+             !strcmp(id, "input.mouse"))       exec_input_click(args, obs, ocap);
     else if (!strcmp(id, "build.compile_app")) exec_build_compile(args, obs, ocap);
     else if (!strcmp(id, "build.deploy_app"))  exec_build_deploy(args, obs, ocap);
     else { snprintf(obs, ocap, "{\"error\":\"unknown-tool\",\"id\":\"%s\"}", id); return 0; }
@@ -1586,6 +2577,36 @@ static int dispatch_tool(const char *id, const char *args, char *obs, int ocap) 
 // uses it to drive build.compile_app/deploy_app deterministically (still through
 // the real consent + audit path).
 int aiclient_run_action(const char *id, const char *args, char *obs, int ocap) {
+    // #708: a device-tier AI action, tool id "device.<class>.<verb>", is
+    // gated by the per-device capability manifest FIRST (a FORBID verb is
+    // refused before any consent prompt), then deferred to the SAME token +
+    // consent + audit gate as every other tool. No OS tool formats,
+    // partitions or ejects a device today, so no executor runs here yet;
+    // this is the live gate an LLM's ACTION reaches, ahead of any executor.
+    if (!strncmp(id, "device.", 7)) {
+        // #708: device.list is a READ-ONLY enumeration of removable volumes (not
+        // a device action), ungated like input.windows, so the model can discover
+        // a device before asking to act on it.
+        if (!strcmp(id, "device.list")) {
+            exec_device_list(args, obs, ocap);
+            aicap_audit(id, "device.list", args, "ok", "read-only");
+            return AICAP_ALLOW;
+        }
+        // Every other device tool is gated FIRST by the per-device capability
+        // manifest (a FORBID verb is refused before any consent prompt) and then,
+        // for a CONSENT verb, by the SAME token+consent+audit gate as every other
+        // tool - all inside aidev_authorize_tool(). On an ALLOW for the EJECT
+        // verb, the real safe-eject executor runs and REPLACES the gate's
+        // placeholder observation with the actual result. Every OTHER device verb
+        // (format, partition, ...) is still gate-only: no executor runs.
+        int az = aidev_authorize_tool(id, args, obs, ocap);
+        if (az == AICAP_ALLOW) {
+            const char *dot = strrchr(id, '.');
+            if (dot && !strcmp(dot + 1, "eject"))
+                exec_device_eject(args, obs, ocap);
+        }
+        return az;
+    }
     char cap[40]; int risk = 0;
     aicap_classify(id, cap, sizeof(cap), &risk);
     char reason[256]; char how[80];
@@ -1790,6 +2811,7 @@ int aiclient_init(void) {
     load_buildsvc();  // #294: build-service URL override
     load_appgen();    // #327: app-generation RAG corpus for chat-to-app
     load_tools();
+    load_launch_manifest();  // #292: dynamic app launch registry + model-facing app list
     aicap_init();   // #293: load persisted capability grants
     return g_have_key;
 }

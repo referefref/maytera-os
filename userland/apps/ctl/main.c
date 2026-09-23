@@ -66,6 +66,8 @@ static void usage(void) {
     printf("  ctl set      <app> <name> <v> write one item\n");
     printf("  ctl call     <app> <name> ... invoke one action\n");
     printf("  ctl path     <app>            show the binary ctl would spawn\n");
+    printf("  ctl live     <app> <verb> ... deliver a verb to the RUNNING instance\n");
+    printf("                                (live document), not a throwaway spawn\n");
     printf("  ctl aipath   get|set <name> [v] drive the SAME item through the AI\n");
     printf("                                tool executor and show both answers\n");
     printf("\nrisk classes: safe (ungated), guarded (needs a capability token\n");
@@ -83,6 +85,23 @@ static void usage(void) {
 static int run_contract(const char *app, int argc, char **argv) {
     static char out[4096];
     int rc = contract_invoke(app, argc, argv, out, (int)sizeof(out));
+    size_t n = strlen(out);
+    if (n) write(1, out, n);
+    return rc;
+}
+
+// `ctl live <app> <verb> ...` - deliver a contract verb to the app's RUNNING
+// instance (touching its live document), the tier-2 wire. If no instance is
+// listening we say so and fall back to the ordinary spawn, so the command
+// always answers rather than silently doing nothing.
+static int run_live(const char *app, int argc, char **argv) {
+    static char out[1024];
+    int rc = contract_invoke_live(app, argc, argv, out, (int)sizeof(out));
+    if (rc == CT_LIVE_NONE || rc == CT_LIVE_TIMEOUT) {
+        printf("live: no running instance of %s answered; falling back to a spawn\n", app);
+        return run_contract(app, argc, argv);
+    }
+    printf("live: delivered to running %s\n", app);
     size_t n = strlen(out);
     if (n) write(1, out, n);
     return rc;
@@ -222,6 +241,15 @@ int main(int argc, char **argv) {
         rest[rc++] = (char *)verb;
         for (int i = 3; i < argc && rc < 22; i++) rest[rc++] = argv[i];
         return run_contract(app, rc, rest);
+    }
+    // ctl live <app> <verb> [args...]: the verb + its args, delivered to the
+    // running instance.  argv[2]=app, argv[3]=verb, argv[4..]=args.
+    if (!strcmp(verb, "live")) {
+        if (argc < 4) { usage(); return CT_ERR_USAGE; }
+        char *rest[24];
+        int rc = 0;
+        for (int i = 3; i < argc && rc < 23; i++) rest[rc++] = argv[i];
+        return run_live(app, rc, rest);
     }
     usage();
     return CT_ERR_USAGE;

@@ -33,6 +33,7 @@
 #include "services.h"
 #include "syscall_path.h"
 #include "fdlayer.h"
+#include "capgate.h"   // Stage 0: the /dev-node permission gate ledger
 #include "../types.h"
 #include "../string.h"
 #include "../serial.h"
@@ -43,9 +44,11 @@
 #include "../fs/ext2.h"
 #include "../fs/perms.h"
 #include "../fs/vfs.h"
+#include "../fs/escrow_guard.h"   // #246/#305 AI escrow kernel enforcement
 #include "../net/smb.h"
 #include "../net/nfs.h"
 #include "../drivers/hotplug.h"   // #250: removable-volume path routing
+#include "../fs/blkmgr.h"          // #404 Stage 4b: aux mount (/MNT/<name>) VFS routing
 #include "../gui/syslog.h"
 #include "../cpu/dlprof.h"
 #include "../cpu/scprof.h"  // #121: read-path phase attribution
@@ -53,6 +56,7 @@
 #include "../security/uaccess_smap.h"  // #19/#645: AC brackets on the user-buffer copies
 #include "../security/selftest_registry.h"  // #PERMSKIP
 #include "fdown.h"                           // #fdguard: legacy fd ownership guard
+#include "advlock.h"                          // #404 Stage 6: advisory file locking
 #include "../security/seclog.h"              // #fdguard: seclog_report_io_boundary
 #include "../fs/bootlog.h"                   // #fdguard: bootlog_write on bypass
 
@@ -124,10 +128,31 @@ static int fd_used[LEGACY_MAX_FDS];
 // never inherit a previous file's error.
 static int fd_werr[LEGACY_MAX_FDS];
 
+// #708 AI SAFE-EJECT BUSY CHECK. The AI device-manifest eject executor
+// (userland aiclient.c exec_device_eject) must REFUSE to eject a removable
+// volume that still has open file handles, rather than force-invalidating them
+// the way a user-driven hotplug_eject() deliberately does (#250). This is the
+// read-only signal it consults, exposed as SYS_VOL_BUSY: how many legacy FAT
+// handles are open against the fat_fs_t backing removable volume slot `index`.
+// Justified C, not Rust: it reads the fd_table[]/fd_used[] statics that live
+// ONLY in this file plus a fat_file_t's `fs` field, which is exactly the legacy
+// fd-layer entanglement the Rust-first rule exempts (there is no #[repr(C)]
+// mirror of the shared fd pool). Returns the open-handle count (0 = not busy),
+// and 0 for a slot with no readable FAT mount (exFAT / disk image / empty /
+// out-of-range), because hotplug_volume_fat() returns NULL for all of those.
+int hotplug_vol_busy(int index) {
+    fat_fs_t *vfs = hotplug_volume_fat(index);
+    if (!vfs) return 0;
+    int n = 0;
+    for (int i = 0; i < LEGACY_MAX_FDS; i++)
+        if (fd_used[i] && fd_table[i].fs == vfs) n++;
+    return n;
+}
+
 // ===========================================================================
 // #FDNS: THE LEGACY FD NUMBERS LIVE IN THEIR OWN, DISJOINT RANGE.
 //
-// THE BUG THIS REMOVES (measured on golden build 2025, VM <vmid>, 2026-08-23).
+// THE BUG THIS REMOVES (measured on golden build 2025, VM 2620, 2026-08-23).
 // This kernel has TWO descriptor namespaces:
 //
 //   * proc->fds[0..MAX_FDS-1]  per-process file_t: console, pipes, PTYs,
@@ -366,6 +391,35 @@ typedef struct {
 } smb_fd_t;
 static smb_fd_t smbfd[LEGACY_MAX_FDS];
 
+// ---- #404 Stage 4b: AUX (Disk Manager) mount fds, parallel to e2fd/smbfd -----
+// Routes userland open/read/write/close/readdir on "/MNT/<name>/..." through a
+// partition the Disk Manager formatted and mounted (SYS_MOUNT). Whole-file
+// buffered exactly like the SMB/NFS family (read caches the file, writes flush
+// on close), which bounds kernel RAM and keeps the aux FS ops (which take the
+// ext2 lock, or a FAT root-dir walk) OUT of the per-byte read/write path.
+//   * ext2 aux: served by the REAL ext2 driver via its ext2_*_on API on a
+//     caller-owned ext2_fs_t (efs), rebuilt per open with ext2_mount_into() so
+//     it always reflects the committed on-disk state (this is what makes a file
+//     persist across unmount+remount).
+//   * FAT aux: served by the self-contained Rust FAT root-dir layer via the
+//     blkmgr_aux_fat_*_c C entry points.
+// The FAT/ext2 boot volumes never touch this code.
+#define AUX_FILE_MAX (256 * 1024)   // whole-file bound for an aux-mount file
+typedef struct {
+    int       used;
+    int       fstype;          // MNT_FS_FAT16/FAT32/EXT2
+    int       is_dir;
+    ext2_fs_t efs;             // ext2 aux geometry (via_blkmgr); unused for FAT
+    uint32_t  dir_ino;         // ext2 dir inode (readdir)
+    uint32_t  dir_pos;         // ext2/FAT readdir cursor
+    char      mnt[32];         // the mount point, e.g. "/MNT/test"
+    char      rel[256];        // mount-relative path, e.g. "/hello" ("" = the mount root dir)
+    uint8_t  *rbuf; uint32_t rsize, rpos;             // file read cache
+    uint8_t  *wbuf; uint32_t wcap, wlen; int writing; // create/replace buffer
+    int       wdirty;
+} aux_fd_t;
+static aux_fd_t auxfd[LEGACY_MAX_FDS];
+
 
 /* #359 Phase 2: POSIX errno values so libc open() can set errno correctly
    (CPython's import machinery needs a missing file to raise FileNotFoundError,
@@ -379,14 +433,67 @@ static smb_fd_t smbfd[LEGACY_MAX_FDS];
 #define MOS_EINVAL  22
 #define MOS_EMFILE  24
 #define MOS_EFBIG   27
+#define MOS_EEXIST  17   /* #745: O_CREAT|O_EXCL on an existing file */
 #define MOS_EOK     0
 #endif
+
+// #404 Stage 6: resolve a USERLAND fd to the canonical path the advisory lock
+// layer keys on, its legacy slot index (the flock identity), and best-effort
+// size/position for l_whence resolution. Returns 0 on success, -1 if `fd` is
+// not a lockable, caller-owned legacy file fd. It reads the static legacy fd
+// tables (fd_table/e2fd/smbfd), which is why it lives here and not in
+// proc/advlock.c. Ownership is enforced via legacy_owner_ok (#fdguard), so a
+// process cannot lock through another process's fd.
+int advlock_resolve_fd(int fd, char *pathbuf, int cap, int *slot_out,
+                       uint64_t *size_out, uint64_t *pos_out) {
+    if (!pathbuf || cap <= 0) return -1;
+    if (!lfd_is(fd)) return -1;
+    int idx = lfd_idx(fd);
+    if (idx < 0 || idx >= LEGACY_MAX_FDS) return -1;
+    if (!legacy_owner_ok(idx, "advlock")) return -1;   // #fdguard: must own it
+    pathbuf[0] = 0;
+    if (slot_out) *slot_out = idx;
+    uint64_t sz = 0, pos = 0;
+    if (fd >= 3 && auxfd[idx].used) {
+        // #404 Stage 4b: name it "<mount><rel>" for Task Manager / handle views.
+        strncpy(pathbuf, auxfd[idx].mnt, cap - 1); pathbuf[cap - 1] = 0;
+        { int l = (int)strlen(pathbuf);
+          strncpy(pathbuf + l, auxfd[idx].rel, cap - 1 - l); pathbuf[cap - 1] = 0; }
+        sz = auxfd[idx].rbuf ? auxfd[idx].rsize : auxfd[idx].wlen;
+        pos = auxfd[idx].rbuf ? auxfd[idx].rpos : auxfd[idx].wlen;
+    } else if (fd >= 3 && smbfd[idx].used) {
+        strncpy(pathbuf, smbfd[idx].path, cap - 1); pathbuf[cap - 1] = 0;
+        sz = smbfd[idx].rbuf ? smbfd[idx].rsize : smbfd[idx].wlen;
+        pos = smbfd[idx].rbuf ? smbfd[idx].rpos : smbfd[idx].wlen;
+    } else if (fd >= 3 && e2fd[idx].used) {
+        ext2_fd_t *e = &e2fd[idx];
+        strncpy(pathbuf, e->path, cap - 1); pathbuf[cap - 1] = 0;
+        if (e->rw)            { sz = e->wlen; pos = e->rwpos; }
+        else if (e->writing)  { sz = e->wlen; pos = e->wlen; }
+        else                  { sz = e->rsize; pos = e->rpos; }
+    } else if (fd_used[idx]) {
+        strncpy(pathbuf, fd_table[idx].name, cap - 1); pathbuf[cap - 1] = 0;
+        sz = fd_table[idx].file_size;
+        pos = fd_table[idx].position;
+    } else {
+        return -1;   // slot not populated by any family
+    }
+    if (size_out) *size_out = sz;
+    if (pos_out) *pos_out = pos;
+    return 0;
+}
 
 /* #359: fcntl(fd, cmd, arg). CPython needs F_GETFL/F_SETFL/F_GETFD/F_SETFD/
    F_DUPFD to set up std fds and duplicate descriptors. We do not track a
    per-fd flags word, so F_GETFL reports O_RDWR and F_SETFL is a no-op; the
    duplicate commands reuse the existing per-process fd_dup(). */
 int64_t sys_fcntl(int fd, int cmd, long arg) {
+    // #404 Stage 6: POSIX advisory record locks. F_GETLK/F_SETLK/F_SETLKW carry
+    // a `struct flock *` in arg; hand them to the advisory locking layer
+    // (proc/advlock.c over rustkern/advlock.rs). Everything else is the
+    // pre-existing #359 behaviour below.
+    if (cmd == ADV_F_GETLK || cmd == ADV_F_SETLK || cmd == ADV_F_SETLKW)
+        return advlock_fcntl(fd, cmd, (const void *)arg);
     switch (cmd) {
         case 0:    /* F_DUPFD          */
         case 1030: /* F_DUPFD_CLOEXEC  */ {
@@ -426,6 +533,15 @@ int64_t sys_open(const char *upath, int flags) {
         // belongs at the user boundary, once, or it happens twice.
         int prc = sc_path_from_user(upath, kpath, sizeof(kpath));
         if (prc != 0) return (prc == -14) ? -14 : -MOS_ENOENT;
+        // #246 escrow: a write/create/truncate-intent open by an escrow actor
+        // must land inside the granted scope. A read-only open is not a
+        // mutation and is left alone; a non-escrow process is unaffected either
+        // way (escrow_fs_guard returns 0 immediately). This is placed at the
+        // user boundary where kpath is guaranteed canonical; in-kernel callers
+        // reach sys_open_k() directly and are never escrow actors.
+        if ((flags & (O_ACCMODE | O_CREAT | O_TRUNC)) &&
+            escrow_fs_guard(ESCROW_OP_WRITE, kpath, 0) != 0)
+            return -MOS_EACCES;
     }
     return sys_open_k(upath ? kpath : (const char *)0, flags);
 }
@@ -598,27 +714,76 @@ void path_resolve_e2e_selftest(void) {
 // branch.
 static int g_path_e2e_done = 0;
 
+#ifdef EXCL_SELFTEST
+// ===========================================================================
+// #745 O_EXCL boot self-test. VERIFICATION HARNESS, OFF by default: build with
+// `make EXCL_SELFTEST=1` (which passes -DEXCL_SELFTEST) to arm it.
+//
+// It drives the REAL sys_open_k() path with O_CREAT|O_EXCL, which is the exact
+// code an open() syscall reaches, so it proves the O_EXCL branches added to
+// THIS file are wired, not merely that fat_vfs.c / ext2_vfs.c compile.
+//
+// WHY IT IS A FLAGGED HARNESS AND NOT AN ALWAYS-ON TEST. O_EXCL cannot be
+// exercised without CREATING a file, i.e. a WRITE. The #58 cwd e2e test above
+// is deliberately read-only because "a boot self-test that mutates the
+// filesystem is a boot self-test that eventually corrupts one". So this one is
+// off in every shipped build; it cleans up after itself on every path, and it
+// is called from a KERNEL context (before login) so sys_open_k()'s PRIV_USER
+// permission block is skipped and an EACCES can never masquerade as an O_EXCL
+// result.
+// ===========================================================================
+static void excl_one(const char *label, const char *path, int use_ext2) {
+    extern int fat_delete(fat_fs_t *fs, const char *path);
+    extern int ext2_unlink(const char *path);
+    // Remove any leftover from a previous armed boot so the create below is the
+    // genuine first-create, not a spurious EEXIST from our own last run.
+    if (use_ext2) { ext2_unlink(path); } else { fat_delete(&g_fat_fs, path); }
+
+    const int OFLAGS = O_WRONLY | O_CREAT | O_EXCL;   /* 0x1|0x40|0x80 = 0xC1 */
+    int64_t f1 = sys_open_k(path, OFLAGS);            // must CREATE and succeed
+    int64_t f2 = -999;
+    if (f1 >= 0) {
+        sys_close((int)f1);
+        f2 = sys_open_k(path, OFLAGS);                // exists now -> EEXIST
+        if (f2 >= 0) { sys_close((int)f2); }          // unexpected: still clean up
+    }
+    int ok = (f1 >= 0) && (f2 == -MOS_EEXIST);
+    kprintf("[#745 O_EXCL] %s path=%s create=%lld reopen=%lld (want create>=0, reopen=-%d) -> %s\n",
+            label, path, (long long)f1, (long long)f2, MOS_EEXIST, ok ? "PASS" : "FAIL");
+    // Clean up the file this test created so a reboot starts clean.
+    if (use_ext2) { ext2_unlink(path); } else { fat_delete(&g_fat_fs, path); }
+}
+
+void excl_selftest(void) {
+    extern int g_root_ext2;
+    kprintf("[#745 O_EXCL] boot self-test starting\n");
+    // "/boot/..." is excluded from ext2-root routing, so it always hits the FAT
+    // ESP; a bare "/..." name hits ext2 when ext2 is the root filesystem.
+    excl_one("FAT ", "/boot/EXCLT.TMP", 0);
+    // The golden is always ext2-root, so the ext2 arm runs there. On a
+    // FAT-root system there is no second local filesystem to test; the FAT arm
+    // above has already covered the only one present, so there is nothing to
+    // declare not-run.
+    if (g_root_ext2) {
+        excl_one("ext2", "/EXCLT.TMP", 1);
+    }
+    kprintf("[#745 O_EXCL] boot self-test done\n");
+}
+#endif /* EXCL_SELFTEST */
+
 int64_t sys_open_k(const char *path, int flags) {
     if (!g_path_e2e_done && proc_current()) {
         g_path_e2e_done = 1;          // set FIRST: the test itself calls us
         path_resolve_e2e_selftest();
     }
-    // #396: /dev/<name> device nodes (CDC-ACM serial, etc.) resolve through the
-    // in-kernel dev namespace and install a file_t in the per-process fd table.
-    if (path && path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' && path[4]=='/') {
-        extern struct file *dev_open(const char *name, int flags);
-        extern int fd_alloc_install(struct file *f);
-        struct file *df = dev_open(path + 5, flags);
-        if (!df) return -1;
-        int nfd = fd_alloc_install(df);
-        if (nfd < 0) {
-            IGNORE_RESULT("dup slot eviction: the description survives in the "
-                          "original fd, so this put is not the final flush",
-                          file_put(df));
-            return -1;
-        }
-        return nfd;
-    }
+    // STAGE 0 DEFECT 5 (docs/SYSTEM_CAPABILITY_API.md 1.5, section 12).
+    // THE /dev/ BRANCH USED TO BE HERE, i.e. BEFORE the permission block below,
+    // and it RETURNED. So opening any device node bypassed perms_check()
+    // entirely: /dev/ttyACM0 (a USB serial adapter, with real read and write
+    // fops), /dev/ptmx, /dev/pts/N, /dev/console and every node the system ever
+    // adds were reachable by any Ring-3 process regardless of the permission
+    // model. It has been MOVED to after the check; see the note at its new home
+    // below. Do not move it back: the ordering IS the control.
     // Permission check
     process_t *p = proc_current();
     if (p && p->privilege == PRIV_USER) {
@@ -663,10 +828,100 @@ int64_t sys_open_k(const char *path, int flags) {
                 if (perms_check(parent, p->euid, p->egid, W_OK | X_OK) != 0) {
                     return -MOS_EACCES;
                 }
-            } else if (perms_check(path, p->euid, p->egid, access) != 0) {
-                return -MOS_EACCES;
+            } else {
+                int rc = perms_check(path, p->euid, p->egid, access);
+                // (perms-orphan, no-ticket, wallpaperpersist-followup): SELF-HEAL a file that already exists on disk but
+                // carries NO PERMS.DB entry at all. #679's perms_on_create()
+                // stamps ownership only at the MOMENT a name is first created
+                // through this exact O_CREAT path above; a file that reaches
+                // disk any other way (keepstate.sh's cross-golden-refresh file
+                // carry on the build host, a restored backup, an asset placed
+                // by hand) never gets that stamp. It then falls into
+                // perms_check_leaf()'s no-entry default (root-owned, 0755),
+                // which denies W_OK to everyone but root FOREVER, even though
+                // it sits inside a directory its real owner can otherwise
+                // create freely into. Measured: after a golden refresh carried
+                // /HOME/JAMES/CONFIG/*.CFG forward this way, the compositor
+                // (uid 1000) got a permanent [PERMS-DENY] on
+                // /HOME/JAMES/CONFIG/DOCKSTYL.CFG and four siblings; the same
+                // shape silently drops a saved wallpaper/theme choice whenever
+                // the carrying file was never captured at all (see #92
+                // profile.c / #683 userconf.c, and the keepstate.sh gap noted
+                // in blame.md).
+                //
+                // Only self-heals when (a) there is truly NO entry for this
+                // exact path - a real, deliberate entry (a seed, an operator
+                // chmod) is left alone, never overridden, and (b) the caller
+                // already holds the SAME W_OK|X_OK on the PARENT directory
+                // that would let it create this exact name fresh today, via
+                // the ordinary O_CREAT branch two cases above. That is
+                // precisely the authority POSIX would use to decide who owns
+                // a brand new file in this directory, so this changes nothing
+                // about who ends up allowed to write here - it only extends
+                // WHEN that decision applies, to a name that happens to
+                // already exist rather than one being created this instant.
+                if (rc != 0 && (flags & 0x40) && (access & W_OK) &&
+                    !perms_has_entry(path)) {
+                    char parent[SC_PATH_MAX];
+                    sc_parent_of(path, parent, sizeof(parent));
+                    if (perms_check(parent, p->euid, p->egid, W_OK | X_OK) == 0) {
+                        perms_on_create(path, p->euid, p->egid, 0);
+                        rc = perms_check(path, p->euid, p->egid, access);
+                    }
+                }
+                if (rc != 0) {
+                    // Stage 0: a /dev node refused by the permission model is the
+                    // defect-5 gate actually firing. Counted separately from every
+                    // other EACCES so "the /dev ordering fix is wired" is a number
+                    // somebody can read, not a claim (proc/capgate.h).
+                    if (path && path[0]=='/' && path[1]=='d' && path[2]=='e' &&
+                        path[3]=='v' && path[4]=='/') {
+                        capgate_note_refusal_rs(CAPGATE_K_DEV_PERM);
+                    }
+                    return -MOS_EACCES;
+                }
             }
         }
+    }
+
+    // #396: /dev/<name> device nodes (CDC-ACM serial, etc.) resolve through the
+    // in-kernel dev namespace and install a file_t in the per-process fd table.
+    //
+    // STAGE 0 DEFECT 5: THIS BLOCK IS DELIBERATELY BELOW THE PERMISSION CHECK.
+    // It used to be above it and it returns, so every device node was exempt
+    // from perms_check() by construction. That is not a missing rule, it is a
+    // structural exemption, and it applied to every node the system will ever
+    // register, not only to the serial adapter where it happened to be noticed.
+    //
+    // WHAT THIS DOES AND DOES NOT BUY, STATED PLAINLY. Device nodes now HAVE
+    // permission semantics; before this they had none, so an operator entry in
+    // /CONFIG/PERMS.DB for /DEV/TTYACM0 was inert no matter what it said. The
+    // modes the kernel seeds for these nodes (fs/perms.c, perms_dev_node_seed[])
+    // deliberately PRESERVE today's effective access so that no shipping app
+    // regresses, which means this change by itself does NOT take serial out of
+    // ambient reach. That is Stage 4's `serial.port` capability. What Stage 0
+    // delivers here is the mechanism: the policy knob now exists and is
+    // consulted, where before it was structurally impossible to set.
+    //
+    // Ordering detail worth keeping: this prefix test is LOWERCASE-ONLY, so
+    // "/DEV/PTMX" never reaches dev_open() at all and falls through to the FAT
+    // and ext2 resolvers. That is not a case-insensitivity bypass of the check
+    // above, because perms_check() normalises and uppercases its key, so both
+    // spellings are checked against the same entry before we get here.
+    if (path && path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' && path[4]=='/') {
+        extern struct file *dev_open(const char *name, int flags);
+        extern int fd_alloc_install(struct file *f);
+        struct file *df = dev_open(path + 5, flags);
+        if (!df) return -1;
+        int nfd = fd_alloc_install(df);
+        if (nfd < 0) {
+            IGNORE_RESULT("dup slot eviction: the description survives in the "
+                          "original fd, so this put is not the final flush",
+                          file_put(df));
+            return -1;
+        }
+        capgate_note_allowed_rs(CAPGATE_K_DEV_PERM);
+        return nfd;
     }
 
     // #746: decode the flags word ONCE, here, with the shared decoder in
@@ -724,6 +979,11 @@ int64_t sys_open_k(const char *path, int flags) {
             // Refusing here is what keeps a volume the UI labels
             // "not browsable" from half-opening.
             if (!vfs) FD_FAIL(-MOS_ENOENT);
+            // #745: O_CREAT|O_EXCL must fail if the target exists.
+            // Atomic w.r.t. other opens: the syscall body is not
+            // preempted between this test and the create below.
+            if (om.create && om.excl && fat_exists(vfs, vrel))
+                FD_FAIL(-MOS_EEXIST);
             if (fat_open(vfs, vrel, &fd_table[fd]) != 0) {
                 extern int fat_create(fat_fs_t *fs, const char *path);
                 if (om.create && fat_create(vfs, vrel) == 0 &&
@@ -743,6 +1003,88 @@ int64_t sys_open_k(const char *path, int flags) {
             fd_used[fd] = 1;
             return lfd_ext(fd);
         }
+    }
+
+    // #404 Stage 4b: AUX MOUNT (/MNT/<name>/...). A partition the Disk Manager
+    // formatted and mounted (SYS_MOUNT) is served here, not by the boot FAT/ext2.
+    // MUST come before the ext2-root branch: with ext2 as root every "/" path is
+    // a candidate for ext2 resolution and /MNT is not an ext2-root path. Files
+    // are whole-file buffered (the SMB/NFS pattern) so the aux FS operations stay
+    // out of the per-byte read/write path.
+    if (path && path[0]=='/' && path[1]=='M' && path[2]=='N' && path[3]=='T' &&
+        (path[4]=='/' || path[4]=='\0')) {
+        aux_mnt_info_t mi;
+        if (blkmgr_aux_resolve_c(path, &mi) == 1 && mi.found) {
+            aux_fd_t *a = &auxfd[fd];
+            for (uint64_t z = 0; z < sizeof(*a); z++) ((uint8_t *)a)[z] = 0;
+            a->fstype = mi.fstype;
+            // Record the mount point and the mount-relative path.
+            { int i = 0; for (; i < (int)mi.rel_off && i < 31 && path[i]; i++) a->mnt[i] = path[i]; a->mnt[i] = 0; }
+            { const char *r = path + mi.rel_off; int i = 0; for (; r[i] && i < 255; i++) a->rel[i] = r[i]; a->rel[i] = 0; }
+            // FS-relative path: ext2 wants a leading '/'. "" -> "/" (the mount root).
+            char erel[260];
+            if (a->rel[0] == '/') { int i=0; while (a->rel[i] && i<259){erel[i]=a->rel[i];i++;} erel[i]=0; }
+            else if (a->rel[0]) { erel[0]='/'; int i=0; while (a->rel[i] && i<258){erel[i+1]=a->rel[i];i++;} erel[i+1]=0; }
+            else { erel[0]='/'; erel[1]=0; }
+
+            if (mi.fstype == MNT_FS_EXT2) {
+                if (ext2_mount_into(&a->efs, mi.kind, mi.index, (uint32_t)mi.pstart) != 0)
+                    FD_FAIL(-MOS_ENOENT);
+                uint32_t ino = ext2_resolve_path_on(&a->efs, erel);
+                if (om.create && om.excl && ino) FD_FAIL(-MOS_EEXIST);
+                if (ino) {
+                    ext2_inode_t in;
+                    if (ext2_read_inode_on(&a->efs, ino, &in) != 0) FD_FAIL(-1);
+                    if ((in.i_mode & 0xF000) == 0x4000) {          // directory
+                        a->is_dir = 1; a->dir_ino = ino; a->dir_pos = 0;
+                    } else if (om.can_write) {
+                        // Create/replace: buffer, commit whole file on close.
+                        a->writing = 1; a->wcap = 4096; a->wlen = 0; a->wdirty = 1;
+                        a->wbuf = (uint8_t *)kmalloc(a->wcap);
+                        if (!a->wbuf) FD_FAIL(-MOS_ENOMEM);
+                    } else {                                       // read
+                        uint32_t sz = in.i_size;
+                        if (sz > AUX_FILE_MAX) FD_FAIL(-MOS_EFBIG);
+                        uint32_t cap = sz ? sz : 1;
+                        a->rbuf = (uint8_t *)kmalloc(cap);
+                        if (!a->rbuf) FD_FAIL(-MOS_ENOMEM);
+                        int64_t g = sz ? ext2_read_file_range_on(&a->efs, ino, 0, sz, a->rbuf) : 0;
+                        if (g < 0) { kfree(a->rbuf); a->rbuf = 0; FD_FAIL(-1); }
+                        a->rsize = (uint32_t)g; a->rpos = 0;
+                    }
+                } else if (om.create) {
+                    if (!ext2_parent_dir_exists_on(&a->efs, erel)) FD_FAIL(-MOS_ENOENT);
+                    a->writing = 1; a->wcap = 4096; a->wlen = 0; a->wdirty = 1;
+                    a->wbuf = (uint8_t *)kmalloc(a->wcap);
+                    if (!a->wbuf) FD_FAIL(-MOS_ENOMEM);
+                } else {
+                    FD_FAIL(-MOS_ENOENT);
+                }
+            } else if (mi.fstype == MNT_FS_FAT16 || mi.fstype == MNT_FS_FAT32) {
+                if (a->rel[0] == 0) {                              // the mount root dir
+                    a->is_dir = 1; a->dir_pos = 0;
+                } else if (om.can_write) {
+                    // The Rust FAT layer refuses overwrite, so create-only here.
+                    a->writing = 1; a->wcap = 4096; a->wlen = 0; a->wdirty = 1;
+                    a->wbuf = (uint8_t *)kmalloc(a->wcap);
+                    if (!a->wbuf) FD_FAIL(-MOS_ENOMEM);
+                } else {                                           // read (bounded)
+                    a->rbuf = (uint8_t *)kmalloc(65536);
+                    if (!a->rbuf) FD_FAIL(-MOS_ENOMEM);
+                    int64_t g = blkmgr_aux_fat_read_c(a->mnt, a->rel, a->rbuf, 65536);
+                    if (g < 0) { kfree(a->rbuf); a->rbuf = 0; FD_FAIL(-MOS_ENOENT); }
+                    a->rsize = (uint32_t)g; a->rpos = 0;
+                }
+            } else {
+                FD_FAIL(-MOS_ENOENT);
+            }
+            a->used = 1;
+            fd_used[fd] = 1;
+            return lfd_ext(fd);
+        }
+        // Under /MNT but no matching mount: it is the aux namespace, so ENOENT
+        // rather than falling through to the boot filesystems.
+        FD_FAIL(-MOS_ENOENT);
     }
 
     // #317 pass 2: SMB network share. Mount on demand, then open as a directory
@@ -847,6 +1189,11 @@ int64_t sys_open_k(const char *path, int flags) {
         for (uint64_t z = 0; z < sizeof(*e); z++) ((uint8_t *)e)[z] = 0;
         { int z = 0; while (rel[z] && z < 255) { e->path[z] = rel[z]; z++; } e->path[z] = 0; }
         uint32_t ino = ext2_resolve_path(rel);
+        // #745: O_CREAT|O_EXCL fails EEXIST if the name already
+        // exists on ext2. Checked before the create branch below,
+        // and the syscall body is not preempted between the two,
+        // so the test-then-create pair is atomic on this medium.
+        if (om.create && om.excl && ino) FD_FAIL(-MOS_EEXIST);
         if (ino) {
             ext2_inode_t in;
             if (ext2_read_inode(ino, &in) != 0) FD_FAIL(-1);
@@ -982,6 +1329,16 @@ int64_t sys_open_k(const char *path, int flags) {
                 e->rwin_base = 0; e->rwin_len = 0;   // empty; filled on first read
             }
         } else if (om.create) {                          // O_CREAT
+            // FS CORRECTNESS (opencreatenoent): refuse a create whose PARENT
+            // directory does not exist, BEFORE allocating the fd. This branch is
+            // reached only when the target itself is absent (ino == 0), so the
+            // question is purely about the parent. ext2_write_file() (the
+            // close-time commit) already rejects a missing parent, but that
+            // rejection lands at close and is swallowed, leaving a bogus-success
+            // fd and an invisible file (kescrow2fix in blame.md). Same parent
+            // resolution the write path uses; "/" and bare names resolve to the
+            // ext2 root, so ordinary creates under an existing dir are unchanged.
+            if (!ext2_parent_dir_exists(rel)) FD_FAIL(-MOS_ENOENT);
             e->writing = 1; e->wcap = 4096; e->wlen = 0; e->wdirty = 1;
             e->wbuf = (uint8_t *)kmalloc(e->wcap);
             if (!e->wbuf) FD_FAIL(-1);
@@ -1019,6 +1376,11 @@ int64_t sys_open_k(const char *path, int flags) {
     // Open the file. If it does not exist and O_CREAT (0x40) is set, create it
     // first so userland tools (cp, mv, editors, curl -o, ...) can make new files.
     extern int fat_create(fat_fs_t *fs, const char *path);
+    // #745: O_CREAT|O_EXCL fails EEXIST if the file already exists on
+    // the FAT ESP. Atomic: the syscall body is not preempted between
+    // this existence test and the fat_create() below.
+    if (om.create && om.excl && fat_exists(&g_fat_fs, path))
+        FD_FAIL(-MOS_EEXIST);
     if (fat_open(&g_fat_fs, path, &fd_table[fd]) != 0) {
         if (om.create && fat_create(&g_fat_fs, path) == 0 &&
             fat_open(&g_fat_fs, path, &fd_table[fd]) == 0) {
@@ -1107,6 +1469,7 @@ int64_t sys_ftruncate(int fd, int64_t length) {
     if (fd < 3) return -1;
 
     if (smbfd[fd].used) return -1;      // whole-file upload on close
+    if (auxfd[fd].used) return -1;      // #404 Stage 4b: whole-file commit on close
 
     if (e2fd[fd].used) {
         ext2_fd_t *e = &e2fd[fd];
@@ -1137,8 +1500,36 @@ int64_t sys_close(int fd) {
     // #FDNS: everything below operates on the legacy tables, which are indexed
     // by lfd_idx(fd), not by fd. A number outside the legacy range is not ours.
     if (!lfd_is(fd)) return -1;
+    // #404 Stage 6: release advisory locks this fd/process holds on the file
+    // BEFORE the slot is torn down (the path is read from the slot). Takes the
+    // USERLAND fd; a no-op for a not-owned or non-lockable fd.
+    advlock_on_close(fd);
     fd = lfd_idx(fd);
     if (!legacy_owner_ok(fd, "close")) return -1;   // #fdguard
+
+    // #404 Stage 4b: aux-mount fd. Commit a buffered create/replace to the aux
+    // FS, free buffers. The relative path is turned into an FS path the same way
+    // it was at open (ext2 wants a leading '/'; "" means the mount root dir).
+    if (fd >= 3 && fd < LEGACY_MAX_FDS && auxfd[fd].used) {
+        aux_fd_t *a = &auxfd[fd];
+        int rc = 0;
+        if (a->writing && a->wdirty && a->wbuf) {
+            char erel[260];
+            if (a->rel[0] == '/') { int i=0; while (a->rel[i] && i<259){erel[i]=a->rel[i];i++;} erel[i]=0; }
+            else { erel[0]='/'; int i=0; while (a->rel[i] && i<258){erel[i+1]=a->rel[i];i++;} erel[i+1]=0; }
+            if (a->fstype == MNT_FS_EXT2) {
+                rc = ext2_write_file_on(&a->efs, erel, a->wbuf, a->wlen);
+            } else {
+                int64_t w = blkmgr_aux_fat_write_c(a->mnt, a->rel, a->wbuf, a->wlen);
+                rc = (w == (int64_t)a->wlen) ? 0 : -1;
+            }
+        }
+        if (a->rbuf) kfree(a->rbuf);
+        if (a->wbuf) kfree(a->wbuf);
+        for (uint64_t z = 0; z < sizeof(*a); z++) ((uint8_t *)a)[z] = 0;
+        legacy_fd_release(fd);
+        return rc;
+    }
 
     // #317: SMB-backed fd. Flush an upload (write-on-close), close dir handle.
     if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
@@ -1280,6 +1671,29 @@ int64_t sys_fsync(int fd) {
     fd = lfd_idx(fd);
     if (!legacy_owner_ok(fd, "fsync")) return -1;   // #fdguard
 
+    // #404 Stage 4b: aux-mount buffered create/replace. Commit to the aux FS
+    // WITHOUT releasing, and keep it idempotent (a following close is then a
+    // no-op), matching the SMB/ext2 fsync contracts above.
+    if (fd >= 3 && fd < LEGACY_MAX_FDS && auxfd[fd].used) {
+        aux_fd_t *a = &auxfd[fd];
+        if (a->is_dir || !a->writing || !a->wbuf) return 0;
+        if (!a->wdirty) return 0;
+        char erel[260];
+        if (a->rel[0] == '/') { int i=0; while (a->rel[i] && i<259){erel[i]=a->rel[i];i++;} erel[i]=0; }
+        else if (a->rel[0]) { erel[0]='/'; int i=0; while (a->rel[i] && i<258){erel[i+1]=a->rel[i];i++;} erel[i+1]=0; }
+        else { erel[0]='/'; erel[1]=0; }
+        int rc;
+        if (a->fstype == MNT_FS_EXT2) {
+            rc = ext2_write_file_on(&a->efs, erel, a->wbuf, a->wlen);
+        } else {
+            int64_t w = blkmgr_aux_fat_write_c(a->mnt, a->rel, a->wbuf, a->wlen);
+            rc = (w == (int64_t)a->wlen) ? 0 : -1;
+        }
+        if (rc != 0) return rc;
+        a->wdirty = 0;
+        return 0;
+    }
+
     // --- family 2: SMB / NFS upload-on-close buffer.
     if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
         smb_fd_t *s = &smbfd[fd];
@@ -1390,6 +1804,18 @@ int64_t sys_read(int fd, void *buf, size_t count) {
     if (!lfd_is(fd)) return -1;          // #FDNS
     fd = lfd_idx(fd);
     if (!legacy_owner_ok(fd, "read")) return -1;   // #fdguard
+
+    // #404 Stage 4b: aux-mount fd (/MNT/<name>): serve from the whole-file cache.
+    if (fd >= 3 && fd < LEGACY_MAX_FDS && auxfd[fd].used) {
+        aux_fd_t *a = &auxfd[fd];
+        if (a->is_dir || !a->rbuf) return -1;
+        uint32_t avail = (a->rpos < a->rsize) ? (a->rsize - a->rpos) : 0;
+        uint32_t n = (count < avail) ? (uint32_t)count : avail;
+        if (n) { uaccess_ac_t __ac = uaccess_begin();
+                 memcpy(buf, a->rbuf + a->rpos, n);
+                 uaccess_end(__ac); a->rpos += n; }
+        return (int64_t)n;
+    }
 
     // #317: SMB-backed fd: serve from the cached file image.
     if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
@@ -1515,6 +1941,26 @@ static int64_t sys_write_inner(int fd, const void *buf, size_t count) {
     if (!lfd_is(fd)) return -1;          // #FDNS
     fd = lfd_idx(fd);
     if (!legacy_owner_ok(fd, "write")) return -1;   // #fdguard
+
+    // #404 Stage 4b: aux-mount fd (/MNT/<name>): buffer writes; the whole file is
+    // committed to the aux FS on close (ext2_write_file_on / blkmgr_aux_fat_write_c).
+    if (fd >= 3 && fd < LEGACY_MAX_FDS && auxfd[fd].used) {
+        aux_fd_t *a = &auxfd[fd];
+        if (!a->writing || !a->wbuf) return -1;
+        a->wdirty = 1;
+        if ((uint64_t)a->wlen + count > AUX_FILE_MAX) return -1;   // bounded aux file
+        if (a->wlen + count > a->wcap) {
+            uint32_t ncap = a->wcap ? a->wcap : 4096;
+            while (ncap < a->wlen + count) ncap *= 2;
+            uint8_t *nb = (uint8_t *)kmalloc(ncap);
+            if (!nb) return -1;
+            memcpy(nb, a->wbuf, a->wlen);
+            kfree(a->wbuf); a->wbuf = nb; a->wcap = ncap;
+        }
+        if (count && copy_from_user(a->wbuf + a->wlen, buf, count) != 0) return -14;
+        a->wlen += (uint32_t)count;
+        return (int64_t)count;
+    }
 
     // #317: SMB-backed fd: buffer writes; uploaded to the share on close.
     if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
@@ -1747,6 +2193,21 @@ int64_t sys_seek(int fd, int64_t offset, int whence) {
     fd = lfd_idx(fd);
     if (!legacy_owner_ok(fd, "seek")) return -1;   // #fdguard
 
+    // #404 Stage 4b: aux-mount fd: seek within the cached read image (a write
+    // buffer is append-only in this cut, so a seek applies to the read side).
+    if (fd >= 3 && fd < LEGACY_MAX_FDS && auxfd[fd].used) {
+        aux_fd_t *a = &auxfd[fd];
+        int64_t np;
+        if (whence == 0) np = offset;
+        else if (whence == 1) np = (int64_t)a->rpos + offset;
+        else if (whence == 2) np = (int64_t)a->rsize + offset;
+        else return -1;
+        if (np < 0) np = 0;
+        if (np > (int64_t)a->rsize) np = a->rsize;
+        a->rpos = (uint32_t)np;
+        return np;
+    }
+
     // #317: SMB-backed fd: seek within the cached read image.
     if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
         smb_fd_t *s = &smbfd[fd];
@@ -1827,6 +2288,29 @@ int64_t sys_readdir_k(int fd, sc_dirent_t *de) {
     if (!legacy_owner_ok(fd, "readdir")) return -1;   // #fdguard
     if (!fd_used[fd]) {
         return -1;
+    }
+
+    // #404 Stage 4b: aux-mount directory fd (/MNT/<name>[/subdir]).
+    if (fd >= 3 && fd < LEGACY_MAX_FDS && auxfd[fd].used && auxfd[fd].is_dir) {
+        aux_fd_t *a = &auxfd[fd];
+        if (a->fstype == MNT_FS_EXT2) {
+            char nm[256]; uint32_t cino = 0; uint8_t ft = 0;
+            if (ext2_readdir_on(&a->efs, a->dir_ino, &a->dir_pos, nm, sizeof(nm),
+                                &cino, &ft) != 0) return -1;
+            int i = 0; while (nm[i] && i < 255) { de->name[i] = nm[i]; i++; } de->name[i] = '\0';
+            de->type = (ft == 2) ? 1 : 0;   // EXT2_FT_DIR == 2
+            de->size = 0;
+            if (ft != 2) { ext2_inode_t in; if (ext2_read_inode_on(&a->efs, cino, &in) == 0) de->size = in.i_size; }
+            return 0;
+        } else {
+            char nm[64]; int isd = 0; uint32_t sz = 0;
+            if (blkmgr_aux_fat_readdir_c(a->mnt, &a->dir_pos, nm, sizeof(nm), &isd, &sz) != 0)
+                return -1;
+            int i = 0; while (nm[i] && i < 255) { de->name[i] = nm[i]; i++; } de->name[i] = '\0';
+            de->type = isd ? 1 : 0;
+            de->size = sz;
+            return 0;
+        }
     }
 
     // #317 pass 4: NFS-backed directory fd. NFSv3 READDIR carries only names
@@ -2006,3 +2490,124 @@ void fdown_boot_check(void) {
 _Static_assert(LEGACY_MAX_FDS == 128,
                "#fdguard: fdown.rs LEGACY_SLOTS is hardcoded 128; keep it in "
                "sync with LEGACY_MAX_FDS or the boot check will flag it");
+
+// ===========================================================================
+// #404 Stage 4b VFS ORACLE. Marker-gated (only run when /DISKMGR.TST armed the
+// scratch device; see the main.c boot harness).
+//
+// Proves the two halves of the deliverable on the RAM scratch, using the exact
+// PRODUCTION code paths:
+//
+//   RESOLVER  - open/create/close/readdir/unmount of "/MNT/<name>/..." go
+//               through the real sys_open_k()/sys_close()/sys_readdir_k() cores,
+//               the /MNT prefix hook, and the auxfd family.
+//   WRITE-MOUNT + PERSISTENCE - content write, read-back, and survival across
+//               unmount+remount go through ext2_write_file_on() /
+//               ext2_read_file_range_on() (the SAME functions the auxfd close
+//               and read paths call), on an ext2_mount_into() handle routed to
+//               the scratch by blkmgr_dev_rw_c().
+//
+// HONEST LIMIT: the per-byte sys_write()/sys_read() copy uses copy_from_user()/
+// copy_to_user(), which by design reject a KERNEL source/destination, so a
+// boot-context oracle cannot push bytes THROUGH those two syscalls (there is no
+// Ring-3 buffer here). That last seam - user buffer -> sys_write -> auxfd wbuf
+// -> ext2_write_file_on at close - is what a userland app exercises. Everything
+// it would rely on (the resolver, the aux ext2 driver, persistence) is proven
+// here; the readdir SIZE check below also confirms the resolver reads back the
+// exact byte count the write committed.
+// ===========================================================================
+void blkmgr_vfs_ext2_selftest(void) {
+    extern int     blkmgr_scratch_present_rs(void);
+    extern int     blkmgr_vfs_scratch_prep_rs(void);
+    extern int64_t blkmgr_mount_scratch_c(int part_index, const char *path);
+    extern int64_t blkmgr_umount_kernel_c(const char *path);
+
+    if (!blkmgr_scratch_present_rs()) {
+        bootlog_write("[DISKMGR] Stage-4b VFS oracle NOT ARMED (no scratch device)");
+        return;
+    }
+    int pass = 0, total = 0;
+#define VCHK(c, l) do { total++; if (c) { pass++; } else { \
+        kprintf("[DISKMGR] vfs4b FAIL: %s\n", (l)); \
+        bootlog_write("[DISKMGR] vfs4b FAIL: %s", (l)); } } while (0)
+
+    if (blkmgr_vfs_scratch_prep_rs() != 1) {
+        kprintf("[DISKMGR] vfs4b: scratch ext2 prep FAILED\n");
+        bootlog_write("[DISKMGR] vfs4b: scratch ext2 prep FAILED");
+        return;
+    }
+    VCHK(blkmgr_mount_scratch_c(1, "/MNT/test") == 0, "mount ext2 p2 at /MNT/test");
+
+    const char *payload = "MayteraOS Stage 4b: ext2 write-mount through the VFS.\n";
+    int wl = (int)strlen(payload);
+
+    // --- RESOLVER: create an (empty) file through the real open/close syscalls.
+    int64_t fd = sys_open_k("/MNT/test/HELLO.TXT", O_CREAT | O_WRONLY);
+    VCHK(fd >= 0, "resolver: open /MNT/test/HELLO.TXT O_CREAT|O_WRONLY");
+    if (fd >= 0) VCHK(sys_close((int)fd) == 0, "resolver: close (commit via ext2_write_file_on)");
+
+    // --- RESOLVER: the just-created file is now resolvable through the resolver.
+    int64_t fr = sys_open_k("/MNT/test/HELLO.TXT", O_RDONLY);
+    VCHK(fr >= 0, "resolver: reopen the created file O_RDONLY");
+    if (fr >= 0) sys_close((int)fr);
+
+    // --- WRITE-MOUNT: write real content with the production ext2 aux writer,
+    // then read it back with the production aux reader.
+    aux_mnt_info_t mi;
+    VCHK(blkmgr_aux_resolve_c("/MNT/test/HELLO.TXT", &mi) == 1 && mi.found,
+         "aux resolve /MNT/test/HELLO.TXT");
+    ext2_fs_t efs;
+    VCHK(ext2_mount_into(&efs, mi.kind, mi.index, (uint32_t)mi.pstart) == 0,
+         "ext2_mount_into the aux partition");
+    VCHK(ext2_write_file_on(&efs, "/HELLO.TXT", payload, (uint32_t)wl) == 0,
+         "ext2_write_file_on writes content");
+    uint32_t ino = ext2_resolve_path_on(&efs, "/HELLO.TXT");
+    VCHK(ino != 0, "resolve HELLO.TXT after write");
+    char rb[128];
+    int64_t g = ino ? ext2_read_file_range_on(&efs, ino, 0, (uint64_t)wl, rb) : -1;
+    VCHK(g == wl && memcmp(rb, payload, (size_t)wl) == 0, "read content back matches");
+
+    // --- RESOLVER: readdir lists HELLO.TXT with the byte count just written.
+    int64_t fdd = sys_open_k("/MNT/test", O_RDONLY);
+    VCHK(fdd >= 0, "resolver: open /MNT/test as a directory");
+    int seen = 0; uint32_t seen_sz = 0;
+    if (fdd >= 0) {
+        sc_dirent_t de; int guard = 0;
+        while (guard++ < 4096 && sys_readdir_k((int)fdd, &de) == 0) {
+            if (!strcmp(de.name, "HELLO.TXT") || !strcmp(de.name, "hello.txt")) {
+                seen = 1; seen_sz = de.size;
+            }
+        }
+        sys_close((int)fdd);
+    }
+    VCHK(seen, "resolver: readdir /MNT/test shows HELLO.TXT");
+    VCHK(seen && seen_sz == (uint32_t)wl, "resolver: readdir reports the written size");
+
+    // --- PERSISTENCE: unmount, confirm it leaves the namespace, remount, and
+    // read the content back from a FRESH mount handle (the load-bearing proof).
+    VCHK(blkmgr_umount_kernel_c("/MNT/test") == 0, "unmount /MNT/test");
+    VCHK(sys_open_k("/MNT/test/HELLO.TXT", O_RDONLY) < 0, "resolver: path gone while unmounted");
+    VCHK(blkmgr_mount_scratch_c(1, "/MNT/test") == 0, "REMOUNT ext2 p2 at /MNT/test");
+
+    aux_mnt_info_t mi2;
+    VCHK(blkmgr_aux_resolve_c("/MNT/test/HELLO.TXT", &mi2) == 1 && mi2.found,
+         "aux resolve after remount");
+    ext2_fs_t efs2;
+    VCHK(ext2_mount_into(&efs2, mi2.kind, mi2.index, (uint32_t)mi2.pstart) == 0,
+         "ext2_mount_into after remount");
+    uint32_t ino2 = ext2_resolve_path_on(&efs2, "/HELLO.TXT");
+    char rb2[128];
+    int64_t g2 = ino2 ? ext2_read_file_range_on(&efs2, ino2, 0, (uint64_t)wl, rb2) : -1;
+    VCHK(g2 == wl && memcmp(rb2, payload, (size_t)wl) == 0,
+         "content PERSISTED across unmount+remount");
+    // The resolver also finds it again after the remount.
+    int64_t fr2 = sys_open_k("/MNT/test/HELLO.TXT", O_RDONLY);
+    VCHK(fr2 >= 0, "resolver: reopen after remount");
+    if (fr2 >= 0) sys_close((int)fr2);
+
+    blkmgr_umount_kernel_c("/MNT/test");
+
+    kprintf("[DISKMGR] Stage-4b VFS ext2 oracle: %d/%d passed\n", pass, total);
+    bootlog_write("[DISKMGR] Stage-4b VFS ext2 oracle: %d/%d passed", pass, total);
+#undef VCHK
+}

@@ -160,8 +160,8 @@ static const file_ops_t fat_file_ops = {
 // --------------------------------------------------------------------------
 
 // Open a FAT path and return a struct file* wrapping it, or NULL on error.
-// `flags` honors O_CREAT (0x40) and O_TRUNC (0x200); O_EXCL is not yet
-// enforced (matches pre-refactor behavior).
+// `flags` honors O_CREAT (0x40), O_TRUNC (0x200) and, since #745, O_EXCL
+// (0x80): O_CREAT|O_EXCL fails (returns NULL) if the file already exists.
 //
 // Caller receives one reference; drop via file_put() or install in an fd.
 file_t *fat_vfs_open(const char *path, int flags) {
@@ -181,12 +181,24 @@ file_t *fat_vfs_open(const char *path, int flags) {
             kfree(fp);
             return NULL;
         }
-    } else if (flags & O_TRUNC) {
-        fat_close(fp);
-        fat_delete(&g_fat_fs, path);
-        if (fat_create(&g_fat_fs, path) != 0) { kfree(fp); return NULL; }
-        if (fat_open(&g_fat_fs, path, fp) != 0) { kfree(fp); return NULL; }
-        needs_wbuf = 1;
+    } else {
+        // fat_open() succeeded: the file EXISTS.
+        // #745: O_CREAT|O_EXCL on an existing file must fail rather than
+        // open or truncate it. A lock that does not lock is worse than no
+        // lock. Returns NULL (this path cannot convey EEXIST; the syscall
+        // open() path in fdlayer.c returns -EEXIST).
+        if ((flags & O_CREAT) && (flags & O_EXCL)) {
+            fat_close(fp);
+            kfree(fp);
+            return NULL;
+        }
+        if (flags & O_TRUNC) {
+            fat_close(fp);
+            fat_delete(&g_fat_fs, path);
+            if (fat_create(&g_fat_fs, path) != 0) { kfree(fp); return NULL; }
+            if (fat_open(&g_fat_fs, path, fp) != 0) { kfree(fp); return NULL; }
+            needs_wbuf = 1;
+        }
     }
 
     file_t *f = file_alloc(&fat_file_ops, fp, flags);

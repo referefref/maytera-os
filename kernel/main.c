@@ -975,7 +975,11 @@ extern uint64_t g_xhci_cmd_noblock_refused; // #134
             // field on this line can imply: every other counter here advances
             // fine on a machine whose desktop is frozen, because they are all
             // counted by whatever code does manage to run.
-            char _tw[176];
+            // #tickdead: 256, was 176. tickwatch_hb_field() now appends the
+            // acknowledgement-latency field, and snprintf truncates SILENTLY:
+            // the first thing a too-small buffer deletes is the newest and
+            // least-expected diagnostic, which is exactly the one being added.
+            char _tw[256];
             (void)tickwatch_poll(ticks, _now_ms, hz);
             if (tickwatch_hb_field(_tw, sizeof(_tw)) <= 0) _tw[0] = '\0';
 
@@ -1042,12 +1046,29 @@ extern uint64_t g_xhci_cmd_noblock_refused; // #134
                     _hp_cli1ms = g_flip_cli_over1ms;
                 }
             }
+            extern unsigned long g_idle_enq_refused;   // #imachang
             snprintf(hb, sizeof(hb),
                      "[HB] tick=%lu uptime=%lus gap=%lums ctxsw=%lu flips=%lu "
                      "fgapus=%lu hb=%lu blkc=%lu/%lu procs=%lu heapKB=%lu "
                      "tcp=%lu blkw=%lu blks=%lu stgstl=%lu blgKB=%lu nskip=%lu txus=%lu "
                      "mscerr=%lu bldef=%lu nhold=%luus nhra=%p blgnb=%lu "
                      "xcmd=%lu/%lu blgdrop=%lu fltlost=%lu "
+                     // #imachang: THE PID-0 STARVATION COUNTER, DURABLY.
+                     // g_idle_enq_refused counts wake-ups aimed at a process
+                     // add_to_ready_queue() refuses because it is is_idle
+                     // (proc/process.c:3842). #pid0desk's own comment says a
+                     // silent refusal there "was able to starve the desktop for
+                     // 175 seconds without leaving a single trace in any log",
+                     // and the counter's own comment says it MUST be 0 on a
+                     // fixed build. It was reported ONLY as idleq= in a
+                     // serial-only scheduler diagnostic, so on the one machine
+                     // this whole heartbeat exists for - the iMac14,4, which
+                     // has no serial port - the direct evidence for a
+                     // boot-thread starvation hang was unreadable. kernel_main
+                     // still runs its own init tail on pid 0, so this is live
+                     // for the BOOT path even though #pid0desk moved the GUI
+                     // session off it.
+                     "idleq=%lu "
                      // #COMPIDLE: the frame workload, DURABLY. Serial is
                      // silent in GUI mode, so [FLIPPROF] cannot be read on
                      // the owner's laptop; /HEARTBEAT.TXT can. fbKBs is
@@ -1101,6 +1122,7 @@ extern uint64_t g_xhci_cmd_noblock_refused; // #134
                      (unsigned long)g_xhci_cmd_noblock_refused,
                      (unsigned long)bootlog_dropped_bytes(),
                      (unsigned long)bootlog_fault_lost(),
+                     (unsigned long)g_idle_enq_refused,   // #imachang idleq=
                      (unsigned long)_hb_fbKBs,
                      (unsigned long)_hb_ffull,
                      (unsigned long)_hb_fpart,
@@ -1223,6 +1245,9 @@ static void desktop_session_thread(void *arg) {
     blk_stage_report();
 #ifdef BLKSTAGE_TEST
     blk_stage_selftest();
+#endif
+#ifdef EXCL_SELFTEST
+    { extern void excl_selftest(void); excl_selftest(); }  // #745 verify harness
 #endif
     gfx_boot_log("[BOOT] Starting login screen...");
     boot_stage(BSTAGE_LOGIN);
@@ -1460,6 +1485,17 @@ void kernel_main(boot_info_t *boot_info) {
         int diag_on = (boot_info && boot_info->magic == BOOT_INFO_MAGIC &&
                        (boot_info->diag_flags & BOOT_DIAG_SCREEN)) ? 1 : 0;
         boot_stage_diag_set(diag_on);
+        // #remotedeploy: say so, loudly and persistently, if the loader fell
+        // back to the backup kernel. Read with the same defensive magic check
+        // as diag_on above: BSS garbage from an older loader must not be able
+        // to fake this.
+        if (boot_info && boot_info->magic == BOOT_INFO_MAGIC &&
+            (boot_info->diag_flags & BOOT_DIAG_BACKUP_KERNEL)) {
+            kprintf("[BOOT] RUNNING THE BACKUP KERNEL: /boot/kernel.elf was "
+                    "unusable and /boot/kernel.elf.bak was booted instead.\n");
+            bootlog_write("[BOOT] BACKUP KERNEL BOOTED (/boot/kernel.elf "
+                          "missing or invalid; ran /boot/kernel.elf.bak)");
+        }
         if (boot_info && boot_info->framebuffer.address != 0) {
             early_fb_init(boot_info->framebuffer.address,
                           boot_info->framebuffer.width,
@@ -1543,6 +1579,16 @@ void kernel_main(boot_info_t *boot_info) {
     // Proving the formatter before trusting anything it prints is the only
     // order that makes sense.
     kformat_selftest();
+
+    // #no-ticket getrandom: prove the CSPRNG feeding SYS_GETRANDOM is live,
+    // non-constant and non-repeating AT RUNTIME on this machine (a build gate
+    // cannot show it). Same family as kformat_selftest above.
+    {
+        extern uint32_t getrandom_selftest_rs(void);
+        uint32_t grc = getrandom_selftest_rs();
+        kprintf("[GETRANDOM] selftest %s (%u/3 checks)\n", grc == 3 ? "PASS" : "FAIL", grc);
+        bootlog_write("[GETRANDOM] selftest %s checks=%u/3", grc == 3 ? "PASS" : "FAIL", grc);
+    }
     boot_stage(BSTAGE_FORMATTER);
 
     // #ASUSDIAG: the flight recorder's record layout, CRC and dirty-sector
@@ -1559,6 +1605,20 @@ void kernel_main(boot_info_t *boot_info) {
         int frc = fltrec_selftest(&fchecks);
         kprintf("[FLTREC] selftest %s (%u checks)\n", frc == 0 ? "PASS" : "FAIL", fchecks);
         bootlog_write("[FLTREC] selftest %s checks=%u", frc == 0 ? "PASS" : "FAIL", fchecks);
+    }
+
+    // (word6heap, docs/WORD6_LOCALHEAP_PLAN.md) Win16 KERNEL.5/6/7/9 local-heap
+    // regression test: LocalReAlloc data-copy, LocalSize accuracy, LocalFree
+    // LIFO reclaim under a 100-cycle alloc/free stress loop. Runs against a
+    // synthetic, isolated CPU/memory pair (see win16_localheap_selftest's own
+    // comment) so it needs no loaded guest and can run this early, same
+    // reasoning as FLTREC just above.
+    {
+        extern int win16_localheap_selftest(uint32_t *checks);
+        uint32_t wchecks = 0;
+        int wrc = win16_localheap_selftest(&wchecks);
+        kprintf("[W6LHEAP] selftest %s (%u checks)\n", wrc == 0 ? "PASS" : "FAIL", wchecks);
+        bootlog_write("[W6LHEAP] selftest %s checks=%u", wrc == 0 ? "PASS" : "FAIL", wchecks);
     }
 
     // #624 step 2: install the real per-boot stack canary IMMEDIATELY, while
@@ -1721,6 +1781,18 @@ void kernel_main(boot_info_t *boot_info) {
     // #429 (restored b713): demand paging / COW init, dropped in the churn.
     boot_stage(BSTAGE_DEMAND);
     { extern void demand_init(void); demand_init(); }
+
+    // #stackguard: PROVE THE KERNEL-STACK GUARD PAGE ON EVERY BOOT.
+    //
+    // Ring-0 kernel stacks are allocated by mm/kstack.c with an unmapped page
+    // immediately below them, so running one off its low end faults at a known
+    // boundary instead of silently overwriting the next heap allocation. This
+    // is the structural check that the punch actually landed: it is
+    // non-destructive, costs one 16 KiB allocation and four page-table reads,
+    // and it is here rather than later because everything it needs (PMM, VMM,
+    // heap) is up exactly one line above, and every kernel stack allocated
+    // after this point depends on it being true.
+    { extern void kstack_selftest(void); kstack_selftest(); }
 
     // Initialize graphics subsystem
     kprintf("\n");
@@ -2032,11 +2104,14 @@ void kernel_main(boot_info_t *boot_info) {
         boot_stage(BSTAGE_SMPINIT);
         // #67: smp_init() (LAPIC bring-up, needed by #71's HDA MSI) still runs
         // HERE. The AP START has MOVED to after the FAT root is mounted, so the
-        // /SMPSCHED.TXT escape hatch is readable and one kernel binary can be
-        // tested with AP user scheduling both on and off. This changes nothing
-        // in the shipping build: g_smp_user_sched is 0, so smp_start_aps() was
-        // already unreachable at this point (see cpu/smp.c and the
-        // concurrency-lint allowlist, which both record it).
+        // /NOSMPSCHED.TXT gate file is readable and one kernel binary can
+        // be tested with AP user scheduling both on and off.
+        // #SMPDEFAULT (2026-09-02): this comment used to end "this changes
+        // nothing in the shipping build: g_smp_user_sched is 0". It is 1 now,
+        // so the AP start below IS reached on a shipping boot. The split still
+        // matters for exactly the reason it always did: smp_init() must run
+        // before the FAT root is mounted (the LAPIC and #71's HDA MSI depend on
+        // it), and the gate file cannot be read until after.
         smp_init();
     }
     // #745 (#62): arm the REDUNDANT tick source now that the Local APIC is up.
@@ -2560,6 +2635,100 @@ void kernel_main(boot_info_t *boot_info) {
         ext2_selftest();
     }
 
+#ifdef EXT2_RENAME_SELFTEST
+    // #746-dir: compile-time-gated rename self-test (throwaway VM only). Runs on
+    // the mounted ext2 ROOT, then a FAT-ESP rename to prove the FAT path (which
+    // #746-dir does not touch) is unchanged. ZERO code in a normal build.
+    {
+        extern void ext2_rename_selftest(void);
+        ext2_rename_selftest();
+        if (g_fat_fs.mounted) {
+            int ok = (fat_write_file(&g_fat_fs, "/boot/RTOLD.TXT", "fatdata", 7) == 0);
+            ok = ok && (fat_rename(&g_fat_fs, "/boot/RTOLD.TXT", "/boot/RTNEW.TXT") == 0);
+            ok = ok && fat_exists(&g_fat_fs, "/boot/RTNEW.TXT");
+            ok = ok && !fat_exists(&g_fat_fs, "/boot/RTOLD.TXT");
+            kprintf("[RENAMETEST] %s: FAT rename no-regression (/boot RTOLD->RTNEW)\n", ok ? "PASS" : "FAIL");
+            bootlog_write("[RENAMETEST] FAT rename no-regression: %s", ok ? "PASS" : "FAIL");
+            fat_delete(&g_fat_fs, "/boot/RTNEW.TXT");
+        }
+    }
+#endif
+
+#ifdef OPENCREATE_SELFTEST
+    // (opencreatenoent): compile-time-gated create-under-missing-parent test,
+    // throwaway VM only; ZERO code in a normal build (mirrors EXT2_RENAME_SELFTEST
+    // above). Proves (1) NO REGRESSION: O_CREAT under an EXISTING dir still
+    // creates + writes + reads on the ext2 ROOT and an existing-file reopen reads
+    // it back; (2) THE FIX: O_CREAT under a MISSING parent returns -ENOENT (-2)
+    // with NO fd and NO file left; (3) a NESTED missing parent is also -ENOENT;
+    // plus a FAT-ESP sanity that the (untouched) FAT create rejects a missing
+    // parent and still creates under an existing dir.
+    {
+        extern int64_t sys_open_k(const char *path, int flags);
+        extern int64_t sys_close(int fd);
+        const int OWC = 0x0001 | 0x0040 | 0x0200;   // O_WRONLY|O_CREAT|O_TRUNC
+        int all = 1;
+
+        ext2_unlink("/OCTDIR/A.TXT"); ext2_rmdir("/OCTDIR");   // idempotent clean
+
+        // (1) ext2 no-regression, part A: the CHANGED fdlayer create branch
+        // still allocates an fd and COMMITS a new file under an EXISTING dir.
+        int mk = ext2_mkdir("/OCTDIR");
+        int fd = (int)sys_open_k("/OCTDIR/A.TXT", OWC);
+        if (fd >= 0) sys_close(fd);
+        int created = (ext2_resolve_path("/OCTDIR/A.TXT") != 0);
+        // (1) part B: content round-trips under an EXISTING dir. A boot self-test
+        // has no USER buffer, so sys_write()'s user-pointer check rejects a kernel
+        // literal (-EFAULT); this exercises the canonical ext2 write/read
+        // primitives the fdlayer flush itself calls, exactly as EXT2_RENAME_SELFTEST
+        // uses fat_write_file() rather than sys_write().
+        int wr = (ext2_write_file("/OCTDIR/A.TXT", "hello", 5) == 0);
+        uint32_t rsz = 0; void *rd = ext2_read_whole("/OCTDIR/A.TXT", &rsz);
+        int rok = (rd && rsz == 5 && ((char *)rd)[0] == 'h' && ((char *)rd)[4] == 'o');
+        if (rd) kfree(rd);
+        int nr_ok = (mk == 0 || mk == -2) && fd >= 0 && created && wr && rok;
+        kprintf("[OPENCREATE-SELFTEST] %s: ext2 create-under-existing-dir "
+                "(mk=%d fd=%d created=%d wrote=%d readback=%d/%u)\n",
+                nr_ok ? "PASS" : "FAIL", mk, fd, created, wr, rok, rsz);
+        all = all && nr_ok;
+
+        // (2) THE FIX: missing parent -> -ENOENT, no fd, no file
+        int fdm = (int)sys_open_k("/OCTNOPE/B.TXT", OWC);
+        int left = (ext2_resolve_path("/OCTNOPE/B.TXT") != 0);
+        int fix_ok = (fdm == -2) && !left;
+        kprintf("[OPENCREATE-SELFTEST] %s: ext2 create-under-MISSING-parent "
+                "(rc=%d want=-2 file_left=%d)\n", fix_ok ? "PASS" : "FAIL", fdm, left);
+        all = all && fix_ok;
+
+        // (3) nested missing parent -> -ENOENT
+        int fdn = (int)sys_open_k("/OCTNOPE/X/C.TXT", OWC);
+        int leftn = (ext2_resolve_path("/OCTNOPE/X/C.TXT") != 0);
+        int nest_ok = (fdn == -2) && !leftn;
+        kprintf("[OPENCREATE-SELFTEST] %s: ext2 nested-missing-parent "
+                "(rc=%d file_left=%d)\n", nest_ok ? "PASS" : "FAIL", fdn, leftn);
+        all = all && nest_ok;
+
+        // FAT ESP sanity (my diff does NOT touch FAT; fat_create_inner already
+        // rejects a missing parent). /boot is FAT per fat_path_on_ext2.
+        if (g_fat_fs.mounted) {
+            int fg = fat_create(&g_fat_fs, "/boot/OCTFAT.TXT");
+            int fge = fat_exists(&g_fat_fs, "/boot/OCTFAT.TXT");
+            int fb = fat_create(&g_fat_fs, "/boot/OCTNOPE/D.TXT");
+            int fbl = fat_exists(&g_fat_fs, "/boot/OCTNOPE/D.TXT");
+            int fat_ok = (fg == 0) && fge && (fb != 0) && !fbl;
+            kprintf("[OPENCREATE-SELFTEST] %s: FAT create good(rc=%d exists=%d) "
+                    "missing-parent(rc=%d left=%d)\n",
+                    fat_ok ? "PASS" : "FAIL", fg, fge, fb, fbl);
+            all = all && fat_ok;
+            fat_delete(&g_fat_fs, "/boot/OCTFAT.TXT");
+        }
+
+        ext2_unlink("/OCTDIR/A.TXT"); ext2_rmdir("/OCTDIR");   // cleanup
+        kprintf("[OPENCREATE-SELFTEST] OVERALL %s\n", all ? "PASS" : "FAIL");
+        bootlog_write("[OPENCREATE-SELFTEST] OVERALL %s", all ? "PASS" : "FAIL");
+    }
+#endif
+
     // #418 (restored b713): arm the crash logger now that the FAT root is
     // mounted. Without this panic_log_write() early-returns (armed==0) so
     // /PANIC.TXT and /STAGE.TXT are NEVER written on a fault. Its startup
@@ -2687,20 +2856,35 @@ void kernel_main(boot_info_t *boot_info) {
         boot_stage(BSTAGE_SECURITY);
         security_init();
 
-        /* #67: AP BRING-UP + THE SMP USER-SCHEDULING ESCAPE HATCH.
+        /* #67 / #SMPDEFAULT: AP BRING-UP. SMP IS THE SHIPPING DEFAULT.
          *
          * g_smp_user_sched gates whether ANY application processor is started
          * (see cpu/smp.c: the old claim that "APs still run kernel jobs in
-         * parallel" was false, which is why a 2-vCPU VM pins exactly one core).
-         * It defaults to 0 and SHIPS at 0 until the redesigned per-cpu run
-         * queue + safe context-switch handoff has been proven against a real
-         * multi-process load, because the failure it guards is a SILENT wedge.
+         * parallel" was false, which is why a 2-vCPU VM pinned exactly one
+         * core). It now DEFAULTS TO 1 and SHIPS at 1. SMP is a requirement of
+         * this OS, not a tuning knob: a measurement showing SMP slower is a bug
+         * report about the Big Kernel Lock, never a reason to ship one core.
          *
-         * Drop an empty /SMPSCHED.TXT at the root of the FAT ESP to enable it
-         * for that boot with no rebuild. Placed here, and not at the original
-         * call site further up, purely so the FAT root is mounted and this file
-         * is readable; smp_init() (which the LAPIC and #71's HDA MSI depend on)
-         * still runs at the original point. */
+         * THE GATE IS INVERTED, matching /BKLPARK.TXT, /NOSCHEDBKL.TXT,
+         * /NOTLBSHOOT.TXT and /NOBLITNARROW.TXT: the file now turns the feature
+         * OFF, not on.
+         *
+         *   /NOSMPSCHED.TXT   force AP user scheduling OFF for this boot
+         *   /SMPSCHED.TXT     force it ON, explicitly. STILL HONOURED, because
+         *                     the owner's USB sticks and several scripts write
+         *                     this file after every image write and they must
+         *                     keep meaning what they always meant rather than
+         *                     silently becoming a no-op.
+         *   neither           ON, by default.
+         *
+         * If BOTH are present, OFF wins: an explicit request to disable is the
+         * one a human types when something is on fire, and a stale enable file
+         * left on a stick must not override it.
+         *
+         * Placed here, and not at the original call site further up, purely so
+         * the FAT root is mounted and these files are readable; smp_init()
+         * (which the LAPIC and #71's HDA MSI depend on) still runs at the
+         * original point. */
         {
             extern int  g_smp_user_sched;
             extern void smp_user_sched_enable(int on);
@@ -2708,24 +2892,42 @@ void kernel_main(boot_info_t *boot_info) {
             extern void smp_selftest(void);
             extern uint32_t smp_get_cpu_count(void);
             extern uint32_t smp_get_online_count(void);
-            if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/SMPSCHED.TXT")) {
-                kprintf("[MAIN] #67: /SMPSCHED.TXT present, ENABLING AP user "
-                        "scheduling (per-cpu run queues, safe handoff)\n");
+            const char *smp_gate_why = "defaulted ON (no gate file)";
+            // #130 (2026-08-15): RECORD IT WHERE A MACHINE WITH NO SERIAL CAN
+            // BE READ. Every SMP message in this kernel was kprintf-only
+            // (smp.c: 40 kprintf, ZERO bootlog_write), and kprintf goes to
+            // serial. The real iMac has no serial console, so on that hardware
+            // there had NEVER been any record of whether SMP came up. The
+            // reason string below is carried all the way to the [SMP] result
+            // line so the persistent log says not just WHAT the effective
+            // state is but WHY it is that.
+            int smp_force_off = (g_fat_fs.mounted &&
+                                 fat_exists(&g_fat_fs, "/NOSMPSCHED.TXT"));
+            int smp_force_on  = (g_fat_fs.mounted &&
+                                 fat_exists(&g_fat_fs, "/SMPSCHED.TXT"));
+            if (smp_force_off) {
+                smp_gate_why = "forced OFF by /NOSMPSCHED.TXT";
+                kprintf("[MAIN] #67: /NOSMPSCHED.TXT present, AP user "
+                        "scheduling FORCED OFF for this boot; user processes "
+                        "run on the BSP only.\n");
+                smp_user_sched_enable(0);
+                bootlog_write("[SMP] gate: /NOSMPSCHED.TXT PRESENT -> AP user "
+                              "scheduling FORCED OFF (BSP only)");
+            } else if (smp_force_on) {
+                smp_gate_why = "forced ON by /SMPSCHED.TXT";
+                kprintf("[MAIN] #67: /SMPSCHED.TXT present, AP user scheduling "
+                        "FORCED ON (this is also the default; the file is still "
+                        "honoured so existing sticks and scripts keep working)\n");
                 smp_user_sched_enable(1);
-                // #130 (2026-08-15): RECORD IT WHERE A MACHINE WITH NO SERIAL
-                // CAN BE READ. Every SMP message in this kernel was kprintf-only
-                // (smp.c: 40 kprintf, ZERO bootlog_write), and kprintf goes to
-                // serial. The real iMac has no serial console, so on that
-                // hardware there has NEVER been any record of whether SMP came
-                // up - the gate file's presence was the only observable, and a
-                // file being present says nothing about what the kernel then
-                // did with it. That gap is why SMP could be armed on the target
-                // machine and its status still be genuinely unknown afterwards.
                 bootlog_write("[SMP] gate: /SMPSCHED.TXT PRESENT -> AP user "
-                              "scheduling ENABLED");
+                              "scheduling FORCED ON (same as the default)");
             } else {
-                bootlog_write("[SMP] gate: /SMPSCHED.TXT absent -> AP user "
-                              "scheduling OFF (BSP only)");
+                smp_gate_why = "defaulted ON (no gate file)";
+                kprintf("[MAIN] #67: AP user scheduling ON (shipping default). "
+                        "Add /NOSMPSCHED.TXT to the ESP to force it off.\n");
+                smp_user_sched_enable(1);
+                bootlog_write("[SMP] gate: no gate file -> AP user scheduling "
+                              "ON (shipping default)");
             }
 #ifdef FDRACE_TEST
             /* #SMPGLOBALS: fd-table lock negative control. Present ONLY in a
@@ -2990,6 +3192,79 @@ void kernel_main(boot_info_t *boot_info) {
                               "/NOBLITNARROW.TXT\n");
                   bootlog_write("[blitnarrow] gate: blit row loop UNLOCKED (default)");
               } }
+            // #invnarrow (#168 stage 2) SHIPPING DEFAULT, gate INVERTED
+            // 2026-09-04. uw_commit_content() copies the whole of a window's
+            // content_buffer into content_presented under content_seq. MEASURED
+            // on golden 2330 as SYS_WIN_INVALIDATE: 37.0-46.8 s of BKL hold in
+            // a 234 s boot, 3.7-4.3 ms per call, ~29% of ALL BKL hold time and
+            // 22% of wall clock, the second-largest holder after the blit row
+            // loop /BLITNARROW.TXT already narrowed.
+            //
+            // It shipped default OFF while the open question was MEMORY, not
+            // correctness (see the comment on g_inv_narrow in proc/syscall.c).
+            // That question is now answered: the spare is one extra buffer per
+            // actively-committing window, a realistic four-window desktop costs
+            // 8.8 MB with 116 MB of kernel heap still free, and deliberately
+            // overcommitting to eight large windows makes INVNARROW_SPARE_BUDGET
+            // bind exactly as designed - 14,302 commits fell back to the locked
+            // path and the machine stayed live at 33 present/s, ABOVE the 30 of
+            // the control. So the cap degrades gracefully rather than failing.
+            //
+            // THE GATE IS INVERTED, matching /NOSMPSCHED.TXT, /NOBLITNARROW.TXT,
+            // /BKLPARK.TXT and /NOTLBSHOOT.TXT: the file now turns the feature
+            // OFF, not on.
+            //
+            //   /NOINVNARROW.TXT  force the content commit back UNDER the BKL
+            //                     (the control arm, and the panic button).
+            //   /INVNARROW.TXT    force it ON, explicitly. STILL HONOURED, and
+            //                     deliberately NOT allowed to decay into a
+            //                     no-op: the smp-reval2 rigs, several archived
+            //                     test images and the owner's own scripts write
+            //                     this file, and a gate file that silently stops
+            //                     meaning anything is a failure mode this tree
+            //                     has hit before. It assigns g_inv_narrow
+            //                     explicitly rather than leaning on the default.
+            //   neither           ON, by default.
+            //
+            // If BOTH are present, OFF wins, for the same reason it does for
+            // /SMPSCHED.TXT: an explicit disable is what a human types when
+            // something is on fire, and a stale enable file left on a stick must
+            // not override it.
+            //
+            // The reason string reaches /BOOTLOG.TXT, not just serial, because
+            // NEITHER of the owner's machines has a serial port and "which arm
+            // did that boot actually run" is the first question of every
+            // measurement.
+            { extern int g_inv_narrow;
+              int inv_force_off = (g_fat_fs.mounted &&
+                                   fat_exists(&g_fat_fs, "/NOINVNARROW.TXT"));
+              int inv_force_on  = (g_fat_fs.mounted &&
+                                   fat_exists(&g_fat_fs, "/INVNARROW.TXT"));
+              if (inv_force_off) {
+                  g_inv_narrow = 0;
+                  kprintf("[MAIN] #invnarrow: /NOINVNARROW.TXT present, the "
+                          "content commit copy runs under the GIANT LOCK again "
+                          "(FORCED OFF, control arm)\n");
+                  bootlog_write("[invnarrow] gate: /NOINVNARROW.TXT PRESENT -> "
+                                "content commit FORCED OFF, under the BKL "
+                                "(control arm)");
+              } else if (inv_force_on) {
+                  g_inv_narrow = 1;
+                  kprintf("[MAIN] #invnarrow: /INVNARROW.TXT present, content "
+                          "commit copy FORCED ON with the BKL DROPPED (this is "
+                          "also the default; the file is still honoured so "
+                          "existing sticks and scripts keep working)\n");
+                  bootlog_write("[invnarrow] gate: /INVNARROW.TXT PRESENT -> "
+                                "content commit FORCED ON, BKL DROPPED (same as "
+                                "the default)");
+              } else {
+                  g_inv_narrow = 1;
+                  kprintf("[MAIN] #invnarrow: content commit copy runs with the "
+                          "BKL DROPPED (shipping default). Add /NOINVNARROW.TXT "
+                          "to the ESP to force it off.\n");
+                  bootlog_write("[invnarrow] gate: no gate file -> content commit "
+                                "UNLOCKED, BKL DROPPED (shipping default)");
+              } }
             { extern int g_bkl_wake_off;
               if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/BKLWAKEOFF.TXT")) {
                   g_bkl_wake_off = 1;
@@ -3076,9 +3351,9 @@ void kernel_main(boot_info_t *boot_info) {
                 }
 
             } else {
-                kprintf("[MAIN] #67: AP user scheduling OFF (default); user "
-                        "processes run on the BSP only. Add /SMPSCHED.TXT to "
-                        "the ESP to enable.\n");
+                kprintf("[MAIN] #67: AP user scheduling OFF for this boot "
+                        "(/NOSMPSCHED.TXT); user processes run on the BSP "
+                        "only. Remove that file to get the default back.\n");
             }
             // #130: the OUTCOME, not the intent. How many cores actually came
             // online, and is the AP scheduler actually live? Written to the
@@ -3086,10 +3361,18 @@ void kernel_main(boot_info_t *boot_info) {
             // running?" from the stick after the fact.
             {
                 extern int g_smp_user_sched;
+                // The line the owner and every test harness reads. It now
+                // carries WHY as well as WHAT, because "off" with no reason is
+                // indistinguishable from a kernel that tried and failed.
                 bootlog_write("[SMP] result: %u of %u core(s) online, "
-                              "AP user scheduling %s",
+                              "AP user scheduling %s (%s)",
                               smp_get_online_count(), smp_get_cpu_count(),
-                              g_smp_user_sched ? "LIVE" : "off");
+                              g_smp_user_sched ? "LIVE" : "OFF",
+                              smp_gate_why);
+                kprintf("[SMP] result: %u of %u core(s) online, "
+                        "AP user scheduling %s (%s)\n",
+                        smp_get_online_count(), smp_get_cpu_count(),
+                        g_smp_user_sched ? "LIVE" : "OFF", smp_gate_why);
             }
         }
 
@@ -3177,6 +3460,74 @@ void kernel_main(boot_info_t *boot_info) {
     // NEXT image over the top, which is the live disc-swap path. See
     // dos/diskimg_test.c.
     { extern void diskimg_boot_harness(void); diskimg_boot_harness(); }
+
+    // #404 disk-mgr Stage 0: synthetic scratch block device + destructive-op
+    // oracle. No-op unless /DISKMGR.TST exists on the ESP root, so a normal
+    // golden allocates NO scratch device and runs NO destructive self-test.
+    // When armed it kmallocs a RAM-backed scratch disk and proves, on THAT
+    // device only, the raw round-trip, the GPT PREPARE/APPLY round-trip, that
+    // the nonce refusals FIRE, and that a WRITE aimed at the real boot disk is
+    // REFUSED and changes nothing. One durable line either way (#QUIETBOOT:
+    // a marker-gated harness that never says whether its marker is present is
+    // how /CDTEST.TXT became invisible dead code).
+    {
+        extern void *fat_read_file(fat_fs_t *fs, const char *path, unsigned int *size_out);
+        extern int  blkmgr_scratch_init_rs(uint32_t sectors);
+        extern int  blkmgr_selftest_rs(uint32_t *out_passed, uint32_t *out_total);
+        unsigned int dsz = 0;
+        char *dcfg = (char *)fat_read_file(&g_fat_fs, "/DISKMGR.TST", &dsz);
+        if (!dcfg || dsz == 0) {
+            if (dcfg) kfree(dcfg);
+            bootlog_write("[DISKMGR] Stage-0 oracle NOT ARMED (no /DISKMGR.TST). "
+                          "No scratch device; destructive self-test skipped.");
+        } else {
+            kfree(dcfg);
+            uint32_t scr_sectors = 90112;  /* 44 MiB RAM-backed scratch disk
+                                             (fits a FAT32 partition for Stage 3) */
+            if (blkmgr_scratch_init_rs(scr_sectors) != 0) {
+                bootlog_write("[DISKMGR] Stage-0: scratch device alloc FAILED");
+            } else {
+                uint32_t dp = 0, dt = 0;
+                int drc = blkmgr_selftest_rs(&dp, &dt);
+                kprintf("[DISKMGR] oracle %s (%u/%u checks) on %u-sector scratch dev\n",
+                        drc == 0 ? "PASS" : "FAIL", dp, dt, scr_sectors);
+                bootlog_write("[DISKMGR] oracle %s checks=%u/%u scratch=%u sectors",
+                              drc == 0 ? "PASS" : "FAIL", dp, dt, scr_sectors);
+                /* #404 Stage 3: mkfs (FAT16 + ext2 multi-group + FAT32) oracle. */
+                extern int blkmgr_mkfs_selftest_rs(uint32_t *, uint32_t *);
+                extern int blkmgr_mkfs_dump_rs(void);
+                uint32_t mp = 0, mt = 0;
+                int mrc = blkmgr_mkfs_selftest_rs(&mp, &mt);
+                kprintf("[DISKMGR] mkfs oracle %s (%u/%u checks)\n",
+                        mrc == 0 ? "PASS" : "FAIL", mp, mt);
+                bootlog_write("[DISKMGR] mkfs oracle %s checks=%u/%u",
+                              mrc == 0 ? "PASS" : "FAIL", mp, mt);
+                /* Dump clean FAT16 + ext2 images to the ext2 root for the host
+                   to check with real fsck.fat / fsck.ext2 / mount. */
+                int ddc = blkmgr_mkfs_dump_rs();
+                kprintf("[DISKMGR] mkfs dump rc=%d (/MKFS_FAT.IMG /MKFS_EXT2.IMG)\n", ddc);
+                bootlog_write("[DISKMGR] mkfs dump rc=%d", ddc);
+                /* #404 Stage 4: mount table oracle. On the scratch device only:
+                   mkfs FAT16, MOUNT at /MNT/scratch, write+read a file through
+                   the mount, confirm SYS_MOUNT_LIST reflects it, UNMOUNT, and
+                   prove the refusals fire (unmount / and /boot refused, mount of
+                   the real boot disk refused with the boot sector unchanged). */
+                extern int blkmgr_mount_selftest_rs(uint32_t *, uint32_t *);
+                uint32_t up = 0, ut = 0;
+                int urc = blkmgr_mount_selftest_rs(&up, &ut);
+                kprintf("[DISKMGR] mount oracle %s (%u/%u checks)\n",
+                        urc == 0 ? "PASS" : "FAIL", up, ut);
+                bootlog_write("[DISKMGR] mount oracle %s checks=%u/%u",
+                              urc == 0 ? "PASS" : "FAIL", up, ut);
+                /* #404 Stage 4b: VFS resolver + ext2 write-mount oracle. Drives
+                   the REAL open/read/write/close/readdir syscall cores on an
+                   ext2 aux mount at /MNT/test and proves create+write+read-back
+                   and PERSISTENCE across unmount+remount. */
+                extern void blkmgr_vfs_ext2_selftest(void);
+                blkmgr_vfs_ext2_selftest();
+            }
+        }
+    }
     // #193: proves which FILESYSTEM answers a path that a mounted disk
     // image and the folder underneath it both contain. No-op unless
     // /IMG193.TXT names an image.
@@ -3254,6 +3605,7 @@ void kernel_main(boot_info_t *boot_info) {
     { extern void fetchown_boot_check(void); fetchown_boot_check(); }
     // #fdguard: prove the legacy-fd and /dev/pts ownership guards
     { extern void fdown_boot_check(void); fdown_boot_check(); }
+    { extern void advlock_boot_check(void); advlock_boot_check(); }
     { extern void ptsown_boot_check(void); ptsown_boot_check(); }
     // #745 task #59: prove the framebuffer ownership rules before anything can
     // claim the screen (arm/claim/release/re-arm, and the released-means-
@@ -3643,6 +3995,12 @@ void kernel_main(boot_info_t *boot_info) {
     // Bounded, once, one [RUST-DIFF]/[RUST-SEC]/[RUST-PERF] line each (#426).
     extern void ed25519_decode_selftest(void);
     ed25519_decode_selftest();
+    { extern int ed25519_verify_selftest(void); ed25519_verify_selftest(); }  // #658 precursor: RFC8032 verify KAT (accept+forgery-reject)
+    { extern int ecdsa_verify_selftest(void); ecdsa_verify_selftest(); }  // #659 (crypkat): RFC6979 P-256 ECDSA verify KAT (accept+forgery-reject); the TLS X.509 cert-signature verifier
+    { extern int pbkdf2_shadow_selftest(void); pbkdf2_shadow_selftest(); }  // authkat: PBKDF2-HMAC-SHA256 KAT + SHADOW verify_against_record accept/reject; the local-login/SHADOW password trust anchor
+    { extern int chacha20_poly1305_selftest(void); chacha20_poly1305_selftest(); }  // aeadkat: RFC8439 ChaCha20-Poly1305 AEAD KAT (accept + tamper-reject); the TLS1.3 record data plane
+    { extern int x25519_selftest(void); x25519_selftest(); }  // ecdhkat: RFC7748 X25519 ECDH KAT (5.2 scalarmult + 6.1 DH-agreement + negatives); the TLS1.3 key_share / TLS1.2 x25519-ECDHE shared secret
+    { extern int rsa_verify_selftest(void); rsa_verify_selftest(); }  // secroad2: RSA PKCS#1 v1.5 SHA-256 cert-signature verify KAT (accept+forgery-reject); the X.509 RSA-cert trust anchor (cert_store.c)
     extern void xdr_rust_selftest(void);
     xdr_rust_selftest();
 
@@ -3721,6 +4079,50 @@ void kernel_main(boot_info_t *boot_info) {
     {
         extern void netattach_selftest(void);
         netattach_selftest();
+    }
+
+    // #imacnet: resolver-failover + fetch-breadcrumb policy self-test. Runs
+    // before net_init() and saves/restores every static it touches, so it
+    // cannot perturb the live resolver. It is DISCRIMINATING: each case is one
+    // the obvious wrong implementation fails, above all "an NXDOMAIN must not
+    // count as the resolver being dead". One durable [NETBREAD] line.
+    {
+        extern unsigned int netbread_selftest_rs(unsigned int *checks);
+        unsigned int nchk = 0;
+        unsigned int nfail = netbread_selftest_rs(&nchk);
+        bootlog_write("[NETBREAD] self-test %s mask=0x%x checks=%u",
+                      nfail ? "FAIL" : "PASS", nfail, nchk);
+    }
+
+    // #httpdns: DNS transaction-table self-test. Also before net_init(), also
+    // save/restore. Every check is one the OLD single-global resolver fails:
+    // two lookups getting distinct slots, each remembering its own hostname,
+    // ids unique across live slots, a reply reaching only the lookup that
+    // asked, a straggler for a freed id being dropped rather than landing on
+    // the slot's next occupant, and the #netfix2 hedge bookkeeping (which
+    // resolvers this question went to, and which one answered) being per
+    // transaction rather than per machine. If this ever says FAIL, concurrent
+    // name lookups are cross-wiring again and the browser/App Store symptom is
+    // back.
+    {
+        extern unsigned int dnstx_selftest_rs(unsigned int *extra);
+        unsigned int dbad2 = 0;
+        unsigned int dbad = dnstx_selftest_rs(&dbad2);
+        bootlog_write("[DNSTX] self-test %s mask=0x%x/0x%x",
+                      (dbad || dbad2) ? "FAIL" : "PASS", dbad, dbad2);
+    }
+
+    // #netfix2: the failure-reason registry that every layer of the fetch stack
+    // now writes into, and the system-clock plausibility verdict. Both run
+    // before net_init() for the same reason netbread does: they save and
+    // restore their own state, and an instrument that has not proven itself
+    // before the subsystem it instruments starts is an instrument nobody can
+    // trust the output of.
+    {
+        extern void netfail_boot_selftest(void);
+        extern void netclock_boot_report(void);
+        netfail_boot_selftest();
+        netclock_boot_report();
     }
 
     gfx_boot_log("[BOOT] Initializing network stack...");
@@ -3806,6 +4208,15 @@ void kernel_main(boot_info_t *boot_info) {
     }
     gfx_boot_progress(85);
 
+    // #imacnic: LAST CALL FOR "WHICH DEVICES DID NOBODY DRIVE". Every bus and
+    // every driver that is going to claim a PCI function has now had its turn
+    // (storage at stage 22, USB at 23, audio, and the network stack just above),
+    // so this is the earliest point at which an unclaimed function is a settled
+    // fact rather than a device whose driver has not run yet. It writes to
+    // /BOOTLOG.TXT, which is the only channel that survives on a machine with no
+    // serial port. See pci_bootlog_claims() in drivers/pci.h.
+    pci_bootlog_claims();
+
     // Initialize mouse driver
     gfx_boot_log("[BOOT] Initializing input devices...");
     boot_stage(BSTAGE_INPUT);
@@ -3838,6 +4249,13 @@ void kernel_main(boot_info_t *boot_info) {
     gfx_boot_log("[BOOT] Device layer (/dev) initialized");
     kprintf("[KERNEL] /dev namespace initialized\n");
 
+    // Stage 2 serial.port: probe for a legacy 16550 beyond COM1 (the console)
+    // and publish it in the mediated serial-port gateway. On a VM with a second
+    // serial this publishes ttyS1; on hardware without one it publishes nothing,
+    // which is correct: a serial port is born gated, never ambient.
+    extern void serialport_init(void);
+    serialport_init();
+
     // Initialize PTY subsystem (must be after dev_init)
     extern void pty_init(void);
     pty_init();
@@ -3860,6 +4278,18 @@ void kernel_main(boot_info_t *boot_info) {
     }
 #endif
 
+#ifdef FMHANGTEST
+    /* #fmhang: the #426 storage-stack-under-cli negative control. Needs a
+     * process table + scheduler + proc_current(), so it is created HERE,
+     * after proc_init(). It sleeps until the desktop is up, then does one
+     * audiolog_write() from a spinlock_acquire_irqsave() region. FMHANGTEST
+     * builds only. */
+    {
+        extern void fmhang_selftest_worker(void *arg);
+        proc_create_ex("fmhangtest", fmhang_selftest_worker, 0, PRIO_LOW, 64 * 1024);
+    }
+#endif
+
     /* #745 (#75) MEASURED, build 1876: WITHOUT THIS, /SMPSCHED.TXT DOES NOTHING.
      *
      * smp_start_aps() runs ~700 lines above this, as soon as the FAT root is
@@ -3872,7 +4302,7 @@ void kernel_main(boot_info_t *boot_info) {
      * consumer. So the refusal was a one-way door: the AP never retried and
      * never joined.
      *
-     * MEASURED on three gate-ON boots of build 1876 on throwaway VM <vmid>:
+     * MEASURED on three gate-ON boots of build 1876 on throwaway VM 2690:
      * "consumers=0x1" on every one of 40 [SCHEDCORE] lines, with
      * "[SCHED] cpu 1 reached the scheduler before proc_init()" once per boot
      * and zero contended BKL acquisitions all boot. The gate was ON and the
@@ -3899,6 +4329,21 @@ void kernel_main(boot_info_t *boot_info) {
     // #711 slice 2: the graph is a fold of the journal, so it comes up
     // immediately after the journal and before anything can ask it a question.
     { extern void gfs_fold_init(void); gfs_fold_init(); }
+    // #246 cross-boot fix: the fold has just replayed prior boots' still-present
+    // escrow AI_TASK/OBJECT nodes, so seed the escrow local allocator ABOVE them
+    // NOW (before any process can enter escrow) or a 2nd boot of a persisted
+    // journal DUPs and every SYS_ESCROW_ENTER/escrow_spawn_marked returns
+    // ESCROW_E_GRAPH. See fs/escrow_guard.c escrow_seed_local().
+    { extern void escrow_seed_local(void); escrow_seed_local(); }
+    // #305 Stage 5A: populate + seal (default ON, runtime kill-switch
+    // /CONFIG/ESCROWSEAL.OFF) the escrow immutable core BEFORE any contract can be
+    // issued. escrow_guard reads the principal from here and re-verifies it, so a
+    // tampered principal fails closed; when sealed, a post-boot write to it faults.
+    { extern void escrow_core_init(void); escrow_core_init(); }
+    // #246 Stage 4 (CAP_SCOPE_DEVICE): load the device-identity KNOWN_HOSTS/TOFU
+    // store from /CONFIG so a device trusted on a prior boot is remembered.
+    // Best-effort; a missing store is a clean empty one.
+    { extern void escdev_init(void); escdev_init(); }
     { extern void seclog_init(void); seclog_init(); }
 
     kprintf("[KERNEL] Process subsystem initialized\n");
@@ -3975,6 +4420,19 @@ void kernel_main(boot_info_t *boot_info) {
     boot_stage(BSTAGE_STI);
     sti();
 
+#ifdef KSTACK_OVERFLOW_SELFTEST
+    // #stackguard, `make KSTACKTEST=1`. IT MUST BE HERE, AFTER sti(), AND THAT
+    // IS THE POINT OF THE PLACEMENT.
+    //
+    // The guard is tested at INTERRUPT ENTRY (cpu/idt.c isr_handler). Running
+    // the deliberate overflow before sti() would take no interrupts at all, so
+    // the check would never execute, the recursion would walk off the stack
+    // exactly as the real defect does, and the test would "prove" the guard by
+    // reproducing the bug. It was placed there first, and this comment exists
+    // so nobody moves it back. Does not return; halts the machine on purpose.
+    { extern void kstack_overflow_selftest(void); kstack_overflow_selftest(); }
+#endif
+
     // #507 DELAY SELF-CHECK. A delay that lies does not fail loudly: it makes
     // USB enumeration intermittent (#433/#373/#366), which is how the PIT
     // mode-3 halving survived so long. So measure the shared busy-delay against
@@ -4049,6 +4507,12 @@ void kernel_main(boot_info_t *boot_info) {
     // 8259 mask, the LAPIC LINT0 virtual-wire routing and the I/O APIC
     // redirection entries for GSI0/GSI2, so a dead tick can be ATTRIBUTED to a
     // mask rather than guessed at from a symptom.
+    // #tickdead: WHICH ARM, AND DOES THE INSTRUMENT'S OWN LOGIC PASS ITS
+    // SELF-TEST. Read the gate first so the report states the arm that will
+    // actually run. /CONFIG is readable by now (the root filesystem mounted
+    // ~1700 lines above); absent means the shipping, fixed arm.
+    { extern void tick_ack_read_gate(void); tick_ack_read_gate();
+      extern void tick_ack_boot_report(void); tick_ack_boot_report(); }
     tickwatch_boot_report();
 
     // Enable preemptive multitasking
@@ -4393,6 +4857,21 @@ void kernel_main(boot_info_t *boot_info) {
             extern void elevate_selftest(void);
             elevate_selftest();
         }
+        // Stage 0 of the capability API (docs/SYSTEM_CAPABILITY_API.md).
+        // Proves on THIS build that the compositor principal refuses a
+        // non-owner AND refuses everybody while the framebuffer latch is
+        // UNCLAIMED, and that the handle-ownership rule admits a sibling
+        // pthread while refusing an unrelated process and a kernel-owned
+        // handle. Every case in it is a REFUSAL, which is exactly the
+        // behaviour a normal boot never exercises.
+        {
+            extern void capgate_selftest(void);
+            capgate_selftest();
+        }
+        {
+            extern void caps_selftest(void);
+            caps_selftest();
+        }
         // #745: the /CONFIG/LOGIN.CFG contract. Proves on THIS build that the
         // sign-in mode parses the one way it is allowed to, and - the case that
         // matters - that composing the file for an autologin change PRESERVES
@@ -4564,6 +5043,55 @@ void kernel_main(boot_info_t *boot_info) {
     // /CONFIG/FDGUARD.TEST exists (present on no production golden). Launches
     // /APPS/FDXTEST and /APPS/PTSXTEST to prove the fd/pts ownership guards.
     { extern void fdguard_start_deferred_test(void); fdguard_start_deferred_test(); }
+
+    // #246/#305 gated escrow kernel-enforcement verifier. No-op unless
+    // /CONFIG/ESCROW.TEST exists (present on no production golden). Launches
+    // /APPS/ESCROWT to prove the FS-mutation escrow chokepoint.
+    { extern void escrow_start_deferred_test(void); escrow_start_deferred_test(); }
+
+    // #246 Stage 6 gated verifier: the escrow userland is now a THIN CLIENT of
+    // the kernel enforcement, and the contract chokepoint is generalised beyond
+    // the filesystem to a non-FS effect (device eject). No-op unless
+    // /CONFIG/ESCU6.TEST exists (present on no production golden). Launches
+    // /APPS/ESCU6 to prove photos.organize end to end via the thin client, that
+    // the KERNEL is the authority when the userland check is bypassed, and that
+    // a marked actor's device eject is refused at Ring 0.
+    { extern void escu6_start_deferred_test(void); escu6_start_deferred_test(); }
+
+    // #246 Stage 2 gated MANDATORY-escrow verifier. No-op unless
+    // /CONFIG/ESCROW2.TEST exists (present on no production golden). Uses the
+    // kernel TRUSTED SPAWNER to launch /APPS/ESCROW2T ALREADY MARKED, proving it
+    // is enforced from its first instruction, cannot self-exit, and its forked
+    // child inherits the mark and stays enforced.
+    { extern void escrow2_start_deferred_test(void); escrow2_start_deferred_test(); }
+
+    // #246 Stage 4 (CAP_SCOPE_DEVICE) verifier. Two gated pieces, both no-ops on
+    // a production golden:
+    //  - escdev_selftest(): only built when the kernel is compiled with
+    //    -DESCROW_DEVICE_SELFTEST; proves the device-identity policy + TOFU + the
+    //    guard decision (allow on the bound device / deny on a different device /
+    //    fail closed on identity change or device gone).
+    //  - escrow4_start_deferred_test(): no-op unless /CONFIG/ESCROW4.TEST exists;
+    //    launches /APPS/ESCROW4T device-scoped to a REAL mounted removable volume
+    //    to prove an in-scope write is ALLOWED on the correct device end to end.
+    { extern void escdev_selftest(void); escdev_selftest(); }
+    // #246 Stage 5 (part B) rollback/undo engine verifier. Only built with
+    // -DESCROW_UNDO_SELFTEST; proves on the REAL filesystem that a recorded
+    // move reverts with bytes intact, a mkdir reverts, and the engine refuses
+    // to clobber an occupied slot or remove a non-empty directory. No-op on a
+    // production golden.
+    { extern void escrow_undo_selftest(void); escrow_undo_selftest(); }
+    // #305 Stage 5A immutable-core verifier (only under -DESCROW_CORE_SELFTEST).
+    { extern void escrow_core_seal_text(void); escrow_core_seal_text(); }  // #305 keystone: seal .text RO late (default ON, /CONFIG/ESCROWSEAL.OFF kill-switch)
+    { extern void escrow_core_selftest(void); escrow_core_selftest(); }
+    { extern void escrow4_start_deferred_test(void); escrow4_start_deferred_test(); }
+
+    // #708 gated AI safe-eject device-executor verifier. No-op unless
+    // /CONFIG/AIEJECT.TEST exists (present on no production golden). Launches
+    // /APPS/AIEJTEST to prove device.list + device.block.eject on a real
+    // removable volume (flush+unmount+stop, busy-refuse, forbidden-verb,
+    // boot-disk-never-target).
+    { extern void aieject_start_deferred_test(void); aieject_start_deferred_test(); }
 
     // #702 real-hardware defensive hardening: kick off audio hardware
     // probing (HDA controller reset/CORB-RIRB/codec parse, #71 MSI arm) on
@@ -4807,6 +5335,7 @@ void kernel_shell(void) {
                         shell_print("GUI:\n");
                         shell_print("  gui     - Start desktop environment\n");
                         shell_print("  wget    - Fetch URL (wget <url>)\n");
+                        shell_print("  dns     - Show/set resolver (dns | dns auto | dns <ip>)\n");
                         shell_print("  splash  - Show boot splash screen\n");
                         shell_print("\nPress Ctrl+C to cancel running commands\n");
                     } else if (strcmp(command_buffer, "hblog") == 0) {
@@ -4906,6 +5435,69 @@ void kernel_shell(void) {
                             }
                         } else {
                             shell_print("No ATA drive found\n");
+                        }
+                    } else if (strncmp(command_buffer, "dns", 3) == 0 &&
+                               (command_buffer[3] == 0 || command_buffer[3] == ' ')) {
+                        // #netfix2: inspect and change the resolver from the
+                        // serial console.
+                        //
+                        // Not test scaffolding: "which resolver is this machine
+                        // using, is that a pin or the lease, and put it back to
+                        // automatic" is the exact question three separate user
+                        // reports have turned on, and until now the only way to
+                        // answer it was a GUI dialog on a machine whose GUI was
+                        // failing to fetch. It is also the only deterministic
+                        // way to exercise the unpin path without a mouse click
+                        // (#334 makes GUI click automation unreliable).
+                        const char *a = command_buffer + 3;
+                        while (*a == ' ') a++;
+                        extern uint32_t dns_get_server(void);
+                        extern int      dns_server_is_pinned(void);
+                        extern void     dns_set_server(uint32_t);
+                        extern void     dns_set_server_auto(void);
+                        extern uint32_t dhcp_get_dns(void);
+                        extern int      net_persist_netcfg(void);
+                        extern uint32_t wget_parse_ip(const char *);
+                        if (*a == 0) {
+                            // #netfix2: ACTIVE and PREFERRED are different
+                            // things and the first version of this conflated
+                            // them. MEASURED on the bench: it printed
+                            // "active: 192.0.2.1 (PINNED by an explicit
+                            // choice)" when 192.0.2.1 was the HEDGE
+                            // fallback and 1.1.1.1 was the pin. A diagnostic
+                            // that mislabels which of two values is which is
+                            // worse than one that prints only one of them.
+                            extern uint32_t netbread_dns_preferred_rs(void);
+                            uint32_t d = dns_get_server(), o = dhcp_get_dns();
+                            uint32_t p = netbread_dns_preferred_rs();
+                            shell_printf("  querying:  %d.%d.%d.%d\n",
+                                (d>>24)&0xFF,(d>>16)&0xFF,(d>>8)&0xFF,d&0xFF);
+                            shell_printf("  preferred: %d.%d.%d.%d (%s)\n",
+                                (p>>24)&0xFF,(p>>16)&0xFF,(p>>8)&0xFF,p&0xFF,
+                                dns_server_is_pinned()
+                                    ? "PINNED: an explicit choice that overrides DHCP on EVERY network"
+                                    : "automatic: whatever the network offers");
+                            shell_printf("  DHCP offered: %d.%d.%d.%d\n",
+                                (o>>24)&0xFF,(o>>16)&0xFF,(o>>8)&0xFF,o&0xFF);
+                            if (d != p)
+                                shell_print("  NOTE: querying differs from preferred, so a "
+                                            "failover or hedge has already fired this boot.\n");
+                            shell_print("  usage: dns auto | dns <a.b.c.d>\n");
+                        } else if (strcmp(a, "auto") == 0) {
+                            dns_set_server_auto();
+                            int pr = net_persist_netcfg();
+                            uint32_t d = dns_get_server();
+                            shell_printf("  now automatic: %d.%d.%d.%d (persist rc=%d)\n",
+                                (d>>24)&0xFF,(d>>16)&0xFF,(d>>8)&0xFF,d&0xFF, pr);
+                        } else {
+                            uint32_t v = wget_parse_ip(a);
+                            if (v == 0) { shell_print("  bad address\n"); }
+                            else {
+                                dns_set_server(v);
+                                int pr = net_persist_netcfg();
+                                shell_printf("  pinned %d.%d.%d.%d (persist rc=%d)\n",
+                                    (v>>24)&0xFF,(v>>16)&0xFF,(v>>8)&0xFF,v&0xFF, pr);
+                            }
                         }
                     } else if (strcmp(command_buffer, "net") == 0) {
                         // Print network status to both serial and console

@@ -13,7 +13,7 @@
 //     terminates the transfer. Every wait is BOUNDED (xhci_delay_ms, 1ms/iter)
 //     so a silent printer can never block on the full xHCI timeout.
 //
-// M3D Micro command reference (from the M33-Fio project, the build server:<workspace>):
+// M3D Micro command reference (from the M33-Fio project, the build server:/root/m3d-ref):
 //   Bootloader (single characters):  'S' = dump the 0x301-byte EEPROM (ends in
 //     '\r'); firmwareVersion is the little-endian u32 at offset 0x00, the
 //     serial number is ASCII near the end.  'Q' = leave the bootloader and run
@@ -361,6 +361,13 @@ static file_t *cdc_dev_open(int flags) {
 
 void usb_cdc_acm_dev_init(void) {
     dev_register("ttyACM0", cdc_dev_open);
+    // Stage 2 serial.port: publish the SAME backend through the mediated
+    // gateway. The /dev/ttyACM0 node stays (root-owned 0600 now, fs/perms.c), so
+    // the raw path is refused to the desktop uid; a userland app reaches this
+    // adapter only by SYS_SERIAL_OPEN("ttyACM0") under a serial.port grant.
+    extern int serialport_register_dev(const char *name, uint32_t cls,
+                                        struct file *(*open)(int));
+    serialport_register_dev("ttyACM0", 2u /*SERIALPORT_CLS_USB_CDC*/, cdc_dev_open);
 }
 
 // -----------------------------------------------------------------------------

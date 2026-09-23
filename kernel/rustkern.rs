@@ -87,6 +87,7 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/aes.rs"] mod aes;
 #[path = "rustkern/amlhid.rs"] mod amlhid;   // #ASUSKBD: DSDT _HID presence scan
 #[path = "rustkern/argtab.rs"] mod argtab;
+#[path = "rustkern/getrandom.rs"] mod getrandom;   // SYS_GETRANDOM: user buffer <- kernel CSPRNG
 #[path = "rustkern/common.rs"] mod common;
 #[path = "rustkern/arp.rs"] mod arp;
 #[path = "rustkern/bklsite.rs"] mod bklsite;   // #118: per-call-site BKL hold accounting
@@ -109,6 +110,8 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/conring.rs"] mod conring;   // #745 (task #70): async console ring + overflow policy
 #[path = "rustkern/dhcp.rs"] mod dhcp;
 #[path = "rustkern/dns.rs"] mod dns;
+#[path = "rustkern/dnstx.rs"] mod dnstx;   // #httpdns: the DNS transaction table (one slot per in-flight lookup)
+#[path = "rustkern/netfail.rs"] mod netfail;   // #netfix2: WHY a fetch failed + clock plausibility
 #[path = "rustkern/dragsess.rs"] mod dragsess;   // cross-window drag session (Tier 5 docking)
 #[path = "rustkern/doscrtc.rs"] mod doscrtc;   // #740: what an INT 10h mode set leaves in the CRTC (stale-Offset trap)
 #[path = "rustkern/dosmem.rs"] mod dosmem;   // #745: XMS 3.0 + LIM EMS 4.0 for the DOS guest
@@ -124,6 +127,7 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/dosprof.rs"] mod dosprof;
 #[path = "rustkern/rawsc.rs"] mod rawsc;   // #DOSRING3: focus-scoped raw scancodes for a Ring-3 DOS host
 #[path = "rustkern/dosdisp.rs"] mod dosdisp;
+#[path = "rustkern/dostick.rs"] mod dostick;   // (#ravideo) the guest IRQ0 pace, and why it must not be a function of the host burst size
 #[path = "rustkern/dosmick.rs"] mod dosmick;   // (#mickey) what a DOS guest is told the mouse did: unit-gain counters + clamp homing   // #745 (local 105): DOS host-window letterbox geometry
 #[path = "rustkern/dos4gw.rs"] mod dos4gw;   // #740: DOS/4GW guest bridge - INT frame marshalling, MISS census, DPMI memory
 #[path = "rustkern/dpmi.rs"] mod dpmi;   // #740: the DPMI host core (INT 31h) for DOS/4GW guests
@@ -144,7 +148,12 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/firstrun.rs"] mod firstrun;   // #252: THE first-run (OOBE) state chokepoint
 #[path = "rustkern/fetchown.rs"] mod fetchown;   // #745 (task #36): async HTTP job slot ownership
 #[path = "rustkern/fbown.rs"] mod fbown;   // #745 (task #59): framebuffer claim ownership + lifetime
+#[path = "rustkern/capgate.rs"] mod capgate;   // Stage 0 capability API: compositor-principal + handle-ownership rules
+#[path = "rustkern/caps.rs"] mod caps;   // Stage 1 capability API: grant model + requirement table + consent state machine
+#[path = "rustkern/capdev.rs"] mod capdev;   // #246 Stage 4: CAP_SCOPE_DEVICE device-identity policy (fingerprint + logical key + confidence + TOFU verdict)
+#[path = "rustkern/escrowundo.rs"] mod escrowundo;   // #246 Stage 5B: escrow rollback/undo reversibility policy
 #[path = "rustkern/fdown.rs"] mod fdown;   // #fdguard: legacy fd table cross-process ownership
+#[path = "rustkern/advlock.rs"] mod advlock;   // #404 Stage 6: POSIX (fcntl) + BSD (flock) advisory file-lock manager
 #[path = "rustkern/ptsown.rs"] mod ptsown;   // #fdguard: /dev/pts/N attach ownership
 #[path = "rustkern/fsperm.rs"] mod fsperm;
 #[path = "rustkern/fstatkind.rs"] mod fstatkind;   // #120: what KIND of object an fd refers to
@@ -182,11 +191,13 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/mono.rs"] mod mono;
 #[path = "rustkern/mprotect.rs"] mod mprotect;   // #404: SYS_MPROTECT Ring-3 argument validation
 #[path = "rustkern/netattach.rs"] mod netattach;   // hot-plug NIC attach handoff (xhci rescan -> net worker)
+#[path = "rustkern/netbread.rs"] mod netbread;   // #imacnet: durable net breadcrumbs + DNS resolver failover
 #[path = "rustkern/netstat.rs"] mod netstat;   // #745: structured net status + non-blocking probe
 #[path = "rustkern/fwfilter.rs"] mod fwfilter;   // #238: THE packet filter (rules, conntrack, config codec)
 #[path = "rustkern/mp4.rs"] mod mp4;
 #[path = "rustkern/parttbl.rs"] mod parttbl;
 #[path = "rustkern/instdisk.rs"] mod instdisk;
+#[path = "rustkern/blkmgr.rs"] mod blkmgr;   // #404 disk-mgr: scratch dev + SYS_BLK_* + SYS_PART_* (Stages 0-2)
 #[path = "rustkern/pe.rs"] mod pe;
 #[path = "rustkern/pgrp.rs"] mod pgrp;   // #745 (local 82): POSIX process-group + session policy
 #[path = "rustkern/pipewr.rs"] mod pipewr;   // #111: pipe write-side decision machine (blocking write + SIGPIPE)
@@ -194,8 +205,11 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/png.rs"] mod png;
 #[path = "rustkern/winbuf.rs"] mod winbuf;   // #137: window content-buffer size policy
 #[path = "rustkern/winblit.rs"] mod winblit;  // #blitguard: sys_win_blit geometry contract
+#[path = "rustkern/wm_bounds.rs"] mod wm_bounds;  // #404 (cfhost): SYS_WM_SET_BOUNDS placement policy (Cardfile window hosting)
 #[path = "rustkern/pwpolicy.rs"] mod pwpolicy;   // password strength + breached-password policy
 #[path = "rustkern/permpath.rs"] mod permpath;   // #674: POSIX path resolution for perms_check()
+#[path = "rustkern/accesssys.rs"] mod accesssys; // #dosperm: SYS_ACCESS, so Ring 3 can ASK perms_check()
+#[path = "rustkern/dosstate.rs"] mod dosstate;   // #dosperm: a DOS game may write the files it shipped with
 #[path = "rustkern/permhome.rs"] mod permhome;   // #PERMSKIP: "is this PERMS.DB key a user home?"
 #[path = "rustkern/selftestreg.rs"] mod selftestreg; // #PERMSKIP: the register of self-tests that DID NOT RUN
 #[path = "rustkern/ptwalk.rs"] mod ptwalk;   // #647: live page-table hierarchy walk
@@ -209,6 +223,7 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/cpuobs.rs"] mod cpuobs;   // #83: which core is a task on
 #[path = "rustkern/affinity.rs"] mod affinity;   // #affinity: persistent per-process CPU affinity + per-process migration counts
 #[path = "rustkern/inputlat.rs"] mod inputlat;   // #affinity: input-to-present latency, the first responsiveness instrument
+#[path = "rustkern/tickack.rs"] mod tickack;       // #tickdead: WHERE an interrupt is acknowledged, and BLOCKED-vs-ABSENT blame
 #[path = "rustkern/tickwatch.rs"] mod tickwatch;   // #745 (#62): periodic-tick health verdict + failover decision   // #67: SMP livelock diagnostic + run-queue placement policy
 #[path = "rustkern/seccore.rs"] mod seccore;
 #[path = "rustkern/sha256.rs"] mod sha256;
@@ -325,6 +340,13 @@ pub extern "C" fn sec_event_name(event: u32) -> *const u8 {
         // #fdguard: appended per the append-only rule; a matching arm here
         // and in sec_event_severity, or a new event logs as INFO UNKNOWN.
         13 => b"IO_BOUNDARY\0",
+        // Stage 1 capability API: grant / refusal / revocation. INFO via the
+        // default severity arm, like ELEVATION (per-use refusals are rate-
+        // limited into the durable log + GraphFS journal, not toasted).
+        14 => b"CAPABILITY\0",
+        // Stage 1 capability API: grant / refusal / revocation. INFO via the
+        // default severity arm, like ELEVATION.
+        14 => b"CAPABILITY ",
         _ => b"UNKNOWN\0",
     };
     s.as_ptr()

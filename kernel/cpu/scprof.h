@@ -38,7 +38,7 @@
 // (SYS_EXIT) or that resumes at proc/syscall.asm's fork-child label would leave
 // a per-cpu depth counter permanently wrong, and a permanently wrong depth
 // counter silently mis-attributes every later syscall on that core.
-typedef struct { uint64_t t0, i0, b0, ph[SCP_PHASE_N]; } scp_frame_t;
+typedef struct { uint64_t t0, i0, b0, ph[SCP_PHASE_N]; uint32_t cpu; } scp_frame_t;
 typedef struct { uint64_t t0; } scp_span_t;
 
 // Syscall bracket. scp_enter() snapshots; scp_exit() records the delta.

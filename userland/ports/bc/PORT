@@ -1,0 +1,123 @@
+# mports recipe: bc-gh (Gavin D. Howard's bc), version 7.0.3. Tier 2 item #11 of
+# docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md: an arbitrary-precision
+# calculator with zero dependencies, BSD-2-Clause. Chosen over GNU bc, which is
+# GPL-3.0-or-later and blocked against the GPLv2 base.
+#
+# WHICH bc. This is the bc/dc implementation Gavin Howard maintains and that
+# several BSDs ship as their system bc (FreeBSD, and it is the reference for the
+# POSIX bc). Upstream canonical is git.gavinhoward.com/gavin/bc; the GitHub
+# mirror github.com/gavinhoward/bc is what this recipe fetches, tag 7.0.3 (the
+# newest release at port time, read off the Releases page, not assumed).
+#
+# WHAT THIS PORT DELIVERS. The full bc language: arbitrary-precision numbers with
+# a real fractional scale (not the integer-only homegrown /APPS/BC it replaces),
+# user-defined functions, the extended math built-ins (a/s/c/l/e via the -l
+# library: arctangent, sine, cosine, natural log, exponential), arrays, strings,
+# and the GNU/POSIX bc feature set. Built bc-ONLY (dc is not built), with history
+# and NLS disabled so the port needs no termios line editor and no locale
+# catalogue: it reads expressions from stdin or from files named on argv and
+# writes results to stdout, which is exactly Class B.
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA; the only
+# executable part is ports/bc/build.sh.
+
+name=bc
+version=7.0.3
+
+# CLASS B ("CLI tool, file I/O: Class A plus open/read/write, argv"). bc reads
+# stdin or files given on argv, writes stdout/stderr, consults a couple of
+# environment variables (BC_ENV_ARGS, BC_LINE_LENGTH) and isatty() for prompt
+# behaviour, and installs a SIGINT handler to interrupt a long computation. That
+# is stdio + a little of unistd, no sockets, no window, no process model. B is
+# the honest letter.
+class=B
+homepage=https://github.com/gavinhoward/bc
+
+# The GitHub source tarball for tag 7.0.3. The sha256 below is of THIS file and
+# was MEASURED on the build container, not copied from a web page:
+#   wget -O bc-7.0.3.tar.gz \
+#     https://github.com/gavinhoward/bc/archive/refs/tags/7.0.3.tar.gz
+#   sha256sum bc-7.0.3.tar.gz
+#   -> 3c625e8034ef47c9ae11a1ed3dcc22314bf374144decf546647b9a722f7313d6  (1,290,902 bytes)
+# The archive unpacks to bc-7.0.3/. It ships gen/lib.bc, gen/lib2.bc and the
+# help text, from which build.sh regenerates the C string tables with the
+# upstream strgen tool (compiled for the HOST); no configure.sh, TCL or CMake is
+# needed.
+source_url=https://github.com/gavinhoward/bc/archive/refs/tags/7.0.3.tar.gz
+tarball=bc-7.0.3.tar.gz
+sha256=3c625e8034ef47c9ae11a1ed3dcc22314bf374144decf546647b9a722f7313d6
+srcdir=bc-7.0.3
+
+# BSD-2-Clause. The full grant is at LICENSE.md of the tarball (Gavin D. Howard
+# and contributors). mports proves it exists in the unpacked tree; if a future
+# upstream moves it, the build fails rather than shipping unattributed. The
+# label MUST equal the components.tsv row for userland/ports/bc exactly, or
+# vendor-attribution-check fails.
+licence=BSD-2-Clause
+licence_files=LICENSE.md
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): does this want to USE a platform layer, or
+# to BE one? bc USES. It is a self-contained C program: it owns its own main()
+# but imposes no event loop, no window system and no runtime on the OS; it reads
+# stdin/files and writes stdout through the shared libc and nothing else. There
+# is no reimplementation of a MayteraOS shared primitive here: it is upstream bc
+# compiled against our libc, with ONE target adaptation (the sig* setjmp mapping,
+# see patches) that upstream itself already ships for _WIN32.
+adoption=USES. A self-contained arbitrary-precision calculator. It owns main() but imposes no event loop, window system or runtime; it reaches only the shared libc (stdio/stdlib/string/math plus open/read/write/isatty/getenv and a SIGINT handler). The only MayteraOS-specific delta is a one-branch setjmp mapping the patch adds, matching upstream's own _WIN32 branch.
+
+# libc is the shared platform library, not a port. Against the current libc.a
+# every bc translation unit compiles and the whole bc links with ZERO undefined
+# symbols (measured: crt0 + libbc.a + libc.a links clean). bc needs no other
+# port: no ncurses (history disabled), no math library port (libc's math.h /
+# libm covers what it uses), nothing.
+needs=libc
+
+# Nothing to copy into place before patching.
+prepare=none
+
+# ONE patch, status-maytera-sigjmp.patch, and it is a target adaptation, not a
+# bug fix: it maps sigsetjmp(j,0)/siglongjmp/sigjmp_buf to setjmp/longjmp/jmp_buf
+# under -DMAYTERAOS, because the freestanding libc <setjmp.h> has only the plain
+# forms and bc always passes savesigs=0 (so the mapping is behaviour-preserving).
+# Upstream already ships this exact mapping for _WIN32; the hunk adds a MayteraOS
+# branch beside it. Two lines of real change; the engine source is otherwise
+# byte-for-byte unaltered, so there is no patch series to rot at the next bump.
+patches=status-maytera-sigjmp.patch
+
+# build=script: ports/bc/build.sh compiles the upstream strgen tool for the HOST,
+# runs it to regenerate gen/lib.c, gen/lib2.c and gen/bc_help.c from the bc math
+# library and help text the tarball ships, then cross-compiles the seventeen
+# bc-only engine translation units plus those three generated files into one
+# libbc.a. It cannot be build=objects because the generated files do not exist
+# in the tarball (strgen makes them) and because the codegen needs a host
+# compile step, neither of which a static `sources=` list can express. Same
+# structural class as the sqlite/quickjs script builds.
+build=script
+
+# -DMAYTERAOS selects the setjmp mapping branch the patch adds (see patches). All
+# the other bc feature -D flags (bc-only, no dc, no history, no NLS, extra math
+# on) live in build.sh where the codegen and the compile share them, because
+# strgen's output depends on some of them.
+cflags=-DMAYTERAOS
+
+# App-style port (like darkhttpd/myman): bc is a PROGRAM, its main() lives inside
+# libbc.a, and userland/apps/bc links crt0 + libbc.a + libc into /APPS/BC. It
+# installs no public header for a consumer to compile against.
+headers=none
+
+lib=libbc.a
+
+# THE ANTI-NO-OP CHECK. mports proves with nm that every one of these is a
+# DEFINED symbol in libbc.a, so a build that dropped a translation unit or a
+# codegen step fails HERE and not at bc's confused runtime:
+#   main          (src/main.c   - the program entry crt0 calls)
+#   bc_main       (src/bc.c     - the bc driver)
+#   bc_num_add bc_num_mul bc_num_div bc_num_mod   (src/num.c - the bignum core)
+#   bc_program_exec  (src/program.c - the bytecode executor)
+#   bc_parse_parse   (src/bc_parse.c - the bc parser, PROVES bc language landed)
+#   bc_lex_token     (src/bc_lex.c - the bc lexer)
+#   bc_vm_boot       (src/vm.c - the VM bring-up)
+#   bc_lib_name      (gen/lib.c - the -l math library string table, PROVES the
+#                     strgen codegen ran; without it a(1)/s()/c()/l()/e() vanish)
+symbols=main bc_main bc_num_add bc_num_mul bc_num_div bc_num_mod bc_program_exec bc_parse_parse bc_lex_token bc_vm_boot bc_lib_name

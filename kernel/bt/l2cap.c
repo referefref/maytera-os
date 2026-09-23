@@ -239,12 +239,27 @@ static void sig_info_req(hci_handle_t h, uint8_t id, const uint8_t *d, uint16_t 
     send_sig(h, L2CAP_SIG_INFO_RSP, id, rsp, 4);
 }
 
+// LE Connection Parameter Update Request (code 0x12, LE signalling CID 0x0005).
+// A peripheral (our LE HID peer, e.g. a BLE keyboard/mouse) sends this to ask
+// the central to adopt its preferred connection interval/latency/timeout. If we
+// never answer, some devices stall their own SMP/HOGP setup and drop the link.
+// We accept (result 0x0000). Applying the parameters via LE_Connection_Update is
+// optional for correctness and skipped here; accepting unblocks the peer.
+static void sig_conn_param_update_req(hci_handle_t h, uint8_t id,
+                                      const uint8_t *d, uint16_t len) {
+    (void)d; (void)len;
+    uint8_t rsp[2];
+    wr16(rsp + 0, 0x0000);   // result: accepted
+    send_sig(h, 0x13 /* CONN_PARAM_UPDATE_RSP */, id, rsp, 2);
+}
+
 static void process_signalling(hci_handle_t h, const uint8_t *p, uint16_t len) {
     while (len >= 4) {
         uint8_t code = p[0], id = p[1];
         uint16_t clen = rd16(p + 2);
         if (len < 4 + clen) break;
         const uint8_t *cd = p + 4;
+        kprintf("[BT-L2CAP] sig code=0x%02x id=%u len=%u\n", code, id, clen);
         switch (code) {
             case L2CAP_SIG_CONN_REQ:    sig_conn_req(h, id, cd, clen); break;
             case L2CAP_SIG_CONN_RSP:    sig_conn_rsp(h, cd, clen); break;
@@ -253,6 +268,9 @@ static void process_signalling(hci_handle_t h, const uint8_t *p, uint16_t len) {
             case L2CAP_SIG_DISCONN_REQ: sig_disc_req(h, id, cd, clen); break;
             case L2CAP_SIG_DISCONN_RSP: sig_disc_rsp(h, cd, clen); break;
             case L2CAP_SIG_INFO_REQ:    sig_info_req(h, id, cd, clen); break;
+            case 0x12: /* LE Conn Param Update Request */
+                sig_conn_param_update_req(h, id, cd, clen); break;
+            case 0x13: /* LE Conn Param Update Response */ break;
             default:
                 kprintf("[BT-L2CAP] unhandled signal 0x%02x\n", code);
                 break;
@@ -272,6 +290,9 @@ void l2cap_input(hci_handle_t h, const uint8_t *pdu, uint16_t len) {
     const uint8_t *payload = pdu + 4;
     uint16_t paylen = (uint16_t)(len - 4);
     if (l2len < paylen) paylen = l2len;
+
+    kprintf("[BT-L2CAP] rx handle=0x%04x cid=0x%04x l2len=%u paylen=%u\n",
+            h, cid, l2len, paylen);
 
     if (cid == L2CAP_CID_SIGNALING || cid == L2CAP_CID_LE_SIGNALING) {
         process_signalling(h, payload, paylen);

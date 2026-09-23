@@ -63,7 +63,7 @@
 #                                       #  proven RED without the edge)
 #
 # ENVIRONMENT
-#   MPORTS_CACHE    tarball cache            (default <workspace>)
+#   MPORTS_CACHE    tarball cache            (default /root/mports-cache)
 #   MPORTS_OFFLINE  1 = never touch the network; a cache miss is fatal and
 #                   prints the exact wget command to run
 #
@@ -73,7 +73,7 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORTS_DIR="$SELF_DIR"
-: "${MPORTS_CACHE:=<workspace>}"
+: "${MPORTS_CACHE:=/root/mports-cache}"
 : "${MPORTS_OFFLINE:=0}"
 WORK="$PORTS_DIR/.work"
 OUT="$PORTS_DIR/out"
@@ -111,7 +111,7 @@ mk_var() {
 # PORT manifest: strict key=value. Every key is whitelisted; an unknown key is
 # fatal. Required keys must be present and non-empty.
 # ---------------------------------------------------------------------------
-PORT_KEYS="name version class licence licence_files homepage source_url tarball sha256 srcdir needs adoption copyleft copyleft_note prepare patches build sources exclude exclude_reason cflags headers install_sources lib symbols"
+PORT_KEYS="name version class licence licence_files homepage source_url tarball sha256 srcdir needs adoption copyleft copyleft_note prepare patches build sources exclude exclude_reason cflags headers install_sources install_data lib symbols"
 PORT_REQUIRED="name version class licence licence_files homepage source_url tarball sha256 srcdir needs adoption copyleft prepare patches build headers lib symbols"
 
 # Banned outright in a shipped image (share-alike against our GPLv2 base, and
@@ -384,6 +384,21 @@ do_build() {
   cflags="$cflags $(mk_var MPORTS_INCLUDE) ${P[cflags]:-}"
   local obj objs=0 nsrc=0 src
   if [ "${P[build]}" = "script" ]; then
+    # #745 (angband): a build=script recipe (ncurses, and now angband via its
+    # ncurses \`needs=\`) can be the FIRST port ever built in a fresh worktree,
+    # where $OUT (ports/out/, gitignored) does not exist yet. ncurses/build.sh
+    # does \`LIBC=\$(cd "$OUT/../../libc" && pwd)\` before its own
+    # \`mkdir -p \$OUT/lib $OUT/include\`, and bash's cd requires every real
+    # path component including $OUT itself to already exist to walk \`..\`
+    # back up from it. In the ORIGINAL dev tree this was masked: zlib/pcre2/
+    # lua/sqlite/darkhttpd (build=objects, alphabetically before ncurses) each
+    # create $OUT via the install step below as a side effect, so by the time
+    # ncurses ran, $OUT already existed by accident of build order. A fresh
+    # worktree that builds ncurses (or anything needing it) FIRST had no such
+    # accident. Fix the mechanism, not the instance: guarantee $OUT exists
+    # before ANY build=script recipe runs, unconditionally, so the order other
+    # ports happen to run in is never load-bearing again.
+    mkdir -p "$OUT" || die "$name: cannot create $OUT before build.sh"
     log "$name: build=script, running ports/$name/build.sh"
     ( cd "$s" && MPORTS_CFLAGS="$cflags" MPORTS_OUT="$OUT" MPORTS_SRC="$s" \
         bash "$PORTS_DIR/$name/build.sh" ) || die "$name: build.sh FAILED"
@@ -420,11 +435,18 @@ do_build() {
 
   # --- install --------------------------------------------------------------
   mkdir -p "$OUT/include" "$OUT/lib" "$OUT/receipt" || die "$name: cannot create $OUT"
+  # headers=none is the APP port case: a program (darkhttpd) installs no public
+  # header, exactly as it declares no install_sources. Treated as a literal here,
+  # parallel to prepare=none / patches=none / install_sources=none, so the
+  # required-key check (headers must be non-empty) is still satisfied by a word
+  # that means "nothing to install" rather than by a bogus filename.
   local h
-  for h in ${P[headers]}; do
-    [ -f "$s/$h" ] || die "$name: headers names '$h' but it is not in the unpacked tree"
-    cp "$s/$h" "$OUT/include/$(basename "$h")" || die "$name: cannot install header $h"
-  done
+  if [ "${P[headers]}" != none ]; then
+    for h in ${P[headers]}; do
+      [ -f "$s/$h" ] || die "$name: headers names '$h' but it is not in the unpacked tree"
+      cp "$s/$h" "$OUT/include/$(basename "$h")" || die "$name: cannot install header $h"
+    done
+  fi
   cp "$libpath" "$OUT/lib/${P[lib]}" || die "$name: cannot install ${P[lib]}"
 
   # install_sources: upstream .c files that belong to a CONSUMER, not to the
@@ -453,6 +475,35 @@ do_build() {
     done
   fi
 
+  # install_data: a READ-ONLY DATA TREE a port ships beside its code, for a
+  # runtime that needs real files on disk at a fixed path (Angband's lib/
+  # gamedata+customize+help+screens, #745 Tier 3 #15 - the FIRST real user).
+  # Same shape as install_sources (space-separated "SRC:DST" pairs, copied
+  # AFTER the patch series so a consumer gets OUR version), but a directory,
+  # not a translation unit, and installed under $OUT/data/ rather than
+  # $OUT/src/. WHY NOT REACH INTO .work/ instead (the unpacked+patched tree
+  # already has the data right there): .work is explicitly SCRATCH (its path
+  # embeds the upstream version, and "mports.sh clean" deletes it while
+  # leaving out/ alone), the same reason install_sources does not point
+  # build-golden.sh at .work/ for lua.c either. $OUT/data/<name> is the
+  # stable contract build-golden.sh's ext2 overlay step reads from, parallel
+  # to how it already reads $OUT/terminfo for the ncurses port.
+  local dpair dsrc ddst ndata=0
+  if [ -n "${P[install_data]:-}" ] && [ "${P[install_data]}" != none ]; then
+    for dpair in ${P[install_data]}; do
+      case "$dpair" in
+        *:*) dsrc="${dpair%%:*}"; ddst="${dpair#*:}" ;;
+        *) die "$name: install_data entry '$dpair' is not SRC:DST" ;;
+      esac
+      case "$dsrc" in ''|*..*|/*) die "$name: install_data SRC '$dsrc' is empty or escapes the unpacked tree" ;; esac
+      case "$ddst" in ''|*..*|/*) die "$name: install_data DST '$ddst' is empty or escapes $OUT/data" ;; esac
+      [ -d "$s/$dsrc" ] || die "$name: install_data names '$dsrc' but it is not a directory in the unpacked tree. Upstream moved it; the manifest is stale."
+      mkdir -p "$OUT/data/$ddst" || die "$name: cannot create $OUT/data/$ddst"
+      cp -r "$s/$dsrc/." "$OUT/data/$ddst/" || die "$name: cannot install data tree $dsrc -> $OUT/data/$ddst"
+      ndata=$((ndata + $(find "$s/$dsrc" -type f | wc -l)))
+    done
+  fi
+
   local bytes; bytes="$(stat -c %s "$OUT/lib/${P[lib]}")"
   {
     echo "port=$name"
@@ -466,18 +517,19 @@ do_build() {
     echo "lib=${P[lib]} bytes=$bytes libsha256=$(sha_of "$OUT/lib/${P[lib]}")"
     echo "headers=${P[headers]}"
     echo "install_sources=${P[install_sources]:-none} (installed=$ninst)"
+    echo "install_data=${P[install_data]:-none} (files=$ndata)"
     echo "symbols_verified=$oksym/$nsym"
     echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } > "$OUT/receipt/$name.txt"
 
-  log "OK $name ${P[version]} -> $OUT/lib/${P[lib]} ($bytes bytes), $(printf '%s' "${P[headers]}" | wc -w) header(s), $oksym/$nsym promised symbols defined, $prepared prepare copy(ies), $applied patch(es) applied, $ninst consumer source(s) installed"
+  log "OK $name ${P[version]} -> $OUT/lib/${P[lib]} ($bytes bytes), $([ "${P[headers]}" = none ] && echo 0 || printf '%s' "${P[headers]}" | wc -w) header(s), $oksym/$nsym promised symbols defined, $prepared prepare copy(ies), $applied patch(es) applied, $ninst consumer source(s) installed, $ndata data file(s) installed"
 }
 
 do_clean() {
   local name="$1"; parse_port "$name"
   rm -rf "$WORK/$name"
   rm -f "$OUT/lib/${P[lib]}" "$OUT/receipt/$name.txt"
-  local h; for h in ${P[headers]}; do rm -f "$OUT/include/$(basename "$h")"; done
+  local h; [ "${P[headers]}" = none ] || for h in ${P[headers]}; do rm -f "$OUT/include/$(basename "$h")"; done
   local i; for i in ${P[install_sources]:-}; do [ "$i" = none ] || rm -f "$OUT/src/$(basename "$i")"; done
   log "$name: cleaned"
 }
@@ -848,6 +900,23 @@ EOF
   # 22. back to good, to prove the tree was not left poisoned
   write_manifest "$tsha" none "toy_add toy_mul" Toy-Permissive
   chk "the corrected port again" GREEN ""
+
+  # 23. headers=none is the APP port literal (darkhttpd installs no header).
+  #     It must build GREEN, proving the literal is accepted rather than looked
+  #     up as a filename called "none".
+  write_manifest "$tsha" none "toy_add toy_mul" Toy-Permissive
+  sed -i 's/^headers=.*/headers=none/' "$tmp/ports/toy/PORT"
+  chk "headers=none (an app port that installs no header)" GREEN ""
+
+  # 24. a header the tarball does not contain is STILL fatal, so headers=none
+  #     did not blunt the real check.
+  write_manifest "$tsha" none "toy_add toy_mul" Toy-Permissive
+  sed -i 's/^headers=.*/headers=ghost.h/' "$tmp/ports/toy/PORT"
+  chk "a header the tarball does not contain" RED "it is not in the unpacked tree"
+
+  # 25. back to good once more, to prove neither case above poisoned the tree.
+  write_manifest "$tsha" none "toy_add toy_mul" Toy-Permissive
+  chk "the corrected port a final time" GREEN ""
 
   echo "mports self-test: $pass/$total"
   [ "$pass" = "$total" ]

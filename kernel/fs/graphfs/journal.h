@@ -25,6 +25,13 @@
 #define GFSJ_OP_BOOT            1   // a boot happened; carries the boot gen
 #define GFSJ_OP_AUDIT           2   // a security_audit() event (slice 1 consumer)
 #define GFSJ_OP_CHECKPOINT      3   // discontinuity marker (e.g. tamper found)
+#define GFSJ_OP_ESCROW_DECISION 4   // #246 Stage 3: a kernel escrow enforcement
+                                    // DECISION (a DENY, or an in-scope mutation
+                                    // ALLOW). A system record, NOT a graph
+                                    // mutation: gfsf_apply() counts it and does
+                                    // not fold it (op < OP_GRAPH_FIRST), so it
+                                    // needs no Rust decoder. See fs/escrow_guard.c
+                                    // for the payload schema.
 #define GFSJ_OP_NODE_CREATE     16  // slice 2
 #define GFSJ_OP_VERSION_COMMIT  17  // slice 2
 #define GFSJ_OP_EDGE_ADD        18  // slice 2: a contract GRANT is an edge

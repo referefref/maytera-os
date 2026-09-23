@@ -18,6 +18,7 @@
 #include <libcss/fpmath.h>
 
 #include "css_select_bind.h"
+#include "cssvar.h"
 
 /* ------------------------------------------------------------------ */
 /* Built-in user-agent stylesheet (minimal but covers common defaults) */
@@ -26,11 +27,35 @@ static const char UA_CSS[] =
 	"html, address, blockquote, body, dd, div, dl, dt, fieldset, form,"
 	"frame, frameset, h1, h2, h3, h4, h5, h6, noframes, ol, p, ul, center,"
 	"dir, hr, menu, pre { display: block; }\n"
+	/*
+	 * HTML5 sectioning and grouping elements. Their absence here was not a
+	 * cosmetic gap: with no rule giving them `display: block`, <header>,
+	 * <nav>, <main>, <section>, <article>, <footer>, <figure> and
+	 * <figcaption> all defaulted to INLINE. A page built out of them, which
+	 * is every page written since about 2012, produced no block breaks at
+	 * all in its main structure and ran together into one long paragraph.
+	 */
+	"article, aside, details, figcaption, figure, footer, header, hgroup,"
+	"main, nav, section, summary, dialog { display: block; }\n"
+	"template { display: none; }\n"
 	"head, style, script, title, meta, link { display: none; }\n"
 	"li { display: list-item; }\n"
 	"table { display: table; }\n"
 	"tr { display: table-row; }\n"
 	"td, th { display: table-cell; }\n"
+	/*
+	 * The row groups. Their absence was not cosmetic: with no rule, <thead>
+	 * and <tbody> defaulted to INLINE, so the rows inside them were not
+	 * reachable as table content at all and every cell fell through to the
+	 * block path as a full-width bar.
+	 */
+	"thead { display: table-header-group; }\n"
+	"tbody { display: table-row-group; }\n"
+	"tfoot { display: table-footer-group; }\n"
+	"caption { display: table-caption; }\n"
+	"colgroup { display: table-column-group; }\n"
+	"col { display: table-column; }\n"
+	"th { font-weight: bold; text-align: center; }\n"
 	"body { margin: 8px; line-height: 1.2; color: #000000; }\n"
 	"h1 { font-size: 2em; font-weight: bold; margin: 16px 0; }\n"
 	"h2 { font-size: 1.5em; font-weight: bold; margin: 14px 0; }\n"
@@ -52,6 +77,7 @@ struct mcs_ctx {
 	css_stylesheet *author_sheet; /* optional, single combined */
 	css_unit_ctx unit;
 	css_media media;
+	int vp_w, vp_h;               /* viewport in CSS px, for vw/vh and @media */
 };
 
 /* ------------------------------------------------------------------ */
@@ -635,6 +661,8 @@ mcs_ctx *mcs_create(void)
 	/* media: screen, viewport metrics filled by caller via unit ctx */
 	memset(&c->media, 0, sizeof(c->media));
 	c->media.type = CSS_MEDIA_SCREEN;
+	c->vp_w = 1024;
+	c->vp_h = 768;
 	c->media.width = INTTOFIX(1024);
 	c->media.height = INTTOFIX(768);
 
@@ -651,11 +679,42 @@ mcs_ctx *mcs_create(void)
 	return c;
 }
 
+void mcs_set_viewport(mcs_ctx *c, int w, int h)
+{
+	if (!c) return;
+	if (w < 1) w = 1;
+	if (h < 1) h = 1;
+	c->vp_w = w;
+	c->vp_h = h;
+	c->media.width = INTTOFIX(w);
+	c->media.height = INTTOFIX(h);
+	c->unit.viewport_width = INTTOFIX(w);
+	c->unit.viewport_height = INTTOFIX(h);
+}
+
 int mcs_add_author_css(mcs_ctx *c, const char *css, unsigned long len)
 {
 	css_stylesheet *s;
+	char *pre;
+	size_t prelen = 0;
 	if (!c || !css || len == 0) return -1;
-	s = make_sheet(css, len, false);
+
+	/*
+	 * Resolve custom properties and math functions before libcss sees the
+	 * text. Measured on maytera.net's sheet: 243 of ~540 declarations
+	 * contain a var() and 29 contain a clamp(), and libcss drops every one
+	 * of them as a parse error. That is the whole palette and the whole
+	 * spacing scale. If the resolver fails to allocate we fall back to the
+	 * raw text, which is exactly today's behaviour, never worse.
+	 */
+	pre = cssvar_preprocess(css, (size_t) len, c->vp_w, c->vp_h, &prelen);
+	if (pre && prelen > 0) {
+		s = make_sheet(pre, (unsigned long) prelen, false);
+		free(pre);
+	} else {
+		if (pre) free(pre);
+		s = make_sheet(css, len, false);
+	}
 	if (!s) return -1;
 	if (css_select_ctx_append_sheet(c->select, s, CSS_ORIGIN_AUTHOR, NULL)
 			!= CSS_OK) {
@@ -677,9 +736,40 @@ css_computed_style *mcs_compute_style(mcs_ctx *c, dom_element *node,
 
 	if (!c || !node) return NULL;
 
+	/*
+	 * Inline style attribute (#245, libcsslst). The style="" attribute is a
+	 * per-element stylesheet at author origin, higher priority than any
+	 * selector-matched author rule. It was passed as NULL here, so EVERY
+	 * inline declaration (list-style-type, color, display, ...) was silently
+	 * dropped: a <ul style="list-style-type:square"> computed to the initial
+	 * DISC. Build a one-off inline sheet from the attribute and hand it to
+	 * css_select_style, which is exactly what the inline_style parameter is
+	 * for. The sheet is destroyed after selection; the computed results hold
+	 * their own ref-counted copies of anything they need from it.
+	 */
+	css_stylesheet *inline_sheet = NULL;
+	{
+		dom_string *an = NULL, *sv = NULL;
+		if (dom_string_create((const uint8_t *) "style", 5, &an)
+				== DOM_NO_ERR && an) {
+			dom_element_get_attribute(node, an, &sv);
+			dom_string_unref(an);
+		}
+		if (sv) {
+			const char *sd = dom_string_data(sv);
+			size_t sl = dom_string_byte_length(sv);
+			if (sd && sl > 0)
+				inline_sheet = make_sheet(sd,
+						(unsigned long) sl, true);
+			dom_string_unref(sv);
+		}
+	}
+
 	g_mcs_stage = 1;
-	e = css_select_style(c->select, node, &c->unit, &c->media, NULL,
+	e = css_select_style(c->select, node, &c->unit, &c->media, inline_sheet,
 			&g_handler, c, &results);
+	if (inline_sheet)
+		css_stylesheet_destroy(inline_sheet);
 	g_mcs_last_err = (int) e;
 	if (e != CSS_OK || results == NULL) { g_mcs_stage = 2; return NULL; }
 

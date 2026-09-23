@@ -2,6 +2,7 @@
 // Combines TCP sockets with TLS for secure HTTP
 
 #include "https.h"
+#include "netfail.h"   // #netfix2: record WHY a fetch failed
 #include "tcp.h"
 #include "dns.h"
 #include "ip.h"
@@ -14,6 +15,8 @@
 #include "../cpu/dlprof.h"
 #include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 #include "http_progress.h"   // #25: real per-fetch progress for the browser chrome
+#include "../sync/waitq.h"   // #httpsddl: wait_event_timeout() for the TLS recv wait
+#include "socket.h"          // #httpsddl: net_rx_waitq() (owning header, #742)
 
 // #615: per-phase fetch profile. Every https_get/https_get_hdr/https_post
 // records where its wall clock went (dns / arp / tcp connect / tls handshake /
@@ -46,12 +49,28 @@ static int https_tcp_send(void *user_data, const void *data, size_t length) {
     https_conn_t *conn = (https_conn_t *)user_data;
 
     size_t sent = 0;
+    // #httpsddl / #426: bound the WOULD_BLOCK retry. This loop previously had
+    // NO deadline: a peer advertising a zero window wedges it FOREVER in the
+    // caller (a Ring-3 app in sys_http_fetch, or the kernel serial-shell/browser
+    // fetch), because tcp.c has no persist/zero-window probe and the retransmit
+    // timer never fires with nothing unacked (it needs snd_una < snd_nxt). Shape
+    // and 10s magnitude match smb_send_all() (net/smb.c): the budget is "no
+    // forward progress for 10s", reset on every byte accepted, so a slow-but-
+    // advancing send is never falsely aborted; only a true stall trips it.
+    uint64_t send_start = sched_now_ms();
+    const uint64_t send_deadline_ms = 10000;   // ~10s no-progress cap (smb_send_all)
     while (sent < length) {
         net_lock();
         int ret = tcp_send(conn->tcp_socket, (const uint8_t *)data + sent, length - sent);
         net_unlock();
         if (ret < 0) {
             if (ret == TCP_ERR_WOULD_BLOCK) {
+                if (sched_now_ms() - send_start > send_deadline_ms) {
+                    // Stalled for the whole budget. Return the same negative
+                    // error the hard-failure path returns so tls_send_record()
+                    // unwinds cleanly (ret == TCP_ERR_WOULD_BLOCK here).
+                    return ret;
+                }
                 net_poll();
                 tcp_timer();
                 proc_sleep(1);   // yield while the TX buffer drains
@@ -60,6 +79,7 @@ static int https_tcp_send(void *user_data, const void *data, size_t length) {
             return ret;
         }
         sent += ret;
+        send_start = sched_now_ms();   // forward progress: reset the no-progress deadline
         net_poll();
         tcp_timer();
     }
@@ -98,7 +118,23 @@ static int https_tcp_recv(void *user_data, void *buffer, size_t length) {
         net_poll();
         tcp_timer();
         g_dp_tls_sleep++;
-        proc_sleep(2);   // yield so the OS stays responsive during the fetch
+        // #httpsddl / #426: replace the proc_sleep(2) busy-poll with a parked
+        // wait on the shared net RX queue. socket_net_wake() (net/ethernet.c,
+        // fired on EVERY delivered IP frame) wakes this queue the instant TCP
+        // buffers more data, so a normal fetch resumes promptly; the ~100ms
+        // slice is the tier-2 backstop bounding a lost/absent wake, and the
+        // outer 5s deadline is the real cap. tcp_rx_pending()!=0 is the cheap,
+        // BSS-only readiness predicate (>0 data, -1 terminal, 0 = keep waiting),
+        // the same one the BSD socket recv uses (#524). Remote-peer wait: a
+        // timeout is the correct semantics. RX is still pumped on this thread by
+        // the net_poll()/tcp_timer() above AND redundantly off-thread by
+        // net_worker()'s ~1s pass and the compositor flip path, so parking
+        // cannot stall the fetch. Blockable context: every https_get() caller
+        // (sys_http_fetch syscall body, the fetch worker thread, the serial-
+        // shell wget) runs scheduler-live with net_lock released here.
+        (void)wait_event_timeout(net_rx_waitq(),
+                                 tcp_rx_pending(conn->tcp_socket) != 0,
+                                 wq_ms_to_ticks(100));
 
         // Do NOT bail out on CLOSE_WAIT here. A server honoring "Connection: close"
         // commonly sends its (often small) response and the FIN back-to-back, so a
@@ -167,7 +203,12 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
     // enforced once at the fetch gate, which admits one paced re-probe. Testing
     // net_is_up() here vetoed that probe.
     extern int net_wire_usable(void);
-    if (!net_wire_usable()) { kprintf("[HTTPS] no carrier/address; skipping connect to %s\n", hostname); return NULL; }
+    if (!net_wire_usable()) {
+        extern int nic_link_up(void);
+        NETFAIL(nic_link_up() ? NF_NO_ADDRESS : NF_NO_CARRIER, 0);   // #netfix2
+        kprintf("[HTTPS] no carrier/address; skipping connect to %s\n", hostname);
+        return NULL;
+    }
     https_conn_t *conn = kzalloc(sizeof(https_conn_t));
     if (!conn) return NULL;
 
@@ -185,6 +226,12 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
     int ret = dns_resolve(hostname, &host_ip);
     g_pf_dns = sched_now_ms() - _t_dns0;
     if (ret != 0) {
+        // WEAK: dns_resolve() has already recorded exactly which of the eight
+        // DNS faults this was. Overwriting that with a generic one here would
+        // relabel every resolver fault in the OS as the same thing and send
+        // the reader to the wrong subsystem, which is the whole reason
+        // netfail has two setters.
+        NETFAIL_WEAK(NF_DNS_SILENT, ret);   // #netfix2
         kprintf("[HTTPS] DNS resolution failed: %d\n", ret);
         kfree(conn);
         return NULL;
@@ -211,6 +258,7 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
         // Create TCP socket
         conn->tcp_socket = tcp_socket();
         if (conn->tcp_socket < 0) {
+            NETFAIL(NF_SOCKET, 0);   // #netfix2
             kprintf("[HTTPS] Failed to create socket\n");
             kfree(conn);
             return NULL;
@@ -218,6 +266,7 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
 
         ret = tcp_connect(conn->tcp_socket, host_ip, port);
         if (ret < 0 && ret != TCP_ERR_IN_PROGRESS) {
+            NETFAIL(NF_TCP_FAILED, ret);   // #netfix2
             kprintf("[HTTPS] TCP connect failed: %d (attempt %d)\n", ret, attempt + 1);
             tcp_close(conn->tcp_socket);
             conn->tcp_socket = -1;
@@ -234,12 +283,14 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
             proc_sleep(2);   // yield during the connect wait
 
             if (sched_now_ms() - start_time_ms > timeout_ms) {
+                NETFAIL(NF_TCP_TIMEOUT, (int)timeout_ms);   // #netfix2
                 kprintf("[HTTPS] TCP connection timeout (attempt %d)\n", attempt + 1);
                 dead = 1;
                 break;
             }
             tcp_state_t state = tcp_get_state(conn->tcp_socket);
             if (state == TCP_STATE_CLOSED) {
+                NETFAIL(NF_TCP_REFUSED, 0);   // #netfix2
                 kprintf("[HTTPS] TCP connection reset/refused (attempt %d)\n", attempt + 1);
                 dead = 1;
                 break;
@@ -252,6 +303,7 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
             continue;
         }
         connected = 1;
+        netfail_clear();   // #netfix2: attempt 1 may have failed; this one did not
     }
     if (!connected) {
         kprintf("[HTTPS] TCP connect failed after retries\n");
@@ -266,6 +318,7 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
     // Create TLS context
     conn->tls = tls_create();
     if (!conn->tls) {
+        NETFAIL(NF_TLS_CTX, 0);   // #netfix2
         kprintf("[HTTPS] Failed to create TLS context\n");
         tcp_close(conn->tcp_socket);
         kfree(conn);
@@ -288,6 +341,12 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
     ret = tls_connect(conn->tls);
     g_pf_tls = sched_now_ms() - _t_tls0;
     if (ret < 0) {
+        // WEAK: the certificate layer records the SPECIFIC reason (expired,
+        // not-yet-valid, wrong hostname, no trusted CA, or a system clock so
+        // wrong that a perfectly good certificate cannot possibly validate).
+        // Those need five different actions from the user and only one of them
+        // is "the site is broken".
+        NETFAIL_WEAK(NF_TLS_HANDSHAKE, ret);   // #netfix2
         kprintf("[HTTPS] TLS handshake failed: %s\n", tls_strerror(ret));
         tls_free(conn->tls);
         tcp_close(conn->tcp_socket);
@@ -949,6 +1008,7 @@ redo_fetch: ;
 
     // Parse URL
     if (https_parse_url(cur_url, host, path, &port) != 0) {
+        NETFAIL(NF_BAD_URL, 0);   // #netfix2
         kprintf("[HTTPS] Invalid URL\n");
         return HTTPS_ERR_CONNECT;
     }
@@ -985,6 +1045,7 @@ redo_fetch: ;
         // cheap and does not hit the DNS negative-cache. This makes h2 fetches to
         // musicbrainz.org / archive.org (album-art path) reliable under load.
         for (int h2try = 0; h2rc != 0 && h2st == 0 && h2try < 3; h2try++) {
+            NETFAIL(NF_HTTP_NO_STATUS, 0);   // #netfix2 (#333)
             kprintf("[HTTPS] h2 no-status; reconnect+retry %d\n", h2try + 1);
             net_poll(); tcp_timer(); proc_sleep(400);
             conn = https_connect(host, port);
@@ -1009,7 +1070,8 @@ redo_fetch: ;
                 redir_hops++;
                 goto redo_fetch;
             }
-            kprintf("[HTTPS] Redirect blocked (SSRF/scheme downgrade): %s\n", nxt);
+            NETFAIL(NF_HTTP_REDIRECT_BLOCKED, 0);   // #netfix2
+        kprintf("[HTTPS] Redirect blocked (SSRF/scheme downgrade): %s\n", nxt);
         }
         return (h2rc == 0) ? HTTPS_SUCCESS : HTTPS_ERR_TLS;
     }
@@ -1042,6 +1104,7 @@ redo_fetch: ;
     _t_req = sched_now_ms();
     kfree(request);
     if (ret < 0) {
+        NETFAIL(NF_HTTP_SEND, ret);   // #netfix2
         kprintf("[HTTPS] Failed to send request: %d\n", ret);
         https_conn_release(conn, 0);
         /* #616: a pooled connection the peer had already torn down fails HERE.
@@ -1177,6 +1240,7 @@ redo_fetch: ;
                 int cc = https_chunked_is_complete(buffer + headers_end, body_len);
                 if (cc == 1) { chunked_done = 1; goto recv_done; }
                 if (cc < 0) {
+                    NETFAIL(NF_HTTP_CHUNKED, 0);   // #netfix2
                     kprintf("[HTTPS] Malformed chunked framing; aborting\n");
                     kfree(buffer);
                     https_conn_release(conn, 0);
@@ -1229,6 +1293,7 @@ recv_done:
     // truncated body -- this is what corrupted JSON callers (HA /api/states,
     // pip metadata) that only check the status code.
     if (headers_end > 0 && is_chunked && !chunked_done) {
+        NETFAIL(NF_HTTP_TRUNCATED, 0);   // #netfix2
         kprintf("[HTTPS] Truncated chunked body: connection ended before the terminating chunk\n");
         kfree(buffer);
         return HTTPS_ERR_TRUNCATED;
@@ -1236,6 +1301,7 @@ recv_done:
     if (headers_end > 0 && !is_chunked && content_length > 0) {
         uint32_t body_len = buffer_len - (uint32_t)headers_end;
         if (body_len < content_length) {
+            NETFAIL(NF_HTTP_TRUNCATED, (int)content_length);   // #netfix2
             kprintf("[HTTPS] Truncated body: got %u of %u advertised bytes\n",
                     body_len, content_length);
             kfree(buffer);
@@ -1256,7 +1322,8 @@ recv_done:
                 redir_hops++;
                 goto redo_fetch;
             }
-            kprintf("[HTTPS] Redirect blocked (SSRF/scheme downgrade): %s\n", nxt);
+            NETFAIL(NF_HTTP_REDIRECT_BLOCKED, 0);   // #netfix2
+        kprintf("[HTTPS] Redirect blocked (SSRF/scheme downgrade): %s\n", nxt);
         }
     }
 

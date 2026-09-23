@@ -10,6 +10,8 @@
 #include "../cpu/isr.h"
 #include "../sync/spinlock.h"   // #522: atomic_cas64() for the timeout claim
 #include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
+#include "../sync/waitq.h"   // #dhcpwake: park the blocking DORA/link wait
+#include "../sync/noblock.h" // #dhcpwake: wq_may_block() no-block guard
 
 extern uint32_t g_timer_hz;
 
@@ -20,6 +22,28 @@ extern uint32_t g_timer_hz;
 // DHCP state
 static int dhcp_state = DHCP_STATE_IDLE;
 static uint32_t dhcp_xid = 0x12345678;
+
+// #dhcpwake: progress wait queue. The SYS_NET_DHCP blocking path
+// (dhcp_discover_blocking) parks on this instead of busy-polling for carrier or
+// for the DORA OFFER/ACK. Redundant, always-armed wakers so no wake is ever
+// lost (the HDA PCM-pump pattern):
+//   - LINK: net_worker() wakes it on the carrier down->up edge AND once per
+//           ~1s worker pass (the redundant, always-armed source).
+//   - DORA: dhcp_handle() wakes it when an OFFER/ACK advances the state (the
+//           natural RX-ingest waker), dhcp_poll() wakes it the instant DAD
+//           completes to BOUND, and net_worker()'s ~1s pass is the redundant
+//           backstop. A missed edge costs at most one worker tick, never a
+//           hang, and never a busy-poll.
+static wait_queue_head_t dhcp_wq;
+static int dhcp_wq_ready = 0;
+
+// Wake any thread parked in dhcp_discover_blocking(). Safe from any context:
+// wake_up_all() uses spinlock_acquire_irqsave(), so it is callable from under
+// net_lock (cli + spinlock, interrupts off), which is where dhcp_handle() and
+// dhcp_poll() run. A no-op until dhcp_init() arms the queue.
+void dhcp_wake(void) {
+    if (dhcp_wq_ready) wake_up_all(&dhcp_wq);
+}
 
 // #520: DHCP tracing, DEFAULT OFF (same precedent as g_tcp_dbg, #225). These
 // traces are diagnostic only and MUST stay off in shipping builds: kprintf is
@@ -681,10 +705,17 @@ static void dhcp_handle(uint32_t src_ip, uint16_t src_port,
             }
             break;
     }
+
+    // #dhcpwake: an OFFER/ACK was ingested and may have advanced the state
+    // (DISCOVERING->REQUESTING). Wake the blocking DORA waiter so it re-checks
+    // BOUND without polling. Runs under net_lock; wake_up_all() is irqsave-safe.
+    dhcp_wake();
 }
 
 // Initialize DHCP client
 void dhcp_init(void) {
+    wait_queue_head_init(&dhcp_wq);   // #dhcpwake: arm the progress wait queue
+    dhcp_wq_ready = 1;
     dhcp_state = DHCP_STATE_IDLE;
     dhcp_xid = timer_ticks ^ 0xDEADBEEF;  // Random-ish transaction ID
 
@@ -736,7 +767,7 @@ int dhcp_discover(void) {
     // dhcp_init() ran `dhcp_xid = timer_ticks ^ 0xDEADBEEF` BEFORE sti(), when
     // timer_ticks is always 0, so every MayteraOS box on earth started at
     // 0xDEADBEEF and sent its first DISCOVER as 0xDEADBEF0. OBSERVED on the the build host
-    // LAN: two independent MayteraOS VMs (00:00:5E:00:53:00 and 00:00:5E:00:53:00)
+    // LAN: two independent MayteraOS VMs (bc:24:11:5f:d9:25 and bc:24:11:a9:3b:1e)
     // broadcasting DISCOVERs with the IDENTICAL xid 0xdeadbef0 at the same time.
     // Two consequences, both real:
     //   1) CORRECTNESS: OFFERs are broadcast (we set flags=0x8000), so box A's
@@ -799,35 +830,42 @@ int dhcp_discover_blocking(void) {
         return 0;
     }
 
-    // #381: carrier gate. With no cable there is nothing to wait for: the ~10s
-    // link-wait below would just spin (and, on the UI/boot path, block). Fail
-    // fast; the background net worker restarts DHCP on the carrier-up edge.
+    // #dhcpwake / #426 no-block guard. dhcp_discover_blocking() reaches
+    // wait_event_timeout() below, which PARKS the caller. That is legal only
+    // from a schedulable context. The sole live caller is SYS_NET_DHCP (a
+    // syscall body: scheduler live, proc_current() set, IF on, net_lock NOT
+    // held) - verified blockable. This guard is defence in depth: if a future
+    // caller reaches here from a no-block context (IRQ, cli+spinlock, pid 0),
+    // fail fast rather than trip wq_assert_may_block()'s panic path.
+    if (!wq_may_block()) {
+        kprintf("[DHCP] blocking DHCP from a no-block context; deferring to net worker\n");
+        return -1;
+    }
+
+    // #381: carrier gate. With no cable there is nothing to wait for. Fail fast;
+    // the background net worker restarts DHCP on the carrier-up edge.
     if (!nic_link_up()) {
         kprintf("[DHCP] link down; DHCP deferred to net worker (carrier-up)\n");
         return -1;
     }
 
-    // Wait for link to come up. #378: a real switch takes >3s to autonegotiate,
-    // so wait up to ~10s (was ~2s). Critically, PUMP THE NIC RX PATH during the
-    // wait: for the USB dongle, the PHY link state only refreshes when
-    // usb_eth_receive() runs (usb_asix_refresh_link) and nic_link_up() itself
-    // now actively re-reads the PHY, so a bare io_wait() spin (the old code)
-    // could never observe the carrier coming up. eth_receive() is safe here
-    // (net stack is initialised before this is called).
-    kprintf("[DHCP] Waiting for link (pumping RX, up to ~10s)...\n");
+    // #dhcpwake: park on the DHCP progress queue until carrier is up, replacing
+    // the old ~10s DELAY_SPIN busy-poll (allowlist [DEBT], HARMFUL). Redundant,
+    // always-armed wake: net_worker() wakes dhcp_wq on the carrier down->up edge
+    // AND once per ~1s worker pass, so a missed edge costs at most one worker
+    // tick. On e1000/virtio nic_link_up() is a real-time MMIO read, and the #381
+    // gate above already returned -1 if it were down, so the condition is
+    // observed on the first check and we do NOT sleep at all on the normal path.
+    // #378: a real switch may still be autonegotiating, so allow up to ~10s.
+    // eth_receive() no longer needs pumping here: net_worker's net_poll() burst
+    // and the compositor flip path's net_poll() drive RX/PHY refresh off this
+    // thread. With the cable out (or no server) this returns cleanly at the
+    // deadline instead of burning a core.
+    kprintf("[DHCP] Waiting for link (up to ~10s)...\n");
     {
-        extern volatile uint64_t timer_ticks;
         extern uint32_t g_timer_hz;
-        uint64_t hz = g_timer_hz ? g_timer_hz : 100;
-        uint64_t start = timer_ticks;
-        uint64_t limit = hz * 10;          // ~10 seconds
-        int guard = 0;
-        while (!nic_link_up()) {
-            eth_receive();                 // pump RX so d->link can advance
-            for (int j = 0; j < 200; j++) io_wait();
-            if (timer_ticks != start && (timer_ticks - start) >= limit) break;
-            if (++guard > 200000) break;   // hard cap if timer_ticks is stalled
-        }
+        uint64_t hz = g_timer_hz ? g_timer_hz : 250;
+        (void)wait_event_timeout(&dhcp_wq, nic_link_up(), hz * 10);  // ~10s cap
     }
 
     if (!nic_link_up()) {
@@ -851,43 +889,41 @@ int dhcp_discover_blocking(void) {
     kprintf("[DHCP] Discovery succeeded, entering wait loop...\n");
     kprintf("[DHCP] About to access timer_ticks...\n");
 
-    // Use iteration-based timeout (timer_ticks may not be updating)
-    // ~10 seconds worth of iterations
-    kprintf("[DHCP] Waiting for response (timer_ticks=%llu)...\n", timer_ticks);
-    int max_iterations = 100000;  // ~10 seconds at ~100us per iteration
-    int retries_done = 0;
-    int retry_interval = 30000;   // ~3 seconds between retries
-
-    for (int iter = 0; iter < max_iterations; iter++) {
-        // Process incoming packets
-        eth_receive();
-        // #380: drive the ACK->DAD->BOUND transition (dhcp_poll owns it now).
-        dhcp_poll();
-
-        // Check if we got a response
-        if (dhcp_state == DHCP_STATE_BOUND) {
-            kprintf("[DHCP] Success! Bound after %d iterations\n", iter);
-            return 0;
-        }
-
-        // Check for timeout/retry
-        if ((iter % retry_interval) == (retry_interval - 1)) {
-            retries_done++;
-            if (retries_done >= 3) {
-                kprintf("[DHCP] Max retries reached\n");
-                break;
+    // #dhcpwake: park on the DHCP progress queue until BOUND, replacing the old
+    // fixed-delay DELAY_SPIN busy poll (allowlist [DEBT], HARMFUL: a no-server
+    // network burned a core for ~10s). Redundant wakers feed dhcp_wq: the RX
+    // ingest path (dhcp_handle) on an OFFER/ACK, dhcp_poll() the instant DAD
+    // completes to BOUND, and net_worker()'s ~1s pass as the always-armed
+    // backstop. RX/DORA is driven OFF this thread now (net_worker's net_poll()
+    // burst + the compositor flip path's net_poll()), so parking here does not
+    // stall the state machine. Retransmit semantics preserved: up to 3 attempts,
+    // ~3s each, DISCOVER re-sent on each attempt that times out, ~9-10s overall.
+    // A no-server network now returns cleanly at the budget, with no busy poll.
+    kprintf("[DHCP] Waiting for response (parked; timer_ticks=%llu)...\n", timer_ticks);
+    {
+        extern uint32_t g_timer_hz;
+        uint64_t hz = g_timer_hz ? g_timer_hz : 250;
+        uint64_t attempt_ticks = hz * 3;      // ~3s per attempt (matches old retry)
+        const int max_attempts = 3;
+        for (int attempt = 0; attempt < max_attempts; attempt++) {
+            int rc = wait_event_timeout(&dhcp_wq,
+                                        dhcp_state == DHCP_STATE_BOUND,
+                                        attempt_ticks);
+            if (rc == WAIT_OK) {
+                kprintf("[DHCP] Success! Bound (blocking path)\n");
+                return 0;
             }
-            kprintf("[DHCP] No response, retry %d/3...\n", retries_done);
-
-            // Re-send discover
-            uint8_t packet[576];
-            int len = dhcp_build_packet(packet, DHCP_DISCOVER);
-            udp_send(0xFFFFFFFF, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, packet, len);
-        }
-
-        // Small delay (~100us)
-        for (int i = 0; i < 100; i++) {
-            io_wait();
+            // This attempt's ~3s window elapsed with no lease (the condition-wins
+            // rule already folded any signal into rc). Retransmit DISCOVER unless
+            // this was the final attempt.
+            if (attempt + 1 < max_attempts) {
+                kprintf("[DHCP] No response, retry %d/%d...\n",
+                        attempt + 1, max_attempts);
+                uint8_t packet[576];
+                int len = dhcp_build_packet(packet, DHCP_DISCOVER);
+                udp_send(0xFFFFFFFF, DHCP_CLIENT_PORT, DHCP_SERVER_PORT,
+                         packet, len);
+            }
         }
     }
 
@@ -978,6 +1014,7 @@ void dhcp_poll(void) {
             // No defender after 3 probes -> the address is ours to use.
             arp_dad_disarm();
             dhcp_state = DHCP_STATE_BOUND;
+            dhcp_wake();   // #dhcpwake: DORA done; wake the blocking waiter now
             ip_set_address(dhcp_offered_ip);
             ip_set_gateway(dhcp_gateway);
             ip_set_netmask(dhcp_netmask);
@@ -1000,7 +1037,7 @@ void dhcp_poll(void) {
             // in the entire kernel (net_apply_static_config), so every
             // DHCP-configured machine resolved through dns_init()'s
             // compiled-in 8.8.8.8 forever while Settings displayed the
-            // offered address as if it were in use. Measured on VM <vmid>:
+            // offered address as if it were in use. Measured on VM 2333:
             // dhcp=BOUND, lease offered 192.0.2.1, packets went to 8.8.8.8.
             //
             // _dhcp() and not dns_set_server(): a lease must never overrule a

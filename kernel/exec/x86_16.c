@@ -2872,8 +2872,21 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // pmode arena always has tens of MB free, so the answer the walk would compute
         // is "memory OK". Force DGROUP(WINWORD autodata 075f):0x1a37 bit0 the instant
         // before Word tests it so the check passes and Word proceeds past the box.
+        // #word6blank: this BEHAVIOR was accidentally coupled to the k334log
+        // trace gate (which defaults OFF and has no enable path anywhere in the
+        // tree, #289 b455), unlike every sibling FIX block in this file
+        // (FB4FIX/SHAREFIX/W6TBLFIX above) which correctly gates the FIX on
+        // cpu->cs/cpu->ip alone and gates only the kprintf on g_ole2_k334log.
+        // With the behavior itself gated on k334log, Word 6 ALWAYS hit the
+        // "not enough memory" MessageBox and exited immediately on every
+        // launch (root or non-root alike; verified identical for both), which
+        // W6PERSIST then leaves as a permanently blank chrome-only window.
+        // This is the actual root cause of the reported blank-window bug, NOT
+        // the #708 GUESTFS gate (the reproduction's serial trace shows zero
+        // GUESTFS-DENY lines before this MessageBox fires). Fix: match the
+        // sibling blocks' pattern exactly, gate the FIX on cs/ip only.
         { extern int g_ole2_k334log; static int w6memfix=0;
-          if (g_ole2_k334log && cpu->cs==0x0327 && (cpu->ip==0x11c7||cpu->ip==0x11c6)) {
+          if (cpu->cs==0x0327 && (cpu->ip==0x11c7||cpu->ip==0x11c6)) {
             uint8_t f37=x86_16_rd8(cpu,cpu->ds,0x1a37);
             if (!(f37 & 1)) {
               x86_16_wr8(cpu, cpu->ds, 0x1a37, (uint8_t)(f37 | 1));
@@ -2901,6 +2914,11 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // block whose size makes the next step land exactly on pLast. The walk then
         // terminates cleanly (si == dx). One-shot per arena (idempotent: skipped once
         // the chain already reaches pLast).
+        // #word6blank: same k334log/behavior coupling bug as W6MEMFIX above,
+        // fixed the same way (gate the FIX on cs/ip only; keep the kprintf on
+        // g_ole2_k334log). Left disabled, this walk spins until the runaway
+        // instruction guard aborts the guest, which is a slower dead end than
+        // W6MEMFIX's immediate exit but the same class of bug.
         { extern int g_ole2_k334log; static int lhfix=0;
           // (#278 Word6 LOCAL-HEAP REPAIR) Terminate WINWORD's MS-C local-heap
           // compaction walk (seg231, runtime cs=0x073f). The walk advances si over
@@ -2915,7 +2933,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
           // walk's busy-path advance (si += (hdr & ~1) + 1) lands exactly on dx and
           // `cmp si,dx; jz done` terminates. We patch BOTH memory ([si]) and the live
           // BX so the in-flight test/advance use the bridge value this iteration.
-          if (g_ole2_k334log && cpu->cs==0x073f && cpu->ip==0x05f2 && lhfix<256) {
+          if (cpu->cs==0x073f && cpu->ip==0x05f2 && lhfix<256) {
             uint16_t ds=cpu->ds, si=cpu->si, dx=cpu->dx;
             if (cpu->bx==0 && si<dx && dx>(uint16_t)(si+1)) {
               uint16_t bridge=(uint16_t)(((dx - si - 1) & ~1u) | 1u);  // busy, size = dx-si-1

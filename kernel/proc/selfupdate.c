@@ -56,15 +56,48 @@
 extern fat_fs_t g_fat_fs;
 extern void acpi_reboot(void);
 
-// The four ESP kernel paths that MUST be kept in sync (the bootloader loads
-// /boot/kernel.elf, but stale copies at the other three have historically
-// caused the wrong kernel to load; see CLAUDE.md).
-static const char *const g_kernel_paths[4] = {
-    "/boot/kernel.elf",
-    "/KERNEL.ELF",
-    "/kernel.elf",
-    "/EFI/BOOT/kernel.elf",
+// THE ESP KERNEL PATHS THIS UPDATE WRITES, and an honest account of the one it
+// cannot.
+//
+// The bootloader loads /boot/kernel.elf. Stale copies elsewhere on the ESP have
+// historically caused the wrong kernel to load (see CLAUDE.md), and
+// build/invariant-gate.sh requires the kernel to be byte-identical on every ESP
+// boot path of a BUILT IMAGE.
+//
+// #remotedeploy: this table used to list four paths and TWO OF THEM WERE NOT ON
+// THE ESP AT ALL. Under the ext2 root, fat_path_on_ext2() (fs/fat.c) redirects
+// everything that is not /boot or /EFI, so "/KERNEL.ELF" and "/kernel.elf" were
+// written to the EXT2 ROOT: two spurious multi-megabyte files per update, and
+// the ESP's own /KERNEL.ELF never touched. The read-back verify could not see
+// it, because verify_path_sha() uses fat_read_file(), which applies the SAME
+// redirect: it read back the ext2 copy it had just written and reported success.
+// A verify that shares a routing bug with the write cannot detect that bug.
+// ("/KERNEL.ELF" and "/kernel.elf" are also ONE dirent on FAT, which is
+// case-insensitive, so they were never two ESP paths in the first place.)
+//
+// So the table is now the ESP paths that are REACHABLE and PROVEN: both are
+// under the /boot and /EFI prefixes that fat_path_on_ext2() exempts, so an
+// ordinary fat_write_file() lands them on the FAT ESP the firmware boots from,
+// and an ordinary fat_read_file() reads those same bytes back.
+//
+// KNOWN GAP, STATED RATHER THAN PAPERED OVER. The ESP-ROOT copy at /KERNEL.ELF
+// is NOT updated and will be stale after an OTA. It is inert: the bootloader
+// loads \boot\kernel.elf and nothing reads the ESP root copy. It cannot be
+// written from here today because the FAT layer offers no way to address it: an
+// attempt was built and MEASURED to fail, because fat_write_file_inner() and
+// fat_delete_inner() call the PUBLIC fat_open/fat_delete/fat_create, i.e. they
+// re-enter the redirecting dispatch layer they live underneath, so a
+// non-redirecting wrapper around them cannot force the ESP. Fixing that means
+// making the whole inner layer of fs/fat.c consistently non-redirecting, which
+// is a change to the filesystem every subsystem depends on and wants its own
+// verification pass. Until then: after a remote update, the ESP-root
+// /KERNEL.ELF is stale. Do not "fix" it by adding it back to this table; that
+// writes junk to ext2 and reports success, which is where this started.
+static const char *const g_kernel_paths[2] = {
+    "/boot/kernel.elf",       // what the firmware actually loads
+    "/EFI/BOOT/kernel.elf",   // the historical stale-copy footgun; kept in step
 };
+#define KPATH_COUNT ((int)(sizeof(g_kernel_paths) / sizeof(g_kernel_paths[0])))
 #define KPATH_PRIMARY  (g_kernel_paths[0])
 #define KPATH_BACKUP   "/boot/kernel.elf.bak"
 #define KPATH_MARKER   "/CONFIG/PENDING_UPDATE.TXT"
@@ -107,6 +140,11 @@ static uint32_t hex_to_bytes(const char *s, uint8_t *out, uint32_t max) {
 static int verify_path_sha(fat_fs_t *fs, const char *path,
                            const uint8_t expected[32]) {
     uint32_t sz = 0;
+    // Both entries in g_kernel_paths[] are /boot or /EFI, which
+    // fat_path_on_ext2() exempts, so this reads the FAT ESP: the same bytes the
+    // firmware will load. Keep it that way. If a path that is NOT so exempted
+    // is ever added to that table, this read silently starts checking the ext2
+    // copy instead and the verify stops meaning anything.
     void *buf = fat_read_file(fs, path, &sz);
     if (!buf) return 0;
     uint8_t d[32];
@@ -115,11 +153,11 @@ static int verify_path_sha(fat_fs_t *fs, const char *path,
     return memcmp(d, expected, 32) == 0;
 }
 
-// Restore all four kernel paths from the in-RAM backup. Returns 0 if every
-// path was rewritten successfully, -1 otherwise (the dangerous case).
+// Restore every kernel path from the in-RAM backup. Returns 0 if every path
+// was rewritten successfully, -1 otherwise (the dangerous case).
 static int restore_all(fat_fs_t *fs, const void *old_bytes, uint32_t old_len) {
     int ok = 0;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < KPATH_COUNT; i++) {
         if (fat_write_file(fs, g_kernel_paths[i], old_bytes, old_len) != 0) {
             kprintf("[SELFUPD] RESTORE FAILED for %s\n", g_kernel_paths[i]);
             bootlog_write("[SELFUPD] RESTORE FAILED for %s", g_kernel_paths[i]);
@@ -267,9 +305,19 @@ int kernel_selfupdate_apply(const void *new_kernel, uint32_t len,
     }
     memcpy(img, new_kernel, len);
 
-    // ---- 4. WRITE the new image to all four paths, verify each -----------
+    // ---- 4. WRITE the new image to every ESP path, verify each -----------
+    //
+    // #remotedeploy ORDERING NOTE, and it is deliberate. KPATH_PRIMARY
+    // (/boot/kernel.elf) is the path the firmware actually loads, and it is
+    // written FIRST because it is the one whose torn-write window matters. The
+    // window cannot be closed here: fat_write_file() is delete-then-recreate
+    // (fs/fat.c), so for the duration of a multi-megabyte write that file is
+    // absent or short, and no amount of care in THIS function survives a power
+    // cut. That case is handled one layer down, by the loader: uefi/bootloader.c
+    // validates the image it loads and falls back to KPATH_BACKUP, which was
+    // written and flushed in step 3 above, before any of this ran.
     int failed = 0;
-    for (int i = 0; i < 4 && !failed; i++) {
+    for (int i = 0; i < KPATH_COUNT && !failed; i++) {
         const char *p = g_kernel_paths[i];
         if (fat_write_file(fs, p, img, len) != 0) {
             kprintf("[SELFUPD] WRITE FAILED for %s\n", p);
@@ -343,8 +391,8 @@ int kernel_selfupdate_apply(const void *new_kernel, uint32_t len,
         kprintf("[SELFUPD] wrote marker %s\n", KPATH_MARKER);
     }
 
-    kprintf("[SELFUPD] SUCCESS: all 4 paths -> build %u (sha %s)\n",
-            target_build, shahex);
+    kprintf("[SELFUPD] SUCCESS: all %d ESP paths -> build %u (sha %s)\n",
+            KPATH_COUNT, target_build, shahex);
     bootlog_write("[SELFUPD] SUCCESS build %u sha %s", target_build, shahex);
     return SELFUPD_OK;
 }

@@ -15,13 +15,33 @@
 #define MODE_READ  0x1
 #define MODE_WRITE 0x2
 #define MODE_APPEND 0x4
+#define UNGET_MAX 4
 
 struct FILE {
     int fd;
     int flags;         // MODE_* plus _IOFBF/_IOLBF/_IONBF << 4
     int eof;
     int error;
-    int ungot;         // >= 0 when ungetc pending
+    // #745 (myman port): a single scalar pushback slot is not enough.
+    // ungetc_cp437_utf8() (a vendored port's own helper, and the textbook
+    // glibc-compatible pattern generally) pushes back a MULTI-BYTE UTF-8
+    // sequence with SEQUENTIAL ungetc() calls - up to 4 for an astral-plane
+    // codepoint - relying on them behaving as a LIFO stack (last pushed is
+    // first read back), which is what every real fgetc()/ungetc()
+    // implementation with more than one slot of headroom provides. A single
+    // `int ungot` silently drops every push except the last, so the 2nd and
+    // 3rd bytes of a pushed-back multi-byte sequence vanish and the next
+    // fgetc() calls see only the final byte - reproduced end to end porting
+    // myman: pushing back '\r' through the CP437 table (which maps CP437
+    // byte 0x0D to U+266A, EIGHTH NOTE, not literal CR) corrupted the
+    // stream, and readmaze()'s header parser read back a stray byte instead
+    // of the '\r' it had just pushed. `ungot_n` (0..UNGET_MAX) is how many
+    // of `ungot[]` are valid pending bytes, popped from the top (index
+    // ungot_n-1) by fgetc(), pushed at index ungot_n by ungetc(). 4 is sized
+    // to the worst case ungetc_cp437_utf8() itself needs (a 4-byte UTF-8
+    // sequence), not an arbitrary round number.
+    int ungot[UNGET_MAX];
+    int ungot_n;       // 0..UNGET_MAX pending pushed-back bytes
 
     char *rd_buf;
     size_t rd_size;
@@ -94,7 +114,7 @@ static void stream_init(FILE *s, int fd, int mode_bits, int buf_mode,
     s->flags = mode_bits | (buf_mode << 4);
     s->eof = 0;
     s->error = 0;
-    s->ungot = -1;
+    s->ungot_n = 0;
     s->rd_buf = NULL;
     s->rd_size = 0;
     s->rd_pos = 0;
@@ -293,7 +313,7 @@ static int refill(FILE *f) {
 
 int fgetc(FILE *f) {
     if (!f || !(f->flags & MODE_READ)) { errno = EBADF; return EOF; }
-    if (f->ungot >= 0) { int c = f->ungot; f->ungot = -1; return c; }
+    if (f->ungot_n > 0) { return f->ungot[--f->ungot_n]; }
     // If stream has a write buffer with pending data, flush first
     if (f->flags & MODE_WRITE) flush_writes(f);
     if (!f->rd_buf || f->rd_size == 0) {
@@ -327,7 +347,8 @@ char *fgets(char *s, int n, FILE *f) {
 
 int ungetc(int c, FILE *f) {
     if (!f || c == EOF) return EOF;
-    f->ungot = c & 0xFF;
+    if (f->ungot_n >= UNGET_MAX) return EOF;   // stack full: see the struct comment
+    f->ungot[f->ungot_n++] = c & 0xFF;
     f->eof = 0;
     return c;
 }
@@ -348,7 +369,7 @@ int fseek(FILE *f, long off, int whence) {
     if (!f) { errno = EBADF; return -1; }
     flush_writes(f);
     f->rd_pos = f->rd_len = 0;
-    f->ungot = -1;
+    f->ungot_n = 0;
     f->eof = 0;
     long r = lseek(f->fd, off, whence);
     return (r < 0) ? -1 : 0;
@@ -361,6 +382,13 @@ long ftell(FILE *f) {
     // account for unread bytes in buffer
     if (f->flags & MODE_READ) r -= (long)(f->rd_len - f->rd_pos);
     if (f->flags & MODE_WRITE) r += (long)f->wr_pos;
+    // #745: a pending ungetc() byte is logically "not yet re-consumed", so
+    // it must count as still-unread, exactly like the rd_buf compensation
+    // just above - this was missing entirely before (ftell() ignored
+    // ungetc() in both directions: over-counting while a byte was pending,
+    // then failing to advance when fgetc() consumed it from the ungot stack
+    // instead of the ring buffer, since neither touches rd_pos/rd_len).
+    if ((f->flags & MODE_READ) && f->ungot_n > 0) r -= f->ungot_n;
     return r;
 }
 
@@ -474,4 +502,18 @@ char *tmpnam(char *s) {
     (void)s;
     errno = ENOSYS;
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Large-file positioning, added for the libedit port (#745). off_t is signed
+// long on this target, so these delegate directly to fseek/ftell.
+// ---------------------------------------------------------------------------
+int fseeko(FILE *fp, off_t off, int whence)
+{
+	return fseek(fp, (long)off, whence);
+}
+
+off_t ftello(FILE *fp)
+{
+	return (off_t)ftell(fp);
 }

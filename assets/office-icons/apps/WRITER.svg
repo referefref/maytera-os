@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- MayteraOS Office launcher icon: Writer (/APPS/WRITER).
+       Original MayteraOS artwork (no third-party geometry). Family: the white
+       sheet outline at the CoreUI-equivalent 4px weight (32/512 = 4/64), the
+       Maytera mountain-M peaks as the shared suite cue, and the app colour on
+       the content only. Writer = blue text lines. -->
+  <rect x="11" y="5" width="42" height="54" rx="3" ry="3" fill="none" stroke="#ffffff" stroke-width="4" stroke-linejoin="round"/>
+  <polyline points="19,20 25,12.5 32,19 39,12.5 45,20" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#4da3ff">
+    <rect x="19" y="27" width="26" height="4" rx="1"/>
+    <rect x="19" y="35" width="26" height="4" rx="1"/>
+    <rect x="19" y="43" width="26" height="4" rx="1"/>
+    <rect x="19" y="51" width="15" height="4" rx="1"/>
+  </g>
+</svg>

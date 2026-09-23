@@ -53,6 +53,14 @@ extern void mouse_inject_button(int32_t x, int32_t y, int down);// drivers/mouse
 extern void mouse_inject_button_mask(int32_t x, int32_t y, uint32_t mask); // drivers/mouse.c (#speedcap)
 extern void mouse_inject_move(int32_t x, int32_t y);            // drivers/mouse.c (Win16 SkiFree repro)
 extern void mouse_get_position(int32_t *x, int32_t *y);         // drivers/mouse.c
+extern uint8_t mouse_get_buttons(void);                          // drivers/mouse.c
+// #browserwheel: same real injection point a USB HID wheel report reaches
+// (usb_hid.c's mouse path calls this exact function with the report's
+// {dx,dy,buttons,wheel}), so SCROLL below exercises the genuine hardware
+// entry point end-to-end (compositor get_mouse_scroll() poll ->
+// sys_inject_mouse MOUSE_EVENT_SCROLL -> wm_inject_app_scroll -> per-window
+// queue), not a bypass of it.
+extern void mouse_inject_hid(int dx, int dy, uint8_t buttons, int wheel); // drivers/mouse.c
 extern volatile uint64_t g_mouse_poll_count;                    // gui/fb_syscall.c (new)
 // #resizelag: kernel-side cost of user_window_handle_resize() (kmalloc +
 // background fill + memcpy of the content buffer), proc/syscall.c.
@@ -61,6 +69,15 @@ extern uint64_t g_uwresize_total_us;
 extern uint64_t g_uwresize_max_us;
 extern int32_t  g_uwresize_last_cw;
 extern int32_t  g_uwresize_last_ch;
+// #resizecoalesce: live resize-queue ledger + deterministic self-test
+// (proc/syscall.c). RZQ/RZQZ read/zero the ledger; RZTEST drives the REAL
+// uw_enqueue() in legacy and scan modes to prove appended stays O(1).
+extern uint64_t g_rzq_enqueued;
+extern uint64_t g_rzq_coalesced;
+extern uint64_t g_rzq_appended;
+void uw_coalesce_selftest(int n, int interleave, int scan_all,
+                          uint64_t *enq, uint64_t *coal, uint64_t *app,
+                          int *resizes_left, int *count_left);
 // #resizelag: real outer window bounds for slot `idx` (proc/syscall.c),
 // so a host-side drag probe can compute a resize-grip point exactly
 // instead of guessing off a screenshot.
@@ -567,6 +584,36 @@ static void ti_process_line(const char *line) {
         ti_reply(buf);
         return;
     }
+    // (#dosmouse) RDOWN/RUP - HOLD the right button, the way MDOWN/MUP hold the
+    // left one. RCLICK is a complete click whose latch releases the instant the
+    // COMPOSITOR samples the edge (ti_rclick_edge -> CA_SMP_RDOWN), which is
+    // about one frame. That is the right criterion for compositor-native chrome
+    // and it is TOO SHORT for anything further downstream: a Ring-3 app receives
+    // the level only after compositor frame -> sys_inject_mouse -> per-window
+    // queue -> its own pump thread -> its own sampling loop, several scheduling
+    // hops after the latch has already let go. MEASURED on the Ring-3 DOS host:
+    // RCLICK produced no guest button event at all while the identical in-kernel
+    // guest, which reads the same kernel global the injection writes, saw all
+    // four edges. With MDOWN/MUP (left) the same guest saw press and release
+    // correctly, which is what identified the latch as the artifact rather than
+    // the app. There was no way to run that experiment on the RIGHT button,
+    // so the right-button release path had no harness route at all - the exact
+    // shape this file already complains about for the right-click menus (#speedcap).
+    if (!strncmp(p, "RDOWN", 5)) {               // RDOWN <x> <y>  (right press, held)
+        p += 5; int x = parse_dec(&p); int y = parse_dec(&p);
+        if (x <= -1000000 || y <= -1000000) { ti_reply("ERR RDOWN badarg\n"); return; }
+        ti_last_x = x; ti_last_y = y;
+        mouse_inject_button_mask(x, y, 2u);
+        snprintf(buf, sizeof(buf), "OK RDOWN %d %d\n", x, y);
+        ti_reply(buf);
+        return;
+    }
+    if (!strncmp(p, "RUP", 3)) {                 // RUP  (right release at last point)
+        mouse_inject_button_mask(ti_last_x, ti_last_y, 0u);
+        snprintf(buf, sizeof(buf), "OK RUP %d %d\n", ti_last_x, ti_last_y);
+        ti_reply(buf);
+        return;
+    }
     if (!strncmp(p, "MOVE", 4)) {                // MOVE <x> <y>  (position only, no click)
         p += 4; int x = parse_dec(&p); int y = parse_dec(&p);
         if (x <= -1000000 || y <= -1000000) { ti_reply("ERR MOVE badarg\n"); return; }
@@ -574,6 +621,60 @@ static void ti_process_line(const char *line) {
         mouse_inject_move(x, y);
         snprintf(buf, sizeof(buf), "OK MOVE %d %d\n", x, y);
         ti_reply(buf);
+        return;
+    }
+    // #browserwheel: SCROLL <delta>  - inject one wheel notch at the last
+    // known pointer position (same real path a USB/PS2 wheel report takes:
+    // mouse_inject_hid() feeds g_mouse.scroll, mouse_get_scroll() drains it,
+    // the compositor's per-frame poll relays it via sys_inject_mouse(...,
+    // MOUSE_EVENT_SCROLL, delta) exactly as for real hardware). delta follows
+    // the OS-wide convention: positive = up/toward content start (see
+    // userland/libc/gui_scroll.h). x/y motion is 0 - this is a pure wheel
+    // event, matching what a stationary hand on a real wheel produces.
+    if (!strncmp(p, "SCROLL", 6)) {              // SCROLL <delta>
+        p += 6; int delta = parse_dec(&p);
+        if (delta <= -1000000) { ti_reply("ERR SCROLL badarg\n"); return; }
+        if (delta < -127) delta = -127;
+        if (delta > 127) delta = 127;
+        mouse_inject_hid(0, 0, mouse_get_buttons(), delta);
+        snprintf(buf, sizeof(buf), "OK SCROLL %d\n", delta);
+        ti_reply(buf);
+        return;
+    }
+    // #resizecoalesce: live resize-queue ledger from the REAL production
+    // enqueue path. RZQ = read, RZQZ = read then zero. enqueued = EVENT_RESIZE
+    // offered; coalesced = merged onto an existing queued resize; appended =
+    // new slots (the app-visible relayout count; O(1) is the target). Test the
+    // 4-char RZQZ before the 3-char RZQ so RZQ does not shadow it.
+    if (!strncmp(p, "RZQZ", 4) || !strncmp(p, "RZQ", 3)) {
+        int zero = !strncmp(p, "RZQZ", 4);
+        snprintf(buf, sizeof(buf),
+                 "OK RZQ enqueued=%lu coalesced=%lu appended=%lu\n",
+                 (unsigned long)g_rzq_enqueued, (unsigned long)g_rzq_coalesced,
+                 (unsigned long)g_rzq_appended);
+        ti_reply(buf);
+        if (zero) { g_rzq_enqueued = 0; g_rzq_coalesced = 0; g_rzq_appended = 0; }
+        return;
+    }
+    // #resizecoalesce: deterministic self-test of the REAL uw_enqueue() in
+    // BOTH the legacy adjacent-tail mode and the robust scan mode, plain and
+    // with a 1:1 interleaved non-resize event. RZTEST [n]  (default 40). The
+    // interleave/legacy line's app=N vs interleave/scan's app=1 is the proof.
+    if (!strncmp(p, "RZTEST", 6)) {
+        p += 6; int n = parse_dec(&p); if (n <= 0 || n > 60) n = 40;
+        uint64_t e, c, a; int rl, cl;
+        uw_coalesce_selftest(n, 0, 0, &e, &c, &a, &rl, &cl);
+        snprintf(buf, sizeof(buf), "OK RZTEST plain      legacy n=%d enq=%lu coal=%lu app=%lu resizesLeft=%d count=%d\n",
+                 n, (unsigned long)e, (unsigned long)c, (unsigned long)a, rl, cl); ti_reply(buf);
+        uw_coalesce_selftest(n, 0, 1, &e, &c, &a, &rl, &cl);
+        snprintf(buf, sizeof(buf), "OK RZTEST plain      scan   n=%d enq=%lu coal=%lu app=%lu resizesLeft=%d count=%d\n",
+                 n, (unsigned long)e, (unsigned long)c, (unsigned long)a, rl, cl); ti_reply(buf);
+        uw_coalesce_selftest(n, 1, 0, &e, &c, &a, &rl, &cl);
+        snprintf(buf, sizeof(buf), "OK RZTEST interleave legacy n=%d enq=%lu coal=%lu app=%lu resizesLeft=%d count=%d\n",
+                 n, (unsigned long)e, (unsigned long)c, (unsigned long)a, rl, cl); ti_reply(buf);
+        uw_coalesce_selftest(n, 1, 1, &e, &c, &a, &rl, &cl);
+        snprintf(buf, sizeof(buf), "OK RZTEST interleave scan   n=%d enq=%lu coal=%lu app=%lu resizesLeft=%d count=%d\n",
+                 n, (unsigned long)e, (unsigned long)c, (unsigned long)a, rl, cl); ti_reply(buf);
         return;
     }
     // #resizelag: read the resize-cost ledger. RSTAT resets nothing (so a

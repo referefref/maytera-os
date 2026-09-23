@@ -7,8 +7,15 @@ item: Editor | /APPS/EDITOR | icon=highlight
 item: Notes | /APPS/NOTES | icon=notes
 item: Calculator | /APPS/CALC | icon=calculator
 item: Converter | /APPS/CONVERT | icon=converter
+item: Planetarium | /APPS/stellarium | icon=planetarium
 item: World Clock | /APPS/clock | icon=clock
 item: Timers | /APPS/TIMERS | icon=timers
+# (prodapps 2026-09-19) Markdown viewer over the shared MD4C port; the .md
+# association in build/assets/ASSOC.CFG points here too. icon=highlight is
+# reused (Editor) rather than adding an id: icon files live outside the repo.
+item: Markdown Viewer | /APPS/MDVIEW | icon=highlight
+# (prodapps 2026-09-19) History of the #542 system clipboard. icon=notes reused.
+item: Clipboard History | /APPS/CLIPHIST | icon=notes
 item: Authenticator | /APPS/mfa | icon=auth
 item: Launcher | /APPS/LAUNCHER | icon=launcher
 item: Task Switcher | /APPS/WINSWTCH | icon=taskswitch
@@ -56,4 +63,7 @@ item: Help | /APPS/help | icon=help
 # truth for this item's menu presence going forward, with the legacy file
 # still a safety net if this fragment line is ever lost.
 category: Office
+item: Writer | /APPS/WRITER | icon=writer
+item: Sheets | /APPS/SHEETS | icon=sheets
+item: Slides | /APPS/SLIDES | icon=slides
 item: Microsoft Word 6.0 | /WIN16/WORD6/WINWORD.EXE | icon=win3x | type=win16

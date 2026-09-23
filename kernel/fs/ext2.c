@@ -46,6 +46,30 @@ extern int   ata_write_sectors_dma(uint8_t channel, uint8_t drive, uint32_t lba,
 #define EXT2_FT_REG_FILE    1
 #define EXT2_FT_DIR         2
 
+// #404 Stage 4b: unified blkmgr device I/O, the ONLY sector path that reaches an
+// AUX (Disk Manager) volume on AHCI / USB / the RAM scratch device. Boot-root
+// I/O still goes through blk_read/blk_write below; an aux fs (fs->via_blkmgr)
+// routes here instead. Returns sectors transferred (>0) / negative, matching the
+// blk_read/blk_write convention the FS layer already checks.
+extern int64_t blkmgr_dev_rw_c(uint8_t kind, uint8_t index, uint64_t lba,
+                               uint32_t count, void *buf, int write);
+
+// One place that decides "legacy blk_* vs unified blkmgr" for a given fs, so no
+// call site below has to. `lba` is the ABSOLUTE device LBA (part_start_lba is
+// already folded in by the caller, exactly as for blk_read/blk_write).
+static int e2_dev_read(const ext2_fs_t *fs, uint32_t lba, uint32_t count, void *buf) {
+    if (fs->via_blkmgr)
+        return (int)blkmgr_dev_rw_c(fs->dev_kind, fs->dev_index, lba, count, buf, 0);
+    return blk_read(fs->channel, fs->drive, lba, count, buf);
+}
+static MUST_CHECK int e2_dev_write(const ext2_fs_t *fs, uint32_t lba, uint32_t count,
+                                   const void *buf) {
+    if (fs->via_blkmgr)
+        return (int)blkmgr_dev_rw_c(fs->dev_kind, fs->dev_index, lba, count,
+                                    (void *)buf, 1);
+    return blk_write(fs->channel, fs->drive, lba, count, buf);
+}
+
 static ext2_fs_t g_ext2;
 
 // #99 Phase C boot cutover: when non-zero, the kernel treats ext2 as the root
@@ -116,7 +140,7 @@ static int g_ext2_wq_ready = 0;
 // re-acquired inside its own time slice every single time, before any woken
 // waiter could be scheduled. A waiter was therefore passed over indefinitely.
 //
-// MEASURED on build 969 (serial [SW] instrumentation, throwaway VM <vmid>, two
+// MEASURED on build 969 (serial [SW] instrumentation, throwaway VM 2618, two
 // runs): the kernel heartbeat thread - which writes /HEARTBEAT.TXT, and on an
 // ext2-root system fat_write_file() routes that to the ext2 volume - sat in
 // PROC_STATE_BLOCKED on g_ext2_wq (resolved by symbol from the blocked PCB's
@@ -311,8 +335,7 @@ static void ext2_cache_init_once(uint32_t bs) {
 static int ext2_read_block_raw(const ext2_fs_t *fs, uint32_t block, void *buf) {
     uint32_t sectors_per_block = fs->block_size / EXT2_SECTOR_SIZE;
     uint32_t lba = fs->part_start_lba + block * sectors_per_block;
-    int r = blk_read(fs->channel, fs->drive, lba,
-                            sectors_per_block, buf);
+    int r = e2_dev_read(fs, lba, sectors_per_block, buf);
     if (r != (int)sectors_per_block) {
         return -1;
     }
@@ -323,6 +346,14 @@ static int ext2_read_block_raw(const ext2_fs_t *fs, uint32_t block, void *buf) {
 // Returns 0 on success, <0 on error.
 static int ext2_read_block(const ext2_fs_t *fs, uint32_t block, void *buf) {
     uint32_t bs = fs->block_size;
+    // #404 Stage 4b: an AUX fs bypasses the shared block cache entirely. g_e2c
+    // is keyed by block number ONLY, so it cannot distinguish the root device's
+    // block N from an aux device's block N; caching an aux block would serve it
+    // to a root read (and vice-versa). Aux volumes are rare and small, so a
+    // direct read per block is the correct, safe choice.
+    if (fs->via_blkmgr) {
+        return ext2_read_block_raw(fs, block, buf);
+    }
     ext2_cache_init_once(bs);
 
     // Cache lookup.
@@ -937,6 +968,61 @@ int ext2_mount(uint8_t channel, uint8_t drive, uint32_t part_start_lba) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// #404 Stage 4b: mount an AUX ext2 volume into a CALLER-OWNED ext2_fs_t.
+//
+// This is the SAME superblock/geometry parse as ext2_mount() above, but it
+// fills `fs` (not the g_ext2 singleton) and routes every sector through the
+// unified blkmgr device layer by (dev_kind, dev_index) - the only path that
+// reaches an AHCI/USB/RAM-scratch second volume. It deliberately does NOT do
+// the #610 dirty-mark superblock write the boot mount does: an aux mount is
+// transient (the Disk Manager re-parses it on demand), so it leaves the
+// on-disk s_state untouched and never bumps s_mnt_count. Returns 0 on success.
+// ---------------------------------------------------------------------------
+int ext2_mount_into(ext2_fs_t *fs, uint8_t dev_kind, uint8_t dev_index,
+                    uint32_t part_start_lba) {
+    if (!fs) return -1;
+    memset(fs, 0, sizeof(*fs));
+    fs->via_blkmgr    = 1;
+    fs->dev_kind      = dev_kind;
+    fs->dev_index     = dev_index;
+    fs->part_start_lba = part_start_lba;
+
+    uint8_t *sb = (uint8_t *)kmalloc(1024);
+    if (!sb) return -1;
+    // Superblock: 1024 bytes at partition byte offset 1024 (relative LBA 2).
+    if (e2_dev_read(fs, part_start_lba + 2, 2, sb) != 2) { kfree(sb); return -2; }
+    if (rd16(sb + 56) != EXT2_MAGIC) { kfree(sb); return -3; }
+
+    uint32_t log_block_size = rd32(sb + 24);
+    fs->inodes_count     = rd32(sb + 0);
+    fs->blocks_count     = rd32(sb + 4);
+    fs->first_data_block = rd32(sb + 20);
+    fs->block_size       = (uint32_t)1024 << log_block_size;
+    fs->blocks_per_group = rd32(sb + 32);
+    fs->inodes_per_group = rd32(sb + 40);
+    uint16_t inode_size16 = rd16(sb + 88);
+    fs->inode_size       = inode_size16 ? (uint32_t)inode_size16 : 128;
+
+    if (fs->blocks_per_group == 0 || fs->inodes_per_group == 0 ||
+        fs->block_size == 0) {
+        kfree(sb);
+        return -4;
+    }
+    fs->groups_count =
+        (fs->blocks_count - fs->first_data_block + fs->blocks_per_group - 1)
+        / fs->blocks_per_group;
+    if (fs->groups_count == 0) fs->groups_count = 1;
+    fs->bgd_table_block = fs->first_data_block + 1;
+    {
+        int li = 0; for (; li < 16; li++) fs->sb_label[li] = (char)sb[120 + li];
+        fs->sb_label[16] = 0;
+    }
+    kfree(sb);
+    fs->mounted = 1;
+    return 0;
+}
+
 // Fetch the inode table block number for the group that owns inode `ino`.
 static int ext2_group_inode_table(const ext2_fs_t *fs, uint32_t group,
                                   uint32_t *out_inode_table) {
@@ -998,37 +1084,39 @@ static void ext2_stamp_raw_mtime(uint8_t *ri) {
     memcpy(ri + 16, &t, 4);            // i_mtime
 }
 
-int ext2_read_inode(uint32_t ino, ext2_inode_t *out) {
-    if (!g_ext2.mounted || ino == 0) {
+// #404 Stage 4b: the fs-parameterised body. ext2_read_inode() below is the
+// g_ext2 wrapper; ext2_read_inode_on() is the same logic against any fs.
+int ext2_read_inode_on(const ext2_fs_t *fs, uint32_t ino, ext2_inode_t *out) {
+    if (!fs->mounted || ino == 0) {
         return -1;
     }
 
-    uint32_t group = (ino - 1) / g_ext2.inodes_per_group;
-    uint32_t index = (ino - 1) % g_ext2.inodes_per_group;
-    if (group >= g_ext2.groups_count) {
+    uint32_t group = (ino - 1) / fs->inodes_per_group;
+    uint32_t index = (ino - 1) % fs->inodes_per_group;
+    if (group >= fs->groups_count) {
         return -2;
     }
 
     uint32_t inode_table = 0;
-    if (ext2_group_inode_table(&g_ext2, group, &inode_table) != 0) {
+    if (ext2_group_inode_table(fs, group, &inode_table) != 0) {
         return -3;
     }
 
     // Byte offset of the inode within the device.
-    uint64_t byte_off = (uint64_t)inode_table * g_ext2.block_size
-                        + (uint64_t)index * g_ext2.inode_size;
+    uint64_t byte_off = (uint64_t)inode_table * fs->block_size
+                        + (uint64_t)index * fs->inode_size;
 
     // Read the containing block, then copy the inode out of it. The inode is
     // <= block_size and may straddle nothing because inode_size divides evenly
     // into block_size for sane filesystems (256 | 1024).
-    uint32_t block_of_inode = (uint32_t)(byte_off / g_ext2.block_size);
-    uint32_t off_in_block   = (uint32_t)(byte_off % g_ext2.block_size);
+    uint32_t block_of_inode = (uint32_t)(byte_off / fs->block_size);
+    uint32_t off_in_block   = (uint32_t)(byte_off % fs->block_size);
 
-    uint8_t *blk = (uint8_t *)kmalloc(g_ext2.block_size);
+    uint8_t *blk = (uint8_t *)kmalloc(fs->block_size);
     if (!blk) {
         return -4;
     }
-    if (ext2_read_block(&g_ext2, block_of_inode, blk) != 0) {
+    if (ext2_read_block(fs, block_of_inode, blk) != 0) {
         kfree(blk);
         return -5;
     }
@@ -1064,6 +1152,10 @@ int ext2_read_inode(uint32_t ino, ext2_inode_t *out) {
 
     kfree(blk);
     return 0;
+}
+
+int ext2_read_inode(uint32_t ino, ext2_inode_t *out) {
+    return ext2_read_inode_on(&g_ext2, ino, out);
 }
 
 // #554: thin accessor for rustkern/fsperm.rs (Files Properties / details
@@ -1154,10 +1246,11 @@ static uint32_t ext2_bmap(const ext2_fs_t *fs, const ext2_inode_t *inode,
 // indirect-block caches, so a sequential read reads each singly/doubly-indirect
 // pointer block at most once per run instead of once per data block. Returns the
 // physical block (0 = sparse hole) or EXT2_BMAP_ERR on a read error.
-static uint32_t ext2_resolve_cached(const ext2_inode_t *inode, uint32_t logical,
+static uint32_t ext2_resolve_cached(const ext2_fs_t *fs,
+                                    const ext2_inode_t *inode, uint32_t logical,
                                     uint8_t *indbuf, uint32_t *ind_cached,
                                     uint8_t *dindbuf, uint32_t *dind_cached) {
-    uint32_t ptrs = g_ext2.block_size / 4;
+    uint32_t ptrs = fs->block_size / 4;
     if (logical < EXT2_NDIR_BLOCKS) {
         return inode->i_block[logical];
     }
@@ -1166,7 +1259,7 @@ static uint32_t ext2_resolve_cached(const ext2_inode_t *inode, uint32_t logical,
         uint32_t ind = inode->i_block[EXT2_IND_BLOCK];
         if (!ind) return 0;
         if (*ind_cached != ind) {
-            if (ext2_read_block(&g_ext2, ind, indbuf) != 0) return EXT2_BMAP_ERR;
+            if (ext2_read_block(fs, ind, indbuf) != 0) return EXT2_BMAP_ERR;
             *ind_cached = ind;
         }
         return rd32(indbuf + logical * 4);
@@ -1176,13 +1269,13 @@ static uint32_t ext2_resolve_cached(const ext2_inode_t *inode, uint32_t logical,
         uint32_t dind = inode->i_block[EXT2_DIND_BLOCK];
         if (!dind) return 0;
         if (*dind_cached != dind) {
-            if (ext2_read_block(&g_ext2, dind, dindbuf) != 0) return EXT2_BMAP_ERR;
+            if (ext2_read_block(fs, dind, dindbuf) != 0) return EXT2_BMAP_ERR;
             *dind_cached = dind;
         }
         uint32_t ind = rd32(dindbuf + (logical / ptrs) * 4);
         if (!ind) return 0;
         if (*ind_cached != ind) {
-            if (ext2_read_block(&g_ext2, ind, indbuf) != 0) return EXT2_BMAP_ERR;
+            if (ext2_read_block(fs, ind, indbuf) != 0) return EXT2_BMAP_ERR;
             *ind_cached = ind;
         }
         return rd32(indbuf + (logical % ptrs) * 4);
@@ -1190,12 +1283,15 @@ static uint32_t ext2_resolve_cached(const ext2_inode_t *inode, uint32_t logical,
     return 0;   // triply-indirect not supported (treat as hole)
 }
 
-int64_t ext2_read_file_ino(uint32_t ino, void *buf, uint64_t max) {
-    if (!g_ext2.mounted) {
+// #404 Stage 4b: fs-parameterised whole-file reader. ext2_read_file_ino() is
+// the g_ext2 wrapper below.
+static int64_t ext2_read_file_ino_on(const ext2_fs_t *fs, uint32_t ino,
+                                     void *buf, uint64_t max) {
+    if (!fs->mounted) {
         return -1;
     }
     ext2_inode_t inode;
-    if (ext2_read_inode(ino, &inode) != 0) {
+    if (ext2_read_inode_on(fs, ino, &inode) != 0) {
         return -2;
     }
 
@@ -1212,7 +1308,7 @@ int64_t ext2_read_file_ino(uint32_t ino, void *buf, uint64_t max) {
     }
 
     uint8_t *out = (uint8_t *)buf;
-    uint32_t bs  = g_ext2.block_size;
+    uint32_t bs  = fs->block_size;
     uint32_t spb = bs / EXT2_SECTOR_SIZE;
     uint8_t *indbuf  = (uint8_t *)kmalloc(bs);
     uint8_t *dindbuf = (uint8_t *)kmalloc(bs);
@@ -1229,7 +1325,7 @@ int64_t ext2_read_file_ino(uint32_t ino, void *buf, uint64_t max) {
     uint64_t copied = 0;
     uint32_t lb = 0;
     while (copied < size) {
-        uint32_t phys = ext2_resolve_cached(&inode, lb, indbuf, &ind_cached,
+        uint32_t phys = ext2_resolve_cached(fs, &inode, lb, indbuf, &ind_cached,
                                             dindbuf, &dind_cached);
         if (phys == EXT2_BMAP_ERR) { rc = -4; goto done; }
 
@@ -1240,7 +1336,7 @@ int64_t ext2_read_file_ino(uint32_t ino, void *buf, uint64_t max) {
             if (phys == 0) {
                 memset(out + copied, 0, (size_t)remaining);
             } else {
-                if (ext2_read_block(&g_ext2, phys, tmp) != 0) goto done;
+                if (ext2_read_block(fs, phys, tmp) != 0) goto done;
                 memcpy(out + copied, tmp, (size_t)remaining);
             }
             copied += remaining;
@@ -1256,12 +1352,12 @@ int64_t ext2_read_file_ino(uint32_t ino, void *buf, uint64_t max) {
         uint32_t run = 1;
         while (copied + (uint64_t)(run + 1) * bs <= size &&
                (run + 1) * spb <= EXT2_DMA_MAX_SECTORS) {
-            uint32_t nx = ext2_resolve_cached(&inode, lb + run, indbuf, &ind_cached,
+            uint32_t nx = ext2_resolve_cached(fs, &inode, lb + run, indbuf, &ind_cached,
                                               dindbuf, &dind_cached);
             if (nx != phys + run) break;   // hole, error, or discontiguous
             run++;
         }
-        if (blk_read(g_ext2.channel, g_ext2.drive, g_ext2.part_start_lba + phys * spb,
+        if (e2_dev_read(fs, fs->part_start_lba + phys * spb,
                         run * spb, out + copied) != (int)(run * spb)) {
             goto done;
         }
@@ -1273,6 +1369,10 @@ int64_t ext2_read_file_ino(uint32_t ino, void *buf, uint64_t max) {
 done:
     kfree(indbuf); kfree(dindbuf); kfree(tmp);
     return rc;
+}
+
+int64_t ext2_read_file_ino(uint32_t ino, void *buf, uint64_t max) {
+    return ext2_read_file_ino_on(&g_ext2, ino, buf, max);
 }
 
 // #572: block size of the mounted volume (0 if not mounted). Lets the syscall
@@ -1289,10 +1389,11 @@ uint32_t ext2_block_size(void) {
 // bytes read (0 at/after EOF), or a negative error. Reuses the exact same
 // indirect-block resolver, block cache, and contiguous-run DMA gather as the
 // whole-file reader, so the bytes returned are identical.
-int64_t ext2_read_file_range(uint32_t ino, uint64_t off, uint64_t len, void *dst) {
-    if (!g_ext2.mounted) return -1;
+int64_t ext2_read_file_range_on(const ext2_fs_t *fs, uint32_t ino,
+                                uint64_t off, uint64_t len, void *dst) {
+    if (!fs->mounted) return -1;
     ext2_inode_t inode;
-    if (ext2_read_inode(ino, &inode) != 0) return -2;
+    if (ext2_read_inode_on(fs, ino, &inode) != 0) return -2;
 
     uint64_t size = inode.i_size;
     if (inode.i_size_high != 0) size |= (uint64_t)inode.i_size_high << 32;
@@ -1301,7 +1402,7 @@ int64_t ext2_read_file_range(uint32_t ino, uint64_t off, uint64_t len, void *dst
     if (len == 0) return 0;
 
     uint8_t *out = (uint8_t *)dst;
-    uint32_t bs  = g_ext2.block_size;
+    uint32_t bs  = fs->block_size;
     uint32_t spb = bs / EXT2_SECTOR_SIZE;
     uint8_t *indbuf  = (uint8_t *)kmalloc(bs);
     uint8_t *dindbuf = (uint8_t *)kmalloc(bs);
@@ -1320,7 +1421,7 @@ int64_t ext2_read_file_range(uint32_t ino, uint64_t off, uint64_t len, void *dst
         uint64_t cur  = off + copied;
         uint32_t lb   = (uint32_t)(cur / bs);
         uint32_t boff = (uint32_t)(cur % bs);
-        uint32_t phys = ext2_resolve_cached(&inode, lb, indbuf, &ind_cached,
+        uint32_t phys = ext2_resolve_cached(fs, &inode, lb, indbuf, &ind_cached,
                                             dindbuf, &dind_cached);
         if (phys == EXT2_BMAP_ERR) { rc = -4; goto rdone; }
 
@@ -1333,7 +1434,7 @@ int64_t ext2_read_file_range(uint32_t ino, uint64_t off, uint64_t len, void *dst
             if (phys == 0) {
                 memset(out + copied, 0, chunk);       // sparse hole
             } else {
-                if (ext2_read_block(&g_ext2, phys, tmp) != 0) goto rdone;
+                if (ext2_read_block(fs, phys, tmp) != 0) goto rdone;
                 memcpy(out + copied, tmp + boff, chunk);
             }
             copied += chunk;
@@ -1346,12 +1447,12 @@ int64_t ext2_read_file_range(uint32_t ino, uint64_t off, uint64_t len, void *dst
         uint32_t run = 1;
         while (copied + (uint64_t)(run + 1) * bs <= len &&
                (run + 1) * spb <= EXT2_DMA_MAX_SECTORS) {
-            uint32_t nx = ext2_resolve_cached(&inode, lb + run, indbuf, &ind_cached,
+            uint32_t nx = ext2_resolve_cached(fs, &inode, lb + run, indbuf, &ind_cached,
                                               dindbuf, &dind_cached);
             if (nx != phys + run) break;
             run++;
         }
-        if (blk_read(g_ext2.channel, g_ext2.drive, g_ext2.part_start_lba + phys * spb,
+        if (e2_dev_read(fs, fs->part_start_lba + phys * spb,
                      run * spb, out + copied) != (int)(run * spb)) {
             goto rdone;
         }
@@ -1362,6 +1463,10 @@ int64_t ext2_read_file_range(uint32_t ino, uint64_t off, uint64_t len, void *dst
 rdone:
     kfree(indbuf); kfree(dindbuf); kfree(tmp);
     return rc;
+}
+
+int64_t ext2_read_file_range(uint32_t ino, uint64_t off, uint64_t len, void *dst) {
+    return ext2_read_file_range_on(&g_ext2, ino, off, len, dst);
 }
 
 // ---------------------------------------------------------------------------
@@ -1449,7 +1554,7 @@ int ext2_dirblock_find(const uint8_t *blk, uint32_t block_size,
 #endif
 }
 
-static int ext2_lookup_inner(uint32_t dir_ino, const char *name,
+static int ext2_lookup_inner_on(const ext2_fs_t *fs, uint32_t dir_ino, const char *name,
                              uint32_t *out_ino, uint8_t *out_type);
 
 // #597: public entry -> take the filesystem lock. Recursive, so the write paths
@@ -1457,24 +1562,24 @@ static int ext2_lookup_inner(uint32_t dir_ino, const char *name,
 int ext2_lookup(uint32_t dir_ino, const char *name,
                 uint32_t *out_ino, uint8_t *out_type) {
     ext2_lock();
-    int r = ext2_lookup_inner(dir_ino, name, out_ino, out_type);
+    int r = ext2_lookup_inner_on(&g_ext2, dir_ino, name, out_ino, out_type);
     ext2_unlock();
     return r;
 }
 
-static int ext2_lookup_inner(uint32_t dir_ino, const char *name,
+static int ext2_lookup_inner_on(const ext2_fs_t *fs, uint32_t dir_ino, const char *name,
                              uint32_t *out_ino, uint8_t *out_type) {
-    if (!g_ext2.mounted) {
+    if (!fs->mounted) {
         return -1;
     }
     ext2_inode_t inode;
-    if (ext2_read_inode(dir_ino, &inode) != 0) {
+    if (ext2_read_inode_on(fs, dir_ino, &inode) != 0) {
         return -2;
     }
 
     uint32_t name_len = (uint32_t)strlen(name);
     uint64_t size = inode.i_size;
-    uint8_t *blk = (uint8_t *)kmalloc(g_ext2.block_size);
+    uint8_t *blk = (uint8_t *)kmalloc(fs->block_size);
     if (!blk) {
         return -3;
     }
@@ -1482,26 +1587,26 @@ static int ext2_lookup_inner(uint32_t dir_ino, const char *name,
     uint64_t consumed = 0;
     uint32_t logical = 0;
     while (consumed < size) {
-        uint32_t phys = ext2_bmap(&g_ext2, &inode, logical);
+        uint32_t phys = ext2_bmap(fs, &inode, logical);
         if (phys == EXT2_BMAP_ERR) {
             kfree(blk);
             return -4;
         }
         if (phys != 0) {
-            if (ext2_read_block(&g_ext2, phys, blk) != 0) {
+            if (ext2_read_block(fs, phys, blk) != 0) {
                 kfree(blk);
                 return -5;
             }
             // Scan this directory block via the strangler seam (Rust under
             // -DRUST_EXT2_DIRFIND, else the #476-hardened C). ci = g_root_ext2,
             // exactly as the original inline loop tested it.
-            if (ext2_dirblock_find(blk, g_ext2.block_size, name, name_len,
+            if (ext2_dirblock_find(blk, fs->block_size, name, name_len,
                                    g_root_ext2, out_ino, out_type)) {
                 kfree(blk);
                 return 0;
             }
         }
-        consumed += g_ext2.block_size;
+        consumed += fs->block_size;
         logical  += 1;
     }
 
@@ -1667,8 +1772,11 @@ void ext2_dir_rust_selftest(void) {
     }
 }
 
-uint32_t ext2_resolve_path(const char *path) {
-    if (!g_ext2.mounted || !path || path[0] != '/') {
+// #404 Stage 4b: fs-parameterised path walk. Uses ext2_lookup_inner_on (no
+// per-component lock); the public ext2_resolve_path() wrapper takes the lock
+// once around the whole walk (recursive, so it nests under the write paths).
+uint32_t ext2_resolve_path_on(const ext2_fs_t *fs, const char *path) {
+    if (!fs->mounted || !path || path[0] != '/') {
         return 0;
     }
 
@@ -1695,7 +1803,7 @@ uint32_t ext2_resolve_path(const char *path) {
 
         uint32_t next = 0;
         uint8_t  type = 0;
-        if (ext2_lookup(cur, component, &next, &type) != 0) {
+        if (ext2_lookup_inner_on(fs, cur, component, &next, &type) != 0) {
             return 0; // not found
         }
         cur = next;
@@ -1703,6 +1811,13 @@ uint32_t ext2_resolve_path(const char *path) {
         if (*p == '/') p++;
     }
     return cur;
+}
+
+uint32_t ext2_resolve_path(const char *path) {
+    ext2_lock();
+    uint32_t r = ext2_resolve_path_on(&g_ext2, path);
+    ext2_unlock();
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -1717,7 +1832,7 @@ uint32_t ext2_resolve_path(const char *path) {
 // carrying a GPT with a FAT ESP and an ext2 root at a non-zero base LBA, and
 // that root is mounted several hundred lines later in main.c by the #365 block.
 //
-// MEASURED 2026-08-27 on golden build 2243 (<workspace>, booted
+// MEASURED 2026-08-27 on golden build 2243 (/root/golden-built.img, booted
 // under QEMU over the shipping USB-MSC path). The ENTIRE output of this
 // function was three lines:
 //
@@ -2286,8 +2401,7 @@ static inline int  e2_werr_take(int dflt) {
 
 static int ext2_write_block(const ext2_fs_t *fs, uint32_t block, const void *buf) {
     uint32_t spb = fs->block_size / EXT2_SECTOR_SIZE;
-    int r = blk_write(fs->channel, fs->drive, fs->part_start_lba + block * spb,
-                             spb, buf);
+    int r = e2_dev_write(fs, fs->part_start_lba + block * spb, spb, buf);
     if (r != (int)spb) {
         // #695: record the cause HERE, at the one place every ext2 write passes
         // through, rather than at each of the 22 call sites. Several callers
@@ -2299,7 +2413,11 @@ static int ext2_write_block(const ext2_fs_t *fs, uint32_t block, const void *buf
         e2_werr_set(EXT2_E_IO);
         return -1;
     }
-    ext2_cache_update(block, buf, fs->block_size);   // keep cache coherent
+    // #404 Stage 4b: only the boot root participates in the shared cache (see
+    // ext2_read_block). An aux fs never populated it, so there is nothing to
+    // keep coherent and touching it would corrupt a same-numbered root block.
+    if (!fs->via_blkmgr)
+        ext2_cache_update(block, buf, fs->block_size);   // keep cache coherent
     return 0;
 }
 
@@ -2336,7 +2454,7 @@ static void ext2_acct_failed(const char *what) {
 static MUST_CHECK int ext2_sb_adjust(ext2_fs_t *fs, int32_t dblocks, int32_t dinodes) {
     uint8_t *sb = (uint8_t *)kmalloc(1024);
     if (!sb) { e2_werr_set(EXT2_E_NOMEM); return -1; }
-    if (blk_read(fs->channel, fs->drive, fs->part_start_lba + 2, 2, sb) != 2) { kfree(sb); e2_werr_set(EXT2_E_IO); return -1; }
+    if (e2_dev_read(fs, fs->part_start_lba + 2, 2, sb) != 2) { kfree(sb); e2_werr_set(EXT2_E_IO); return -1; }
     uint32_t fb = rd32(sb + 12), fi = rd32(sb + 16);
     fb = (uint32_t)((int32_t)fb + dblocks);
     fi = (uint32_t)((int32_t)fi + dinodes);
@@ -2344,7 +2462,7 @@ static MUST_CHECK int ext2_sb_adjust(ext2_fs_t *fs, int32_t dblocks, int32_t din
     // #742: this is the ONE ext2 write that does not go through
     // ext2_write_block(), so it is also the one that never recorded its own
     // failure. Record it here, at the same place ext2_write_block() does.
-    int rc = (blk_write(fs->channel, fs->drive, fs->part_start_lba + 2, 2, sb) == 2) ? 0 : -1;
+    int rc = (e2_dev_write(fs, fs->part_start_lba + 2, 2, sb) == 2) ? 0 : -1;
     if (rc != 0) e2_werr_set(EXT2_E_IO);
     kfree(sb);
     return rc;
@@ -2609,11 +2727,12 @@ static uint32_t ext2_inode_append_run(ext2_fs_t *fs, uint32_t ino, uint32_t logi
             if (chunk * spb > EXT2_DMA_MAX_SECTORS) chunk = EXT2_DMA_MAX_SECTORS / spb;
             if (chunk == 0) chunk = 1;
             const uint8_t *src = (const uint8_t *)data + (uint64_t)done * bs;
-            if (blk_write(fs->channel, fs->drive,
+            if (e2_dev_write(fs,
                           fs->part_start_lba + (uint64_t)(first + done) * spb,
                           chunk * spb, src) != (int)(chunk * spb)) goto rfail;
-            for (uint32_t k = 0; k < chunk; k++)          // keep the cache coherent
-                ext2_cache_update(first + done + k, src + (uint64_t)k * bs, bs);
+            if (!fs->via_blkmgr)                          // aux fs never caches
+                for (uint32_t k = 0; k < chunk; k++)      // keep the cache coherent
+                    ext2_cache_update(first + done + k, src + (uint64_t)k * bs, bs);
             done += chunk;
         }
     }
@@ -2997,7 +3116,7 @@ static int ext2_dir_add(ext2_fs_t *fs, uint32_t dir_ino, const char *name,
                         uint32_t child_ino, uint8_t ftype) {
     int nlen = 0; while (name[nlen]) nlen++;
     ext2_inode_t di;
-    if (ext2_read_inode(dir_ino, &di) != 0) return -1;
+    if (ext2_read_inode_on(fs, dir_ino, &di) != 0) return -1;   // #404 4b: aux-safe
     uint32_t nblocks = di.i_size / fs->block_size;
     uint8_t *blk = (uint8_t *)kmalloc(fs->block_size);
     if (!blk) return -1;
@@ -3417,7 +3536,8 @@ static uint32_t ext2_create_file_ino(ext2_fs_t *fs, uint32_t dir_ino, const char
 
 // ---- path-based public API ------------------------------------------------
 // Split "/a/b/c" -> parent ino (resolve "/a/b") + basename "c".
-static uint32_t ext2_parent_and_base(const char *path, char *base_out, int base_sz) {
+static uint32_t ext2_parent_and_base_on(const ext2_fs_t *fs, const char *path,
+                                        char *base_out, int base_sz) {
     int len = 0; while (path[len]) len++;
     int slash = -1;
     for (int i = len - 1; i >= 0; i--) if (path[i] == '/') { slash = i; break; }
@@ -3433,15 +3553,57 @@ static uint32_t ext2_parent_and_base(const char *path, char *base_out, int base_
     char parent[256]; int pl = slash < 255 ? slash : 255;
     for (int i = 0; i < pl; i++) parent[i] = path[i];
     parent[pl] = 0;
-    return ext2_resolve_path(parent);
+    return ext2_resolve_path_on(fs, parent);
+}
+static uint32_t ext2_parent_and_base(const char *path, char *base_out, int base_sz) {
+    return ext2_parent_and_base_on(&g_ext2, path, base_out, base_sz);
+}
+
+// FS CORRECTNESS (opencreatenoent, no-ticket): does the PARENT directory of an
+// absolute ext2 path exist AND is it a directory? The O_CREAT open paths
+// (proc/fdlayer.c's e2fd branch and ext2_vfs_open) must answer this BEFORE
+// handing back an fd. Without it, a create under a non-existent parent returned
+// a valid-looking fd, then the close-time commit (ext2_write_file_inner, which
+// already refuses a missing parent) failed and was swallowed, so the caller saw
+// "create ok" while nothing ever persisted (kescrow2fix in blame.md:
+// ESCROW2T-DIAG cfd=259, after_create=0). This reuses ext2_parent_and_base, the
+// EXACT parent resolution the write path uses, so the open-time check and the
+// commit-time behaviour agree by construction. A root-level or bare name has
+// parent "/" (EXT2_ROOT_INO), which always exists, so ordinary creates under an
+// existing directory are unaffected. Returns 1 if the parent exists and is a
+// directory, 0 otherwise.
+int ext2_parent_dir_exists_on(const ext2_fs_t *fs, const char *path) {
+    if (!fs->mounted || !path) return 0;
+    char base[256];
+    uint32_t parent = ext2_parent_and_base_on(fs, path, base, sizeof(base));
+    if (!parent || !base[0]) return 0;
+    ext2_inode_t in;
+    if (ext2_read_inode_on(fs, parent, &in) != 0) return 0;
+    return ((in.i_mode & 0xF000) == 0x4000) ? 1 : 0;
+}
+int ext2_parent_dir_exists(const char *path) {
+    return ext2_parent_dir_exists_on(&g_ext2, path);
 }
 
 // Write (create/overwrite-by-create) a file at an absolute ext2 path.
-static int ext2_write_file_inner(const char *path, const void *data, uint32_t len);
+static int ext2_write_file_inner_on(ext2_fs_t *fs, const char *path,
+                                    const void *data, uint32_t len);
 
 int ext2_write_file(const char *path, const void *data, uint32_t len) {
     ext2_lock();
-    int r = ext2_write_file_inner(path, data, len);
+    int r = ext2_write_file_inner_on(&g_ext2, path, data, len);
+    ext2_unlock();
+    return r;
+}
+
+// #404 Stage 4b: create-or-replace on an AUX mount. Shares the SAME ext2_lock
+// as the root (aux writes are rare and serialising with root writes is correct
+// and cheap); routes all I/O to the aux device by fs->via_blkmgr.
+int ext2_write_file_on(ext2_fs_t *fs, const char *path,
+                       const void *data, uint32_t len) {
+    if (!fs) return -1;
+    ext2_lock();
+    int r = ext2_write_file_inner_on(fs, path, data, len);
     ext2_unlock();
     return r;
 }
@@ -3467,29 +3629,30 @@ int ext2_set_times(uint32_t ino, int64_t atime, int64_t mtime) {
     return rc == 0 ? 0 : -1;
 }
 
-static int ext2_write_file_inner(const char *path, const void *data, uint32_t len) {
-    if (!g_ext2.mounted) return -1;
+static int ext2_write_file_inner_on(ext2_fs_t *fs, const char *path,
+                                    const void *data, uint32_t len) {
+    if (!fs->mounted) return -1;
     char base[256];
     e2_werr_clear();            // #695: this operation starts with no cause
-    uint32_t parent = ext2_parent_and_base(path, base, sizeof(base));
+    uint32_t parent = ext2_parent_and_base_on(fs, path, base, sizeof(base));
     if (!parent || !base[0]) return -1;
     // If it already exists: overwrite in place (truncate the inode, keep its
     // number + directory entry, write the new contents). #99 Phase C.
     uint32_t existing = 0; uint8_t t;
-    if (ext2_lookup(parent, base, &existing, &t) == 0) {
+    if (ext2_lookup_inner_on(fs, parent, base, &existing, &t) == 0) {
         if (t == EXT2_FT_DIR) return -2;   // never clobber a directory
-        uint8_t *ri = (uint8_t *)kmalloc(g_ext2.inode_size);
+        uint8_t *ri = (uint8_t *)kmalloc(fs->inode_size);
         if (!ri) return -3;
-        if (ext2_inode_raw(&g_ext2, existing, ri, 0) != 0) { kfree(ri); return -3; }
-        ext2_truncate_inode(&g_ext2, ri);          // frees old data blocks
+        if (ext2_inode_raw(fs, existing, ri, 0) != 0) { kfree(ri); return -3; }
+        ext2_truncate_inode(fs, ri);          // frees old data blocks
         uint32_t sz = len; memcpy(ri + 4, &sz, 4);  // new i_size
         ext2_stamp_raw_mtime(ri);   // #115: overwrite-in-place is a modification
-        int irc = ext2_inode_raw(&g_ext2, existing, ri, 1);   // #695: was discarded
+        int irc = ext2_inode_raw(fs, existing, ri, 1);   // #695: was discarded
         kfree(ri);
         if (irc != 0) return EXT2_E_IO;
-        return ext2_write_data_to_inode(&g_ext2, existing, data, len);
+        return ext2_write_data_to_inode(fs, existing, data, len);
     }
-    uint32_t ino = ext2_create_file_ino(&g_ext2, parent, base, data, len);
+    uint32_t ino = ext2_create_file_ino(fs, parent, base, data, len);
     // #695: -3 used to mean BOTH "filesystem full" and "out of kernel memory".
     return ino ? 0 : e2_werr_take(EXT2_E_NOMEM);
 }
@@ -3513,8 +3676,8 @@ static int ext2_append_file_inner(const char *path, const void *data, uint32_t l
     uint32_t parent = ext2_parent_and_base(path, base, sizeof(base));
     if (!parent || !base[0]) return -1;
     uint32_t ino = 0; uint8_t t = 0;
-    if (ext2_lookup_inner(parent, base, &ino, &t) != 0)
-        return ext2_write_file_inner(path, data, len);   // absent: plain create
+    if (ext2_lookup_inner_on(&g_ext2, parent, base, &ino, &t) != 0)
+        return ext2_write_file_inner_on(&g_ext2, path, data, len);   // absent: plain create
     if (t == EXT2_FT_DIR) return -2;                     // never clobber a directory
     if (len == 0) return 0;
 
@@ -3806,47 +3969,58 @@ static int ext2_mkdir_inner(const char *path) {
 // Iterate directory entries by byte position (#99 Phase B). *pos = byte offset to
 // resume from; on success returns 0, fills name_out/ino_out/type_out and advances
 // *pos. Skips inode-0 slots and "." / "..". Returns -1 at end / on error.
-static int ext2_readdir_ino_inner(uint32_t dir_ino, uint32_t *pos, char *name_out, int name_max,
+static int ext2_readdir_ino_inner_on(const ext2_fs_t *fs, uint32_t dir_ino, uint32_t *pos,
+                                  char *name_out, int name_max,
                                   uint32_t *ino_out, uint8_t *type_out);
 
 int ext2_readdir_ino(uint32_t dir_ino, uint32_t *pos, char *name_out, int name_max,
                      uint32_t *ino_out, uint8_t *type_out) {
     ext2_lock();
-    int r = ext2_readdir_ino_inner(dir_ino, pos, name_out, name_max, ino_out, type_out);
+    int r = ext2_readdir_ino_inner_on(&g_ext2, dir_ino, pos, name_out, name_max, ino_out, type_out);
     ext2_unlock();
     return r;
 }
 
-static int ext2_readdir_ino_inner(uint32_t dir_ino, uint32_t *pos, char *name_out, int name_max,
+// #404 Stage 4b: public aux-mount readdir. No lock: an aux fs is independent of
+// the root and bypasses the shared cache, so a lock-free walk cannot corrupt or
+// be corrupted by a root operation.
+int ext2_readdir_on(const ext2_fs_t *fs, uint32_t dir_ino, uint32_t *pos,
+                    char *name_out, int name_max,
+                    uint32_t *ino_out, uint8_t *type_out) {
+    return ext2_readdir_ino_inner_on(fs, dir_ino, pos, name_out, name_max, ino_out, type_out);
+}
+
+static int ext2_readdir_ino_inner_on(const ext2_fs_t *fs, uint32_t dir_ino, uint32_t *pos,
+                                  char *name_out, int name_max,
                                   uint32_t *ino_out, uint8_t *type_out) {
-    if (!g_ext2.mounted || !pos || !name_out || name_max < 2) return -1;
+    if (!fs->mounted || !pos || !name_out || name_max < 2) return -1;
     ext2_inode_t inode;
-    if (ext2_read_inode(dir_ino, &inode) != 0) return -1;
+    if (ext2_read_inode_on(fs, dir_ino, &inode) != 0) return -1;
     uint64_t size = inode.i_size;
-    uint8_t *blk = (uint8_t *)kmalloc(g_ext2.block_size);
+    uint8_t *blk = (uint8_t *)kmalloc(fs->block_size);
     if (!blk) return -1;
     uint32_t p = *pos;
     while (p < size) {
-        uint32_t logical = p / g_ext2.block_size;
-        uint32_t off = p % g_ext2.block_size;
-        uint32_t phys = ext2_bmap(&g_ext2, &inode, logical);
-        if (phys == 0 || phys == EXT2_BMAP_ERR) { p = (logical + 1) * g_ext2.block_size; continue; }
-        if (ext2_read_block(&g_ext2, phys, blk) != 0) { kfree(blk); return -1; }
+        uint32_t logical = p / fs->block_size;
+        uint32_t off = p % fs->block_size;
+        uint32_t phys = ext2_bmap(fs, &inode, logical);
+        if (phys == 0 || phys == EXT2_BMAP_ERR) { p = (logical + 1) * fs->block_size; continue; }
+        if (ext2_read_block(fs, phys, blk) != 0) { kfree(blk); return -1; }
         // The 8-byte entry header must fit before we read it; a corrupt block
         // that parks off in the trailing < 8 bytes otherwise over-reads (#476).
-        if (off + 8 > g_ext2.block_size) { p = (logical + 1) * g_ext2.block_size; continue; }
+        if (off + 8 > fs->block_size) { p = (logical + 1) * fs->block_size; continue; }
         uint32_t e_ino = rd32(blk + off + 0);
         uint16_t rec   = rd16(blk + off + 4);
         uint8_t  nlen  = blk[off + 6];
         uint8_t  ftype = blk[off + 7];
-        if (rec < 8 || off + rec > g_ext2.block_size) {
+        if (rec < 8 || off + rec > fs->block_size) {
             // #610: this is not a "no more entries" condition, it is a
             // structurally impossible directory block (the #476 / #597 shape).
             // Record it in the superblock so the next boot checks the volume.
             ext2_mark_error("readdir: rec_len out of range");
             kfree(blk); return -1;
         }
-        if ((uint32_t)off + 8 + nlen > g_ext2.block_size) {
+        if ((uint32_t)off + 8 + nlen > fs->block_size) {
             ext2_mark_error("readdir: name_len overruns the block");
             kfree(blk); return -1;
         }
@@ -3877,7 +4051,7 @@ static int ext2_readdir_ino_inner(uint32_t dir_ino, uint32_t *pos, char *name_ou
 // ---------------------------------------------------------------------------
 // #618 BATCHED BLOCK FREES: the App Store install freeze.
 //
-// MEASURED (build 972 lock-hold profiler, throwaway VM <vmid>): the App Store
+// MEASURED (build 972 lock-hold profiler, throwaway VM 2620): the App Store
 // finishes an install by deleting its 103,563,185-byte downloaded archive
 // (/STOREDL.TMP). That single sys_unlink held ext2_lock for tens of seconds in
 // ONE acquisition, which is why the FIFO ticket lock of #617 could not help:
@@ -4167,7 +4341,7 @@ static int ext2_write_data_to_inode(ext2_fs_t *fs, uint32_t ino,
 static int ext2_dir_remove(ext2_fs_t *fs, uint32_t dir_ino, const char *name) {
     int nlen = 0; while (name[nlen]) nlen++;
     ext2_inode_t di;
-    if (ext2_read_inode(dir_ino, &di) != 0) return -1;
+    if (ext2_read_inode_on(fs, dir_ino, &di) != 0) return -1;   // #404 4b: aux-safe
     uint32_t nblocks = di.i_size / fs->block_size;
     uint8_t *blk = (uint8_t *)kmalloc(fs->block_size);
     if (!blk) return -1;
@@ -4324,7 +4498,7 @@ static int ext2_dir_repoint(ext2_fs_t *fs, uint32_t dir_ino, const char *name,
     uint32_t nlen = 0; while (name[nlen]) nlen++;
     if (nlen == 0 || nlen > 255) return -1;
     ext2_inode_t di;
-    if (ext2_read_inode(dir_ino, &di) != 0) return -1;
+    if (ext2_read_inode_on(fs, dir_ino, &di) != 0) return -1;   // #404 4b: aux-safe
     uint32_t nblocks = di.i_size / fs->block_size;
     uint8_t *blk = (uint8_t *)kmalloc(fs->block_size);
     if (!blk) return -1;
@@ -4350,6 +4524,49 @@ static int ext2_dir_repoint(ext2_fs_t *fs, uint32_t dir_ino, const char *name,
     return -1;
 }
 
+// #746 dir-move: adjust a directory inode's i_links_count by `delta`, reusing
+// the SAME raw-inode path (ext2_inode_raw, offset 26) that ext2_mkdir_inner and
+// ext2_rmdir_inner already use to bump/drop the parent link a subdirectory's
+// ".." holds. Best-effort with a loud failure, matching mkdir's treatment of a
+// lost parent-link bump: the move itself has already succeeded by the time this
+// runs, and a wrong link count is an e2fsck-repairable annotation, not lost
+// data. Assumes the ext2 lock is held. C, not Rust, because it is one
+// read-modify-write over the raw inode buffer this whole file manipulates by
+// byte offset; splitting it across the FFI would buy nothing.
+static void ext2_adjust_links(uint32_t ino, int delta) {
+    uint8_t *ri = (uint8_t *)kmalloc(g_ext2.inode_size);
+    if (!ri) { ext2_acct_failed("linkcount-alloc/rename"); return; }
+    if (ext2_inode_raw(&g_ext2, ino, ri, 0) == 0) {
+        int nl = (int)rd16(ri + 26) + delta;
+        if (nl < 0) nl = 0;
+        if (nl > 0xFFFF) nl = 0xFFFF;
+        uint16_t w = (uint16_t)nl; memcpy(ri + 26, &w, 2);
+        if (ext2_inode_raw(&g_ext2, ino, ri, 1) != 0)
+            ext2_acct_failed("linkcount-write/rename");
+    }
+    kfree(ri);
+}
+
+// Is `anc` an ancestor of, or equal to, directory `start`? Walks start -> ".."
+// up towards the root, bounded. Used to REFUSE moving a directory into its own
+// subtree (rename("/a", "/a/b")), which would detach the subtree into a cycle
+// e2fsck reports as an unconnected directory inode. Reuses ext2_lookup (the
+// recursive ext2 lock makes calling it under the held lock safe, exactly as
+// ext2_rename_inner already does). Fails CLOSED: an over-deep walk (corrupt
+// parent chain) returns "ancestor", so the rename is refused rather than risked.
+static int ext2_is_ancestor(uint32_t anc, uint32_t start) {
+    uint32_t cur = start;
+    for (int depth = 0; depth < 4096; depth++) {
+        if (cur == anc) return 1;
+        if (cur == EXT2_ROOT_INO) return 0;
+        uint32_t par = 0; uint8_t ft = 0;
+        if (ext2_lookup(cur, "..", &par, &ft) != 0 || par == 0) return 0;
+        if (par == cur) return 0;          // self-referential ".." (root)
+        cur = par;
+    }
+    return 1;                              // too deep / cyclic: refuse
+}
+
 static int ext2_rename_inner(const char *old_path, const char *new_path) {
     if (!g_ext2.mounted) return -1;
     char obase[256], nbase[256];
@@ -4369,23 +4586,50 @@ static int ext2_rename_inner(const char *old_path, const char *new_path) {
     int have_dest = (ext2_lookup(nparent, nbase, &nino, &ntype) == 0 && nino != 0);
     if (have_dest && nino == oino) return 0;   // already two names for one inode
 
-    // Directories are refused, with the same -2 ext2_unlink uses for the same
-    // reason: moving a directory must also rewrite its ".." entry and adjust
-    // both parents' link counts, and getting that half-right corrupts the tree.
-    // Reported honestly rather than emulated, so the caller can fall back.
-    if (otype == EXT2_FT_DIR) return -2;
-    if (have_dest && ntype == EXT2_FT_DIR) return -2;
+    int src_is_dir = (otype == EXT2_FT_DIR);
+    int cross_dir  = (oparent != nparent);
 
-    // STEP 1: the destination name starts resolving to the source inode.
+    // WHAT WE DELIBERATELY REFUSE (a clean failure that changes NOTHING, so no
+    // data is ever lost). #746 handled regular files only; #746-dir adds the
+    // directory MOVE/RENAME onto a name that does not yet exist. It does NOT add
+    // rename-OVER-an-existing-directory (empty-target replace, EISDIR/ENOTEMPTY
+    // semantics) nor a type-mismatched overwrite: those need a correct
+    // POSIX-semantics decision that is out of scope for this bounded pass, and a
+    // half-done replace of a directory corrupts the tree. Refuse them with -1 (a
+    // generic failure), NOT -2: -2 is fat_rename()'s "one endpoint is a
+    // directory" fallback to copy+delete, which for a directory source cannot
+    // copy anyway and for these cases would be wrong. See CHANGELOG (#746-dir).
+    if (have_dest && (ntype == EXT2_FT_DIR || src_is_dir)) return -1;
+
+    // Refuse moving a directory into its own subtree (rename("/a","/a/b")): it
+    // would leave a subtree whose ".." chain never reaches the root.
+    if (src_is_dir && cross_dir && ext2_is_ancestor(oino, nparent)) return -1;
+
+    // STEP 1: the destination name starts resolving to the source inode. From
+    // here the caller's data is safe under any crash: it is named by the
+    // destination. Everything below either completes the move or, on a crash,
+    // leaves at worst an extra hard link that e2fsck reclaims. NEVER a lost file.
     if (have_dest) {
+        // have_dest here is a regular-file target (all directory/mismatch
+        // destinations were refused above), so this is the atomic one-block
+        // repoint from #746.
         if (ext2_dir_repoint(&g_ext2, nparent, nbase, oino, otype) != 0) return -1;
     } else {
         if (ext2_dir_add(&g_ext2, nparent, nbase, oino, otype) != 0) return -1;
     }
 
-    // From here the caller's data is safe under any crash: it is named by the
-    // destination. Everything below is cleanup, and a failure in it costs disk
-    // space (which e2fsck reclaims), never data.
+    // STEP 1b (directory moved to a DIFFERENT parent only): the moved directory's
+    // ".." must now name the new parent, the new parent gains the link that ".."
+    // holds, and the old parent loses it. A same-directory directory rename needs
+    // none of this: ".." is unchanged and the parent's subdirectory count is the
+    // same before and after. The moved directory's OWN link count is unchanged in
+    // both cases (it still has exactly one name and the same set of children).
+    if (src_is_dir && cross_dir) {
+        if (ext2_dir_repoint(&g_ext2, oino, "..", nparent, EXT2_FT_DIR) != 0)
+            ext2_acct_failed("dotdot-repoint/rename");
+        ext2_adjust_links(nparent, +1);
+        ext2_adjust_links(oparent, -1);
+    }
 
     // STEP 2: the source name goes away. If this fails the file simply has two
     // names; say so rather than reporting a failed rename the caller would
@@ -4393,7 +4637,9 @@ static int ext2_rename_inner(const char *old_path, const char *new_path) {
     if (ext2_dir_remove(&g_ext2, oparent, obase) != 0)
         ext2_acct_failed("dir-remove/rename");
 
-    // STEP 3: and only now is the inode the destination used to name released.
+    // STEP 3: and only now is the inode a replaced (regular-file) destination
+    // used to name released. Never reached for a directory rename (have_dest
+    // with a directory anywhere was refused above).
     if (have_dest) ext2_release_inode(nino);
     return 0;
 }
@@ -4484,6 +4730,202 @@ int ext2_rmdir(const char *path) {
     return r;
 }
 
+#ifdef EXT2_RENAME_SELFTEST
+// ===========================================================================
+// #746-dir SELF-TEST. Compile-time gated: ZERO code and ZERO calls in a normal
+// build, exactly like main.c's #ifdef EXCL_SELFTEST. It calls the SAME shipping
+// ext2_rename() and reads the on-disk inodes back to prove the properties this
+// data-integrity change must have:
+//   - the inode NUMBER is unchanged across a rename (so no data was copied),
+//   - bytes are intact, link counts move correctly,
+//   - a moved directory's ".." follows to the new parent,
+//   - a replaced regular-file target's inode is released (links -> 0),
+//   - the negative / refuse cases change nothing and never lose data.
+// It finishes with the in-kernel fsck: total==0 proves no orphan inode, no
+// leaked/duplicate block and no wrong link count was left behind. Runs on the
+// real mounted ext2 ROOT (a throwaway VM), which the harness accepts.
+// ===========================================================================
+static int g_rt_fail;
+static int g_rt_run;
+
+#define RT_OK(cond, ...) do {                                            \
+        g_rt_run++;                                                      \
+        int _c = (cond);                                                 \
+        kprintf("[RENAMETEST] %s: ", _c ? "PASS" : "FAIL");             \
+        kprintf(__VA_ARGS__);                                            \
+        kprintf("\n");                                                   \
+        if (!_c) { g_rt_fail++; bootlog_write("[RENAMETEST] FAIL (see serial)"); } \
+    } while (0)
+
+static int rt_write(const char *path, const char *data) {
+    ext2_wstream_t ws;
+    if (ext2_wstream_begin(path, &ws) != 0) return -1;
+    uint32_t len = 0; while (data[len]) len++;
+    if (len && ext2_wstream_block(&ws, data, len) != 0) { ext2_wstream_abort(&ws); return -1; }
+    return ext2_wstream_finish(&ws);
+}
+
+static uint16_t rt_links(uint32_t ino) {
+    ext2_inode_t in;
+    if (ino == 0 || ext2_read_inode(ino, &in) != 0) return 0xFFFF;
+    return in.i_links_count;
+}
+
+static uint32_t rt_dotdot(uint32_t dir_ino) {
+    uint32_t p = 0; uint8_t ft = 0;
+    if (ext2_lookup(dir_ino, "..", &p, &ft) != 0) return 0;
+    return p;
+}
+
+// Does path's content equal `want`? Reads by inode into a stack buffer.
+static int rt_bytes_eq(uint32_t ino, const char *want) {
+    char buf[64];
+    uint32_t wl = 0; while (want[wl]) wl++;
+    int64_t n = ext2_read_file_ino(ino, buf, sizeof(buf));
+    if (n < 0 || (uint32_t)n != wl) return 0;
+    return memcmp(buf, want, wl) == 0;
+}
+
+void ext2_rename_selftest(void) {
+    if (!g_ext2.mounted) {
+        kprintf("[RENAMETEST] ext2 volume absent; harness idle\n");
+        bootlog_write("[RENAMETEST] ext2 volume absent; harness idle");
+        return;
+    }
+    g_rt_fail = 0; g_rt_run = 0;
+    kprintf("[RENAMETEST] === #746-dir ext2 rename self-test START ===\n");
+    bootlog_write("[RENAMETEST] START");
+
+    // Fresh scratch root.
+    if (ext2_mkdir("/RT") != 0) {
+        kprintf("[RENAMETEST] ABORT: mkdir /RT failed (stale tree? clean the volume)\n");
+        bootlog_write("[RENAMETEST] ABORT: mkdir /RT failed");
+        return;
+    }
+
+    // ---- 1. SAME-DIR FILE RENAME: inode unchanged, bytes intact, links=1 ----
+    RT_OK(rt_write("/RT/A", "hello123") == 0, "setup /RT/A");
+    uint32_t ino_A = ext2_resolve_path("/RT/A");
+    uint16_t lk_A  = rt_links(ino_A);
+    RT_OK(ext2_rename("/RT/A", "/RT/B") == 0, "rename /RT/A -> /RT/B");
+    RT_OK(ext2_resolve_path("/RT/A") == 0, "old name /RT/A is gone");
+    uint32_t ino_B = ext2_resolve_path("/RT/B");
+    RT_OK(ino_B != 0 && ino_B == ino_A, "inode UNCHANGED (no copy): A=%u B=%u",
+          (unsigned)ino_A, (unsigned)ino_B);
+    RT_OK(rt_bytes_eq(ino_B, "hello123"), "bytes intact after rename");
+    RT_OK(rt_links(ino_B) == lk_A && lk_A == 1, "link count unchanged (=1): %u",
+          (unsigned)rt_links(ino_B));
+
+    // ---- 2. CROSS-DIR FILE MOVE ----
+    RT_OK(ext2_mkdir("/RT/D1") == 0 && ext2_mkdir("/RT/D2") == 0, "setup /RT/D1 /RT/D2");
+    RT_OK(rt_write("/RT/D1/F", "world!") == 0, "setup /RT/D1/F");
+    uint32_t ino_F = ext2_resolve_path("/RT/D1/F");
+    RT_OK(ext2_rename("/RT/D1/F", "/RT/D2/G") == 0, "move /RT/D1/F -> /RT/D2/G");
+    RT_OK(ext2_resolve_path("/RT/D1/F") == 0, "old /RT/D1/F is gone");
+    uint32_t ino_G = ext2_resolve_path("/RT/D2/G");
+    RT_OK(ino_G != 0 && ino_G == ino_F, "inode UNCHANGED cross-dir: F=%u G=%u",
+          (unsigned)ino_F, (unsigned)ino_G);
+    RT_OK(rt_bytes_eq(ino_G, "world!"), "bytes intact cross-dir");
+    RT_OK(rt_links(ino_G) == 1, "link count still 1 cross-dir");
+
+    // ---- 3. DIRECTORY RENAME, SAME PARENT: "..", link counts, contents ----
+    RT_OK(ext2_mkdir("/RT/DA") == 0, "setup /RT/DA");
+    RT_OK(rt_write("/RT/DA/x", "xx") == 0, "setup /RT/DA/x");
+    uint32_t ino_DA = ext2_resolve_path("/RT/DA");
+    uint32_t ino_RT = ext2_resolve_path("/RT");
+    uint16_t lk_DA_before = rt_links(ino_DA);
+    uint16_t lk_RT_before = rt_links(ino_RT);
+    RT_OK(ext2_rename("/RT/DA", "/RT/DB") == 0, "rename dir /RT/DA -> /RT/DB");
+    RT_OK(ext2_resolve_path("/RT/DA") == 0, "old dir name /RT/DA gone");
+    uint32_t ino_DB = ext2_resolve_path("/RT/DB");
+    RT_OK(ino_DB != 0 && ino_DB == ino_DA, "dir inode UNCHANGED: DA=%u DB=%u",
+          (unsigned)ino_DA, (unsigned)ino_DB);
+    RT_OK(rt_dotdot(ino_DB) == ino_RT, "'..' still points at same parent /RT (%u==%u)",
+          (unsigned)rt_dotdot(ino_DB), (unsigned)ino_RT);
+    RT_OK(rt_links(ino_DB) == lk_DA_before, "moved dir link count unchanged (%u)",
+          (unsigned)rt_links(ino_DB));
+    RT_OK(rt_links(ino_RT) == lk_RT_before, "parent link count unchanged same-dir (%u)",
+          (unsigned)rt_links(ino_RT));
+    RT_OK(ext2_resolve_path("/RT/DB/x") != 0, "dir contents intact (/RT/DB/x present)");
+
+    // ---- 4. DIRECTORY MOVE, CROSS PARENT: "..", both parents' link counts ----
+    RT_OK(ext2_mkdir("/RT/P1") == 0 && ext2_mkdir("/RT/P2") == 0, "setup /RT/P1 /RT/P2");
+    RT_OK(ext2_mkdir("/RT/P1/M") == 0, "setup /RT/P1/M");
+    RT_OK(rt_write("/RT/P1/M/y", "yy") == 0, "setup /RT/P1/M/y");
+    uint32_t ino_M  = ext2_resolve_path("/RT/P1/M");
+    uint32_t ino_P1 = ext2_resolve_path("/RT/P1");
+    uint32_t ino_P2 = ext2_resolve_path("/RT/P2");
+    uint16_t lk_P1_before = rt_links(ino_P1);
+    uint16_t lk_P2_before = rt_links(ino_P2);
+    uint16_t lk_M_before  = rt_links(ino_M);
+    RT_OK(ext2_rename("/RT/P1/M", "/RT/P2/M") == 0, "move dir /RT/P1/M -> /RT/P2/M");
+    RT_OK(ext2_resolve_path("/RT/P1/M") == 0, "old /RT/P1/M gone");
+    uint32_t ino_M2 = ext2_resolve_path("/RT/P2/M");
+    RT_OK(ino_M2 != 0 && ino_M2 == ino_M, "moved dir inode UNCHANGED: %u==%u",
+          (unsigned)ino_M, (unsigned)ino_M2);
+    RT_OK(rt_dotdot(ino_M2) == ino_P2, "'..' now points at NEW parent P2 (%u==%u)",
+          (unsigned)rt_dotdot(ino_M2), (unsigned)ino_P2);
+    RT_OK(rt_links(ino_P1) == (uint16_t)(lk_P1_before - 1),
+          "old parent P1 link count -1 (%u->%u)", (unsigned)lk_P1_before, (unsigned)rt_links(ino_P1));
+    RT_OK(rt_links(ino_P2) == (uint16_t)(lk_P2_before + 1),
+          "new parent P2 link count +1 (%u->%u)", (unsigned)lk_P2_before, (unsigned)rt_links(ino_P2));
+    RT_OK(rt_links(ino_M2) == lk_M_before, "moved dir own link count unchanged (%u)",
+          (unsigned)rt_links(ino_M2));
+    RT_OK(ext2_resolve_path("/RT/P2/M/y") != 0, "moved dir contents intact (/RT/P2/M/y)");
+
+    // ---- 5. RENAME OVER AN EXISTING REGULAR FILE: atomic replace + free ----
+    RT_OK(rt_write("/RT/T1", "aaaa") == 0 && rt_write("/RT/T2", "bbbbbb") == 0, "setup /RT/T1 /RT/T2");
+    uint32_t ino_T1 = ext2_resolve_path("/RT/T1");
+    uint32_t ino_T2 = ext2_resolve_path("/RT/T2");
+    RT_OK(ino_T1 != ino_T2, "distinct source/target inodes: T1=%u T2=%u",
+          (unsigned)ino_T1, (unsigned)ino_T2);
+    RT_OK(ext2_rename("/RT/T1", "/RT/T2") == 0, "replace /RT/T1 -> /RT/T2");
+    RT_OK(ext2_resolve_path("/RT/T1") == 0, "source name /RT/T1 gone");
+    uint32_t ino_T2_after = ext2_resolve_path("/RT/T2");
+    RT_OK(ino_T2_after == ino_T1, "target now names the SOURCE inode (%u==%u)",
+          (unsigned)ino_T2_after, (unsigned)ino_T1);
+    RT_OK(rt_bytes_eq(ino_T2_after, "aaaa"), "target holds source bytes (no data loss)");
+    RT_OK(rt_links(ino_T2) == 0, "replaced target inode released (links=0), no double name");
+
+    // ---- 6. NEGATIVE: rename a nonexistent source errors, changes nothing ----
+    RT_OK(ext2_rename("/RT/NOPE", "/RT/Z") != 0, "rename of missing source errors");
+    RT_OK(ext2_resolve_path("/RT/Z") == 0, "no phantom /RT/Z created");
+
+    // ---- 7. REFUSE cases: never overwrite/lose a target, never make a cycle ---
+    RT_OK(rt_write("/RT/FF", "ff") == 0 && ext2_mkdir("/RT/DD") == 0, "setup /RT/FF /RT/DD");
+    uint32_t ino_FF = ext2_resolve_path("/RT/FF");
+    uint32_t ino_DD = ext2_resolve_path("/RT/DD");
+    RT_OK(ext2_rename("/RT/FF", "/RT/DD") != 0, "refuse file-over-directory");
+    RT_OK(ext2_resolve_path("/RT/FF") == ino_FF && ext2_resolve_path("/RT/DD") == ino_DD,
+          "file-over-dir refusal changed nothing");
+    RT_OK(ext2_rename("/RT/DD", "/RT/FF") != 0, "refuse dir-over-file");
+    RT_OK(ext2_resolve_path("/RT/DD") == ino_DD && ext2_resolve_path("/RT/FF") == ino_FF,
+          "dir-over-file refusal changed nothing");
+    RT_OK(ext2_mkdir("/RT/SA") == 0 && ext2_mkdir("/RT/SA/SB") == 0, "setup /RT/SA/SB");
+    uint32_t ino_SA = ext2_resolve_path("/RT/SA");
+    RT_OK(ext2_rename("/RT/SA", "/RT/SA/SB/SC") != 0, "refuse move dir into own subtree");
+    RT_OK(ext2_resolve_path("/RT/SA") == ino_SA && ext2_resolve_path("/RT/SA/SB/SC") == 0,
+          "own-subtree refusal changed nothing");
+
+    // ---- FSCK: the whole batch must leave the volume structurally clean -------
+    {
+        ext2_fsck_report_t rep;
+        int rc = ext2_fsck_run(&rep);
+        uint32_t total = ext2_fsck_print(&rep, 1);
+        RT_OK(rc == 0 && rep.completed && total == 0,
+              "in-kernel fsck CLEAN after batch (completed=%u total=%u)",
+              (unsigned)rep.completed, (unsigned)total);
+    }
+
+    kprintf("[RENAMETEST] === DONE: %d/%d checks passed, %d FAILED ===\n",
+            g_rt_run - g_rt_fail, g_rt_run, g_rt_fail);
+    bootlog_write("[RENAMETEST] DONE: %d/%d passed, %d failed",
+                  g_rt_run - g_rt_fail, g_rt_run, g_rt_fail);
+    kprintf("[RENAMETEST] RESULT: %s\n", g_rt_fail == 0 ? "ALL-PASS" : "FAILURES");
+    bootlog_write("[RENAMETEST] RESULT: %s", g_rt_fail == 0 ? "ALL-PASS" : "FAILURES");
+}
+#endif // EXT2_RENAME_SELFTEST
+
 // ===========================================================================
 // Root-cutover helper (#99 Phase C). Read an entire regular file from the
 // mounted ext2 volume into a freshly kmalloc'd buffer. Returns NULL if the
@@ -4553,6 +4995,16 @@ uint64_t ext2_end_bytes(void) {
            (uint64_t)g_ext2.blocks_count * (uint64_t)g_ext2.block_size;
 }
 
+// #404 disk-mgr Stage 4: thin accessors so the Disk Manager mount-list can
+// report the ext2 ROOT boot mount without reaching into the static g_ext2.
+uint64_t ext2_volume_bytes(void) {
+    if (!g_ext2.mounted) return 0;
+    return (uint64_t)g_ext2.blocks_count * (uint64_t)g_ext2.block_size;
+}
+uint32_t ext2_part_lba(void) {
+    return g_ext2.mounted ? g_ext2.part_start_lba : 0;
+}
+
 
 // ===========================================================================
 // #610 SUPERBLOCK STATE (dirty detection) + THE READ-ONLY CONSISTENCY CHECKER
@@ -4604,7 +5056,7 @@ static int g_e2fsck_ffi_ok  = 1;    // cleared if the Rust FFI sizeof lock fails
 // alone: a half-updated set of backups is worse than stale backups, and nothing
 // in this kernel reads them.
 static int ext2_sb_read_raw(const ext2_fs_t *fs, uint8_t *sb1024) {
-    return (blk_read(fs->channel, fs->drive, fs->part_start_lba + 2, 2, sb1024) == 2)
+    return (e2_dev_read(fs, fs->part_start_lba + 2, 2, sb1024) == 2)
            ? 0 : -1;
 }
 
@@ -4636,7 +5088,7 @@ static int ext2_sb_set_state(ext2_fs_t *fs, int op, int bump_mnt) {
         memcpy(sb + E2SB_MNT_COUNT, &mc, 2);
     }
 
-    int rc = (blk_write(fs->channel, fs->drive, fs->part_start_lba + 2, 2, sb) == 2) ? 0 : -4;
+    int rc = (e2_dev_write(fs, fs->part_start_lba + 2, 2, sb) == 2) ? 0 : -4;
     kfree(sb);
     if (rc != 0) return rc;
 

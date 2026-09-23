@@ -230,6 +230,21 @@ typedef struct {
     // pixels of the window's four outer corners; 0 means square.
     int32_t r_window;
 
+    // #osglass (2026-09-16): the OS-WIDE glass opacity (0-255, 255=opaque)
+    // applied to every window's border+titlebar+content by default, unless a
+    // window carries an explicit per-window override (window_t::opacity_
+    // override, set via the titlebar decorator popup's Opacity stepper -
+    // see window.c winmenu_handle_click()). Read via TM_WINDOW_OPACITY
+    // (TM_ENUM: a plain 0-255 byte value, never scaled by ui_px). Default is
+    // style-derived (theme_fill_v2_defaults): 255 (fully opaque) for retro-
+    // style themes so the CDE/Motif look is unchanged, a subtle 235 (~92%)
+    // for every modern theme. This REPLACES the old model where the only
+    // OS-wide opacity was an ephemeral runtime value (g_default_window_
+    // opacity, set only via SYS_SET_WIN_OPACITY from whichever app/slider
+    // last called it, never tied to the active theme) - theme_set() now
+    // pushes this value as the new default on every theme switch.
+    int32_t m_window_opacity;
+
     int32_t d_style;             // 0 beveled, 1 flat, 2 gradient
     int32_t d_titlebar_gradient; // 0/1
     int32_t d_grip;              // 0/1 draw the resize grips
@@ -283,6 +298,7 @@ typedef enum {
     TM_TYPE_DISPLAY,   TM_TYPE_DISPLAY_LH,  TM_TYPE_DISPLAY_W,
     TM_TITLE_INSET,    // #711 loop 2 (designer 1): appended, never renumber
     TM_RADIUS_WINDOW,  // #27: appended, never renumber
+    TM_WINDOW_OPACITY, // #osglass: appended, never renumber
     TM_COUNT
 } theme_metric_v2_t;
 

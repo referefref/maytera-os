@@ -164,6 +164,12 @@ int gfs_fold_stats(gfs_stats_t *out);
 // 1 once the fold is up and answering.
 int gfs_fold_ready(void);
 
+// The highest node `local` (node_id & 0x00FFFFFF) already present for `kind`,
+// counting RETIRED nodes (a retired node still blocks re-creation of its id).
+// 0 if no node of that kind exists. Used to seed the escrow per-contract local
+// allocator above a prior boot's replayed nodes (fs/escrow_guard.c).
+uint32_t gfs_fold_max_local(uint32_t kind);
+
 // ---------------------------------------------------------------------------
 // The Ring-3 surface: SYS_GFS_QUERY (363). READ-ONLY, and there is deliberately
 // no mutating counterpart (docs/GRAPHFS_DESIGN.md section 8). An audit trail

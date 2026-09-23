@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- MayteraOS Office launcher icon: Slides (/APPS/SLIDES). Original MayteraOS
+       artwork. Family sheet + mountain-M cue; Slides = a solid orange slide on
+       easel legs, with the title placeholder cut OUT of the slide (evenodd hole,
+       not a painted dark bar) so it reads on any backdrop and survives the
+       dock's luminance-tint path. Solid rather than outlined on purpose: an
+       outlined 3px slide collapsed into a blob at the 16px taskbar size. -->
+  <rect x="11" y="5" width="42" height="54" rx="3" ry="3" fill="none" stroke="#ffffff" stroke-width="4" stroke-linejoin="round"/>
+  <polyline points="19,20 25,12.5 32,19 39,12.5 45,20" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#ff9f40">
+    <path fill-rule="evenodd" d="M21,27 h22 a2,2 0 0 1 2,2 v13 a2,2 0 0 1 -2,2 h-22 a2,2 0 0 1 -2,-2 v-13 a2,2 0 0 1 2,-2 z M24,31 h11 a1,1 0 0 1 1,1 v1 a1,1 0 0 1 -1,1 h-11 a1,1 0 0 1 -1,-1 v-1 a1,1 0 0 1 1,-1 z"/>
+    <rect x="30" y="44" width="4" height="4"/>
+    <polygon points="32,47 26,55 29.5,55 32,51.5 34.5,55 38,55"/>
+  </g>
+</svg>

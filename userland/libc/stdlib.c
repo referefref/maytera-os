@@ -9,6 +9,16 @@
 #include "errno.h"
 #include "pthread.h"
 #include "stdio.h"   // #745: exit() must fflush() buffered stdio, see below
+#include "fcntl.h"   // O_RDWR/O_CREAT/O_EXCL for mkstemp (#745)
+#include "time.h"    // time() seed for mkstemp (#745)
+
+// #portstack: these are provided by libc for general use, but a port that
+// ships its own (e.g. the CPython wsupp compat layer) must win at its own
+// link. Marking them weak lets a strong app/port definition override, while
+// libc still serves every app that has none. Fixes CPython relink dup-symbols.
+#pragma weak strtoimax
+#pragma weak strtoumax
+
 #define errno_set(e) (errno = (e))
 
 // ============================================================================
@@ -106,7 +116,7 @@ static uint64_t heap_mapped = HEAP_START;
 
 // #COMPRESPAWN: SAY WHEN THE HEAP IS GROWING WITHOUT BOUND, WHILE IT STILL CAN.
 //
-// MEASURED 2026-08-25 on the owner's VM <vmid> (golden 2054): the compositor took
+// MEASURED 2026-08-25 on the owner's a test VM (golden 2054): the compositor took
 // a page fault writing through an address 288 MB into this heap, after 8.8
 // hours. Reconstructing that number needed the CR2 from a kernel exception line
 // and arithmetic against HEAP_START. Nothing in the process had ever said "my
@@ -1281,6 +1291,13 @@ void qsort(void *base, size_t nmemb, size_t size,
 
 long long llabs(long long n) { return (n < 0) ? -n : n; }
 
+// div/ldiv/lldiv: C-standard division returning quotient and remainder.
+// Added for the libarchive port (#745, archive_time.c). C99 requires quot to
+// truncate toward zero, which is exactly what C integer / and % already do.
+div_t div(int numer, int denom) { div_t r; r.quot = numer / denom; r.rem = numer % denom; return r; }
+ldiv_t ldiv(long numer, long denom) { ldiv_t r; r.quot = numer / denom; r.rem = numer % denom; return r; }
+lldiv_t lldiv(long long numer, long long denom) { lldiv_t r; r.quot = numer / denom; r.rem = numer % denom; return r; }
+
 long long strtoll(const char *nptr, char **endptr, int base) {
     const char *s = nptr;
     while (*s==' '||*s=='\t'||*s=='\n'||*s=='\r'||*s=='\f'||*s=='\v') s++;
@@ -1323,6 +1340,18 @@ unsigned long long strtoull(const char *nptr, char **endptr, int base) {
     }
     if (endptr) *endptr=(char*)(any?s:nptr);
     return neg ? (unsigned long long)(-(long long)acc) : acc;
+}
+
+// strtoimax/strtoumax: the <inttypes.h> intmax_t parsers. They were DECLARED in
+// inttypes.h but defined nowhere (a latent gap surfaced by the libarchive port,
+// #745). On x86-64 intmax_t is long long, so these are thin forwarders. Purely
+// additive: nothing else in the tree defined them, so no multiple-definition.
+// intmax_t is "long" on x86-64 (gcc stdint.h); match that width exactly.
+long strtoimax(const char *nptr, char **endptr, int base) {
+    return (long)strtoll(nptr, endptr, base);
+}
+unsigned long strtoumax(const char *nptr, char **endptr, int base) {
+    return (unsigned long)strtoull(nptr, endptr, base);
 }
 
 // ============================================================================
@@ -1515,4 +1544,45 @@ void *bsearch(const void *key, const void *base, unsigned long nmemb,
         else return (void*)p;
     }
     return (void*)0;
+}
+
+// mkstemp: create and open a unique temporary file, added for the libedit port
+// (#745). The template's trailing "XXXXXX" is replaced with a filename that did
+// not previously exist; the file is created O_EXCL with 0600 permissions.
+int mkstemp(char *tmpl)
+{
+	static const char set[] =
+	    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+	size_t n = strlen(tmpl);
+	if (n < 6) {
+		errno = EINVAL;
+		return -1;
+	}
+	char *x = tmpl + n - 6;
+	for (int i = 0; i < 6; i++) {
+		if (x[i] != 'X') {
+			errno = EINVAL;
+			return -1;
+		}
+	}
+	// A cheap changing seed: mix an incrementing counter with a clock tick.
+	static unsigned counter = 0;
+	unsigned seed = (unsigned)(uintptr_t)tmpl ^ (counter += 0x9e3779b9u);
+	seed ^= (unsigned)time((void *)0) * 2654435761u;
+	for (int attempt = 0; attempt < 4096; attempt++) {
+		seed = seed * 1103515245u + 12345u;
+		unsigned r = seed;
+		for (int i = 0; i < 6; i++) {
+			x[i] = set[r % 62u];
+			r /= 62u;
+			r += seed >> (i + 1);
+		}
+		int fd = open(tmpl, O_RDWR | O_CREAT | O_EXCL, 0600);
+		if (fd >= 0)
+			return fd;
+		if (errno != EEXIST)
+			return -1;
+	}
+	errno = EEXIST;
+	return -1;
 }

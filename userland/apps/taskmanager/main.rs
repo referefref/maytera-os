@@ -52,6 +52,7 @@ fn panic(_i: &PanicInfo) -> ! {
 // libc FFI
 // ---------------------------------------------------------------------------
 extern "C" {
+    fn syscall0(n: i64) -> i64;
     fn syscall1(n: i64, a1: i64) -> i64;
     fn syscall2(n: i64, a1: i64, a2: i64) -> i64;
     fn syscall3(n: i64, a1: i64, a2: i64, a3: i64) -> i64;
@@ -67,6 +68,47 @@ extern "C" {
                   variant: i32, st: i32);
     fn gui_progress(handle: i32, x: i32, y: i32, w: i32, h: i32, pct: i32);
     fn gui_lighten(c: u32, amt: i32) -> u32;
+    // (tmglass) the glass primitives the App Repo pilot draws its panels with
+    // (libc/gui.c: AA rounded fill blending toward a caller-supplied outer
+    // colour, 1px rounded border, 2-layer soft shadow, blend). Shared, not
+    // re-implemented here: docs/UI_GLASS_DESIGN_SYSTEM.md section 9.
+    fn gui_fill_rounded_aa(handle: i32, x: i32, y: i32, w: i32, h: i32, r: i32, color: u32, bg: u32);
+    fn gui_rounded_border(handle: i32, x: i32, y: i32, w: i32, h: i32, r: i32, color: u32);
+    fn gui_soft_shadow(handle: i32, x: i32, y: i32, w: i32, h: i32, r: i32, bg: u32);
+    fn gui_mix(a: u32, b: u32, t: i32) -> u32;
+    fn gui_ttf_render_width(s: *const u8, size: i32) -> i32;
+    // (2026-09-16 owner fix) gui_text_ttf_centered() (libc/gui.c) centers a
+    // label on BOTH axes using real TTF metrics (gui_ttf_render_width() for
+    // x, font_metrics()'s ascent-descent for y), not size-as-line-height.
+    // The tab strip was hand-measuring x only and guessing y (PAD + 5), which
+    // is why the label sat high and off-centre - this is the same helper
+    // gui_button() uses for its own label, called, not re-measured here.
+    fn gui_text_ttf_centered(handle: i32, x: i32, y: i32, w: i32, h: i32,
+                             s: *const u8, color: u32, size: i32);
+    // (2026-09-16 owner fix, see glass-transparency-is-os-wide) the manual
+    // frosted-wallpaper backdrop (gui_glass_backdrop_sync/blit/at) used to
+    // live here: this app sampled and blurred the ACTUAL wallpaper into its
+    // own content every frame, so the window looked translucent no matter
+    // what the OS-wide theme opacity said - a per-app hardcode that ignored
+    // the compositor's real per-window opacity blend (kernel/gui/window.c,
+    // theme-driven via wm_set_default_opacity()). This app never called
+    // SET_WIN_OPACITY and never set a per-window override, so removing the
+    // backdrop hack is enough: content is now a plain deterministic fill
+    // (draw_bg(), below) and the compositor's own opacity blend is what
+    // makes the window read as glass under a modern theme or fully opaque
+    // under a retro one, exactly like every other window. Calculator/Media
+    // Player/Image Viewer (calcglass/audglass/imgglass) carry the same old
+    // hack and are UNCHANGED here - out of scope for this Task Manager fix.
+    //
+    // libc/gui_theme.h: reads the active theme FILE's style= line. Comparing
+    // the numeric theme id to 4 (what apply_theme() did before) only ever
+    // matched the ONE built-in classic theme, the anti-pattern that header
+    // warns every app away from.
+    fn gui_theme_is_classic() -> i32;
+    // libc/wallpapers.h: the ONE wallpaper index -> file mapping, shared with
+    // the compositor and Settings (#517). wp_entry_t is two 40-byte char
+    // arrays; the mirror below is size-locked.
+    fn wp_enumerate(out: *mut WpEntry, max: i32) -> i32;
 
     // #178: the ONE ranking of "what is eating the CPU" (libc/proccpu.h).
     // This is the SAME OBJECT FILE that /APPS/top and /APPS/SYSMON call, not a
@@ -95,6 +137,46 @@ extern "C" {
     fn gui_confirm_singleton_render(handle: i32, win_w: i32, win_h: i32);
     fn gui_confirm_singleton_handle_key(key: i32) -> i32;
     fn gui_confirm_singleton_handle_mouse(x: i32, y: i32, clicked: i32) -> i32;
+
+    // (2026-09-16 owner fix) The shared scrollable-viewport primitive
+    // (userland/libc/gui_scroll.h/.c), the first Rust consumer of which was
+    // midiplay/main.rs - copied here rather than re-derived, same GuiScroll
+    // mirror. Called, not re-implemented: the Processes list used to hand-roll
+    // its own `scroll: usize` with an inverted wheel direction (it treated the
+    // OS convention's positive=up as "scroll further into the list") and a
+    // clamp against the wrong bound (`nproc` instead of
+    // `content_px - viewport_px`), so scrolling down ran past the last row
+    // into blank space and scrolling up did the opposite of what the wheel
+    // asked for. gui_scroll_wheel()/gui_scroll_config() own that clamp and
+    // that convention in ONE place now, matching every other list in the OS.
+    fn gui_scroll_config(s: *mut GuiScroll, x: i32, y: i32, w: i32, h: i32,
+                         content_px: i32, step_px: i32);
+    fn gui_scroll_wheel(s: *mut GuiScroll, scroll_delta: i32) -> i32;
+    fn gui_scroll_reveal(s: *mut GuiScroll, top_px: i32, h_px: i32) -> i32;
+    fn gui_scroll_first_item(s: *const GuiScroll) -> i32;
+}
+
+/// Mirror of `gui_scroll_t` (userland/libc/gui_scroll.h): eleven C ints, in
+/// this order. The C side owns every field; this app only ever passes the
+/// struct by pointer and reads `offset` through the accessor functions. Keep
+/// it in sync with the header by hand, the same way GuiPalette is (and the
+/// same way midiplay/main.rs's identical copy is).
+#[repr(C)]
+struct GuiScroll {
+    x: i32, y: i32, w: i32, h: i32,
+    content_px: i32,
+    step_px: i32,
+    offset: i32,
+    snap: i32,
+    drag: i32,
+    drag_grab: i32,
+    hover: i32,
+}
+impl GuiScroll {
+    const fn new() -> GuiScroll {
+        GuiScroll { x: 0, y: 0, w: 0, h: 0, content_px: 0, step_px: 0, offset: 0,
+                    snap: 1, drag: 0, drag_grab: 0, hover: 0 }
+    }
 }
 
 const GUI_CONFIRM_DESTRUCTIVE: i32 = 0;
@@ -111,7 +193,25 @@ struct GuiPalette {
     field_bg: u32,
     field_border: u32,
     track: u32,
+    // (tmglass) gui_palette_t grew these two ENGINE-OWNED fields at #745;
+    // gui_set_palette() does `g_pal = *p` (a 48-byte struct copy) and then
+    // overwrites both, so the old 40-byte mirror had it reading 8 bytes past
+    // the end of this struct on every apply_theme(). Harmless in effect (the
+    // values are replaced before use) but an over-read, and the size lock
+    // below is what stops it silently happening again.
+    focus: u32,
+    edge_strong: u32,
 }
+const _: () = assert!(core::mem::size_of::<GuiPalette>() == 48);
+
+/// Mirror of libc/wallpapers.h wp_entry_t: file[40] then name[40].
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WpEntry {
+    file: [u8; 40],
+    name: [u8; 40],
+}
+const _: () = assert!(core::mem::size_of::<WpEntry>() == 80);
 
 const GUI_STYLE_CLASSIC: i32 = 0;
 const GUI_STYLE_MODERN: i32 = 1;
@@ -125,6 +225,13 @@ const GUI_ST_DISABLED: i32 = 4;
 // ---------------------------------------------------------------------------
 const SYS_EXIT: i64 = 0;
 const SYS_KILL: i64 = 80;
+// (tmglass) all re-read out of userland/libc/syscall.h, not assumed.
+const SYS_OPEN: i64 = 10;
+const SYS_CLOSE: i64 = 11;
+const SYS_READ: i64 = 12;
+const SYS_WIN_BLIT: i64 = 35;          // (win, 0, 0, w | h<<16, px) - scaled to the content rect
+const SYS_GET_WALLPAPER: i64 = 205;    // () -> the shared wallpaper index
+const SYS_DECODE_IMAGE: i64 = 253;     // (data, len, tw<<16 | th, out, cap, dims[2])
 const SYS_WIN_CREATE: i64 = 30;
 const SYS_WIN_DESTROY: i64 = 31;
 const SYS_WIN_DRAW_RECT: i64 = 32;
@@ -347,6 +454,69 @@ fn draw_text(h: i32, x: i32, y: i32, s: &[u8], size: i32, color: u32) {
     let packed = ((color & 0x00FF_FFFF) | (((size as u32) & 0xFF) << 24)) as i64;
     unsafe { syscall5(SYS_WIN_DRAW_TTF, h as i64, x as i64, y as i64, s.as_ptr() as i64, packed); }
 }
+fn text_w(s: &[u8], size: i32) -> i32 {
+    unsafe { gui_ttf_render_width(s.as_ptr(), size) }
+}
+
+// ---------------------------------------------------------------------------
+// (tmglass) Glass tokens and the frosted backdrop.
+//
+// docs/UI_GLASS_DESIGN_SYSTEM.md sections 1 and 10, exactly as the App Repo
+// pilot (userland/apps/appstore/main.c build_backdrop / draw_header) applied
+// them: always dark, teal accent, regardless of the active theme (owner
+// decision, recorded at glasstm). Copy the NAMES as well as the values; a
+// second name for the same hex is how two surfaces drift apart.
+// ---------------------------------------------------------------------------
+const C_PANEL: u32 = 0x0012_2420;       // WEL_BG_MID: the glass panel fill (= pal.surface)
+const C_CARD: u32 = 0x000E_1D1B;        // DK_CARD_FILL: nested cards (= pal.surface_raised)
+const C_EDGE: u32 = 0x002C_4A44;        // DK_STROKE_UNSEL: panel border, App Repo C_border
+const C_HAIR: u32 = 0x001E_322E;        // hairline rule inside a panel
+const C_INK: u32 = 0x00F3_FBF9;         // DK_HEADLINE
+const C_INK_DIM: u32 = 0x00A9_D9CC;     // DK_BODY
+const C_ACCENT: u32 = 0x006A_E2CF;      // DK_ACCENT
+const C_ACCENT_INK: u32 = 0x0004_231A;  // App Repo C_accent_ink: text on the accent
+const C_OK: u32 = 0x003F_D6A4;          // App Repo C_ok
+const C_ERR: u32 = 0x00FF_AAA2;         // DK_ERROR
+const WEL_BG_TOP: u32 = 0x000A_1614;
+const WEL_BG_BOTTOM: u32 = 0x0005_0A09;
+
+/// (2026-09-16 owner fix) Plain vertical gradient wash for the window's own
+/// margins - a fixed function of window height, not a sample of the desktop
+/// wallpaper. This REPLACES the old gui_glass_backdrop_* recipe (decode the
+/// wallpaper, point-sample it, blur it, tint it toward C_PANEL, blit it into
+/// the window every time the chrome was dirty): that recipe made this window
+/// look translucent unconditionally, regardless of the OS-wide theme opacity,
+/// because the "glass" was faked in the app's own pixels rather than left to
+/// the compositor's real per-window alpha blend. This app now only ever
+/// paints fully opaque pixels; whether the desktop shows through is entirely
+/// the compositor's decision (kernel/gui/window.c win->opacity, theme-driven).
+///
+/// Deliberately cheap (a handful of flat rects, no decode/scale/blur), so
+/// unlike the old backdrop it needs no dirty-flag gate: draw() calls it every
+/// frame.
+fn draw_bg(a: &App) {
+    const BANDS: i32 = 24;
+    let bh = (a.dh + BANDS - 1) / BANDS;
+    if bh <= 0 { return; }
+    let mut y = 0;
+    while y < a.dh {
+        let h = if bh < a.dh - y { bh } else { a.dh - y };
+        let col = grad_at(a.dh, y);
+        win_draw_rect(a.win, 0, y, a.dw, h, col);
+        y += bh;
+    }
+}
+
+/// The vertical-gradient colour at content-space y, matching what draw_bg()
+/// paints there. AA rounded corners (draw_tabs()/draw_panel()) sample this
+/// instead of the old backdrop buffer, so a corner's antialiasing fringe
+/// blends into the flat colour actually behind it rather than a flat guess
+/// (a flat guess is what produces a visible halo around a round corner).
+fn grad_at(dh: i32, y: i32) -> u32 {
+    if dh <= 0 { return WEL_BG_TOP; }
+    let yc = if y < 0 { 0 } else if y > dh { dh } else { y };
+    mix(WEL_BG_TOP, WEL_BG_BOTTOM, ((yc * 100) / dh) as u32)
+}
 
 // ---------------------------------------------------------------------------
 // Fixed-point / formatting helpers. No float anywhere: the kernel target is
@@ -413,7 +583,11 @@ struct App {
     // sysmon, top and this app's rollback twin.
     cpu: ProcCpu,
     sel_pid: u32,
-    scroll: usize,
+    /// (2026-09-16 owner fix) the Processes list's scroll offset, now owned by
+    /// the shared gui_scroll_t primitive instead of a hand-rolled usize with
+    /// its own (inverted, unclamped) wheel math. See gui_scroll_config() in
+    /// draw() and gui_scroll_wheel()/gui_scroll_reveal() below.
+    list: GuiScroll,
     cpu_total: i32,
     mem_total: u64,
     mem_used: u64,
@@ -509,17 +683,9 @@ fn theme_active() -> i32 {
     unsafe { syscall1(SYS_GET_THEME, 0) as i32 }
 }
 
-/// Perceptual luminance, integer weights (Rec.601 x100). Picks readable ink for
-/// ANY theme background, which is what keeps LIGHT themes legible: light-theme
-/// contrast is a repeat offender in this codebase, so ink is DERIVED from the
-/// background rather than hardcoded.
-fn lum(c: u32) -> u32 {
-    let r = (c >> 16) & 0xFF;
-    let g = (c >> 8) & 0xFF;
-    let b = c & 0xFF;
-    (r * 30 + g * 59 + b * 11) / 100
-}
-fn ink_on(bg: u32) -> u32 { if lum(bg) > 140 { 0x0018_1818 } else { 0x00F0_F0F0 } }
+// (tmglass) lum()/ink_on() are gone: the palette is a fixed dark glass, so
+// the ink on the accent is the measured token C_ACCENT_INK, not a luminance
+// pick. Bring them back the day this window follows the theme again.
 fn mix(a: u32, b: u32, pct: u32) -> u32 {
     let f = |sh: u32| {
         let x = (a >> sh) & 0xFF;
@@ -531,25 +697,31 @@ fn mix(a: u32, b: u32, pct: u32) -> u32 {
 
 impl App {
     fn apply_theme(&mut self) {
-        let tid = theme_active();
-        unsafe { gui_set_style(if tid == 4 { GUI_STYLE_CLASSIC } else { GUI_STYLE_MODERN }); }
-        let wb = theme_color(THEME_COLOR_WINDOW_BG);
-        let accent = theme_color(THEME_COLOR_ACCENT);
-        self.dark = lum(wb) < 128;
-        let surface = mix(if self.dark { 0x0026_2A30 } else { 0x00F5_F6F8 }, accent, 5);
-        let raised = mix(if self.dark { 0x002C_313B } else { 0x00ED_EFF3 }, accent, 6);
-        let ink = ink_on(surface);
+        // The widget FAMILY (bevelled vs rounded) still follows the active
+        // theme file, exactly as the App Repo does; the COLOURS do not.
+        unsafe { gui_set_style(if gui_theme_is_classic() != 0 { GUI_STYLE_CLASSIC } else { GUI_STYLE_MODERN }); }
+        // (tmglass) The App Repo dark-glass language, docs/UI_GLASS_DESIGN_
+        // SYSTEM.md sections 1 and 10: always dark, teal accent, regardless of
+        // the active theme (owner decision at glasstm). Content sits INSIDE the
+        // glass panels, so pal.surface is the PANEL fill: every shared widget
+        // (gui_button, gui_card) anti-aliases its edges against pal.surface,
+        // and that has to be the colour actually behind it. Nested cards (the
+        // Performance charts) are DK_CARD_FILL, the section 6 "nested card".
+        let _ = (theme_color(THEME_COLOR_WINDOW_BG), theme_color(THEME_COLOR_ACCENT), theme_active());
+        self.dark = true;
         self.pal = GuiPalette {
-            surface,
-            surface_raised: raised,
-            ink,
-            ink_dim: mix(ink, surface, 45),
-            accent,
-            accent_hover: unsafe { gui_lighten(accent, 24) },
-            border: if self.dark { 0x003A_424F } else { 0x00CD_D3DB },
-            field_bg: if self.dark { 0x0033_3A45 } else { 0x00FF_FFFF },
-            field_border: if self.dark { 0x003A_424F } else { 0x00CD_D3DB },
-            track: mix(surface, accent, 20),
+            surface: C_PANEL,
+            surface_raised: C_CARD,
+            ink: C_INK,
+            ink_dim: C_INK_DIM,
+            accent: C_ACCENT,
+            accent_hover: unsafe { gui_lighten(C_ACCENT, 18) },
+            border: C_EDGE,
+            field_bg: 0x0021_3B34,
+            field_border: 0x004E_7168,
+            track: 0x0016_241F,
+            focus: 0,        // engine-owned, overwritten by gui_set_palette()
+            edge_strong: 0,  // engine-owned, overwritten by gui_set_palette()
         };
         unsafe { gui_set_palette(&self.pal); }
     }
@@ -914,9 +1086,22 @@ impl App {
         if i < 0 { i = 0; }
         if i >= self.nproc as i32 { i = self.nproc as i32 - 1; }
         self.sel_pid = self.procs[i as usize].pid;
-        // Keep the selection on screen.
-        let idx = i as usize;
-        if idx < self.scroll { self.scroll = idx; }
+        // (2026-09-16 owner fix) Keep the selection on screen, in EITHER
+        // direction: the old code only handled scrolling UP to reveal a
+        // selection above the current view (`if idx < self.scroll`) - Down
+        // arrow past the last visible row moved sel_pid but never scrolled
+        // to follow it, so the selection silently walked off the bottom of
+        // the list. Reconfigure against the CURRENT viewport/content size (a
+        // resize or a changed process count since the last draw() must not
+        // use a stale one) and let the shared primitive reveal whichever
+        // direction is needed; it also owns the same clamp draw() uses, so
+        // there is exactly one definition of "how far this list can scroll".
+        let visible_h = (list_bottom(self.dh) - LIST_TOP_Y).max(0);
+        unsafe {
+            gui_scroll_config(&mut self.list, 0, LIST_TOP_Y, self.dw, visible_h,
+                              (self.nproc as i32) * ROW_H, ROW_H);
+            gui_scroll_reveal(&mut self.list, i * ROW_H, ROW_H);
+        }
         self.refresh_detail();
     }
 }
@@ -959,18 +1144,92 @@ fn cron_action_name(a: u8) -> &'static [u8] {
     match a { 0 => b"callback\0", 1 => b"launch\0", 2 => b"event\0", _ => b"?\0" }
 }
 
+/// (2026-09-16 owner fix) The tab strip, ATTACHED to the panel below it. It
+/// used to be floating pills sitting apart from the panel with a gap (PANEL_Y
+/// added 10px of clear space) and no shared edge: the active tab was a
+/// separate accent-filled capsule with nothing tying it visually to the box
+/// its own content lived in. Now the active tab is filled the SAME colour as
+/// the panel (C_PANEL) and sits with NO gap above it (PANEL_Y, logic.rs), so
+/// draw_main_panel() - called right after this, every frame - visually
+/// continues the active tab's fill straight down into the box. A 3px accent
+/// bar along the active tab's top edge is what still marks it as selected,
+/// since the fill itself no longer does. Inactive tabs use the darker
+/// C_CARD ("nested card") fill, which is what reads them as sitting behind
+/// the active one rather than as separate buttons.
+///
+/// Corners: gui_fill_rounded_aa()/gui_rounded_border() only take ONE radius
+/// for all four corners, and a tab wants rounded top / square bottom (the
+/// bottom has to be square to butt flush against the panel). Both calls are
+/// given a rect extended TAB_R px past the tab's real bottom (PAD + TAB_H);
+/// draw_main_panel(), drawn immediately afterward, paints over that
+/// extension with its own flat top strip, which is what turns the rounded
+/// bottom corners into a square edge with no second primitive needed.
+///
+/// Label placement goes through the shared gui_text_ttf_centered() instead of
+/// a hand-measured x with a guessed y (this is fix #3: the label used to sit
+/// high and off-centre because "PAD + 5" was never actually the vertical
+/// centre of a 26px-tall tab, and the guess did not track font metrics).
 fn draw_tabs(a: &App) {
-    let mut x = PAD;
     for (i, name) in TAB_NAMES.iter().enumerate() {
         let sel = i == a.tab as usize;
-        let w = 84;
-        let bg = if sel { a.pal.accent } else { a.pal.surface_raised };
-        win_draw_rect(a.win, x, PAD, w, TAB_H, bg);
-        let ink = if sel { ink_on(a.pal.accent) } else { a.pal.ink_dim };
-        draw_text(a.win, x + 8, PAD + 6, name, 11, ink);
-        x += w + 3;
+        let r = tab_rect(i);
+        let outer = grad_at(a.dh, PAD);
+        let fill = if sel { C_PANEL } else { C_CARD };
+        unsafe {
+            gui_fill_rounded_aa(a.win, r.x, PAD, r.w, TAB_H + TAB_R, TAB_R, fill, outer);
+            gui_rounded_border(a.win, r.x, PAD, r.w, TAB_H + TAB_R, TAB_R,
+                               if sel { C_PANEL } else { C_EDGE });
+            if sel {
+                // The selection indicator, now that fill alone can't carry it.
+                win_draw_rect(a.win, r.x + TAB_R, PAD, r.w - 2 * TAB_R, 3, C_ACCENT);
+            }
+        }
+        let ink = if sel { C_INK } else { C_INK_DIM };
+        unsafe { gui_text_ttf_centered(a.win, r.x, PAD, r.w, TAB_H, name.as_ptr(), ink, 12); }
     }
-    win_draw_rect(a.win, PAD, PAD + TAB_H, a.dw - 2 * PAD, 1, a.pal.border);
+}
+
+/// (2026-09-16 owner fix) One panel: soft shadow, AA rounded fill on the
+/// BOTTOM two corners only, 1px border on the sides and bottom, 1px top
+/// highlight. The top used to be rounded like the other three corners, which
+/// is what made the tab strip above it read as a separate floating shape
+/// instead of the same control: gui_fill_rounded_aa()/gui_rounded_border()
+/// still only take one radius, so the top corners are rounded by the same
+/// calls as the bottom ones and then squared BACK off by a flat cover over
+/// the top PANEL_R rows - the same trick draw_tabs() uses in reverse, and
+/// what that function's own top-corner extension is drawn to be squared by.
+/// No border line is drawn across the top at all: the panel is meant to read
+/// as open there, capped by the tab strip, not divided from it by an edge.
+///
+/// Every outer colour comes from grad_at() - the SAME deterministic gradient
+/// draw_bg() just painted behind everything - instead of a backdrop-buffer
+/// sample, because there is no longer a backdrop buffer (see draw_bg()).
+/// Drawn every frame on purpose: the same inputs give the same pixels, so the
+/// repaint is idempotent.
+fn draw_panel(a: &App, x: i32, y: i32, w: i32, h: i32) {
+    let outer = grad_at(a.dh, y + h + 3);
+    unsafe {
+        gui_soft_shadow(a.win, x, y + 2, w, h, PANEL_R, outer);
+        gui_fill_rounded_aa(a.win, x, y, w, h, PANEL_R, C_PANEL, outer);
+        gui_rounded_border(a.win, x, y, w, h, PANEL_R, C_EDGE);
+        win_draw_rect(a.win, x, y, w, PANEL_R, C_PANEL);
+        win_draw_rect(a.win, x + PANEL_R, y + 1, w - 2 * PANEL_R, 1, gui_lighten(C_PANEL, 16));
+    }
+}
+
+/// The main panel every tab draws its content into.
+fn draw_main_panel(a: &App) {
+    let (x, y, w, h) = panel_rect(a.dw, a.dh);
+    draw_panel(a, x, y, w, h);
+}
+
+/// A hairline rule inside the panel, PANEL_IN from either edge.
+fn draw_rule(a: &App, y: i32) {
+    win_draw_rect(a.win, CX, y, a.dw - 2 * CX, 1, C_HAIR);
+}
+/// A full-width list row band inside the panel.
+fn draw_row_band(a: &App, y: i32, color: u32) {
+    win_draw_rect(a.win, CX, y, a.dw - 2 * CX, ROW_H - 1, color);
 }
 
 /// Sparkline chart from a fixed-point percent ring. Bars, not a polyline: bars
@@ -1029,20 +1288,27 @@ fn draw_processes(a: &App) {
     draw_col_hdr(a, c_cpu, top, b"CPU\0", SortCol::Cpu);
     draw_col_hdr(a, c_mem, top, b"Memory\0", SortCol::Mem);
     let ltop = LIST_TOP_Y;
-    win_draw_rect(a.win, PAD, ltop - 3, a.dw - 2 * PAD, 1, a.pal.border);
-    let lbot = a.dh - 44;
+    draw_rule(a, ltop - 3);
+    let lbot = list_bottom(a.dh);
     let rows = ((lbot - ltop) / ROW_H).max(0) as usize;
 
+    // (2026-09-16 owner fix) `a.list` was configured (and re-clamped against
+    // the CURRENT process count and viewport height) by draw() just before
+    // this call - see the gui_scroll_config() call there. Reading the offset
+    // through gui_scroll_first_item() rather than a hand-kept `scroll: usize`
+    // is what makes "can't scroll past the last row" and "up scrolls up" true
+    // by construction instead of by a separately-maintained clamp.
+    let first = unsafe { gui_scroll_first_item(&a.list) }.max(0) as usize;
     let mut b = Buf::new();
     for r in 0..rows {
-        let i = r + a.scroll;
+        let i = r + first;
         if i >= a.nproc { break; }
         let ry = ltop + (r as i32) * ROW_H;
         let sel = a.procs[i].pid == a.sel_pid;
-        if sel { win_draw_rect(a.win, PAD, ry, a.dw - 2 * PAD, ROW_H - 1, a.pal.accent); }
-        else if r & 1 == 1 { win_draw_rect(a.win, PAD, ry, a.dw - 2 * PAD, ROW_H - 1, unsafe { gui_lighten(a.pal.surface, 4) }); }
-        let ink = if sel { ink_on(a.pal.accent) } else { a.pal.ink };
-        let dim = if sel { ink_on(a.pal.accent) } else { a.pal.ink_dim };
+        if sel { draw_row_band(a, ry, C_ACCENT); }
+        else if r & 1 == 1 { draw_row_band(a, ry, unsafe { gui_lighten(C_PANEL, 4) }); }
+        let ink = if sel { C_ACCENT_INK } else { a.pal.ink };
+        let dim = if sel { C_ACCENT_INK } else { a.pal.ink_dim };
 
         draw_text(a.win, c_name, ry + 3, &a.procs[i].name, 12, ink);
         b.clear(); b.putu(a.procs[i].pid as u64);
@@ -1075,13 +1341,13 @@ fn draw_processes(a: &App) {
 
     // footer
     let fy = foot_y(a.dh);
-    win_draw_rect(a.win, PAD, fy - 6, a.dw - 2 * PAD, 1, a.pal.border);
+    draw_rule(a, fy - 8);
     let mut f = Buf::new();
     f.putu(a.nproc as u64); f.puts(b" processes   CPU "); f.putu(a.cpu_total.max(0) as u64); f.put(b'%');
-    draw_text(a.win, PAD, fy + 6, f.as_c(), 11, a.pal.ink_dim);
+    draw_text(a.win, CX, fy + 6, f.as_c(), 11, a.pal.ink_dim);
     // #161/#188: result of the last End Task / Kill / priority change. Empty
     // until one is used.
-    if a.msg.len() > 1 { draw_text(a.win, PAD + 170, fy + 6, a.msg, 11, a.pal.ink); }
+    if a.msg.len() > 1 { draw_text(a.win, CX + 170, fy + 6, a.msg, 11, a.pal.ink); }
     let can = a.sel_pid > 1 && a.sel_pid != NO_SEL;
     let st = if can { GUI_ST_NORMAL } else { GUI_ST_DISABLED };
     // #188: the SAME proc_btns() the click handler hit-tests. The old single
@@ -1178,34 +1444,38 @@ fn draw_net_card(a: &App, x: i32, y: i32, w: i32, h: i32) {
                          2 => b"requesting\0", 3 => b"bound\0", _ => b"?\0" } };
     line(a, lx, &mut yy, b"Config\0", cfg);
     if n.faulty != 0 {
-        draw_text(a.win, lx, yy, b"! link persistently unreachable\0", 11, 0x00E05050);
+        draw_text(a.win, lx, yy, b"! link persistently unreachable\0", 11, C_ERR);
     }
 }
 
 fn draw_performance(a: &App) {
-    let top = PAD + TAB_H + 8;
+    // (tmglass) the control row and the charts all live inside the main
+    // glass panel; PERF_CTL_Y / perf_mode_btns() are the same definitions the
+    // click handler tests.
+    let top = PERF_CTL_Y;
+    let pm = perf_mode_btns();
     unsafe {
-        gui_button(a.win, PAD, top, 80, 22, b"Overall\0".as_ptr(),
+        gui_button(a.win, pm[0].x, top, pm[0].w, PERF_CTL_H, b"Overall\0".as_ptr(),
                    if a.perf_cores { GUI_BTN_SECONDARY } else { GUI_BTN_PRIMARY }, GUI_ST_NORMAL);
-        gui_button(a.win, PAD + 86, top, 80, 22, b"Per-core\0".as_ptr(),
+        gui_button(a.win, pm[1].x, top, pm[1].w, PERF_CTL_H, b"Per-core\0".as_ptr(),
                    if a.perf_cores { GUI_BTN_PRIMARY } else { GUI_BTN_SECONDARY }, GUI_ST_NORMAL);
     }
     // #188: update speed, from the SAME speed_btns() the click handler tests.
     // The refresh interval used to be the literal 1000 in the event loop with
     // no way to change it.
-    draw_text(a.win, PAD + 174, top + 5, b"Speed\0", 10, a.pal.ink_dim);
+    draw_text(a.win, CX + 174, top + 5, b"Speed\0", 10, a.pal.ink_dim);
     let sb = speed_btns();
     let sv = [Speed::High, Speed::Normal, Speed::Low, Speed::Paused];
     for i in 0..4 {
         unsafe {
-            gui_button(a.win, sb[i].x, top, sb[i].w, 22, speed_label(sv[i]).as_ptr(),
+            gui_button(a.win, sb[i].x, top, sb[i].w, PERF_CTL_H, speed_label(sv[i]).as_ptr(),
                        if a.speed == sv[i] { GUI_BTN_PRIMARY } else { GUI_BTN_SECONDARY },
                        GUI_ST_NORMAL);
         }
     }
     let gy = top + 30;
-    let gh = a.dh - gy - PAD;
-    let gw = a.dw - 2 * PAD;
+    let gh = a.dh - gy - PAD - PANEL_IN;
+    let gw = a.dw - 2 * CX;
 
     if a.perf_cores {
         let n = a.ncores.max(1);
@@ -1218,12 +1488,12 @@ fn draw_performance(a: &App) {
         let mut hdr = Buf::new();
         hdr.puts(b"Logical processors: "); hdr.putu(n as u64);
         if n == 1 { hdr.puts(b"   (APs idle: SMP user scheduling off)"); }
-        draw_text(a.win, PAD, gy, hdr.as_c(), 11, a.pal.ink_dim);
+        draw_text(a.win, CX, gy, hdr.as_c(), 11, a.pal.ink_dim);
         if cw < 60 || ch < 40 { return; }
         for i in 0..n {
             let r = (i / cols) as i32;
             let c = (i % cols) as i32;
-            let x = PAD + c * (cw + 6);
+            let x = CX + c * (cw + 6);
             let y = gy + 18 + r * (ch + 6);
             let mut lb = Buf::new();
             lb.puts(b"CPU "); lb.putu(i as u64);
@@ -1239,15 +1509,15 @@ fn draw_performance(a: &App) {
     let cw2 = gw - cw - 6;
     let ch = (gh - 6) / 2;
     let ch2 = gh - ch - 6;
-    let x2 = PAD + cw + 6;
+    let x2 = CX + cw + 6;
     let y2 = gy + ch + 6;
-    draw_chart(a, PAD, gy, cw, ch, &a.cpu_hist, b"CPU\0", a.pal.accent);
+    draw_chart(a, CX, gy, cw, ch, &a.cpu_hist, b"CPU\0", a.pal.accent);
     draw_chart(a, x2, gy, cw2, ch, &a.mem_hist, b"Memory\0", mix(a.pal.accent, 0x0040_C060, 60));
     let mut b = Buf::new();
     b.putu(a.mem_used / 1048576); b.puts(b" of "); b.putu(a.mem_total / 1048576); b.puts(b" MB");
     draw_text(a.win, x2 + 62, gy + 5, b.as_c(), 10, a.pal.ink_dim);
     if ch2 > 40 {
-        draw_disk_card(a, PAD, y2, cw, ch2);
+        draw_disk_card(a, CX, y2, cw, ch2);
         draw_net_card(a, x2, y2, cw2, ch2);
     }
 }
@@ -1265,12 +1535,12 @@ fn line(a: &App, x: i32, y: &mut i32, label: &[u8], val: &[u8]) {
 /// talking to the network".
 fn draw_conns(a: &App) {
     let mut cy = a.dh - 108;
-    win_draw_rect(a.win, PAD, cy - 6, a.dw - 2 * PAD, 1, a.pal.border);
+    draw_rule(a, cy - 6);
     let mut cb = Buf::new();
     cb.puts(if a.conn_all { b"Network connections (all processes): " }
             else { b"Network connections (this process): " });
     cb.putu(a.nconns as u64);
-    draw_text(a.win, PAD, cy, cb.as_c(), 11, a.pal.ink);
+    draw_text(a.win, CX, cy, cb.as_c(), 11, a.pal.ink);
     // The scope toggle, from the SAME conn_scope_btn() the click handler tests.
     let sb = conn_scope_btn(a.dw);
     unsafe {
@@ -1305,11 +1575,11 @@ fn draw_conns(a: &App) {
             put_ip(&mut lb, c.remote_ip);
             lb.put(b':'); lb.putu(c.remote_port as u64);
         }
-        draw_text(a.win, PAD + 8, cy, lb.as_c(), 10, a.pal.ink_dim);
+        draw_text(a.win, CX + 8, cy, lb.as_c(), 10, a.pal.ink_dim);
         cy += 13;
     }
     if a.nconns == 0 {
-        draw_text(a.win, PAD + 8, cy,
+        draw_text(a.win, CX + 8, cy,
                   if a.conn_all { b"(no TCP connections on this machine)\0" }
                   else { b"(this process has no connections)\0" },
                   10, a.pal.ink_dim);
@@ -1317,8 +1587,8 @@ fn draw_conns(a: &App) {
 }
 
 fn draw_details(a: &App) {
-    let mut y = PAD + TAB_H + 10;
-    let x = PAD + 4;
+    let mut y = PANEL_Y + 10;
+    let x = CX;
     if !a.have_detail {
         draw_text(a.win, x, y, b"No process selected (pick one on Processes).\0", 11, a.pal.ink_dim);
         // #188: but the connections panel is still drawn - see draw_conns().
@@ -1345,12 +1615,12 @@ fn draw_details(a: &App) {
     b.clear(); b.put_kb(d.heap_kb);        line(a, x, &mut y, b"Heap (brk)\0", b.as_c());
     b.clear(); b.putu(d.vma_count as u64); line(a, x, &mut y, b"VM regions\0", b.as_c());
     if d.mem_flags & 1 != 0 {
-        draw_text(a.win, x, y, b"! VMA list truncated (corrupt or cyclic)\0", 11, 0x00E05050); y += 15;
+        draw_text(a.win, x, y, b"! VMA list truncated (corrupt or cyclic)\0", 11, C_ERR); y += 15;
     }
 
     // Handles, named (the Process Explorer signature view).
     let hx = a.dw / 2 + 4;
-    let mut hy = PAD + TAB_H + 10;
+    let mut hy = PANEL_Y + 10;
     draw_text(a.win, hx, hy, b"Open handles\0", 12, a.pal.ink); hy += 18;
     for i in 0..a.nhandles {
         if hy > a.dh - 120 { break; }
@@ -1368,8 +1638,11 @@ fn draw_details(a: &App) {
 }
 
 fn draw_services(a: &App) {
-    let top = PAD + TAB_H + 6;
-    let c_name = PAD + 4;
+    // (tmglass) same bands as the other list tabs: LIST_HDR_Y / LIST_TOP_Y /
+    // foot_y() / svc_btns(), which the click handler reads too. This function
+    // used to spell each of them as its own literal.
+    let top = LIST_HDR_Y;
+    let c_name = CX;
     let c_state = a.dw / 2 - 40;
     let c_acct = a.dw / 2 + 40;
     let c_pid = a.dw - 90;
@@ -1377,39 +1650,40 @@ fn draw_services(a: &App) {
     draw_text(a.win, c_state, top, b"State\0", 11, a.pal.ink_dim);
     draw_text(a.win, c_acct, top, b"Account\0", 11, a.pal.ink_dim);
     draw_text(a.win, c_pid, top, b"PID\0", 11, a.pal.ink_dim);
-    let ltop = top + 18;
-    win_draw_rect(a.win, PAD, ltop - 3, a.dw - 2 * PAD, 1, a.pal.border);
+    let ltop = LIST_TOP_Y;
+    draw_rule(a, ltop - 3);
     let mut b = Buf::new();
     for i in 0..a.nsvcs {
         let ry = ltop + (i as i32) * ROW_H;
-        if ry > a.dh - 50 { break; }
+        if ry + ROW_H > list_bottom(a.dh) { break; }
         let sel = i == a.svc_sel;
-        if sel { win_draw_rect(a.win, PAD, ry, a.dw - 2 * PAD, ROW_H - 1, a.pal.accent); }
-        else if i & 1 == 1 { win_draw_rect(a.win, PAD, ry, a.dw - 2 * PAD, ROW_H - 1, unsafe { gui_lighten(a.pal.surface, 4) }); }
-        let ink = if sel { ink_on(a.pal.accent) } else { a.pal.ink };
-        let dim = if sel { ink_on(a.pal.accent) } else { a.pal.ink_dim };
+        if sel { draw_row_band(a, ry, C_ACCENT); }
+        else if i & 1 == 1 { draw_row_band(a, ry, unsafe { gui_lighten(C_PANEL, 4) }); }
+        let ink = if sel { C_ACCENT_INK } else { a.pal.ink };
+        let dim = if sel { C_ACCENT_INK } else { a.pal.ink_dim };
         let s = &a.svcs[i];
         draw_text(a.win, c_name, ry + 3, &s.name, 12, ink);
         draw_text(a.win, c_state, ry + 3, if s.running != 0 { b"Running\0" } else { b"Stopped\0" },
-                  11, if s.running != 0 && !sel { 0x0040C060 } else { dim });
+                  11, if s.running != 0 && !sel { C_OK } else { dim });
         draw_text(a.win, c_acct, ry + 3, &s.account, 11, dim);
         b.clear(); if s.pid != 0 { b.putu(s.pid as u64); } else { b.put(b'-'); }
         draw_text(a.win, c_pid, ry + 3, b.as_c(), 11, dim);
     }
-    if a.nsvcs == 0 { draw_text(a.win, PAD + 4, ltop + 6, b"(no services registered)\0", 11, a.pal.ink_dim); }
-    let fy = a.dh - 36;
-    win_draw_rect(a.win, PAD, fy - 6, a.dw - 2 * PAD, 1, a.pal.border);
+    if a.nsvcs == 0 { draw_text(a.win, CX, ltop + 6, b"(no services registered)\0", 11, a.pal.ink_dim); }
+    let fy = foot_y(a.dh);
+    draw_rule(a, fy - 8);
     let can = a.svc_sel < a.nsvcs;
     let st = if can { GUI_ST_NORMAL } else { GUI_ST_DISABLED };
+    let sb = svc_btns();
     unsafe {
-        gui_button(a.win, PAD, fy, 74, 26, b"Start\0".as_ptr(), GUI_BTN_PRIMARY, st);
-        gui_button(a.win, PAD + 80, fy, 74, 26, b"Stop\0".as_ptr(), GUI_BTN_SECONDARY, st);
+        gui_button(a.win, sb[0].x, fy, sb[0].w, FOOT_H, b"Start\0".as_ptr(), GUI_BTN_PRIMARY, st);
+        gui_button(a.win, sb[1].x, fy, sb[1].w, FOOT_H, b"Stop\0".as_ptr(), GUI_BTN_SECONDARY, st);
     }
 }
 
 fn draw_scheduled(a: &App) {
     let top = LIST_HDR_Y;
-    let c_name = PAD + 4;
+    let c_name = CX;
     let c_when = a.dw * 2 / 5;
     let c_act = a.dw * 3 / 5;
     let c_runs = a.dw - 120;
@@ -1420,17 +1694,17 @@ fn draw_scheduled(a: &App) {
     draw_text(a.win, c_runs, top, b"Runs\0", 11, a.pal.ink_dim);
     draw_text(a.win, c_en, top, b"State\0", 11, a.pal.ink_dim);
     let ltop = LIST_TOP_Y;
-    win_draw_rect(a.win, PAD, ltop - 3, a.dw - 2 * PAD, 1, a.pal.border);
+    draw_rule(a, ltop - 3);
     let mut b = Buf::new();
     for i in 0..a.njobs {
         let ry = ltop + (i as i32) * ROW_H;
-        if ry > a.dh - 50 { break; }
+        if ry + ROW_H > list_bottom(a.dh) { break; }
         // #188: row selection, drawn exactly like the Services tab's.
         let sel = i == a.job_sel;
-        if sel { win_draw_rect(a.win, PAD, ry, a.dw - 2 * PAD, ROW_H - 1, a.pal.accent); }
-        else if i & 1 == 1 { win_draw_rect(a.win, PAD, ry, a.dw - 2 * PAD, ROW_H - 1, unsafe { gui_lighten(a.pal.surface, 4) }); }
-        let ink = if sel { ink_on(a.pal.accent) } else { a.pal.ink };
-        let dim = if sel { ink_on(a.pal.accent) } else { a.pal.ink_dim };
+        if sel { draw_row_band(a, ry, C_ACCENT); }
+        else if i & 1 == 1 { draw_row_band(a, ry, unsafe { gui_lighten(C_PANEL, 4) }); }
+        let ink = if sel { C_ACCENT_INK } else { a.pal.ink };
+        let dim = if sel { C_ACCENT_INK } else { a.pal.ink_dim };
         let j = &a.jobs[i];
         let nm: &[u8] = if j.label[0] != 0 { &j.label } else { &j.target };
         draw_text(a.win, c_name, ry + 3, nm, 12, ink);
@@ -1454,9 +1728,9 @@ fn draw_scheduled(a: &App) {
         b.clear(); b.putu(j.run_count as u64);
         draw_text(a.win, c_runs, ry + 3, b.as_c(), 11, dim);
         draw_text(a.win, c_en, ry + 3, if j.enabled != 0 { b"On\0" } else { b"Off\0" }, 11,
-                  if j.enabled != 0 && !sel { 0x0040C060 } else { dim });
+                  if j.enabled != 0 && !sel { C_OK } else { dim });
     }
-    if a.njobs == 0 { draw_text(a.win, PAD + 4, ltop + 6, b"(no scheduled tasks registered)\0", 11, a.pal.ink_dim); }
+    if a.njobs == 0 { draw_text(a.win, CX, ltop + 6, b"(no scheduled tasks registered)\0", 11, a.pal.ink_dim); }
     // #188: the footer this tab never had. SYS_CRON_ENABLE was declared in this
     // file and called by nothing, so the tab was read-only. Same geometry as
     // the Services tab's Start/Stop, because it is the same idea.
@@ -1465,7 +1739,7 @@ fn draw_scheduled(a: &App) {
     // cron jobs at all, so both buttons must come up DISABLED rather than
     // firing SYS_CRON_ENABLE on jobs[0] of an empty array.
     let fy = foot_y(a.dh);
-    win_draw_rect(a.win, PAD, fy - 6, a.dw - 2 * PAD, 1, a.pal.border);
+    draw_rule(a, fy - 8);
     let can = a.job_sel < a.njobs;
     let st = if can { GUI_ST_NORMAL } else { GUI_ST_DISABLED };
     let sb = sched_btns();
@@ -1473,7 +1747,7 @@ fn draw_scheduled(a: &App) {
         gui_button(a.win, sb[0].x, fy, sb[0].w, FOOT_H, b"Enable\0".as_ptr(), GUI_BTN_PRIMARY, st);
         gui_button(a.win, sb[1].x, fy, sb[1].w, FOOT_H, b"Disable\0".as_ptr(), GUI_BTN_SECONDARY, st);
     }
-    if a.msg.len() > 1 { draw_text(a.win, PAD + 170, fy + 6, a.msg, 11, a.pal.ink); }
+    if a.msg.len() > 1 { draw_text(a.win, CX + 170, fy + 6, a.msg, 11, a.pal.ink); }
 }
 
 fn draw(a: &mut App) {
@@ -1482,8 +1756,30 @@ fn draw(a: &mut App) {
     win_get_size(a.win, &mut w, &mut h);
     if w > 200 { a.dw = w; }
     if h > 200 { a.dh = h; }
-    win_draw_rect(a.win, 0, 0, a.dw, a.dh, a.pal.surface);
+    // (2026-09-16 owner fix) draw_bg() replaces the old backdrop blit and the
+    // dirty-flag/anti-flash machinery that used to gate it: a plain gradient
+    // fill is cheap enough to redraw every frame (no decode/scale/blur), so
+    // there is nothing left that needs to self-commit ahead of the ordinary
+    // draws below, and no window state (a modal covering it, a wallpaper
+    // change) that a fresh paint could "punch through". Everything, this
+    // included, accumulates unpublished until the single win_invalidate() at
+    // the end.
+    draw_bg(a);
+    // (2026-09-16 owner fix) The Processes list's scroll state is re-clamped
+    // here against whatever this frame's process count and viewport height
+    // actually are, same as every other gui_scroll_t consumer: "safe to call
+    // every draw; the offset is re-clamped so a shrinking list never strands
+    // the view" (userland/libc/gui_scroll.c). draw_processes() below only
+    // ever READS it (gui_scroll_first_item()).
+    if a.tab == Tab::Processes {
+        let visible_h = (list_bottom(a.dh) - LIST_TOP_Y).max(0);
+        unsafe {
+            gui_scroll_config(&mut a.list, 0, LIST_TOP_Y, a.dw, visible_h,
+                              (a.nproc as i32) * ROW_H, ROW_H);
+        }
+    }
     draw_tabs(a);
+    draw_main_panel(a);
     match a.tab {
         Tab::Processes => draw_processes(a),
         Tab::Performance => draw_performance(a),
@@ -1542,7 +1838,7 @@ pub extern "C" fn main() -> i32 {
         cpu: ProcCpu { pid: [0; MAXP], ticks: [0; MAXP], n: 0, valid: 0 },
         // NO_SEL, not 0: pid 0 is the idle process, so initialising
         // sel_pid to 0 made idle look selected on first paint.
-        sel_pid: NO_SEL, scroll: 0, cpu_total: 0,
+        sel_pid: NO_SEL, list: GuiScroll::new(), cpu_total: 0,
         mem_total: 0, mem_used: 0,
         cpu_hist: [0; HIST], mem_hist: [0; HIST], core_hist: [[0; HIST]; MAXCORES],
         hist_n: 0, ncores: 1, perf_cores: false,
@@ -1559,7 +1855,8 @@ pub extern "C" fn main() -> i32 {
         speed: Speed::Normal,
         pal: GuiPalette { surface: 0, surface_raised: 0, ink: 0xF0F0F0, ink_dim: 0x909090,
                           accent: 0x3080D0, accent_hover: 0x4090E0, border: 0x404040,
-                          field_bg: 0x202020, field_border: 0x404040, track: 0x303030 },
+                          field_bg: 0x202020, field_border: 0x404040, track: 0x303030,
+                          focus: 0, edge_strong: 0 },
         dark: true,
         msg: b"\0",   // #161: empty until End Task / Kill is used
         pending_sig: 0,
@@ -1689,10 +1986,9 @@ pub extern "C" fn main() -> i32 {
                 draw(&mut app);
               } else {
                 let (mx, my) = (ev.mouse_x, ev.mouse_y);
-                // tabs
+                // tabs: tab_rect()/tab_at(), the rectangles draw_tabs() paints.
                 if my >= PAD && my < PAD + TAB_H {
-                    let idx = ((mx - PAD) / 87) as usize;
-                    if idx < 5 {
+                    if let Some(idx) = tab_at(TAB_NAMES.len(), mx) {
                         app.tab = match idx {
                             0 => Tab::Processes, 1 => Tab::Performance, 2 => Tab::Details,
                             3 => Tab::Services, _ => Tab::Scheduled,
@@ -1732,14 +2028,16 @@ pub extern "C" fn main() -> i32 {
                             draw(&mut app);
                         }
                     } else if my >= LIST_TOP_Y {
-                        let r = ((my - LIST_TOP_Y) / ROW_H) as usize + app.scroll;
+                        let first = unsafe { gui_scroll_first_item(&app.list) }.max(0) as usize;
+                        let r = ((my - LIST_TOP_Y) / ROW_H) as usize + first;
                         if r < app.nproc { app.sel_pid = app.procs[r].pid; app.refresh_detail(); draw(&mut app); }
                     }
                 } else if app.tab == Tab::Performance {
-                    let top = PAD + TAB_H + 8;
-                    if my >= top && my < top + 22 {
-                        if mx >= PAD && mx < PAD + 80 { app.perf_cores = false; draw(&mut app); }
-                        else if mx >= PAD + 86 && mx < PAD + 166 { app.perf_cores = true; draw(&mut app); }
+                    // (tmglass) PERF_CTL_Y / perf_mode_btns(): what draw_performance() paints.
+                    if my >= PERF_CTL_Y && my < PERF_CTL_Y + PERF_CTL_H {
+                        let pm = perf_mode_btns();
+                        if pm[0].hit(mx) { app.perf_cores = false; draw(&mut app); }
+                        else if pm[1].hit(mx) { app.perf_cores = true; draw(&mut app); }
                         else if let Some(s) = speed_at(mx) { app.speed = s; draw(&mut app); }   // #188
                     }
                 } else if app.tab == Tab::Details {
@@ -1766,16 +2064,19 @@ pub extern "C" fn main() -> i32 {
                         if r < app.njobs { app.job_sel = r; draw(&mut app); }
                     }
                 } else if app.tab == Tab::Services {
-                    let fy = app.dh - 36;
-                    if my >= fy && my < fy + 26 {
+                    // (tmglass) foot_y()/FOOT_H/svc_btns()/LIST_TOP_Y: the
+                    // same definitions draw_services() paints from.
+                    let fy = foot_y(app.dh);
+                    if my >= fy && my < fy + FOOT_H {
                         if app.svc_sel < app.nsvcs {
                             let nm = app.svcs[app.svc_sel].name.as_ptr();
-                            if mx >= PAD && mx < PAD + 74 { unsafe { syscall2(SYS_SVC_CONTROL, nm as i64, 1); } }
-                            else if mx >= PAD + 80 && mx < PAD + 154 { unsafe { syscall2(SYS_SVC_CONTROL, nm as i64, 0); } }
+                            let sb = svc_btns();
+                            if sb[0].hit(mx) { unsafe { syscall2(SYS_SVC_CONTROL, nm as i64, 1); } }
+                            else if sb[1].hit(mx) { unsafe { syscall2(SYS_SVC_CONTROL, nm as i64, 0); } }
                             app.refresh(); draw(&mut app);
                         }
                     } else {
-                        let ltop = PAD + TAB_H + 6 + 18;
+                        let ltop = LIST_TOP_Y;
                         if my >= ltop {
                             let r = ((my - ltop) / ROW_H) as usize;
                             if r < app.nsvcs { app.svc_sel = r; draw(&mut app); }
@@ -1785,8 +2086,25 @@ pub extern "C" fn main() -> i32 {
               }
             }
             EVENT_MOUSE_SCROLL => {
-                if ev.scroll_delta > 0 { app.scroll += 1; } else if app.scroll > 0 { app.scroll -= 1; }
-                if app.scroll >= app.nproc { app.scroll = if app.nproc > 0 { app.nproc - 1 } else { 0 }; }
+                // (2026-09-16 owner fix) The old hand-rolled version inverted
+                // the OS-wide wheel convention (positive scroll_delta = up,
+                // kernel/gui/terminal.c and userland/libc/gui_scroll.h; this
+                // code did `if ev.scroll_delta > 0 { scroll += 1 }`, i.e. the
+                // "up" gesture moved further INTO the list) and clamped
+                // against `nproc` instead of `content_px - viewport_px`, so
+                // scrolling down ran past the last row into blank space and
+                // scrolling up moved the wrong way. gui_scroll_wheel() owns
+                // both the convention and the clamp; only Processes has a
+                // list here. Reconfigure first so the clamp is against the
+                // CURRENT process count, not whatever draw() last saw.
+                if app.tab == Tab::Processes {
+                    let visible_h = (list_bottom(app.dh) - LIST_TOP_Y).max(0);
+                    unsafe {
+                        gui_scroll_config(&mut app.list, 0, LIST_TOP_Y, app.dw, visible_h,
+                                          (app.nproc as i32) * ROW_H, ROW_H);
+                        gui_scroll_wheel(&mut app.list, ev.scroll_delta as i32);
+                    }
+                }
                 draw(&mut app);
             }
             _ => {}

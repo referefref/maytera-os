@@ -1,0 +1,137 @@
+Add a hand-built libarchive config.h for MayteraOS (#745).
+
+libarchive normally generates config.h by running ./configure, which would
+probe the Linux BUILD HOST, not the MayteraOS userland target. This creates a
+first-party config.h (MIT, MayteraOS) selected by measurement against
+userland/libc, so the port compiles with -DHAVE_CONFIG_H and no configure run.
+It is load-bearing: without it, archive_platform.h hits its no-config #error and
+no promised symbol is defined, so the mports symbol gate fails.
+
+--- a/libarchive/config.h
++++ b/libarchive/config.h
+@@ -0,0 +1,125 @@
++/* config.h - hand-built libarchive configuration for MayteraOS.
++ * SPDX-License-Identifier: MIT
++ * Copyright (c) MayteraOS contributors.
++ *
++ * MayteraOS mports port of libarchive (#745). This file is FIRST-PARTY MayteraOS
++ * code, added into the upstream tree by the port patch, in place of the config.h
++ * that upstream `configure` would otherwise generate. We do NOT run upstream
++ * `configure`: it would probe the BUILD HOST (Linux glibc), not the MayteraOS
++ * userland target (freestanding, SSE2 hardware float, the small libc under
++ * userland/libc). Every HAVE_* below was selected by MEASUREMENT against that
++ * libc: a symbol is claimed present only if userland/libc actually DEFINES it.
++ *
++ * Codecs: gzip is via the ported zlib (userland/ports/zlib). compress(.Z, LZW),
++ * uudecode, and the identity/none filter are pure C already inside libarchive.
++ * bzip2, xz/lzma, lz4, zstd, lzop, grzip and lrzip need external libraries we do
++ * not ship, so their HAVE_*_H are left undefined; libarchive then registers them
++ * through its external-helper mechanism, which reports a clean error on
++ * MayteraOS because those helper programs are not installed. xar needs
++ * libxml2/expat + liblzma and therefore registers as an honest "not supported"
++ * stub. See docs/MPORTS.md and the ATTRIBUTION.md note for the full matrix.
++ */
++#ifndef MAYTERA_LIBARCHIVE_CONFIG_H
++#define MAYTERA_LIBARCHIVE_CONFIG_H
++
++#define __LIBARCHIVE_CONFIG_H_INCLUDED 1
++
++/* ---- integer types (all present via <stdint.h>/<sys/types.h>) ---- */
++#define HAVE_INTMAX_T 1
++#define HAVE_UINTMAX_T 1
++#define HAVE_INTPTR_T 1
++#define HAVE_UINTPTR_T 1
++#define HAVE_INT64_T 1
++#define HAVE_UINT64_T 1
++#define HAVE_INT32_T 1
++#define HAVE_UINT32_T 1
++#define HAVE_INT16_T 1
++#define HAVE_UINT16_T 1
++#define HAVE_WCHAR_T 1
++
++/* ---- headers userland/libc provides ---- */
++#define HAVE_CTYPE_H 1
++#define HAVE_ERRNO_H 1
++#define HAVE_FCNTL_H 1
++#define HAVE_INTTYPES_H 1
++#define HAVE_LIMITS_H 1
++#define HAVE_LOCALE_H 1
++#define HAVE_SIGNAL_H 1
++#define HAVE_STDARG_H 1
++#define HAVE_STDINT_H 1
++#define HAVE_STDLIB_H 1
++#define HAVE_STRING_H 1
++#define HAVE_TIME_H 1
++#define HAVE_UNISTD_H 1
++#define HAVE_WCHAR_H 1
++#define HAVE_WCTYPE_H 1
++#define HAVE_DIRENT_H 1
++#define HAVE_PWD_H 1
++#define HAVE_GRP_H 1
++#define HAVE_POLL_H 1
++#define HAVE_POLL 1
++#define HAVE_UTIME_H 1
++#define HAVE_SPAWN_H 1
++#define HAVE_SYS_STAT_H 1
++#define HAVE_SYS_TYPES_H 1
++#define HAVE_SYS_TIME_H 1
++#define HAVE_SYS_UTSNAME_H 1
++#define HAVE_SYS_IOCTL_H 1
++#define HAVE_SYS_WAIT_H 1
++
++/* ---- zlib: the ported userland/ports/zlib archive ---- */
++#define HAVE_ZLIB_H 1
++#define HAVE_LIBZ 1
++
++/* ---- functions userland/libc defines ---- */
++#define HAVE_MEMMOVE 1
++#define HAVE_MEMSET 1
++#define HAVE_MKDIR 1
++#define HAVE_STRCHR 1
++#define HAVE_STRRCHR 1
++#define HAVE_STRDUP 1
++#define HAVE_STRNLEN 1
++#define HAVE_STRERROR 1
++#define HAVE_STRFTIME 1
++#define HAVE_MKTIME 1
++#define HAVE_GMTIME_R 1
++#define HAVE_LOCALTIME_R 1
++#define HAVE_TIMEGM 1
++#define HAVE_TZSET 1
++#define HAVE_LSTAT 1
++#define HAVE_FSTAT 1
++#define HAVE_STAT 1
++#define HAVE_GETPID 1
++#define HAVE_SNPRINTF 1
++#define HAVE_VSNPRINTF 1
++#define HAVE_WCSCPY 1
++#define HAVE_WCSLEN 1
++#define HAVE_WCTOMB 1
++#define HAVE_MBTOWC 1
++#define HAVE_STRTOLL 1
++#define HAVE_STRTOUL 1
++#define HAVE_STRTOULL 1
++#define HAVE_SETLOCALE 1
++#define HAVE_MALLOC 1
++#define HAVE_CALLOC 1
++#define HAVE_REALLOC 1
++#define HAVE_FCNTL 1
++#define HAVE_LSEEK 1
++#define HAVE_OPEN 1
++#define HAVE_READ 1
++#define HAVE_WRITE 1
++#define HAVE_CLOSE 1
++#define HAVE_PIPE 1
++#define HAVE_GETEUID 1
++#define HAVE_GETEGID 1
++
++/* ---- external-helper (program) filter: libc has posix_spawnp + <sys/wait.h> ---- */
++#define HAVE_POSIX_SPAWNP 1
++
++/* ---- struct stat: seconds-resolution mtime only ---- */
++#define HAVE_STRUCT_STAT_ST_MTIME 1
++
++/* ---- version strings normally emitted by configure ---- */
++#define LIBARCHIVE_VERSION_STRING "3.8.9"
++
++#endif /* MAYTERA_LIBARCHIVE_CONFIG_H */

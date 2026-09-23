@@ -35,6 +35,13 @@ typedef struct {
     int id;                     // Region ID (index in array)
     shm_state_t state;          // Current state
     uint32_t creator_pid;       // Process that created this region
+    // STAGE 0 (docs/SYSTEM_CAPABILITY_API.md 1.7). The creating THREAD GROUP,
+    // normalised through capgate_tgid_of_rs(). Same reasoning as tcp_conn_t's
+    // owner_tgid and drivers/audio_pcm.c's owner_tgid: a MayteraOS pthread is a
+    // separate process_t with its own pid, so a pid-only owner would mean a
+    // region created on one thread is unmappable from another thread of the
+    // same program.
+    uint32_t creator_tgid;
     uint64_t phys_addr;         // Physical address of shared memory
     size_t size;                // Size in bytes (page-aligned)
     uint32_t flags;             // Creation flags

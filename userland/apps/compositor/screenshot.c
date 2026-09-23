@@ -33,7 +33,6 @@
 #define SHOT_MAX_LONG_EDGE 700     // downscale so the long edge <= this
 #define SHOT_MAX_OUT_W     1024    // static row-buffer ceiling
 
-static const char *SHOT_REQ_PATH     = "/SCREENSHOT.REQ";
 static const char *SHOT_DEFAULT_PATH = "/SCREENSHOT.BMP";
 
 // O_WRONLY | O_CREAT | O_TRUNC  (same flags the rest of the compositor uses).
@@ -167,38 +166,23 @@ int screenshot_capture(const char *path) {
     return 0;
 }
 
-// screenshot_poll: called once per compositor frame. Cheap open() of the request
-// file; when present, read an optional target path from it, delete it, capture.
-// No busy-wait: this rides the existing adaptive frame/idle cadence.
+// screenshot_poll: called once per compositor frame. Dequeues the next screen
+// capture request from the KERNEL-MEDIATED queue (SYS_SCREENSHOT_POLL), which
+// replaced the world-writable /SCREENSHOT.REQ file drop in Stage 1 of the
+// capability API (docs/SYSTEM_CAPABILITY_API.md 1.3 / 4.2). The path now comes
+// from a request the kernel already gated on the screen.capture grant and bound
+// to a path perms_check() permits, so it is no longer an attacker-chosen path
+// out of a file any app could write. No busy-wait: this rides the existing
+// adaptive frame/idle cadence, and the poll returns 0 immediately when empty.
 void screenshot_poll(void) {
-    int fd = sys_open(SHOT_REQ_PATH, 0 /* O_RDONLY */);
-    if (fd < 0) return;   // no request pending (fast common path)
-
-    char buf[160];
-    long n = sys_read(fd, buf, sizeof(buf) - 1);
-    sys_close(fd);
-    if (n < 0) n = 0;
-    buf[n] = '\0';
-
-    // Consume the request so we do not re-capture every frame.
-    sys_unlink(SHOT_REQ_PATH);
-
-    // If the request body names an absolute path (starts with '/'), honor it;
-    // otherwise write the default. Stop the path at the first whitespace/newline.
-    const char *path = SHOT_DEFAULT_PATH;
-    if (buf[0] == '/') {
-        for (int i = 0; buf[i]; i++) {
-            if (buf[i] == '\r' || buf[i] == '\n' || buf[i] == ' ' || buf[i] == '\t') {
-                buf[i] = '\0';
-                break;
-            }
-        }
-        path = buf;
-    }
-
+    char path[160];
+    long n = sys_screenshot_poll(path, (int)sizeof(path));
+    if (n <= 0) return;   // nothing queued (fast common path), or not the compositor
+    if (n >= (long)sizeof(path)) n = (long)sizeof(path) - 1;
+    path[n] = '\0';
+    if (path[0] != '/') return;   // the kernel only queues plain absolute paths
     screenshot_capture(path);
 }
-
 // ===========================================================================
 // #148: PrintScreen hotkey - a DIFFERENT save target from screenshot_capture()
 // above on purpose. That one trades quality for size to survive an SSH exec

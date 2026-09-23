@@ -11,17 +11,16 @@ disk/
 ├── CONFIG/
 │   └── MENU.CFG            # file-browser / menu defaults
 └── THEMES/
-    ├── classic/theme.ini   # Windows 95/98 style
-    ├── dark/theme.ini      # dark theme
-    ├── highcontrast/theme.ini
-    ├── light/theme.ini
-    └── retro-unix/         # default theme: CDE/Motif/NeXTSTEP inspired
+    └── retro-unix/         # example theme asset set: CDE/Motif/NeXTSTEP inspired
         ├── colors/
         ├── cursors/
         ├── icons/
-        ├── README.md
-        └── theme.ini
+        └── README.md
 ```
+
+The live theme format is `.mtheme` (YAML), loaded by `kernel/gui/themes.c`; see
+`docs/THEMES.md` for the format. The old per-directory `theme.ini` files are a
+dead format and are no longer shipped here.
 
 ## What is intentionally NOT here
 

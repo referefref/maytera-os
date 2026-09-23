@@ -1,0 +1,24 @@
+--- a/setup.c	2026-09-18 09:54:25.749835439 +0000
++++ b/setup.c	2026-09-18 09:54:57.404878117 +0000
+@@ -50,7 +50,6 @@
+ setup()
+ {
+ 	const char *const *sp;
+-	static struct stat sbuf;
+ 
+ 	noecho();
+ 	cbreak();
+@@ -68,10 +67,7 @@
+ 	}
+ 
+ 	srand(time(NULL) + getpid());
+-	if ((Dict = fopen(Dict_name, "r")) == NULL) {
+-		endwin();
+-		err(1, "fopen %s", Dict_name);
+-	}
+-	fstat(fileno(Dict), &sbuf);
+-	Dict_size = sbuf.st_size;
++	/* MAYTERA CHANGE (#745 tuigames batch): no on-disk dictionary to open;
++	 * getword.c now picks from a built-in word list. sbuf/Dict/Dict_size
++	 * are left declared (hangman.h still exports them) but unused here. */
+ }

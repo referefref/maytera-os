@@ -10,6 +10,7 @@
 #include "../security/validate.h"   // #503: deferred-write validation (clear_child_tid)
 #include "../security/uaccess_smap.h"  // #19/#645: AC brackets for the user-stack writes
 #include "../mm/heap.h"
+#include "../mm/kstack.h"   // #stackguard: guard-paged Ring-0 stacks
 #include "../mm/vmm.h"
 #include "../mm/pmm.h"
 #include "../cpu/gdt.h"
@@ -25,6 +26,8 @@
 #include "../cpu/mono.h"   // #421 phase 7: mono_us() for the mm-lock watchdog
 #include "../cpu/sse.h"    // #588: fxsave_area_t for the FPU-frame init
 #include "../sync/waitq.h"  // #230: the child-exit wait queue
+#include "../sync/noblock.h"  // #dosmem: g_wq_noblock_violations for [SCHEDSTAT]
+#include "../sync/futex.h"    // #dosmem: futex_get_counts() for [SCHEDSTAT]
 
 // Process table
 static process_t proc_table[MAX_PROCESSES];
@@ -151,6 +154,41 @@ static bool preemption_enabled = false;
 // init_proc(). -1 means "use /dev/console as stdio", 0..7 selects /dev/pts/N.
 int g_tty_bind_pts_idx = -1;
 
+// #246 Stage 2 (docs/CONTRACT_ENFORCEMENT_PLAN.md): single-shot, PER-CPU escrow
+// spawn-arm. The TRUSTED SPAWNER escrow_spawn_marked() (fs/escrow_guard.c) sets
+// this on the CURRENT cpu under preemption-disable, then calls
+// proc_create_user_as(); init_proc() below consumes the arm for THIS cpu BEFORE
+// the new process is enqueued, so a trusted-spawned AI task carries the escrow
+// marker before it can run its first instruction. It is PER-CPU and cpu-keyed,
+// so a concurrent NORMAL spawn on any OTHER cpu never sees it and no normal
+// process is ever marked; armed==0 (the boot default, and the state after every
+// consume) makes the consume a single-byte no-op on the normal spawn path. This
+// is the same single-shot-binding pattern as g_tty_bind_pts_idx above, made
+// per-cpu because a security marker must be race-free under SMP.
+extern uint32_t smp_this_cpu(void);
+struct escrow_spawn_arm {
+    uint8_t  armed;
+    uint32_t task;
+    uint32_t obj;
+    uint64_t edge;
+    char     scope[ESCROW_SCOPE_PREFIX_MAX];
+};
+static struct escrow_spawn_arm g_escrow_arm[64];
+
+void proc_escrow_arm(uint32_t task, uint32_t obj, uint64_t edge, const char *scope) {
+    uint32_t c = smp_this_cpu() & 63;
+    g_escrow_arm[c].task = task;
+    g_escrow_arm[c].obj  = obj;
+    g_escrow_arm[c].edge = edge;
+    strncpy(g_escrow_arm[c].scope, scope, ESCROW_SCOPE_PREFIX_MAX - 1);
+    g_escrow_arm[c].scope[ESCROW_SCOPE_PREFIX_MAX - 1] = '\0';
+    g_escrow_arm[c].armed = 1;   // arm LAST, after the payload is in place
+}
+
+void proc_escrow_disarm(void) {
+    g_escrow_arm[smp_this_cpu() & 63].armed = 0;
+}
+
 // Scheduler tick counter
 static uint64_t sched_ticks = 0;
 // CPU usage accounting: fraction of timer ticks NOT spent in the idle proc (pid 0).
@@ -248,7 +286,7 @@ static int cleanup_proc_slot(process_t *proc) {
     // #446: pid 0's stack_base points at the STATIC boot stack in entry.asm,
     // which must never be handed to kfree().
     if (proc->stack_base && proc->stack_base != (void *)kernel_stack_bottom) {
-        kfree(proc->stack_base);
+        kstack_free(proc->stack_base, proc->stack_size);
         proc->stack_base = NULL;
     }
     
@@ -870,6 +908,36 @@ static void init_proc(process_t *proc, const char *name, process_priority_t prio
         if (fi) proc->fds[0] = fi;
         if (fo) proc->fds[1] = fo;
         if (fe) proc->fds[2] = fe;
+    }
+
+    // #246 Stage 2: consume a PER-CPU escrow spawn-arm set by
+    // escrow_spawn_marked() on this cpu under preemption-disable. For a NORMAL
+    // spawn nothing armed this cpu, so this is a single-byte no-op and the
+    // process stays UNMARKED (escrow_active == ESCROW_ACTIVE_NONE from the
+    // memset at the top of init_proc). For a trusted-spawned AI task it stamps
+    // the MANDATORY marker here, BEFORE proc_create_user_as() reaches
+    // add_to_ready_queue(), so the task is escrow-enforced from its first
+    // instruction and cannot clear its own mark (fs/escrow_guard.c refuses a
+    // LOCKED actor's SYS_ESCROW_EXIT). Preemption is held across the whole
+    // proc_create_user_as() call, so the process cannot be scheduled between
+    // here and the ready-queue insertion.
+    {
+        uint32_t __ec = smp_this_cpu() & 63;
+        if (g_escrow_arm[__ec].armed) {
+            proc->escrow_active     = 2;   // ESCROW_ACTIVE_LOCKED (mandatory)
+            proc->escrow_task_node  = g_escrow_arm[__ec].task;
+            proc->escrow_obj_node   = g_escrow_arm[__ec].obj;
+            proc->escrow_grant_edge = g_escrow_arm[__ec].edge;
+            strncpy(proc->escrow_scope_prefix, g_escrow_arm[__ec].scope,
+                    ESCROW_SCOPE_PREFIX_MAX - 1);
+            proc->escrow_scope_prefix[ESCROW_SCOPE_PREFIX_MAX - 1] = '\0';
+            g_escrow_arm[__ec].armed = 0;   // consume the single-shot arm
+            kprintf("[ESCROW] init_proc stamped MANDATORY marker pid=%u scope=%s "
+                    "task=%08x (spawned already-marked, enforced from first "
+                    "instruction)\n",
+                    (unsigned)proc->pid, proc->escrow_scope_prefix,
+                    (unsigned)proc->escrow_task_node);
+        }
     }
 }
 
@@ -2775,10 +2843,20 @@ static void stacksave_note(process_t *prev, uint64_t live, uint32_t cpu) {
     static int printed = 0;
     if (printed < 4) {
         printed++;
-        kprintf("[STACKSAVE] #75: cpu %u is about to save rsp=0x%lx for '%s' "
-                "pid=%u priv=%u, OUTSIDE its kernel stack [0x%lx,0x%lx). "
-                "user_rsp=0x%lx sched_ra=0x%lx saves=%lu. The kernel is running "
-                "on the WRONG STACK; this is where reason-1 corruption is made.\n",
+        // #dosmem: bootlog_fault_write, not kprintf. This fires from inside
+        // sched_schedule()'s cli region (IF=0) and is the single most valuable
+        // record this scheduler can produce: it names the moment the kernel is
+        // about to run on the wrong stack, which is where #75 reason-1
+        // corruption is MADE. It went to serial only, so on the two machines
+        // that matter it has never been readable. bootlog_fault_write takes no
+        // lock, allocates nothing and touches no filesystem, which is the only
+        // sink legal here; the heartbeat thread drains it within ~2 s. Already
+        // capped at four records by `printed < 4` above.
+        bootlog_fault_write("[STACKSAVE] #75: cpu %u is about to save rsp=0x%lx "
+                "for '%s' pid=%u priv=%u, OUTSIDE its kernel stack "
+                "[0x%lx,0x%lx). user_rsp=0x%lx sched_ra=0x%lx saves=%lu. The "
+                "kernel is running on the WRONG STACK; this is where reason-1 "
+                "corruption is made.",
                 cpu, (unsigned long)live, prev->name, prev->pid,
                 (unsigned)prev->privilege, (unsigned long)lo, (unsigned long)hi,
                 (unsigned long)prev->user_rsp,
@@ -2804,9 +2882,12 @@ void stacksave_selftest(void) {
     if (stacksave_live_is_bad(0x1500, 0, 0) != 0) fail |= 1u << 5;
     if (stacksave_live_is_bad(0x1500, 0x2000, 0x1000) != 0) fail |= 1u << 6;
     if (fail)
-        kprintf("[STACKSAVE] SELFTEST FAILED mask=0x%x - the wrong-stack "
-                "detector is WRONG on this build; do not read its silence as "
-                "evidence.\n", fail);
+        // #dosmem: persistent. A detector that is wrong on this build makes
+        // every later silence meaningless, so the fact must outlive the serial
+        // port. Boot context, interrupts on, fires at most once.
+        bootlog_write("[STACKSAVE] SELFTEST FAILED mask=0x%x - the wrong-stack "
+                      "detector is WRONG on this build; do not read its silence "
+                      "as evidence.", fail);
     else
         kprintf("[STACKSAVE] selftest OK: accepts in-range, rejects at-end, "
                 "below-base and the measured 0xbffee748-in-0x112cb4d0 case, "
@@ -3143,6 +3224,182 @@ static void sched_smp_report(void) {
         kprintf("[BKLSTAT] ok flags=0 badwindows=%lu ncpu=%u win=%luus\n",
                 (unsigned long)nbad, bw.ncpu, (unsigned long)d_bkl_us); }
 
+    // #168 stage 0a: THE LOCK-ORDERING INSTRUMENT, FINALLY READ. cpu/smp.c
+    // increments g_bkl_inv_n every time a core takes the BKL while it still
+    // owns g_rq_lock - the exact AB-BA shape #130 was raised on - and records
+    // the offending core and the RQ_LOCK() source line in process.c that held
+    // g_rq_lock at the time (g_rq_owner_line is a __LINE__, a decimal source
+    // line in THIS file, NOT a return address, so it prints as a plain integer
+    // you look up in process.c rather than through addr2line). Until now the
+    // three counters were written and never read, so the value was UNKNOWN, not
+    // zero. Printed every window on the same dropped-BKL serial path as
+    // [BKLSTAT]. n=0 is the GOOD reading: no inversion observed this boot.
+    // n>0 is a real AB-BA detection, and cpu/rqline name where to look.
+    { extern volatile uint64_t g_bkl_inv_n;
+      extern volatile int      g_bkl_inv_cpu;
+      extern volatile int      g_bkl_inv_line;
+      kprintf("[BKLINV] n=%lu cpu=%d rqline=%d\n",
+              (unsigned long)g_bkl_inv_n, g_bkl_inv_cpu, g_bkl_inv_line); }
+
+    // ======================================================================
+    // #dosmem: THE LOCK / SCHEDULER / FAULT COUNTERS, WHERE THE OWNER CAN
+    // ACTUALLY READ THEM.
+    //
+    // Everything above this point is kprintf, i.e. serial, i.e. nothing on the
+    // two machines this OS is actually run on. The owner's /BOOTLOG.TXT from
+    // build 2346 (1256 lines) contains ZERO [SCHEDCORE], [BKLSTAT], [BKLFAIR],
+    // [BKLPARK], [SCHEDRACE] or [STACKSAVE] lines, because neither of his
+    // machines has a serial port. Every diagnosis this week was reconstructed
+    // from fragments or from VM proxies that do not reproduce his hardware.
+    //
+    // WHY NOT bootlog_write() HERE. We are inside sched_tick(), inside the
+    // TIMER ISR, with RFLAGS.IF clear and the BKL held. bootlog_write() enters
+    // the storage stack, and its own #745/#69 guard would decline the line
+    // anyway. Worse, on the FAT ESP every bootlog_write() is a WHOLE-FILE
+    // rewrite of a ~100 KB file; at this function's ~4 s cadence that is about
+    // 90 MB/hour of USB-MSC traffic, which is the #373 mechanism that wedged
+    // the iMac for 62 s. The diagnostic would become the fault.
+    //
+    // SO: publish, do not write. bootlog_heartbeat_note() is a memcpy into one
+    // static slot (no lock, no allocation, no filesystem, ISR-safe); the 2 s
+    // heartbeat thread appends it to the SAME bounded 16 KB ring the [HB] line
+    // already uses, so it inherits that ring's 30-minute / late-beat-anomaly /
+    // panic flush schedule and costs ZERO extra device writes.
+    //
+    // THE COST, STATED SO IT CAN BE CHECKED: the ring is 16 KB and retains
+    // whole lines. [HB] is ~700 bytes every 2 s; this record is ~300 bytes
+    // every 4 s. Retained history therefore goes from about 45 s to about 38 s.
+    // That is the whole price, and 38 s of history WITH the scheduler and lock
+    // state is worth more than 45 s without it.
+    //
+    // MUSTBE0[...] groups the counters whose own comments say they must be
+    // zero on a correct build, as CUMULATIVE totals rather than per-window
+    // deltas. A must-be-zero counter reported as a delta reads non-zero once
+    // and zero forever after, which is the worst possible shape for a fault
+    // that happened before you started reading.
+    {
+        extern volatile uint64_t g_wq_unpark_rescues;   // sync/waitq.c (#610)
+        uint64_t fw = 0, fk = 0, ft = 0;
+        futex_get_counts(&fw, &fk, &ft);
+        // 768 to match HB_NOTE_CAP: this format's worst case is 710 bytes
+        // (28 unsigned-long fields), and the guard below proves it rather than
+        // asserting it.
+        char sb[768];
+        int k = snprintf(sb, sizeof(sb),
+            "[SCHEDSTAT] up=%lus win=%luus ncpu=%u bkl=%lu/%luc/%lus rec=%lu "
+            "held=%luus max=%luus@0x%x/cpu%u/sw%u long=%lu flags=0x%x "
+            "badwin=%lu pin=%lu/%luto futex=%lu/%lu/%luto unpark=%lu "
+            "MUSTBE0[wqviol=%lu idleq=%lu kstacknull=%lu stksave=%lu "
+            "irqustk=%lu poprun=%lu storms=%lu]",
+            (unsigned long)(sched_ticks / (g_timer_hz ? g_timer_hz : 1)),
+            (unsigned long)d_bkl_us, bw.ncpu,
+            (unsigned long)d_acq, (unsigned long)d_con, (unsigned long)d_spin,
+            (unsigned long)bw.recursive, (unsigned long)d_hsum,
+            (unsigned long)hmax, hres, bw.max_cpu, bw.max_from_switch,
+            (unsigned long)d_long, bw.flags, (unsigned long)bkl_window_bad_rs(),
+            (unsigned long)d_pw, (unsigned long)d_pt,
+            (unsigned long)fw, (unsigned long)fk, (unsigned long)ft,
+            (unsigned long)g_wq_unpark_rescues,
+            (unsigned long)g_wq_noblock_violations,
+            (unsigned long)g_idle_enq_refused,
+            (unsigned long)g_syscall_kstack_null,
+            (unsigned long)g_stacksave_bad,
+            (unsigned long)g_irq_on_user_stack,
+            (unsigned long)g_pop_running,
+            (unsigned long)g_sched_storms);
+        // A record that silently lost its tail is exactly the [NETDIAG] fault
+        // (256-byte line buffer, 512-byte payload, counters in the discarded
+        // half). Say so once rather than shipping a short line that looks whole.
+        if (k >= (int)sizeof(sb)) {
+            static int warned = 0;
+            if (!warned) { warned = 1;
+                kprintf("[SCHEDSTAT] RECORD TRUNCATED: needs %d bytes, buffer is "
+                        "%d. The tail counters are MISSING from /HEARTBEAT.TXT.\n",
+                        k, (int)sizeof(sb)); }
+        } else if (k > 0) {
+            bootlog_heartbeat_note(sb);
+        }
+        // Stage 0 capability gates, on the same durable heartbeat. Reported
+        // here rather than from a boot-time one-shot because the interesting
+        // value is the RUNNING one: a refusal that happens two minutes in is
+        // exactly the one a boot-time print cannot show, and the allowed count
+        // is only meaningful once the compositor has been polling for a while.
+        {
+            extern void capgate_report(void);
+            capgate_report();
+        }
+        {
+            extern void caps_report(void);
+            caps_report();
+        }
+
+        // ------------------------------------------------------------------
+        // THE ANOMALY LINE. Straight to the fault ring (drained to
+        // /BOOTLOG.TXT within ~2 s), because a window that broke an invariant
+        // must not have to wait for the 30-minute heartbeat schedule.
+        //
+        // The trigger is bw.flags, the flag word rustkern/bklstat.rs already
+        // computes and which is 0 when every invariant held, plus the
+        // must-be-zero counters CHANGING, plus pin timeouts in this window. It
+        // deliberately does NOT include long_holds: a BKL hold over 1 ms is
+        // routine in this kernel today (the compositor blit path holds it for
+        // most of a frame), so treating it as an anomaly would fire every
+        // window and drown the real ones. It is reported in the record above
+        // instead, where a reader can see the trend.
+        //
+        // Rate limited two ways: at most one line per 5 s, and at most 24 per
+        // boot. Both bounds matter; a permanently broken invariant would
+        // otherwise turn the anomaly reporter into the write storm.
+        {
+            static uint64_t pv_wqv, pv_idleq, pv_kstack, pv_stk, pv_irqu, pv_poprun;
+            static uint64_t last_anom_us;
+            static unsigned anom_n;
+            int anom = (bw.flags != 0) || (d_pt != 0);
+            if (g_wq_noblock_violations != pv_wqv)   { anom = 1; }
+            if ((uint64_t)g_idle_enq_refused != pv_idleq) { anom = 1; }
+            if (g_syscall_kstack_null != pv_kstack)  { anom = 1; }
+            if (g_stacksave_bad != pv_stk)           { anom = 1; }
+            if (g_irq_on_user_stack != pv_irqu)      { anom = 1; }
+            if (g_pop_running != pv_poprun)          { anom = 1; }
+            pv_wqv    = g_wq_noblock_violations;
+            pv_idleq  = (uint64_t)g_idle_enq_refused;
+            pv_kstack = g_syscall_kstack_null;
+            pv_stk    = g_stacksave_bad;
+            pv_irqu   = g_irq_on_user_stack;
+            pv_poprun = g_pop_running;
+            if (anom && anom_n < 24 &&
+                (last_anom_us == 0 || now_bkl_us - last_anom_us >= 5000000ULL)) {
+                last_anom_us = now_bkl_us;
+                anom_n++;
+                // DELIBERATELY NOT `"[SCHEDANOM] %s", sb`. bootlog_fault_write
+                // formats into a BOOTLOG_LINE_MAX (640) buffer, and sb can be
+                // 710 bytes, so re-emitting the whole record here would cut its
+                // tail off - the [NETDIAG] fault, committed by the code that
+                // was written to fix it. This line carries only what says WHAT
+                // broke; the full window is the [SCHEDSTAT] record in
+                // /HEARTBEAT.TXT, and this line says so.
+                bootlog_fault_write("[SCHEDANOM] flags=0x%x badwin=%lu "
+                    "pintimeouts=%lu | MUSTBE0 wqviol=%lu idleq=%lu "
+                    "kstacknull=%lu stksave=%lu irqustk=%lu poprun=%lu | bkl "
+                    "acq=%lu con=%lu held=%luus max=%luus@0x%x/cpu%u long=%lu | "
+                    "full window: the [SCHEDSTAT] record in /HEARTBEAT.TXT%s",
+                    bw.flags, (unsigned long)bkl_window_bad_rs(),
+                    (unsigned long)d_pt,
+                    (unsigned long)g_wq_noblock_violations,
+                    (unsigned long)g_idle_enq_refused,
+                    (unsigned long)g_syscall_kstack_null,
+                    (unsigned long)g_stacksave_bad,
+                    (unsigned long)g_irq_on_user_stack,
+                    (unsigned long)g_pop_running,
+                    (unsigned long)d_acq, (unsigned long)d_con,
+                    (unsigned long)d_hsum, (unsigned long)hmax, hres,
+                    bw.max_cpu, (unsigned long)d_long,
+                    anom_n == 24 ? " (24th and last: further anomalous windows "
+                                   "appear only in the [SCHEDSTAT] record)" : "");
+            }
+        }
+    }
+
     // #75 (enqrace75b) THE ENQUEUE CENSUS. Per call site: funnel CALLS /
     // enqueues that reached a run queue / how many of those enqueued a task a
     // core was RUNNING at that instant.
@@ -3403,6 +3660,12 @@ static void sched_smp_report(void) {
     // the unfair lock the core doing real work has a wait_max orders of
     // magnitude above the cores that only tick.
     { extern void bkl_fair_report(void); bkl_fair_report(); }
+    // #stackguard: the BKL-wait NESTING high-water, and the guard-page
+    // census for Ring-0 kernel stacks. Separate tags from [BKLFAIR] on purpose:
+    // these two lines are the discriminator for the stack-overflow defect and
+    // must stay readable even while the [BKLFAIR] block is being moved.
+    { extern void bkl_nest_report(void); bkl_nest_report(); }
+    kstack_report();
     // #blitnarrow (#168 step 3): how much of the BKL's hold time the blit
     // narrowing actually removed, and what it cost in dropped frames. Printed
     // in BOTH arms. `unlocked` is the negative control: it MUST be 0 with the
@@ -3427,6 +3690,39 @@ static void sched_smp_report(void) {
                   (unsigned long)g_blitnarrow_gone,
                   (unsigned long)g_blitnarrow_deferred,
                   (unsigned long)g_blitnarrow_us); }
+    // #invnarrow (#168 stage 2): the same three-part accounting the blit
+    // narrowing prints, for the content commit copy. `unlocked` is the
+    // negative control - it MUST be 0 with the gate off and large with it on,
+    // or the two arms are the same experiment. `stale`+`gone` are frames
+    // dropped because another core changed the window under the copy; a large
+    // fraction of `unlocked` would mean the narrowing is buying speed by
+    // throwing work away, which is not a win. `nested` is the I6 commit token
+    // firing (a second writer refused entry to content_seq) and `recommit` is
+    // the bounded locked commit done on its behalf. `spare_kb` is the extra
+    // memory this costs, MEASURED rather than assumed.
+    { extern int g_inv_narrow;
+      extern volatile uint64_t g_invnarrow_unlocked, g_invnarrow_locked,
+                               g_invnarrow_nested, g_invnarrow_nospare,
+                               g_invnarrow_stale, g_invnarrow_gone,
+                               g_invnarrow_recommit, g_invnarrow_deferred,
+                               g_invnarrow_us, g_invnarrow_spare_by,
+                               g_invnarrow_noblock;
+      if (g_inv_narrow || g_invnarrow_locked)
+          kprintf("[INVNARROW] on=%d unlocked=%lu locked=%lu nested=%lu "
+                  "nospare=%lu noblock=%lu stale=%lu gone=%lu recommit=%lu "
+                  "deferred=%lu unlocked_us=%lu spare_kb=%lu\n",
+                  g_inv_narrow,
+                  (unsigned long)g_invnarrow_unlocked,
+                  (unsigned long)g_invnarrow_locked,
+                  (unsigned long)g_invnarrow_nested,
+                  (unsigned long)g_invnarrow_nospare,
+                  (unsigned long)g_invnarrow_noblock,
+                  (unsigned long)g_invnarrow_stale,
+                  (unsigned long)g_invnarrow_gone,
+                  (unsigned long)g_invnarrow_recommit,
+                  (unsigned long)g_invnarrow_deferred,
+                  (unsigned long)g_invnarrow_us,
+                  (unsigned long)(g_invnarrow_spare_by / 1024u)); }
     // #smpfix: what the AP idle loop actually did this boot. `noprog` is the
     // number of times entering the scheduler switched nothing; `halt` is the
     // number of passes that reached the hlt. Before the backoff, noprog and
@@ -4488,7 +4784,7 @@ int proc_create_ex(const char *name, void (*entry)(void *), void *arg,
     proc->detached = 1;
 
     // Allocate stack
-    proc->stack_base = kmalloc(stack_size);
+    proc->stack_base = kstack_alloc(stack_size);   // #stackguard: guard page below
     if (!proc->stack_base) {
         kprintf("[PROC] Failed to allocate stack for %s\n", name);
         proc->state = PROC_STATE_UNUSED;
@@ -4679,6 +4975,15 @@ void proc_exit(int exit_code) {
     if (!me->shares_vm) {
         extern void fdown_proc_exit(uint32_t owner);
         fdown_proc_exit(me->tgid ? me->tgid : me->pid);
+    }
+
+    // #404 Stage 6: release every advisory file lock (fcntl + flock) this
+    // process group held, and wake anyone blocked on them. Group-leader only,
+    // by tgid, same gate/contract as fdown_proc_exit above. cli()-safe: a
+    // bounded table sweep under a spinlock plus wake_up_all, no block.
+    if (!me->shares_vm) {
+        extern void advlock_proc_exit(uint32_t owner);
+        advlock_proc_exit(me->tgid ? me->tgid : me->pid);
     }
 
     // #COMPRESPAWN: TEAR DOWN THE sys_fb_map() WINDOW BEFORE THE ADDRESS SPACE
@@ -5100,7 +5405,7 @@ int proc_wait(int pid, int *status) {
 // #230 A/B BENCHMARK. DEBUG ONLY (-DPROCWAIT_BENCH, `make PROCWAITBENCH=1`).
 //
 // STATUS 2026-08-02: BUILT, RUN, AND NOT YET TRUSTWORTHY. On its first run
-// (build 982, VM <vmid>) it printed 0 ticks for BOTH arms, which is not a result:
+// (build 982, VM 2611) it printed 0 ticks for BOTH arms, which is not a result:
 // 0 for the legacy spin is impossible over a real 2-second wait, so the harness
 // did not actually wait - most likely both proc_wait calls returned -1
 // immediately because the freshly proc_create()d kernel thread was not visible
@@ -5895,7 +6200,7 @@ void sched_schedule(void) {
 // advances timer_ticks by however many 250 Hz ticks REAL TIME says have
 // elapsed, so timer_ticks keeps correct time while sched_tick runs five times
 // less often. A CPU percentage computed as (process ticks / timer_ticks delta)
-// then under-reports by exactly that ratio - MEASURED on VM <vmid> with IRQ0
+// then under-reports by exactly that ratio - MEASURED on VM 2610 with IRQ0
 // deliberately masked, where a genuinely idle machine reported top=idle:19
 // instead of idle:98, which is 98/5. The heartbeat's top= field divides by
 // THIS instead, so the percentage is correct under either tick source.
@@ -6477,7 +6782,7 @@ int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
     }
 
     // Allocate kernel stack (used during syscalls/interrupts)
-    proc->stack_base = kmalloc(KERNEL_STACK_SIZE);
+    proc->stack_base = kstack_alloc(KERNEL_STACK_SIZE);   // #stackguard: guard page below
     if (!proc->stack_base) {
         kprintf("[PROC] Failed to allocate kernel stack for %s\n", name);
         LOG_ERROR("[Process] Failed to allocate kernel stack");
@@ -6501,7 +6806,7 @@ int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
     if (__usr != 0) {
         kprintf("[PROC] Failed to allocate user stack for %s\n", name);
         LOG_ERROR("[Process] Failed to allocate user stack");
-        kfree(proc->stack_base);
+        kstack_free(proc->stack_base, proc->stack_size);
         vmm_destroy_user_space(proc->cr3);
         proc->state = PROC_STATE_UNUSED;
         sched_set_preemption(old_preempt);
@@ -6521,7 +6826,7 @@ int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
         kprintf("[PROC] Failed to load ELF for %s: %s\n", name, elf_strerror(elf_result));
         LOG_ERROR("[Process] Failed to load ELF into user space");
         vmm_free_user_pages(proc->cr3, proc->user_stack_base, stack_pages);
-        kfree(proc->stack_base);
+        kstack_free(proc->stack_base, proc->stack_size);
         vmm_destroy_user_space(proc->cr3);
         proc->state = PROC_STATE_UNUSED;
         sched_set_preemption(old_preempt);
@@ -6555,7 +6860,7 @@ int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
         kprintf("[PROC] %s: refused initial stack (argc=%d envc=%d)\n",
                 name, argc, envc);
         vmm_free_user_pages(proc->cr3, proc->user_stack_base, stack_pages);
-        kfree(proc->stack_base);
+        kstack_free(proc->stack_base, proc->stack_size);
         vmm_destroy_user_space(proc->cr3);
         proc->state = PROC_STATE_UNUSED;
         sched_set_preemption(old_preempt);
@@ -6832,7 +7137,7 @@ int proc_fork(void) {
     }
 
     // Allocate new kernel stack for child
-    child->stack_base = kmalloc(me->stack_size);
+    child->stack_base = kstack_alloc(me->stack_size);   // #stackguard: guard page below
     if (!child->stack_base) {
         if (child->cr3) vmm_destroy_user_space(child->cr3);
         child->state = PROC_STATE_UNUSED;
@@ -6918,6 +7223,16 @@ int proc_fork(void) {
 
     // Ensure child takes the context_switch path (not context_start/IRET)
     if (child->total_time == 0) child->total_time = 1;
+
+    // #246 Stage 2 FORK INHERITANCE (docs/CONTRACT_ENFORCEMENT_PLAN.md): the
+    // escrow_* marker fields (escrow_active / escrow_task_node / escrow_obj_node
+    // / escrow_grant_edge / escrow_scope_prefix) were copied by the whole-struct
+    // memcpy at the top of this function and are DELIBERATELY LEFT in place, so
+    // a child of a marked escrow actor INHERITS the mark AND the same grant
+    // binding, and is enforced identically. An AI task therefore cannot
+    // fork an unmarked child to launder unrestricted FS access. For a NORMAL
+    // (unmarked) parent escrow_active == 0 was copied, so the child is a normal,
+    // unenforced process exactly as before. Do NOT clear these here.
 
     // Add child to ready queue
     add_to_ready_queue(child);
@@ -7013,6 +7328,12 @@ int proc_clone(uint32_t flags, void *user_stack, uint32_t *parent_tid,
     child->sig_pending = 0;
     child->return_work = 0;
 
+    // #246 Stage 2: like proc_fork(), the escrow_* marker fields were copied by
+    // the whole-struct memcpy above and are intentionally left in place, so a
+    // clone/thread of a marked escrow actor is itself a marked actor bound to
+    // the same grant. A NORMAL (unmarked) caller yields an unmarked clone. Do
+    // NOT clear them here.
+
     // Thread group: leader is the caller's tgid (or the caller itself).
     child->tgid = me->tgid ? me->tgid : me->pid;
 
@@ -7058,7 +7379,7 @@ int proc_clone(uint32_t flags, void *user_stack, uint32_t *parent_tid,
 
     // Allocate + copy a fresh kernel stack (the child needs its own kernel
     // stack for syscalls; the copy carries the parent's syscall-entry frame).
-    child->stack_base = kmalloc(me->stack_size);
+    child->stack_base = kstack_alloc(me->stack_size);   // #stackguard: guard page below
     if (!child->stack_base) {
         child->state = PROC_STATE_UNUSED;
         child->cr3 = 0; child->shares_vm = 0;
@@ -7423,6 +7744,16 @@ const char *proc_current_name(void) {
 uint32_t proc_current_pid(void) {
     process_t *p = proc_current();
     return p ? p->pid : 0;
+}
+
+// Stage 0: the tgid twin of the above, and the same narrow-accessor reasoning.
+// Returns the RAW tgid (0 means "this process is its own group leader", which
+// is what process_t documents); normalising 0 to the pid is capgate_tgid_of_rs's
+// job and is done in ONE place so the stamp sites and the check sites cannot
+// disagree. Returns 0 when there is no current process, like its twin.
+uint32_t proc_current_tgid(void) {
+    process_t *p = proc_current();
+    return p ? p->tgid : 0;
 }
 
 // SYS_PROC_LIST backend: snapshot the live process table for Task Manager.

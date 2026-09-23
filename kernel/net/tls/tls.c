@@ -5,6 +5,7 @@
 // TLS 1.3: X25519 key exchange with AES-128-GCM-SHA256 / AES-256-GCM-SHA384
 
 #include "tls.h"
+#include "../netfail.h"   // #netfix2
 #include "../../crypto/csprng.h"   // #tls-rngfix
 
 // #tls-suitefix: the offered cipher suite list and the acceptance test, both
@@ -409,12 +410,26 @@ static int tls_verify_chain(tls_context_t *ctx, cert_chain_t *chain) {
         return TLS_SUCCESS;
     }
     if (!chain || chain->count == 0) {
+        NETFAIL(NF_TLS_CERT_BAD, 0);   // #netfix2
         kprintf("[TLS] Certificate verification: empty/unparseable chain - rejecting\n");
         return TLS_ERR_CERTIFICATE;
     }
 
     int ret = cert_verify_chain(chain, ctx->hostname[0] ? ctx->hostname : NULL);
     if (ret != CERT_SUCCESS) {
+        // #netfix2: five outcomes that all render as "this page will not load"
+        // and need five different things from the user. cert_verify_validity()
+        // has ALREADY recorded the expiry/clock cases with more information
+        // than is available here (it knows whether the clock itself is the
+        // fault), so those are left alone; this fills in the rest.
+        switch (ret) {
+            case CERT_ERR_NO_TRUST_ANCHOR: NETFAIL(NF_TLS_CERT_UNTRUSTED, ret); break;
+            case CERT_ERR_SIGNATURE:       NETFAIL(NF_TLS_CERT_SIGNATURE, ret); break;
+            case CERT_ERR_NAME_MISMATCH:   NETFAIL(NF_TLS_CERT_NAME, ret);      break;
+            case CERT_ERR_EXPIRED:
+            case CERT_ERR_NOT_YET_VALID:   break;   // already recorded, and better
+            default:                       NETFAIL_WEAK(NF_TLS_CERT_BAD, ret);  break;
+        }
         kprintf("[TLS] Certificate chain verification FAILED (err=%d) host=%s leaf-CN=%s\n",
                 ret, ctx->hostname, cert_get_cn(chain->certs[0]));
         return TLS_ERR_CERTIFICATE;

@@ -1,0 +1,63 @@
+# mports recipe: 2048 (mevdschee/2048.c), the classic single-file terminal
+# 2048 clone. tuigames batch (owner request 2026-09-18): "2048 (the classic C
+# terminal 2048)". MIT, dependency closure 0 (plain POSIX termios/stdio, no
+# curses, no ncurses `needs=` at all - the only game in this batch that
+# doesn't touch curses).
+#
+# WHAT THIS PORT SHIPS. ONE translation unit (2048.c, ~580 lines): raw
+# termios (ICANON/ECHO off, TCSANOW) for arrow-key input, ANSI SGR escape
+# codes for the tile colours, printf for the board. No data files, no
+# scorefile (score is in-process only, printed on the game-over screen).
+#
+# The tarball is GitHub's own commit-pinned source archive (codeload), not a
+# tagged release - this project has no version tags, only commits - so the
+# commit hash IS the version pin. The sha256 below is of the tarball itself,
+# MEASURED after fetching it with curl and running sha256sum on the bytes on
+# disk, not copied from a web page:
+#   curl -sL -o 2048c.tar.gz \
+#     https://github.com/mevdschee/2048.c/archive/afc8898691f54d43309497f4c32682fe90bb5f57.tar.gz
+#   sha256sum 2048c.tar.gz
+#   -> 7fcd88c09c38cbecdf6cbd47ef88787d0a42b2f7e36ad97a6bfbf3ae114db38c (19,383 bytes)
+# Commit afc8898 is HEAD of the default branch at fetch time (2026-09-18),
+# per the GitHub commits API, not an arbitrarily old or new pin.
+
+name=2048
+version=afc8898
+class=C
+homepage=https://github.com/mevdschee/2048.c
+
+source_url=https://github.com/mevdschee/2048.c/archive/afc8898691f54d43309497f4c32682fe90bb5f57.tar.gz
+tarball=2048c-afc8898.tar.gz
+sha256=7fcd88c09c38cbecdf6cbd47ef88787d0a42b2f7e36ad97a6bfbf3ae114db38c
+srcdir=2048.c-afc8898691f54d43309497f4c32682fe90bb5f57
+
+licence=MIT
+licence_files=LICENSE
+copyleft=none
+copyleft_note=MIT is permissive; the combined /APPS/TUI2048 binary (this port + userland/libc, both permissive) carries no copyleft obligation.
+
+# No needs=: this is the only game in this batch that touches no curses API
+# at all, only plain POSIX termios + stdio. libc is the shared platform
+# library, not a port.
+
+# THE ADOPTION TEST (owner rule 2): USES. 2048.c is one ordinary Ring-3
+# translation unit driven by termios/stdio. Measured: the object links
+# against userland/libc/libc.a with zero undefined symbols. It reads its own
+# keys with getchar() in its own main loop and imposes no event loop or
+# window system on anything else.
+adoption=USES. Measured: the single compiled object (2048.c) links against userland/libc/libc.a with zero undefined symbols. It owns its own game loop, sets raw termios itself (setBufferedInput()) and restores it on exit; it imposes no event loop or window system on any other program.
+needs=libc
+
+prepare=none
+patches=none
+
+build=objects
+sources=2048.c
+
+headers=none
+lib=lib2048.a
+
+# THE ANTI-NO-OP CHECK: main and drawBoard, two symbols from the one
+# translation unit, so a build that silently compiled an empty or truncated
+# file cannot pass.
+symbols=main drawBoard

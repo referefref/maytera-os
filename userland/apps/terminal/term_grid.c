@@ -261,6 +261,7 @@ void term_full_reset(void) {
     term_autowrap = 1;
     cursor_visible = true;
     in_alt_screen = 0;   // RIS drops any alternate-screen state outright
+    term_charset_reset();   // #745: RIS returns GL to ASCII (G0)
     term_clear();
 }
 // Handle newline (LF). Tier 1 (docs/TERMINAL_PARITY.md): respects a DECSTBM

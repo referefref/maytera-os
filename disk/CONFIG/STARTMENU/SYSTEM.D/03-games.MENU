@@ -30,6 +30,7 @@ item: Maytera Chess | /APPS/CHESS | icon=game_chess
 item: Maytera Squadron | /APPS/SQUADRON | icon=game_squadron
 item: AssaultCube | /APPS/ASSAULTCUBE | icon=game
 item: ClassiCube | /APPS/CLASSICUBE | icon=game
+item: Angband | /APPS/ANGBAND | icon=game | type=native
 # #537: DOOM lives at /GAMES/DOOM/DOOM.ELF (alongside its DOOM1.WAD); the old
 # /APPS/DOOM.ELF path did not exist, so that hardcoded entry launched nothing
 # for an unknown length of time. The existence check in
@@ -42,6 +43,8 @@ item: Solitaire | /APPS/SOLITAIRE | icon=game_solitaire
 item: Pong | /APPS/pong | icon=game_pong
 item: GL Cube | /APPS/GLCUBE | icon=game_glcube
 item: GL Matrix | /APPS/GLMATRIX | icon=game_glmatrix
+item: Lava Lamp | /APPS/LAVALAMP | icon=game
+item: Aquarium | /APPS/AQUARIUM | icon=game
 item: Tetris | /WIN16/MSEP/TETRIS.EXE | icon=win3x | type=win16
 item: Chips Challenge | /WIN16/MSEP/CHIPS.EXE | icon=win3x | type=win16
 item: FreeCell | /WIN16/MSEP/FREECELL.EXE | icon=win3x | type=win16
@@ -431,3 +434,52 @@ item: Red Alert | /DOS/RA/GAME.DAT | icon=dosapp | type=dos
 #   So Red Alert needs an INSTALLED tree plus a perms entry plus the bridge fix.
 #   None of those is a Start-menu change, and until all three exist there is
 #   nothing here to launch.
+
+# 2026-09-05 (gbemu): Game Boy emulator, clean-room from the public DMG
+# hardware spec (see userland/apps/gbemu/gb.rs header). Ships with NO ROM
+# (Pokemon and other commercial titles are copyrighted); launched with no
+# argv it looks for the first *.gb/*.gbc file under /ROMS on the boot medium,
+# which the owner populates himself. A direct terminal launch with a real
+# path argument (gbemu /ROMS/POKEMON.GB) also works. Passes all 11 Blargg
+# cpu_instrs subtests; MBC1/MBC3/MBC5 implemented (MBC5 is what Pokemon
+# Yellow's cartridge type 0x1B actually is).
+item: Game Boy | /APPS/gbemu | icon=game
+
+# 2026-09-07 (#745, Tier 3 item #17 termgames): two small ncurses terminal
+# games, ported once ncurses landed (userland/ports/ncurses) as VOLUME PROOF
+# that the mports recipe system works for more than one library at a time.
+# Both are type=native (an ordinary ELF, not win16/dos): the compositor
+# spawns them and the Terminal's pty (TERM=maytera-256color) gives them a
+# real tty. See userland/ports/myman/PORT and userland/ports/ninvaders/PORT.
+item: MyMan | /APPS/MYMAN | icon=game
+item: nInvaders | /APPS/NINVADERS | icon=game
+item: Moon Buggy | /APPS/MOONBUGY | icon=game
+
+# 2026-09-07 (#745, Tier 3 item #16). XaoS 3.6 (GPL-2.0-or-later), the
+# real-time fractal zoomer, built as a userland app the same way DOOM is
+# (userland/apps/xaos, its own platform driver bridging to SYS_WIN_*, not
+# through mports). type=native: an ordinary PIE ELF, the compositor spawns
+# it and it opens its own window, no win16/dos bridge involved.
+item: XaoS | /APPS/XAOS | icon=game | type=native
+
+# 2026-09-18 (tuigames batch): four bsd-games 2.17 terminal games (BSD-3-Clause,
+# The Regents of the University of California), the classic single-file
+# terminal 2048 (MIT), the dumb/terminal Frotz Z-machine interpreter
+# (GPL-2.0-or-later, no bundled story file - launch from the Terminal with a
+# path argument, e.g. `frotz /path/to/story.z5`), and the modernised
+# open-source Colossal Cave Adventure (BSD-2-Clause). All type=native (ordinary
+# ELFs, not win16/dos): the compositor spawns them and the Terminal's pty
+# (TERM=maytera-256color) gives them a real tty, same as the myman/ninvaders/
+# moon-buggy trio above. NetHack was checked and already ships (DOS binary,
+# see the Rogue/NetHack entries elsewhere in this file) - not re-ported.
+# See userland/ports/hangman/PORT, userland/ports/worm/PORT,
+# userland/ports/robots/PORT, userland/ports/snake/PORT,
+# userland/ports/2048/PORT, userland/ports/frotz/PORT and
+# userland/ports/openadv/PORT.
+item: Hangman | /APPS/HANGMAN | icon=game
+item: Worm | /APPS/WORM | icon=game
+item: Robots | /APPS/ROBOTS | icon=game
+item: Snake | /APPS/SNAKE | icon=game
+item: 2048 | /APPS/TUI2048 | icon=game
+item: Frotz | /APPS/FROTZ | icon=game
+item: Colossal Cave Adventure | /APPS/ADVENTURE | icon=game

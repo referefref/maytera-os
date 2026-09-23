@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- MayteraOS Office suite mark (family badge). Original MayteraOS artwork.
+       The shared sheet + mountain-M cue with the three app colours stacked
+       (Writer blue, Sheets green, Slides orange). NOT a launcher icon for any
+       one app: intended for an "Office" category/group row, an about box, or
+       a future suite-level chooser. -->
+  <rect x="11" y="5" width="42" height="54" rx="3" ry="3" fill="none" stroke="#ffffff" stroke-width="4" stroke-linejoin="round"/>
+  <polyline points="19,20 25,12.5 32,19 39,12.5 45,20" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="19" y="27" width="26" height="6" rx="1.5" fill="#4da3ff"/>
+  <rect x="19" y="37" width="26" height="6" rx="1.5" fill="#3fd17a"/>
+  <rect x="19" y="47" width="26" height="6" rx="1.5" fill="#ff9f40"/>
+</svg>

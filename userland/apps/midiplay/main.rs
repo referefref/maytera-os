@@ -93,7 +93,64 @@ extern "C" {
                   variant: i32, st: i32);
     fn gui_progress(handle: i32, x: i32, y: i32, w: i32, h: i32, pct: i32);
     fn gui_lighten(c: u32, amt: i32) -> u32;
+    /// Real glyph metrics for the size the text is drawn at (gui_style.h). The
+    /// spec (6.4) says a name that does not fit truncates with "...", never a
+    /// mid-glyph clip, and only the engine knows how wide "..." is.
+    fn gui_ttf_width(s: *const u8, size: i32) -> i32;
+
+    // (midiphase) The SHARED scrollable-viewport primitive, userland/libc/
+    // gui_scroll.c. MIDIPLAY_SPEC.md 3.7 names it for the file list and #183
+    // deviated ("no draggable scrollbar"); this is the first Rust consumer of
+    // it, and it is called, not re-implemented: the offset clamp, the thumb
+    // geometry, the wheel convention (POSITIVE delta = up, the one Files once
+    // got backwards) and the contrast-repaired theming all live in the C.
+    fn gui_scroll_config(s: *mut GuiScroll, x: i32, y: i32, w: i32, h: i32,
+                         content_px: i32, step_px: i32);
+    fn gui_scroll_set(s: *mut GuiScroll, offset: i32) -> i32;
+    fn gui_scroll_wheel(s: *mut GuiScroll, scroll_delta: i32) -> i32;
+    fn gui_scroll_press(s: *mut GuiScroll, mx: i32, my: i32) -> i32;
+    fn gui_scroll_motion(s: *mut GuiScroll, mx: i32, my: i32) -> i32;
+    fn gui_scroll_release(s: *mut GuiScroll);
+    fn gui_scroll_first_item(s: *const GuiScroll) -> i32;
+    fn gui_scroll_reveal(s: *mut GuiScroll, top_px: i32, h_px: i32) -> i32;
+    fn gui_scroll_needed(s: *const GuiScroll) -> i32;
+    fn gui_scroll_draw_on(handle: i32, s: *const GuiScroll, surface: u32);
 }
+
+/// Mirror of `gui_scroll_t` (userland/libc/gui_scroll.h): eleven C ints, in
+/// this order. The C side owns every field; this app only ever passes the
+/// struct by pointer and reads `offset` through the accessor functions. Keep it
+/// in sync with the header by hand, the same way GuiEvent and GuiPalette are.
+#[repr(C)]
+struct GuiScroll {
+    x: i32, y: i32, w: i32, h: i32,
+    content_px: i32,
+    step_px: i32,
+    offset: i32,
+    snap: i32,
+    drag: i32,
+    drag_grab: i32,
+    hover: i32,
+}
+impl GuiScroll {
+    const fn new() -> GuiScroll {
+        GuiScroll { x: 0, y: 0, w: 0, h: 0, content_px: 0, step_px: 0, offset: 0,
+                    snap: 1, drag: 0, drag_grab: 0, hover: 0 }
+    }
+}
+
+/// Width of the scrollbar gutter, GUI_SCROLL_W in gui_scroll.h.
+const GUI_SCROLL_W: i32 = 14;
+/// File-list row height (spec 3.7) and the list's top edge in content pixels.
+const LIST_ROW_H: i32 = 20;
+const LIST_Y: i32 = 369;
+/// Two presses on the same row inside this window are one double-click
+/// (spec 5: "double-click = select + play"). 400 ms is the common desktop
+/// default; SYS_MONO_US is TSC-backed and used here ONLY to compare two
+/// keypress timestamps, never to schedule anything.
+const DBLCLICK_US: u64 = 400_000;
+/// "No file from the list is loaded" (the built-in demo or tone is).
+const NO_FILE: usize = usize::MAX;
 
 // Syscall numbers. THIS IS THE FIFTH-COPY HAZARD (kernel/tools/
 // syscall-number-lint rule 5): a no_std Rust app cannot include the C header,
@@ -135,7 +192,9 @@ const O_CREAT: i64 = 0x0040;
 const O_TRUNC: i64 = 0x0200;
 const AUDIO_FORMAT_S16_LE: i64 = 0x0002;
 
+const EVENT_MOUSE_MOVE: u32 = 1;
 const EVENT_MOUSE_DOWN: u32 = 2;
+const EVENT_MOUSE_UP: u32 = 3;
 const EVENT_MOUSE_SCROLL: u32 = 4;
 const EVENT_KEY_DOWN: u32 = 5;
 const EVENT_WINDOW_CLOSE: u32 = 7;
@@ -404,8 +463,20 @@ struct App {
     demo_len: usize,
     using_demo: bool,
     total_frames: u64,
+    /// Keyboard-cursor row of the file list (spec 6.4: selection colours).
     sel: usize,
-    scroll: usize,
+    /// Index into FILES of the file that is actually LOADED, or NO_FILE. Spec
+    /// 6.4: the loaded row carries a "> " prefix so "loaded" and "selected"
+    /// are distinguishable when the user has arrowed away without pressing
+    /// Open.
+    loaded: usize,
+    /// The file list's viewport: offset, thumb, drag and wheel state all live
+    /// in the shared widget, not here.
+    list: GuiScroll,
+    /// Double-click detection: the row and SYS_MONO_US timestamp of the last
+    /// press that landed on a list row.
+    last_click_row: usize,
+    last_click_us: u64,
     name: Buf,
     status: Buf,
     err: i32,
@@ -534,6 +605,7 @@ fn load_demo(a: &mut App, tone: bool) {
     }
     a.name.clear();
     a.name.s(if tone { b"[built-in A440 tone]" } else { b"[built-in demo]" });
+    a.loaded = NO_FILE;
     load_bytes(a, true);
 }
 
@@ -572,6 +644,9 @@ fn load_file(a: &mut App, idx: usize) {
         }
         a.name.s(&full[last..]);
         load_bytes(a, false);
+        // The "> " marker follows the file that is actually playable, so a
+        // corrupt file that failed to open does not get marked as loaded.
+        a.loaded = if a.err == E_OK { idx } else { NO_FILE };
     }
 }
 
@@ -584,6 +659,13 @@ impl App {
 /// ambiguous about where it looked.
 fn scan_files(a: &mut App, label: &mut Buf) {
     const DIRS: [&[u8]; 4] = [b"/MEDIA/MIDI\0", b"/MIDI\0", b"/MUSIC\0", b"/\0"];
+    // A rescan renumbers every row, so the loaded-row marker, the cursor and
+    // the viewport all restart from the top rather than pointing at whatever
+    // file now happens to sit at the old index.
+    a.loaded = NO_FILE;
+    a.sel = 0;
+    a.last_click_row = NO_FILE;
+    unsafe { gui_scroll_set(&mut a.list, 0); }
     unsafe {
         NFILES = 0;
         for d in DIRS.iter() {
@@ -627,7 +709,70 @@ fn scan_files(a: &mut App, label: &mut Buf) {
         }
         label.clear();
         label.s(b"No .MID files found in /MEDIA/MIDI, /MIDI, /MUSIC or /");
-        let _ = a;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File-list geometry (spec 3.7), shared by draw() and the input handlers so
+// the hit rectangles and the painted rows can never disagree.
+//
+// The viewport is a whole number of rows tall. gui_scroll_t with snap=1 keeps
+// every offset on a row boundary EXCEPT the end stop, so a viewport that was
+// not a multiple of the row height would leave a half row across the top edge
+// when scrolled to the end. Sizing the viewport to rows*LIST_ROW_H removes
+// that case entirely: content_px - h is then itself a multiple of the row
+// height. The card behind it is painted at the same rect.
+// ---------------------------------------------------------------------------
+fn list_rows(a: &App) -> i32 {
+    ((a.dh - LIST_Y - 26) / LIST_ROW_H).max(1)
+}
+
+fn list_layout(a: &mut App) {
+    let rows = list_rows(a);
+    let n = unsafe_nfiles() as i32;
+    unsafe {
+        gui_scroll_config(&mut a.list, 8, LIST_Y, a.dw - 16, rows * LIST_ROW_H,
+                          n * LIST_ROW_H, LIST_ROW_H);
+    }
+}
+
+/// Move the keyboard cursor to `row` (clamped) and scroll the minimum distance
+/// that keeps it visible. Spec 5: Up/Down by 1, PgUp/PgDn by a page,
+/// Home/End to the ends.
+fn list_select(a: &mut App, row: usize) {
+    let n = unsafe_nfiles();
+    if n == 0 { return; }
+    a.sel = if row >= n { n - 1 } else { row };
+    list_layout(a);
+    unsafe {
+        gui_scroll_reveal(&mut a.list, a.sel as i32 * LIST_ROW_H, LIST_ROW_H);
+    }
+}
+
+/// Fit `name` (with its optional "> " prefix) into `avail` pixels at 14 px,
+/// measured with the engine's own metrics; a name that does not fit ends in
+/// "..." rather than being clipped mid-glyph (spec 6.4, UI_STYLE_GUIDE 4.5).
+fn fit_row_text(out: &mut Buf, prefix: &[u8], name: &[u8], avail: i32) {
+    out.clear();
+    out.s(prefix);
+    out.s(name);
+    if unsafe { gui_ttf_width(out.b.as_ptr(), 14) } <= avail {
+        return;
+    }
+    // Shorten one byte at a time until prefix + head + "..." fits. Names here
+    // are ASCII (8.3 or ext2 names from readdir), so byte steps are glyph
+    // steps. Bounded by the name length; the loop cannot spin.
+    let mut keep = name.len();
+    while keep > 0 && name[keep - 1] == 0 { keep -= 1; }
+    while keep > 0 {
+        keep -= 1;
+        out.clear();
+        out.s(prefix);
+        out.s(&name[..keep]);
+        out.s(b"...");
+        if unsafe { gui_ttf_width(out.b.as_ptr(), 14) } <= avail {
+            return;
+        }
     }
 }
 
@@ -787,21 +932,46 @@ fn draw(a: &mut App, list_label: &Buf) {
 
     // --- file list ---------------------------------------------------------
     draw_text(a.win, 8, 351, list_label.as_bytes(), 11, p.ink_dim);
-    let list_h = h - 369 - 26;
-    let rows = (list_h / 20).max(1) as usize;
-    unsafe { gui_card(a.win, 8, 369, w - 16, list_h); }
+    let rows = list_rows(a) as usize;
+    let list_h = rows as i32 * LIST_ROW_H;
+    // Re-derived every draw, so a resize or a rescan re-clamps the offset
+    // (gui_scroll_config re-clamps; the widget never strands the view).
+    let (first, needed) = {
+        let rows_i = rows as i32;
+        let n_i = unsafe_nfiles() as i32;
+        unsafe {
+            gui_scroll_config(&mut a.list, 8, LIST_Y, w - 16, rows_i * LIST_ROW_H,
+                              n_i * LIST_ROW_H, LIST_ROW_H);
+            (gui_scroll_first_item(&a.list).max(0) as usize,
+             gui_scroll_needed(&a.list) != 0)
+        }
+    };
+    let p = &a.pal;
+    unsafe { gui_card(a.win, 8, LIST_Y, w - 16, list_h); }
+    // Rows stop short of the gutter only when the gutter is actually drawn;
+    // gui_scroll_draw_on() spends no pixels when the content fits.
+    let gutter = if needed { GUI_SCROLL_W } else { 0 };
+    let row_w = w - 16 - gutter;
     let n = unsafe_nfiles();
+    let mut row_text = Buf::new();
     for r in 0..rows {
-        let idx = a.scroll + r;
+        let idx = first + r;
         if idx >= n { break; }
-        let y = 369 + r as i32 * 20;
+        let y = LIST_Y + r as i32 * LIST_ROW_H;
         if idx == a.sel {
-            win_rect(a.win, 10, y, w - 20, 20, p.accent);
+            win_rect(a.win, 10, y, row_w - 4, LIST_ROW_H, p.accent);
         }
         let name = unsafe { &(*core::ptr::addr_of!(FILES))[idx] };
-        draw_text(a.win, 14, y + 2, name, 14,
+        // Spec 6.4: the loaded file's row is prefixed "> " as part of the text
+        // run, so a selection that has moved away from it stays legible.
+        let prefix: &[u8] = if idx == a.loaded { b"> " } else { b"" };
+        fit_row_text(&mut row_text, prefix, name, row_w - 12);
+        draw_text(a.win, 14, y + 2, row_text.as_bytes(), 14,
                   if idx == a.sel { ink_on(p.accent) } else { p.ink });
     }
+    // The gutter sits on the card, so the contrast repair is told the card's
+    // fill (the same call the AI chat transcript makes for its own ground).
+    unsafe { gui_scroll_draw_on(a.win, &a.list, p.surface_raised); }
 
     // --- status ------------------------------------------------------------
     draw_text(a.win, 8, h - 20, a.status.as_bytes(), 11, p.ink_dim);
@@ -1051,7 +1221,10 @@ pub extern "C" fn main() -> i32 {
         using_demo: true,
         total_frames: 0,
         sel: 0,
-        scroll: 0,
+        loaded: NO_FILE,
+        list: GuiScroll::new(),
+        last_click_row: NO_FILE,
+        last_click_us: 0,
         name: Buf::new(),
         status: Buf::new(),
         err: E_OK,
@@ -1102,12 +1275,11 @@ pub extern "C" fn main() -> i32 {
                 dirty = true;
             }
             while win_event(win, &mut ev, 0) != 0 {
-                if handle(&mut a, &ev, &mut list_label) {
+                if handle(&mut a, &ev, &mut list_label, &mut dirty) {
                     unsafe { syscall1(SYS_WIN_DESTROY, win as i64); }
                     pcm_release(&mut a);
                     return 0;
                 }
-                dirty = true;
             }
         } else {
             // #217: a PAUSED player that nobody comes back to is a stopped
@@ -1123,12 +1295,11 @@ pub extern "C" fn main() -> i32 {
                 }
             }
             if win_event(win, &mut ev, 200) != 0 {
-                if handle(&mut a, &ev, &mut list_label) {
+                if handle(&mut a, &ev, &mut list_label, &mut dirty) {
                     unsafe { syscall1(SYS_WIN_DESTROY, win as i64); }
                     pcm_release(&mut a);
                     return 0;
                 }
-                dirty = true;
             }
         }
         if dirty {
@@ -1138,49 +1309,112 @@ pub extern "C" fn main() -> i32 {
     }
 }
 
-/// Returns true when the app should quit.
-fn handle(a: &mut App, ev: &GuiEvent, list_label: &mut Buf) -> bool {
+/// Returns true when the app should quit. Sets `*dirty` when the event changed
+/// something visible; pointer motion that moved nothing does NOT repaint,
+/// because a full redraw per EVENT_MOUSE_MOVE would spend more time in the
+/// compositor than in the synth while the pointer merely crosses the window.
+fn handle(a: &mut App, ev: &GuiEvent, list_label: &mut Buf, dirty: &mut bool) -> bool {
     match ev.ty {
         EVENT_WINDOW_CLOSE => return true,
-        EVENT_REDRAW => {}
+        EVENT_REDRAW => { *dirty = true; }
         EVENT_RESIZE => {
             win_get_size(a.win, &mut a.dw, &mut a.dh);
+            *dirty = true;
         }
         EVENT_MOUSE_SCROLL => {
-            let d = ev.scroll_delta as i32;
-            if d < 0 { a.scroll += 1; } else if a.scroll > 0 { a.scroll -= 1; }
+            // Positive delta = up, the OS-wide convention the widget owns.
+            list_layout(a);
+            if unsafe { gui_scroll_wheel(&mut a.list, ev.scroll_delta as i32) } != 0 {
+                *dirty = true;
+            }
+        }
+        EVENT_MOUSE_MOVE => {
+            // Cheap no-op inside the widget unless a thumb drag is in progress.
+            if unsafe { gui_scroll_motion(&mut a.list, ev.mouse_x, ev.mouse_y) } != 0 {
+                *dirty = true;
+            }
+        }
+        EVENT_MOUSE_UP => {
+            unsafe { gui_scroll_release(&mut a.list); }
         }
         EVENT_MOUSE_DOWN => {
-            // Content-relative coordinates. The compositor delivers screen
-            // coordinates and the 2 px border plus 20 px titlebar have to come
-            // off; that translation is the recurring userland-app bug this
-            // project has a durable note about, so it is done ONCE here.
+            // Content-relative coordinates, the same space gui_scroll_press()
+            // expects ("window-local, matching what user_window_event_handler
+            // delivers to the app").
             let x = ev.mouse_x;
             let y = ev.mouse_y;
+            *dirty = true;
             if y >= 36 && y < 60 {
                 if x >= 8 && x < 118 { toggle_play(a); }
                 else if x >= 126 && x < 216 { stop(a); }
                 else if x >= 224 && x < 324 { rewind(a); }
                 else if x >= 332 && x < 422 { load_file(a, a.sel); }
                 else if x >= 430 && x < 552 { run_selftest(a); }
-            } else if y >= 369 {
-                let row = ((y - 369) / 20) as usize + a.scroll;
-                if row < unsafe_nfiles() {
-                    a.sel = row;
+            } else if y >= LIST_Y {
+                list_layout(a);
+                // Gutter first: a press on the thumb starts a drag, a press in
+                // the track pages toward the pointer. Only when the widget
+                // declines is this a row press.
+                if unsafe { gui_scroll_press(&mut a.list, x, y) } != 0 {
+                    return false;
+                }
+                let rows = list_rows(a);
+                let r = (y - LIST_Y) / LIST_ROW_H;
+                if r < rows {
+                    let first = unsafe { gui_scroll_first_item(&a.list).max(0) } as usize;
+                    let row = first + r as usize;
+                    if row < unsafe_nfiles() {
+                        // Spec 5: click = select; double-click = select + play.
+                        let now = mono_us();
+                        let again = row == a.last_click_row
+                            && now.saturating_sub(a.last_click_us) <= DBLCLICK_US;
+                        a.sel = row;
+                        if again {
+                            a.last_click_row = NO_FILE;
+                            load_file(a, row);
+                            if a.err == E_OK {
+                                toggle_play(a);
+                            }
+                        } else {
+                            a.last_click_row = row;
+                            a.last_click_us = now;
+                        }
+                    }
                 }
             }
         }
         EVENT_KEY_DOWN => {
+            *dirty = true;
+            // Selection keys (spec 5). These carry NO ASCII character and are
+            // matched on the keycode from libc/keys.rs, never on key_char
+            // (#191). The widget's own gui_scroll_key() moves the VIEWPORT;
+            // the spec wants them to move the CURSOR and keep it in view, so
+            // the cursor moves here and gui_scroll_reveal() does the scrolling.
+            let n = unsafe_nfiles();
+            let page = list_rows(a) as usize;
             match ev.keycode {
                 keys::GUI_KEY_UP => {
-                    if a.sel > 0 { a.sel -= 1; }
-                    if a.sel < a.scroll { a.scroll = a.sel; }
+                    list_select(a, a.sel.saturating_sub(1));
                     return false;
                 }
                 keys::GUI_KEY_DOWN => {
-                    if a.sel + 1 < unsafe_nfiles() { a.sel += 1; }
-                    let rows = ((a.dh - 369 - 26) / 20).max(1) as usize;
-                    if a.sel >= a.scroll + rows { a.scroll = a.sel + 1 - rows; }
+                    list_select(a, a.sel + 1);
+                    return false;
+                }
+                keys::GUI_KEY_PGUP => {
+                    list_select(a, a.sel.saturating_sub(page));
+                    return false;
+                }
+                keys::GUI_KEY_PGDN => {
+                    list_select(a, a.sel + page);
+                    return false;
+                }
+                keys::GUI_KEY_HOME => {
+                    list_select(a, 0);
+                    return false;
+                }
+                keys::GUI_KEY_END => {
+                    if n > 0 { list_select(a, n - 1); }
                     return false;
                 }
                 _ => {}

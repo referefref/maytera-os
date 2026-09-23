@@ -29,4 +29,8 @@ struct group *getgrgid(gid_t gid);
 // Look up group by name
 struct group *getgrnam(const char *name);
 
+// setgroups: no supplementary-group model on MayteraOS; stub returns -1/ENOSYS
+// (posixextra.c). #745 darkhttpd port.
+int setgroups(int size, const gid_t *list);
+
 #endif // _GRP_H

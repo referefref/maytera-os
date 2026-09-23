@@ -1,0 +1,155 @@
+0001-queue-ncurses-timeout-instead-of-select.patch
+
+moon-buggy's main loop (queue.c) waits for "the next scheduled event OR a
+keypress, whichever comes first" by calling select(2) on stdin (fd 0) with a
+struct timeval deadline, then reading the key separately via ncurses wgetch()
+in keyboard.c read_key().
+
+MayteraOS's select() (libc sys/socket.c -> SYS_SOCK_SELECT) is network
+oriented: it scans fds through file_poll() but blocks on the net RX wait queue,
+so a keypress on the Terminal pty does not wake it early, and wait_for_key()'s
+NULL (infinite) timeout would hang the title screen waiting for the player to
+press a key. This is the same class of gap the ninvaders port hit with
+setitimer(ITIMER_REAL)/SIGALRM, and the fix is the same one docs/MPORTS.md
+points at: drive the wait off ncurses' own timeout()/getch() idiom, which is
+proven to work under the Terminal pty (ninvaders, myman).
+
+This patch replaces my_select()/key_ready()/wait_for_key()/wait_until() and
+drain_input() with equivalents built on wtimeout()+wgetch(): a bounded (or
+infinite) wait for a key, with the key pushed back via ungetch() so the
+existing read_key() consumes it exactly once, preserving the original
+"wait does not consume the key" contract. drain_input() becomes flushinp().
+No busy-wait or poll loop is introduced (the wait blocks in ncurses). The
+signal-retry semantics (return negative on a caught signal, caller recomputes
+and retries) are preserved. This also removes the last use of select()/fd_set,
+fcntl(O_NONBLOCK) and modf() in the file.
+
+--- a/queue.c	2026-09-08 14:53:44.654591528 +0000
++++ b/queue.c	2026-09-08 14:53:44.655498708 +0000
+@@ -76,32 +76,33 @@
+  * wait for timeouts or keyboard input
+  */
+ 
++/* MayteraOS port: the original waited on stdin via select(2) with a timeval.
++ * MayteraOS's select() is network-oriented (it blocks on the net RX wait
++ * queue, so a keypress on the Terminal pty does not wake it early, and a NULL
++ * timeout could hang the title screen waiting for input).  ncurses already
++ * owns the terminal here, so we drive the same "wait for a key or a deadline"
++ * off wgetch() with a per-call input timeout, the idiom the ninvaders port
++ * uses.  A key read while waiting is pushed back with ungetch() so read_key()
++ * (keyboard.c) still consumes it exactly once.  */
++
+ static int
+-my_select (struct timeval *timeout)
+-/* Wait until input is ready on stdin or a timeout is reached.
+- * TIMEOUT has the same meaning, as is has for the `select' system
+- * call.  The return value is 0 if we return because of a timeout,
+- * positive if input is ready, and negative if a signal occured.  In
+- * the latter case we must calculate a new TIMEOUT value and call
+- * `my_select' again.  */
++mb_wait_ms (long ms)
++/* Wait up to MS milliseconds for a key (MS < 0 means wait forever).
++ * Return a positive value if a key is ready (pushed back for read_key), 0 on
++ * timeout, and negative if a signal arrived (the caller recomputes and
++ * retries, matching the original my_select contract).  */
+ {
+-  fd_set  rfds;
+-  int  res;
+-
+-  /* Watch stdin (fd 0) to see when it has input. */
+-  FD_ZERO (&rfds);
+-  FD_SET (0, &rfds);
++  int  ch;
+ 
+   if (handle_signals ())  return -1;
+-  res = select (FD_SETSIZE, &rfds, NULL, NULL, timeout);
+-  if (res < 0) {
+-    if (errno == EINTR) {
+-      handle_signals ();
+-    } else {
+-      fatal ("Select failed: %s", strerror (errno));
+-    }
++  wtimeout (moon, (ms < 0) ? -1 : (int) ms);
++  ch = wgetch (moon);
++  if (ch == ERR) {
++    if (handle_signals ())  return -1;
++    return  (ms < 0) ? -1 : 0;   /* forever cannot time out: must be a signal */
+   }
+-  return  res;
++  ungetch (ch);
++  return  1;
+ }
+ 
+ static int
+@@ -111,11 +112,7 @@
+   int  res;
+ 
+   do {
+-    struct timeval  ancient_time;
+-    
+-    ancient_time.tv_sec = 0;
+-    ancient_time.tv_usec = 0;
+-    res = my_select (&ancient_time);
++    res = mb_wait_ms (0);
+   } while (res < 0);
+   return  res;
+ }
+@@ -126,7 +123,7 @@
+   int  res;
+ 
+   do {
+-    res = my_select (NULL);
++    res = mb_wait_ms (-1);
+   } while (res < 0);
+ }
+ 
+@@ -136,24 +133,17 @@
+  * Return a positive value, if a key was pressed, and 0 else.
+  * Set *T_RETURN to the return time.  */
+ {
+-  double  start;
++  double  start, dt;
+   int  res;
+ 
+   do {
+-    double  dt, sec, usec;
+-    struct timeval  tv;
+-    
+     start = vclock ();
+-    dt = to_real(t) - start;
++    dt = to_real (t) - start;
+     if (dt <= 0) {
+       *t_return = start;
+       return  key_ready ();
+     }
+-    
+-    usec = 1e6 * modf (dt, &sec) + 0.5;
+-    tv.tv_sec = sec + 0.5;
+-    tv.tv_usec = usec + 0.5;
+-    res = my_select (&tv);
++    res = mb_wait_ms ((long) (dt * 1000.0 + 0.5));
+   } while (res < 0);
+   *t_return = vclock ();
+ 
+@@ -164,19 +154,9 @@
+ drain_input (void)
+ /* Discard all data from the input queue.  */
+ {
+-  char  buffer [16];
+-  int  oldflags;
+-
+-  oldflags = fcntl (0, F_GETFL, 0);
+-  if (oldflags < 0) {
+-    fatal ("Cannot get file status flags (%s)", strerror (errno));
+-  }
+-  fcntl (0, F_SETFL, oldflags|O_NONBLOCK);
+-  while (read (0, buffer, 16) == 16)
+-    ;
+-  fcntl (0, F_SETFL, oldflags);
++  flushinp ();
+ }
+-
++
+ void
+ clock_reset (void)
+ /* Adjust the clock to make 0 the current time.  */

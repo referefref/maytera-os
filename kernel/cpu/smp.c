@@ -2,6 +2,9 @@
 // Part of Task #41 (SMP Support)
 
 #include "smp.h"
+#include "../fs/bootlog.h"   // #dosmem: SMP bring-up and BKL anomalies
+                             // must survive on a machine with no serial
+                             // port. See the promotions below.
 #include "apic.h"
 #include "gdt.h"
 #include "idt.h"
@@ -12,6 +15,9 @@
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
 #include "../sync/spinlock.h"
+#include "../sync/waitq.h"    // #dosmem: THE shared wait primitive (#426)
+#include "../sync/noblock.h"  // #dosmem: THE canonical "may this context park"
+
 #include "../drivers/acpi_madt.h"
 
 // External trampoline code (from trampoline.asm)
@@ -252,7 +258,7 @@ static cpu_local_t cpu_local[MAYTERA_MAX_CPUS] __attribute__((aligned(64)));
 // fast per-CPU path (before this, callers fall back to the BSP global).
 volatile int g_smp_current_ready = 0;
 volatile int g_ap_running_user[MAYTERA_MAX_CPUS];
-int g_smp_user_sched = 0;  // #67: DEFAULT OFF. AP user-process scheduling.
+int g_smp_user_sched = 1;  // #SMPDEFAULT: DEFAULT ON. AP user-process scheduling.
 //
 // ---------------------------------------------------------------------------
 // #67 (2026-08-12): READ THIS BEFORE CHANGING THE DEFAULT.
@@ -301,17 +307,78 @@ int g_smp_user_sched = 0;  // #67: DEFAULT OFF. AP user-process scheduling.
 //     SCHEDSTORMPANIC=1` turns it into a kpanic, because a panic with state
 //     beats a hang. [SCHEDCORE] reports the per-core split every ~4 s.
 //
-// DO NOT FLIP THIS DEFAULT casually. The bar is the one #421 failed: not one
-// clean boot, but many runs of a real multi-process load with no [SCHEDSTORM]
-// and no wedge. Until then it is enabled per-boot, with no rebuild, by putting
-// an empty /SMPSCHED.TXT at the root of the FAT ESP (main.c), so the SAME
-// kernel binary can be tested both ways.
+// #SMPDEFAULT (2026-09-02): THE DEFAULT IS NOW 1, AND THE GATE IS INVERTED.
+//
+// The bar this comment set was "not one clean boot, but many runs of a real
+// multi-process load with no [SCHEDSTORM] and no wedge", plus the hard
+// prerequisite the #404 audit stated below: cross-CPU TLB invalidation must
+// exist FIRST. Both are met, and each was RE-VERIFIED in current dev rather
+// than taken from prose, because this tree has a documented habit of describing
+// things the code does not do:
+//
+//   * CROSS-CPU TLB INVALIDATION EXISTS. mm/tlbflush.{h,c} publishes the range
+//     and a wait mask, delivers by DIRECTED IPI on vector 0xF2 through a real
+//     IDT gate (cpu/idt.c installs irq_smp_tlb; cpu/idt.asm's stub deliberately
+//     does NOT jmp isr_common, because isr_handler() takes the BKL and a
+//     shootdown reaching a core that is spinning FOR the BKL would then block
+//     inside the wrapper forever), and waits for a per-CPU acknowledgement.
+//     Delivery is REDUNDANT: every spin loop in sync/spinlock.c and smp.c also
+//     calls tlb_service_local(), so a lost IPI costs latency, not correctness.
+//     tlb_selftest() proves peers acknowledge, at boot, printing PASS or FAIL
+//     and never staying silent. The callers are in mm/vmm.c, gated on
+//     smp_get_online_count() > 1, and they cover the frame-free paths that
+//     matter: vmm_unmap_page_in() (so vma_teardown_pages() in mm/demand.c
+//     flushes every page before vmm_free_user_page_cow() can return the frame),
+//     vmm_destroy_user_space() (a full flush BEFORE the first pmm_free_page(),
+//     because that path frees the PAGE TABLES themselves), the COW demotion in
+//     the fork path, and the mprotect range punch.
+//   * g_syscall_saved_frame, one global written by every core and read by
+//     sys_rt_sigreturn, is gone from the live path: the frame is per-task in
+//     process_t (proc/process.h), and the deleted global survives only under
+//     `make SIGFRAMEDIFF=1` as a differential proof kernel that never ships.
+//   * The per-process fd table has a real spinlock (process_t::fd_lock,
+//     fs/vfs.c), and it is the shared spinlock_t, not a private one.
+//
+// WHAT IS STILL BKL-DEPENDENT, STATED HERE SO IT IS NOT QUIETLY FORGOTTEN. The
+// scheduler's select-and-publish invariant is enforced ONLY by the Big Kernel
+// Lock. Commit 30050aa9 fixed a two-core race precisely by having the AP idle
+// loop take the BKL around sched_schedule(). That is FINE while the BKL is
+// still giant, which it is, so it does not block this default. It IS the
+// constraint that gates the ongoing lock-narrowing work: anyone narrowing the
+// BKL out of the scheduler path must replace this invariant with a real one
+// (a per-runqueue lock held across select AND publish) in the same change, or
+// they will reintroduce #421's silent wedge.
+//
+// AND THE STANDING RULE: SMP IS A REQUIREMENT, NOT A SETTING. A benchmark
+// showing SMP slower is a BUG REPORT ABOUT THE BKL, never a reason to ship one
+// core. Do not respond to a bad number here by turning this back to 0; name the
+// mechanism instead.
+//
+// The escape hatch survives, inverted, so the previous behaviour is still one
+// file away and the same binary can still be measured both ways:
+//   /NOSMPSCHED.TXT on the FAT ESP forces AP user scheduling OFF for that boot.
+//   /SMPSCHED.TXT   still forces it ON, so existing sticks and scripts that
+//                   write it keep meaning what they meant instead of silently
+//                   becoming no-ops.
+//   Both present: OFF wins. See main.c for the gate and the [SMP] result line,
+//   which now reports the effective state AND the reason for it.
 // ---------------------------------------------------------------------------
 void smp_user_sched_enable(int on) { g_smp_user_sched = on ? 1 : 0; }
 
 // #279 3b-3C: whole-kernel Big Kernel Lock so APs can run SYSCALL-making apps
 // (BSP kernel code holds the BKL too, serializing against AP syscalls).
 int g_smp_bkl_full = 1;     // #279: whole-kernel BKL ENABLED
+
+// #dosmem: THE WAKE SOURCE smp_parallel_for() NEVER HAD.
+//
+// A waiter cannot be woken by a completion nothing signals, which is why the
+// original completion wait had no choice but to spin. This queue is signalled
+// on EVERY job completion, by whichever core ran the job, so the wait below can
+// be a real sleep. Zero-initialised in .bss (head = NULL, lock = 0), which is
+// exactly what wait_queue_head_init() produces, so it is safe from the first
+// call regardless of when smp_init() runs; smp_init() initialises it explicitly
+// anyway rather than leaning on that.
+static wait_queue_head_t smp_work_wq;
 extern void *smp_ap_take_migratable(void);
 extern void smp_ap_run_user(void *);
 
@@ -461,6 +528,8 @@ static int init_ap_per_cpu(uint32_t cpu_id, uint32_t apic_id) {
     // Allocate stack
     cpu->stack_base = allocate_cpu_stack();
     if (!cpu->stack_base) {
+        bootlog_write("[SMP] ERROR: failed to allocate a kernel stack for CPU "
+                      "%u; that core will not come online", cpu_id);
         kprintf("[SMP] Error: Failed to allocate stack for CPU %u\n", cpu_id);
         return -1;
     }
@@ -503,12 +572,18 @@ static void setup_trampoline(void) {
 // Initialize SMP subsystem
 int smp_init(void) {
     kprintf("[SMP] Initializing Symmetric Multi-Processing...\n");
+    // #dosmem: explicit, even though .bss zeroing already produces the same
+    // state. A queue whose correctness depends on an unwritten assumption about
+    // where it lives is one refactor away from being wrong.
+    wait_queue_head_init(&smp_work_wq);
     
     // Initialize APIC ID lookup table
     memset(apic_to_cpu, 0xFF, sizeof(apic_to_cpu));
     
     // Check if MADT is available
     if (!madt_is_initialized()) {
+        bootlog_write("[SMP] WARNING: MADT not initialized, assuming a single "
+                      "CPU. Every SMP number below is for one core.");
         kprintf("[SMP] Warning: MADT not initialized, assuming single CPU\n");
         cpu_count = 1;
         init_bsp_per_cpu();
@@ -518,6 +593,8 @@ int smp_init(void) {
     // Get CPU count from MADT
     uint32_t madt_cpus = madt_get_enabled_cpu_count();
     if (madt_cpus == 0) {
+        bootlog_write("[SMP] WARNING: MADT reports 0 enabled CPUs, assuming a "
+                      "single CPU");
         kprintf("[SMP] Warning: MADT reports 0 enabled CPUs, assuming single CPU\n");
         cpu_count = 1;
         init_bsp_per_cpu();
@@ -535,6 +612,8 @@ int smp_init(void) {
     
     // Initialize Local APIC (BSP)
     if (lapic_init() != 0) {
+        bootlog_write("[SMP] ERROR: Local APIC init FAILED; no APs can be "
+                      "started and no IPI will be delivered");
         kprintf("[SMP] Error: Failed to initialize Local APIC\n");
         cpu_count = 1;
         init_bsp_per_cpu();
@@ -543,6 +622,8 @@ int smp_init(void) {
     
     // Initialize I/O APIC
     if (ioapic_init() != 0) {
+        bootlog_write("[SMP] WARNING: I/O APIC init FAILED; device interrupt "
+                      "routing falls back to the legacy PIC");
         kprintf("[SMP] Warning: Failed to initialize I/O APIC\n");
         // Continue anyway - we can still use SMP without I/O APIC routing
     }
@@ -570,6 +651,7 @@ int smp_init(void) {
         
         if (cpu_id < cpu_count) {
             if (init_ap_per_cpu(cpu_id, madt_cpu->apic_id) != 0) {
+                bootlog_write("[SMP] WARNING: failed to initialize CPU %u", cpu_id);
                 kprintf("[SMP] Warning: Failed to initialize CPU %u\n", cpu_id);
             }
             cpu_id++;
@@ -642,6 +724,9 @@ static int start_ap(uint32_t cpu_id) {
         return 0;
     }
     
+    bootlog_write("[SMP] ERROR: CPU %u FAILED TO START (INIT-SIPI-SIPI timed "
+                  "out). The machine runs with fewer cores than the firmware "
+                  "reported.", cpu_id);
     kprintf("[SMP] Error: CPU %u failed to start\n", cpu_id);
     cpu->state = CPU_STATE_OFFLINE;
     return -1;
@@ -664,15 +749,52 @@ int smp_start_aps(void) {
     }
     
     kprintf("[SMP] %u/%u APs started successfully\n", started, cpu_count - 1);
+    // #dosmem: HOW MANY CORES THIS MACHINE ACTUALLY GOT, AND HOW THE BIG LOCK
+    // IS CONFIGURED, ON DISK, ONCE.
+    //
+    // Every per-core and per-lock number in [SCHEDSTAT] is meaningless without
+    // it, and until now the only record was a serial line. The owner's
+    // /BOOTLOG.TXT from build 2346 does not say how many cores came up, which
+    // arm of the BKL experiment was armed, or whether parking was on - so every
+    // SMP reading taken from his logs this week rested on an assumption.
+    // bkl full/fair/park are the three gates (/NOSCHEDBKL.TXT, /BKLFAIR.TXT,
+    // /BKLPARK.TXT + /NOBKLPARK.TXT); their VALUES belong next to the core
+    // count, whoever set them.
+    {
+        extern int g_bkl_fair;
+        extern int g_bkl_park;
+        bootlog_write("[SMP] %u/%u APs started, %u CPUs online; bkl full=%d "
+                      "fair=%d park=%d", started, cpu_count - 1, cpus_online,
+                      g_smp_bkl_full, g_bkl_fair, g_bkl_park);
+    }
     
     return started;
 }
 
-// Wait for APs to reach a state
+// Wait for APs to reach a state.
+//
+// capspin (no-ticket): this had ZERO callers and its inner loop was an UNBOUNDED
+// while (state != want && state != HALTED) pause(), which would hang the whole
+// kernel forever on an AP that neither reaches the state nor halts. It is capped
+// with a bounded spin and a LOUD give-up BEFORE anyone wires it up (the ticket
+// 426 no-unbounded-busy-wait discipline), reusing the same fixed-iteration
+// pause() bring-up idiom start_ap() already uses for the AP INIT-IPI settle.
+// SMP semantics are unchanged when the AP DOES reach the state: the loop exits
+// exactly as before. The cap only bounds the pathological stuck-AP case that
+// used to freeze the machine, and it must NEVER weaken SMP for a healthy AP.
+#define SMP_AP_WAIT_MAX_SPINS 10000000u
 void smp_wait_for_aps(uint8_t state) {
     for (uint32_t i = 1; i < cpu_count; i++) {
+        uint32_t spins = 0;
         while (per_cpu_data[i].state != state &&
                per_cpu_data[i].state != CPU_STATE_HALTED) {
+            if (++spins >= SMP_AP_WAIT_MAX_SPINS) {
+                kprintf("[SMP] smp_wait_for_aps: CPU %u stuck in state %u after "
+                        "%u spins (wanted %u), giving up\n",
+                        i, per_cpu_data[i].state,
+                        (unsigned)SMP_AP_WAIT_MAX_SPINS, (unsigned)state);
+                break;
+            }
             pause();
         }
     }
@@ -692,6 +814,18 @@ static volatile uint32_t smp_work_head = 0;   // next slot to pop
 static volatile uint32_t smp_work_tail = 0;   // next slot to push
 static spinlock_t     smp_work_lock = SPINLOCK_INIT;
 static volatile uint64_t smp_jobs_done = 0;
+
+// #dosmem: smp_work_wq is DEFINED near the top of this file, above
+// smp_init(), which initialises it. See the comment there.
+
+// Have all `nj` chunks finished? Written as a function, not a macro, because it
+// is the CONDITION argument of wait_event_timeout(), which evaluates its
+// condition zero or more times and requires it to be cheap and side-effect
+// free. Reads only volatile flags an AP sets with atomic_store32().
+static int smp_chunks_all_done(volatile uint32_t *done, int nj) {
+    for (int i = 0; i < nj; i++) if (!done[i]) return 0;
+    return 1;
+}
 
 int smp_work_submit(void (*fn)(void *), void *arg, volatile uint32_t *done) {
     if (!fn) return -1;
@@ -738,6 +872,11 @@ static void smp_run_job(const smp_job_t *j) {
     j->fn(j->arg);
     atomic_inc64(&smp_jobs_done);
     if (j->done) atomic_store32((volatile uint32_t *)j->done, 1);
+    // #dosmem: signal the completion queue AFTER the done flag is published, so
+    // a waiter that is woken always observes the flag it was woken for. Called
+    // with no lock held (smp_work_pop() released the ring lock before we ran
+    // the job), from an ordinary kernel context on the BSP or an AP.
+    wake_up(&smp_work_wq);
 }
 
 // #279 3b-3: kick HLT'd APs so they re-check the migratable queue.
@@ -813,18 +952,91 @@ void smp_parallel_for(int start, int end, smp_range_fn fn, void *ctx) {
         nj++;
     }
     // Submit all chunks but the first to the pool; run the first on this CPU.
+    // The submit retry is NOT a spin: smp_work_run_one() executes a queued job,
+    // which is what frees the ring slot this loop is waiting for, so every
+    // iteration makes the ring strictly emptier.
     for (int i = 1; i < nj; i++)
         while (smp_work_submit(smp_chunk_run, &ch[i], &done[i]) != 0)
             smp_work_run_one();
     smp_chunk_run(&ch[0]);
     done[0] = 1;
-    // Help drain the queue and wait for every chunk to finish.
-    int all = 0;
-    while (!all) {
-        smp_work_run_one();
-        all = 1;
-        for (int i = 0; i < nj; i++)
-            if (!done[i]) { all = 0; break; }
+
+    // ======================================================================
+    // #dosmem: THE COMPLETION WAIT. This was:
+    //
+    //     int all = 0;
+    //     while (!all) { smp_work_run_one(); all = 1;
+    //                    for (i...) if (!done[i]) { all = 0; break; } }
+    //
+    // an UNBOUNDED busy-wait, reached from sys_win_blit_image_scaled() with the
+    // BKL held. The concurrency lint does not flag it and there is no allowlist
+    // entry for it, for the reason CLAUDE.md already records against
+    // ata_dma_wait(): smp_work_run_one() in the loop body reads as PROGRESS, so
+    // the rule never matches. It is a real instance of the banned pattern that
+    // the gate cannot see, which is worth more than the line count.
+    //
+    // WHY IT CANNOT SIMPLY BE ABANDONED, i.e. why a timeout must not be a
+    // give-up here: ch[] and done[] are on THIS function's stack, and a peer
+    // core writes through both. Returning while a chunk is in flight would let
+    // an AP store into a dead frame. So every branch below loops until all
+    // done[] are set. The fix is not to wait less; it is to stop burning a core
+    // while waiting, and to make a wait that never ends VISIBLE.
+    //
+    // THREE ARMS, in the order the CLAUDE.md preference list gives:
+    //
+    //  1. DRAIN. A chunk still in the ring is work this core can do. This is
+    //     genuine progress, it is how a 1-CPU system finishes at all, and it is
+    //     tried first on every pass.
+    //  2. SLEEP, where sleeping is legal. wq_may_block() (sync/noblock.h) is
+    //     the canonical test and the only one used; no second private notion of
+    //     it is invented here. The wake source is REDUNDANT by construction,
+    //     which is the preferred shape rather than the tolerated one: every
+    //     completion calls wake_up(), AND the bounded re-test re-examines the
+    //     flags directly. A lost wake therefore costs one wait quantum, not a
+    //     hang, and the timeout is not standing in for a wake nobody armed.
+    //  3. Where the context may NOT park (pre-scheduler, an ISR, or a
+    //     cli+spinlock section), keep draining and pausing, but say so. After
+    //     SMP_PF_LOUD_MS the wait reports itself, with the chunk index, the
+    //     core, and the elapsed time, through bootlog_fault_write() - which is
+    //     the only logging primitive legal in that context, and which reaches
+    //     the persistent log on the machines that have no serial port. An
+    //     invisible wait is what is unacceptable; a visible one is merely slow.
+    // ======================================================================
+#define SMP_PF_WAIT_MS   20u    /* re-test quantum; NOT a correctness deadline */
+#define SMP_PF_LOUD_MS   250u   /* say something before a user notices a frame */
+    if (!smp_chunks_all_done(done, nj)) {
+        uint64_t t0 = mono_us();
+        unsigned reported = 0;
+        while (!smp_chunks_all_done(done, nj)) {
+            if (smp_work_run_one()) continue;      // real progress: retry now
+            if (wq_may_block()) {
+                (void)wait_event_timeout(&smp_work_wq,
+                                         smp_chunks_all_done(done, nj),
+                                         wq_ms_to_ticks(SMP_PF_WAIT_MS));
+                continue;
+            }
+            pause();
+            if (!reported && (mono_us() - t0) >= (uint64_t)SMP_PF_LOUD_MS * 1000ULL) {
+                reported = 1;
+                int stuck = -1;
+                for (int i = 0; i < nj; i++) if (!done[i]) { stuck = i; break; }
+                // Rate-limited across the whole boot as well as per call: a
+                // permanently stuck job must not turn the report into the fault.
+                static unsigned s_loud = 0;
+                if (s_loud < 8) {
+                    s_loud++;
+                    bootlog_fault_write("[SMPPARFOR] cpu%u has waited %lums for "
+                        "chunk %d of %d and CANNOT PARK (noblock reason 0x%x), "
+                        "so it is spinning. done=%d/%d ring_pending=%lu.%s",
+                        smp_this_cpu(),
+                        (unsigned long)((mono_us() - t0) / 1000ULL),
+                        stuck, nj, wq_noblock_reason(),
+                        nj - (stuck < 0 ? 0 : 1), nj,
+                        (unsigned long)smp_work_pending(),
+                        s_loud == 8 ? " (8th and last recorded)" : "");
+                }
+            }
+        }
     }
 }
 
@@ -997,6 +1209,8 @@ void ap_entry(void) {
             sec_cr4_write(cr4 | want);
             uint64_t got = sec_cr4_read() & want;
             if (got != want) {
+                bootlog_write("[SECURITY] CPU %u: CR4 SMEP/SMAP bits did NOT "
+                              "take; this core runs without them", cpu_id);
                 kprintf("[SECURITY] CPU %u: CR4 security bits NOT taken "
                         "(wanted 0x%llx, got 0x%llx) - this core runs WITHOUT "
                         "SMEP/SMAP\n", cpu_id,
@@ -1135,51 +1349,28 @@ void smp_send_reschedule_all(void) {
     lapic_send_ipi_all_excluding_self(IPI_VECTOR_RESCHEDULE);
 }
 
-// ############################################################################
-// # DANGER - THIS FUNCTION HAS ZERO CALLERS AND DOES NOT DO WHAT IT IS NAMED. #
-// ############################################################################
+// #404 RESOLVED. This function is a THIN FORWARDER, kept only because cpu/smp.h
+// has always declared the name and callers may reasonably reach for it. It is
+// NOT the mechanism; tlb_flush_page() in mm/tlbflush.c is.
 //
-// Audited #404 (2026-08-23). It is harmless TODAY only because g_smp_user_sched
-// is 0 (smp.c above), which gates ALL AP bring-up, so no other CPU is ever
-// started and the broadcast below reaches nobody. Whoever enables AP scheduling
-// inherits stale-TLB memory corruption unless cross-CPU invalidation exists
-// FIRST. Do NOT wire this in as it stands. Three things are missing, measured:
+// WHAT IT USED TO BE, and why the history is worth keeping: it broadcast an IPI
+// on vector 0xF2 and called that a shootdown. It had no receiver (idt.c
+// registered no gate for 0xF2, so delivery to a live AP raised #GP 0x792), no
+// way to transmit the address (an IPI carries a vector and nothing else), and
+// no acknowledgement, which is the part that actually matters, because
+// vma_teardown_pages() unmaps and then returns the frame to the PMM: a peer
+// still holding a stale translation writes through it into whatever that frame
+// is reallocated to. That is silent corruption, not a fault.
 //
-//  1. THERE IS NO RECEIVER. IPI_VECTOR_TLB is 0xF2 (242) and cpu/idt.c never
-//     registers a gate for it: idt_init() memsets the table and then installs
-//     specific vectors only (240, 0x41, 0x42, 0x50, 0x51). Delivering 242 to a
-//     live AP hits a not-present IDT entry and raises #GP, error 0x792. This is
-//     the exact failure idt.c documents for vector 0x41.
-//     Same hole: IPI_VECTOR_CALL (0xF1) and IPI_VECTOR_STOP (0xF3) have no
-//     gates either. Only IPI_VECTOR_RESCHEDULE (0xF0) lands on a registered
-//     gate, and it is worth checking whether that is intentional.
-//  2. THE ADDRESS IS NEVER TRANSMITTED. An IPI carries a vector and nothing
-//     else. Even with a handler, the receiving CPU cannot know which page to
-//     invalidate: the "request structure" of step 1 in the comment below was
-//     never written.
-//  3. THERE IS NO ACKNOWLEDGEMENT. Step 4 was never written either, and a
-//     shootdown without quiescence is worse than none. vma_teardown_pages()
-//     (mm/demand.c) unmaps and then immediately returns the frame to the PMM;
-//     a peer still holding a stale TLB entry writes through it into whatever
-//     that frame gets reallocated to. That is the #628 corruption class.
-//
-// A CORRECT VERSION IS NOT A SMALL PATCH, and it cannot be shaped like this:
-// callers of this would be under mm_lock(), an irqsave spinlock, so interrupts
-// are OFF. Spinning there for a peer acknowledgement deadlocks if the peer is
-// itself waiting on that same mm_lock or on the BKL, and the ack spin would
-// also be a new concurrency-lint violation that cannot use wait_event() because
-// wq_assert_may_block() correctly refuses an interrupts-off context. It also
-// needs a per-mm cpumask: lapic_send_ipi_all_excluding_self() hits every core
-// whether or not it is running this address space.
-//
-// BOTTOM LINE, worth more than the code: THIS KERNEL HAS NO CROSS-CPU TLB
-// INVALIDATION OF ANY KIND. That is a hard prerequisite for flipping
-// g_smp_user_sched, and single-CPU correctness today rests on
-// vmm_space_is_live() + vmm_invlpg() in mm/vmm.c, which are BSP-local.
-// #404 RESOLVED 2026-08-30. This is now a thin forwarder to the real
-// implementation in mm/tlbflush.c, kept because cpu/smp.h has always declared
-// it and callers may reasonably reach for the name. It is no longer the
-// mechanism; tlb_flush_page() is.
+// The audit note that stood here said it was "harmless TODAY only because
+// g_smp_user_sched is 0", and that "single-CPU correctness rests on
+// vmm_space_is_live() + vmm_invlpg(), which are BSP-local". BOTH PREMISES ARE
+// NOW DEAD: g_smp_user_sched defaults to 1 (#SMPDEFAULT), and the BSP-local
+// path in mm/vmm.c is now only the cpus_online == 1 arm, with the broadcast
+// arm taken as soon as a second core is up. All three missing pieces exist:
+// a real 0xF2 gate with a dedicated stub that does not go through isr_common,
+// a published request the receiver reads, and a per-CPU acknowledgement mask
+// with a redundant cooperative delivery path. See mm/tlbflush.c.
 void smp_tlb_shootdown(uint64_t virt_addr) {
     extern void tlb_flush_page(uint64_t);
     tlb_flush_page(virt_addr);
@@ -2191,6 +2382,80 @@ void bkl_fair_report(void) {
             (unsigned)g_bkl_next, (unsigned)g_bkl_turn);
 }
 
+// ===========================================================================
+// #stackguard: A LOCK WAIT MUST BOUND ITS STACK, NOT ONLY ITS TIME.
+//
+// The wait below runs with interrupts ENABLED, and it must (see the #279 note
+// inside it). But isr_handler() (cpu/idt.c) calls bkl_acquire() BEFORE it
+// dispatches, so an interrupt taken by a core that is already waiting lands
+// another ISR frame ON THE INTERRUPTED TASK'S KERNEL STACK, and that frame
+// contends and sti-s in turn. Nothing unwinds until some level wins the lock,
+// so the depth grows at the tick rate for as long as the hold lasts. At the
+// measured 250 Hz a 2.55 s hold is ~638 frames of ~330 bytes against a 64 KiB
+// stack: overflow is not a risk, it is arithmetic.
+//
+// MEASURED, from [BKLFAIR] and with no new instrument: 3693 waits x 59446 us
+// average is 219.5 s of summed cpu0 wait during a 69 s boot, 3.18x wall clock.
+// One core cannot wait longer than time has passed unless its waits OVERLAP,
+// and overlap on one core is nesting.
+//
+// THE INVARIANT THIS ESTABLISHES: at most BKL_WAIT_STI_DEPTH frames per core
+// may wait with interrupts enabled. A frame beyond that waits with IF=0, so it
+// cannot be interrupted, so no deeper frame can exist. Stack growth from lock
+// contention becomes bounded by a constant instead of by the hold time.
+//
+// WHY GATING IS SAFE, and this is the part that has to be right. A core in
+// this loop with IF=0 loses exactly three things, and all three are already
+// covered by mechanisms that exist for their own reasons:
+//
+//   * The 0xF2 TLB-shootdown IPI. Already polled cooperatively on every
+//     iteration (tlb_service_local() below). That poll exists precisely
+//     because #75 measured a core in this loop taking neither a fixed-vector
+//     IPI nor a directed NMI, so it was never safe to rely on delivery here.
+//   * The 0xF4 BKL wake IPI. Needed only to end a HLT, and a gated frame never
+//     parks (the park is skipped below), so there is no HLT to end.
+//   * The cooperative panic stop. Already polled on every iteration.
+//
+// And it does NOT create a new deadlock class. The case the sti exists to
+// rescue is "the holder is waiting on an interrupt this core would service",
+// but every ISR reaching isr_handler takes the BKL FIRST, so a nested frame
+// that would service a device is itself blocked behind the same holder. Depth
+// 3 was never servicing anything depth 2 was not; it was only consuming stack.
+//
+// It is a CONSTANT, not a timeout. Every timeout value is wrong at some load,
+// and the resource being protected here is a fixed 64 KiB, not a duration.
+#ifndef BKL_WAIT_STI_DEPTH
+#define BKL_WAIT_STI_DEPTH 2u
+#endif
+static volatile uint32_t g_bkl_wait_depth[BKL_STAT_CPUS];
+static uint32_t g_bkl_nest_max[BKL_STAT_CPUS];    // high-water, per core
+static volatile uint64_t g_bkl_nest_gated;        // waits refused the sti
+static volatile uint64_t g_bkl_nest_unaccounted;  // entries with no cpu slot
+
+// The nesting high-water is the discriminator for this whole change: before
+// it, cpu0 reached depths in the hundreds; after, no core may exceed
+// BKL_WAIT_STI_DEPTH + 1 (the first gated frame is itself counted). Printed
+// under its own tag so it cannot collide with the [BKLFAIR] block another
+// agent is moving into the persistent boot log.
+void bkl_nest_report(void) {
+    // BKL_STAT_CPUS is MAYTERA_MAX_CPUS (32), so printing four fixed slots would
+    // report nothing at all about cores 4..31. That is not a cosmetic gap: this
+    // counter IS the evidence that the depth bound holds, and an instrument that
+    // silently covers only the cores you happened to test first is how a bound
+    // gets believed on a machine where it was never observed. Report the maximum
+    // over EVERY core, and name which core it came from, in one line whose width
+    // does not depend on the core count.
+    uint32_t hw = 0, hw_cpu = 0;
+    for (uint32_t c = 0; c < BKL_STAT_CPUS; c++)
+        if (g_bkl_nest_max[c] > hw) { hw = g_bkl_nest_max[c]; hw_cpu = c; }
+    kprintf("[BKLNEST] gate=%u depth_hw=%u (cpu%u, max over %u cores) gated=%llu "
+            "unaccounted=%llu\n",
+            (unsigned)BKL_WAIT_STI_DEPTH, (unsigned)hw, (unsigned)hw_cpu,
+            (unsigned)BKL_STAT_CPUS,
+            (unsigned long long)g_bkl_nest_gated,
+            (unsigned long long)g_bkl_nest_unaccounted);
+}
+
 static void bkl_take_locked(uint32_t depth, uint8_t from_switch,
                             void *ra, uint8_t via) {
     int cpu;                    // #130: read below, with IF=0. Never earlier.
@@ -2215,6 +2480,30 @@ static void bkl_take_locked(uint32_t depth, uint8_t from_switch,
         // #130: valid only until the sti below; kept solely so the migration
         // counter has something to compare against.
         int entry_cpu = (int)smp_this_cpu();
+        // #stackguard: COUNT THIS FRAME'S WAIT AND DECIDE, ONCE, WHETHER IT
+        // MAY ENABLE INTERRUPTS. Both this increment and the matching decrement
+        // below run with IF=0 and against the SAME index, so the pair is
+        // balanced even if the context later migrates core (#130): a migrated
+        // waiter leaves entry_cpu's depth briefly overstated, which can only
+        // gate a future frame EARLIER than needed. Gating early costs interrupt
+        // servicing latency; gating late costs the machine. The conservative
+        // direction is the correct one.
+        //
+        // bkl_take_locked() always returns to its caller, so the decrement
+        // cannot be skipped: the paths that do not return (sched_schedule() on
+        // a switch) are entered from the HANDLER BODY, long after this function
+        // has finished, and their bkl_release_all()/bkl_reacquire() pair runs
+        // its own balanced take.
+        uint32_t nest = 0;
+        if ((uint32_t)entry_cpu < BKL_STAT_CPUS) {
+            nest = ++g_bkl_wait_depth[entry_cpu];
+            if (nest > g_bkl_nest_max[entry_cpu]) g_bkl_nest_max[entry_cpu] = nest;
+        } else {
+            g_bkl_nest_unaccounted++;
+            nest = 1;                       // no slot: behave as before
+        }
+        const int may_sti = (nest <= BKL_WAIT_STI_DEPTH);
+        if (!may_sti) g_bkl_nest_gated++;
         // #166: the contention used to be counted HERE, against entry_cpu. It
         // is now counted at the bottom of this function against the core the
         // take actually finished on, together with the acquisition. See there.
@@ -2227,10 +2516,16 @@ static void bkl_take_locked(uint32_t depth, uint8_t from_switch,
         if (bkl_owner == entry_cpu) {
             g_bkl_self_ra = (uint64_t)(uintptr_t)ra;
             g_bkl_self_n++;
+            // #dosmem: bootlog_fault_write, not kprintf. This is a permanent
+            // wedge signature (a core waiting for a lock it owns can never
+            // complete) and it fires from INSIDE a contended lock wait, where
+            // the comment 15 lines down already establishes that taking the
+            // console lock changes the behaviour being measured.
+            // bootlog_fault_write takes no lock at all. Already one-shot.
             if (g_bkl_self_n == 1)
-                kprintf("[BKL] SELF-WAIT: cpu %d is waiting for the BKL it "
-                        "already owns (depth %u, via %u, ra=0x%lx). This can "
-                        "never complete; see #130.\n",
+                bootlog_fault_write("[BKL] SELF-WAIT: cpu %d is waiting for the "
+                        "BKL it already owns (depth %u, via %u, ra=0x%lx). This "
+                        "can never complete; see #130.",
                         entry_cpu, bkl_depth, (unsigned)via,
                         (unsigned long)(uintptr_t)ra);
         }
@@ -2274,7 +2569,8 @@ static void bkl_take_locked(uint32_t depth, uint8_t from_switch,
         uint64_t wait_t0 = mono_us();
         uint64_t spins = 0;                      // LOCAL: a shared counter here
         for (;;) {                               // would be most of its own cost
-            __asm__ volatile("sti");
+            // #stackguard: the ONE sti this whole gate exists to withhold.
+            if (may_sti) __asm__ volatile("sti");
             // #75 COOPERATIVE PANIC STOP. Measured on a 4-vCPU KVM guest: a
             // core spinning here takes neither a fixed stop IPI nor a directed
             // NMI, however many are issued (the sends are made, rc=0, and the
@@ -2356,6 +2652,10 @@ static void bkl_take_locked(uint32_t depth, uint8_t from_switch,
                 // there is no release coming for a lock nobody holds.
                 if (!busy) { parkspins = 0; continue; }
                 // #smpfix: the hold is long. Stop burning the host and park.
+                // #stackguard: a gated frame is running with IF=0, and the
+                // park below is `sti; hlt` armed by a 0xF4 that cannot be
+                // delivered to it. Parking here would be a HLT with no wake.
+                if (!may_sti) continue;
                 if (!g_bkl_park || ++parkspins < BKL_SPIN_BEFORE_PARK) continue;
                 parkspins = 0;
                 {
@@ -2496,6 +2796,9 @@ static void bkl_take_locked(uint32_t depth, uint8_t from_switch,
             __asm__ volatile("cli");
             if (atomic_cas32(&bkl_word, 0, 1) == 0) break;
         }
+        // #stackguard: balance the entry count. Same index, IF still 0.
+        if ((uint32_t)entry_cpu < BKL_STAT_CPUS && g_bkl_wait_depth[entry_cpu])
+            g_bkl_wait_depth[entry_cpu]--;
         // #130: WE HOLD THE LOCK AND IF IS 0, so this core cannot change under
         // the read. This is the only id that may be published.
         cpu = (int)smp_this_cpu();
@@ -2530,9 +2833,9 @@ static void bkl_take_locked(uint32_t depth, uint8_t from_switch,
             g_bkl_mig_via  = via;       g_bkl_mig_ra = (uint64_t)(uintptr_t)ra;
             g_bkl_mig_n++;
             if (g_bkl_mig_n == 1)
-                kprintf("[BKLMIG] a BKL waiter entered on cpu %d and finished "
-                        "on cpu %d (via %u, ra=0x%lx). The owner published is "
-                        "cpu %d, the core actually running; #130.\n",
+                bootlog_fault_write("[BKLMIG] a BKL waiter entered on cpu %d and "
+                        "finished on cpu %d (via %u, ra=0x%lx). The owner "
+                        "published is cpu %d, the core actually running; #130.",
                         entry_cpu, cpu, (unsigned)via,
                         (unsigned long)(uintptr_t)ra, cpu);
         }
@@ -2548,6 +2851,20 @@ static void bkl_take_locked(uint32_t depth, uint8_t from_switch,
     // two cores in the kernel believing they are alone. Say so loudly: this
     // failure is otherwise silent until something far away corrupts.
     if (bkl_owner != -1 && bkl_owner != cpu) {
+        // #dosmem: PERSISTED, BUT RATE-LIMITED FIRST. Unlike SELF-WAIT and
+        // BKLMIG this site has no one-shot guard: once the lock stops locking
+        // it can fire on every acquisition. The fault ring is 2 KB and drops
+        // on overflow, so an unbounded promotion here would evict every OTHER
+        // record in the ring and report only its own flood. Four is enough to
+        // establish the fact and name the cores.
+        static unsigned s_theft = 0;
+        if (s_theft < 4) {
+            s_theft++;
+            bootlog_fault_write("[BKL] THEFT: cpu %d took the lock while cpu %d "
+                    "still owns it (depth %u). The BKL is not locking; see #67 "
+                    "pass 10.%s", cpu, (int)bkl_owner, bkl_depth,
+                    s_theft == 4 ? " (4th and last recorded)" : "");
+        }
         kprintf("[BKL] THEFT: cpu %d took the lock while cpu %d still owns it "
                 "(depth %u). The BKL is not locking; see #67 pass 10.\n",
                 cpu, (int)bkl_owner, bkl_depth);

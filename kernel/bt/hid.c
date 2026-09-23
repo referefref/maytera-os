@@ -1,8 +1,17 @@
 // hid.c - Bluetooth HID profile (#372, PROTOCOL agent).
 //
-// Classic HIDP over L2CAP: we are the discoverable/connectable host; a BT
-// keyboard/mouse (re)connects and opens the HID control (PSM 0x0011) and
-// interrupt (PSM 0x0013) channels to us. Boot-protocol INPUT reports arrive on
+// Classic HIDP over L2CAP, TWO roles:
+//   - SERVER (inbound): a BT keyboard/mouse pages us and opens the HID control
+//     (PSM 0x0011) and interrupt (PSM 0x0013) channels TO us. l2cap.c accepts on
+//     the registered servers and fires our on_connect callbacks.
+//   - CLIENT (outbound, [no-ticket] bthidp): for a device WE paged (discovered
+//     is_hid, then hci_classic_connect), the device will NOT open the HID
+//     channels; the HOST must. Once such an outbound link is authenticated and
+//     encrypted, hid_encrypt_event() drives the L2CAP client: connect control
+//     (0x0011), then on control OPEN connect interrupt (0x0013), reusing l2cap.c's
+//     existing client signalling (l2cap_connect + sig_conn_rsp/sig_config_rsp).
+// Either role converges on the same channels, so the report path below is shared.
+// Boot-protocol INPUT reports arrive on
 // the interrupt channel and are funnelled, byte-for-byte the same as USB HID,
 // into the kernel input queue via bt_hid_input_report():
 //   - mouse:    mouse_inject_hid(dx,dy,buttons,wheel)         [drivers/mouse.c]
@@ -20,6 +29,7 @@
 #include "l2cap.h"
 #include "../serial.h"
 #include "../string.h"
+#include "../fs/bootlog.h"
 
 extern void keyboard_process_scancode(uint8_t scancode);              // cpu/isr.c
 extern void mouse_inject_hid(int dx, int dy, uint8_t buttons, int wheel); // drivers/mouse.c
@@ -87,8 +97,30 @@ static bt_hid_dev_t *dev_alloc(hci_handle_t h) {
 // ---------------------------------------------------------------------------
 // The input choke point (only place touching the kernel input sinks)
 // ---------------------------------------------------------------------------
+// btbootlog: persist proof-of-input to /BOOTLOG.TXT WITHOUT flooding. A held
+// key or a moving mouse produces a continuous report stream, so log only the
+// FIRST report of each kind (with its leading bytes, the decisive "it typed /
+// moved" proof) and thereafter a periodic running count.
+static void bt_hid_report_bootlog(bt_hid_kind_t kind, const uint8_t *report, uint16_t len) {
+    static uint32_t kb = 0, ms = 0, oth = 0;
+    uint32_t *cnt = (kind == BT_HID_KEYBOARD) ? &kb :
+                    (kind == BT_HID_MOUSE)    ? &ms : &oth;
+    const char *what = (kind == BT_HID_KEYBOARD) ? "keyboard" :
+                       (kind == BT_HID_MOUSE)    ? "mouse" : "other";
+    uint32_t c = ++(*cnt);
+    if (c == 1) {
+        uint8_t b[8];
+        for (uint16_t i = 0; i < 8; i++) b[i] = (i < len) ? report[i] : 0;
+        bootlog_write("[BT-HID] FIRST %s input report len=%u bytes=%02x %02x %02x %02x %02x %02x %02x %02x",
+                      what, len, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+    } else if ((c & 0x7F) == 0) {   // every 128th report: running count, no flood
+        bootlog_write("[BT-HID] %s input reports received: %u (still receiving)", what, c);
+    }
+}
+
 void bt_hid_input_report(bt_hid_kind_t kind, const uint8_t *report, uint16_t len) {
     if (!report || len == 0) return;
+    bt_hid_report_bootlog(kind, report, len);
 
     if (kind == BT_HID_MOUSE) {
         uint8_t buttons = report[0];
@@ -139,6 +171,11 @@ void bt_hid_input_report(bt_hid_kind_t kind, const uint8_t *report, uint16_t len
 // ---------------------------------------------------------------------------
 // Classic HIDP: L2CAP server callbacks (device connects to us)
 // ---------------------------------------------------------------------------
+// Forward decls for the host-initiated (client) path, defined after the callback
+// tables they reference.
+static void hid_client_connect_intr(bt_hid_dev_t *d);
+static void hid_client_busy_clear(void);
+
 static void hid_try_attach(bt_hid_dev_t *d) {
     if (d && d->ctrl && d->intr) {
         bt_hid_attach_classic(d->handle, &d->addr, d->ctrl, d->intr);
@@ -153,6 +190,14 @@ static void hid_on_connect_ctrl(l2cap_chan_t *c) {
     hci_conn_t *hc = hci_conn_by_handle(c->handle);
     if (hc) d->addr = hc->peer;
     kprintf("[BT-HID] control channel open (handle 0x%04x)\n", c->handle);
+    bootlog_write("[BT-HID] Classic control channel open (handle 0x%04x)", c->handle);
+    // Host-initiated (client) path: control is now OPEN, so bring up the
+    // interrupt channel ourselves (spec order: control before interrupt). On the
+    // inbound/server path the device opens interrupt to us, so d->initiator is 0
+    // there and we must not initiate. Guard on !d->intr so an interrupt that
+    // already arrived (or a duplicate on_connect) does not double-issue.
+    if (d->initiator && !d->intr)
+        hid_client_connect_intr(d);
     hid_try_attach(d);
 }
 
@@ -164,6 +209,7 @@ static void hid_on_connect_intr(l2cap_chan_t *c) {
     hci_conn_t *hc = hci_conn_by_handle(c->handle);
     if (hc) d->addr = hc->peer;
     kprintf("[BT-HID] interrupt channel open (handle 0x%04x)\n", c->handle);
+    bootlog_write("[BT-HID] Classic interrupt channel open (handle 0x%04x)", c->handle);
     hid_try_attach(d);
 }
 
@@ -174,6 +220,11 @@ static void hid_on_disconnect(l2cap_chan_t *c) {
     if (d->intr == c) d->intr = NULL;
     if (!d->ctrl && !d->intr) {
         kprintf("[BT-HID] device detached (handle 0x%04x)\n", c->handle);
+        bootlog_write("[BT-HID] HID device detached (handle 0x%04x)", c->handle);
+        // Release the one-target-at-a-time client guard if this was our
+        // host-initiated device, so the next discovered HID can be brought up.
+        if (d->initiator) hid_client_busy_clear();
+        d->initiator = 0;
         d->active = 0;
     }
 }
@@ -213,6 +264,74 @@ static const l2cap_callbacks_t hid_ctrl_cb = { hid_on_connect_ctrl, hid_ctrl_dat
 static const l2cap_callbacks_t hid_intr_cb = { hid_on_connect_intr, hid_intr_data, hid_on_disconnect };
 
 // ---------------------------------------------------------------------------
+// Classic HIDP L2CAP CLIENT (host-initiated, [no-ticket] bthidp)
+//
+// For a device WE paged outbound (discovered is_hid, then hci_classic_connect),
+// the device sits with an authenticated + encrypted ACL link but never opens the
+// HID L2CAP channels; the HOST must initiate them. This is the client role
+// mirroring the server side above: instead of accepting CONN_REQ on 0x11/0x13,
+// we ISSUE CONN_REQ via l2cap.c's l2cap_connect(), whose existing signalling
+// (sig_conn_rsp handles CONN_RSP 0x03 -> CONFIG_REQ 0x04; sig_config_rsp handles
+// CONFIG_RSP 0x05) drives the config handshake and fires the SAME on_connect
+// callbacks. So no parallel signalling is added: we only sequence the two
+// connects and reuse hid_ctrl_cb / hid_intr_cb unchanged.
+//
+// Sequence: encryption complete on an outbound is_hid Classic link
+//   -> l2cap_connect(control 0x0011, hid_ctrl_cb)
+//   -> hid_on_connect_ctrl (control OPEN) -> hid_client_connect_intr()
+//   -> l2cap_connect(interrupt 0x0013, hid_intr_cb)
+//   -> hid_on_connect_intr (interrupt OPEN) -> hid_try_attach -> boot protocol.
+//
+// One HID target at a time (g_hid_client_busy), like gatt.c's g_autoconnect_busy.
+// Event-driven throughout: no busy/poll wait, driven off L2CAP signalling events.
+// ---------------------------------------------------------------------------
+static int g_hid_client_busy = 0;
+
+static void hid_client_busy_clear(void) { g_hid_client_busy = 0; }
+
+static void hid_client_connect_intr(bt_hid_dev_t *d) {
+    if (!d) return;
+    kprintf("[BT-HID] control up (outbound); connecting interrupt PSM 0x%04x (handle 0x%04x)\n",
+            L2CAP_PSM_HID_INTERRUPT, d->handle);
+    l2cap_connect(d->handle, L2CAP_PSM_HID_INTERRUPT, &hid_intr_cb, d);
+}
+
+// Encryption-change observer. Fires for every link (LE included), so filter hard:
+// Classic only (LE/HOGP is gatt.c's), outbound only (role 0 = we are master; an
+// inbound link is role 1 and the device opens the channels itself), is_hid only.
+static void hid_encrypt_event(hci_handle_t h, uint8_t enabled) {
+    if (!enabled) return;
+    hci_conn_t *c = hci_conn_by_handle(h);
+    if (!c) return;
+    if (c->type != HCI_LINK_ACL_CLASSIC) return;   // LE/HOGP handled by gatt.c
+    if (c->role != 0) return;                       // outbound (master) only
+    hci_disc_dev_t dd;
+    if (hci_disc_find(&c->peer, &dd) != BT_OK || !dd.is_hid) return;  // is_hid only
+
+    // Guard against double-initiation: this handle already being brought up/up, or
+    // another HID target already in flight.
+    bt_hid_dev_t *d = dev_by_handle(h);
+    if (d && (d->initiator || d->ctrl || d->intr)) return;
+    if (g_hid_client_busy) return;
+
+    d = dev_alloc(h);
+    if (!d) return;
+    d->transport = BT_HID_TRANSPORT_CLASSIC;
+    d->addr = c->peer;
+    d->initiator = 1;
+    g_hid_client_busy = 1;
+    kprintf("[BT-HID] outbound Classic HID link encrypted (handle 0x%04x); initiating HIDP L2CAP client, control PSM 0x%04x\n",
+            h, L2CAP_PSM_HID_CONTROL);
+    bootlog_write("[BT-HID] outbound Classic HID link encrypted (handle 0x%04x); initiating HIDP L2CAP client", h);
+    if (!l2cap_connect(h, L2CAP_PSM_HID_CONTROL, &hid_ctrl_cb, d)) {
+        kprintf("[BT-HID] control connect could not start (no L2CAP channel)\n");
+        d->initiator = 0;
+        d->active = 0;
+        hid_client_busy_clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // API
 // ---------------------------------------------------------------------------
 int bt_hid_attach_classic(hci_handle_t h, const bt_addr_t *addr,
@@ -227,6 +346,7 @@ int bt_hid_attach_classic(hci_handle_t h, const bt_addr_t *addr,
     uint8_t setproto = HIDP_HDR_SET_PROTOCOL | 0x00;   // 0 = boot protocol
     if (ctrl) l2cap_send(ctrl, &setproto, 1);
     kprintf("[BT-HID] attached classic HID (handle 0x%04x), boot protocol set\n", h);
+    bootlog_write("[BT-HID] attached Classic HID (handle 0x%04x), boot protocol set", h);
     return BT_OK;
 }
 
@@ -237,6 +357,7 @@ int bt_hid_attach_ble(hci_handle_t h, const bt_addr_t *addr, bt_hid_kind_t kind)
     d->kind = kind;
     if (addr) d->addr = *addr;
     kprintf("[BT-HID] attached BLE HID (handle 0x%04x kind %d)\n", h, (int)kind);
+    bootlog_write("[BT-HID] attached BLE HID (handle 0x%04x kind %d)", h, (int)kind);
     return BT_OK;
 }
 
@@ -255,8 +376,12 @@ void bt_hid_poll(void) { /* input is push-driven via l2cap on_data */ }
 
 int bt_hid_init(void) {
     for (int i = 0; i < BT_HID_MAX_DEVICES; i++) g_hid[i].active = 0;
+    g_hid_client_busy = 0;
     l2cap_register_server(L2CAP_PSM_HID_CONTROL,   &hid_ctrl_cb);
     l2cap_register_server(L2CAP_PSM_HID_INTERRUPT, &hid_intr_cb);
-    kprintf("[BT-HID] init: HID control/interrupt servers registered\n");
+    // Host-initiated client: bring up HID channels for a device we paged outbound
+    // once its link is encrypted (the server registrations above cover inbound).
+    hci_add_encrypt_observer(hid_encrypt_event);
+    kprintf("[BT-HID] init: HID control/interrupt servers + outbound-encrypt observer registered\n");
     return BT_OK;
 }

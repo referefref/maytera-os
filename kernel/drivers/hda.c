@@ -27,7 +27,7 @@
 // produced NOTHING.
 //
 // This was not a theoretical problem. The real-hardware capture taken on
-// 2026-08-14 (the build host:<workspace>, build 1902,
+// 2026-08-14 (the build host:/root/imac-hw-capture-20260814/BOOTLOG.TXT, build 1902,
 // 287 lines) contains xHCI, HID, ASIX, USB-hub, auth and session lines and
 // ZERO lines about audio - not the controller probe, not STATESTS, not the
 // codec identity, not the output-DMA check. Whether HDA even ran on that boot

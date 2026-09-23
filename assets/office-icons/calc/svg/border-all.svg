@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- MayteraOS CALC toolbar icon: border-all. Original artwork, 24 grid, stroke 1.5 round (4 px at the 64 px raster, the suite weight). -->
+  <rect x="4" y="4" width="16" height="16" rx="1" stroke="#ffffff" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M12 4v16M4 12h16" stroke="#ffffff" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

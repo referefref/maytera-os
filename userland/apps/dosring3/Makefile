@@ -52,7 +52,8 @@ LDFLAGS = -pie --no-dynamic-linker -z notext -nostdlib -z max-page-size=0x1000 \
 # stale /APPS/COMPOSIT. build/golden-new-apps.list declares DOSUSER to match.
 TARGET  = DOSUSER
 
-KSRC   := $(wildcard $(GEN)/dos/*.c) $(wildcard $(GEN)/exec/*.c) $(GEN)/string.c
+KSRC   := $(wildcard $(GEN)/dos/*.c) $(wildcard $(GEN)/exec/*.c) \
+          $(wildcard $(GEN)/fs/*.c) $(GEN)/string.c
 KOBJ   := $(patsubst $(GEN)/%.c,$(BUILD)/k_%.o,$(subst /,_,$(KSRC)))
 RUSTLIB = $(BUILD)/libdosrust.a
 CRT0    = $(LIBC_DIR)/crt0.o
@@ -75,7 +76,7 @@ clean:
 # never be silently satisfied by something that returns a plausible value.
 symbols: gen $(RUSTLIB)
 	@mkdir -p $(BUILD)
-	@set -e; for f in $(GEN)/dos/*.c $(GEN)/exec/*.c; do \
+	@set -e; for f in $(GEN)/dos/*.c $(GEN)/exec/*.c $(GEN)/fs/*.c; do \
 	   o=$(BUILD)/$$(echo $$f | sed 's|$(GEN)/||; s|/|_|g; s|\.c$$|.o|'); \
 	   $(CC) $(CFLAGS) -c $$f -o $$o; done
 	@nm -g --defined-only $(BUILD)/*.o $(RUSTLIB) 2>/dev/null \
@@ -91,7 +92,7 @@ SHIM_U   = $(BUILD)/ushim.o $(BUILD)/dosmain.o
 
 $(TARGET): gen $(RUSTLIB)
 	@mkdir -p $(BUILD)
-	@set -e; for f in $(GEN)/dos/*.c $(GEN)/exec/*.c \
+	@set -e; for f in $(GEN)/dos/*.c $(GEN)/exec/*.c $(GEN)/fs/*.c \
 	                  $(GEN)/video/font.c $(GEN)/drivers/keymap.c \
 	                  $(GEN)/drivers/audio_resample.c; do \
 	   o=$(BUILD)/$$(echo $$f | sed 's|$(GEN)/||; s|/|_|g; s|\.c$$|.o|'); \

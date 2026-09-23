@@ -92,11 +92,15 @@ This produces `kernel/kernel.elf`. Useful variants:
 - `make clean` - remove `obj/`, `kernel.elf`, and the Rust static lib.
 
 Sources are collected per subdirectory with `$(wildcard ...)` (`mm/`, `cpu/`,
-`video/`, `drivers/`, `net/` + `net/tls/`, `crypto/`, `fs/`, `shell/`, `gui/`,
-`exec/`, `dos/`, `proc/`, `games/`, `vfs/`, `apps/`, `bt/`, `drivers/net/wifi/`,
-plus the vendored media decoders under `media/`). Adding a new `.c` file in one of
-these directories is enough for the Makefile to pick it up; no source list needs
-editing. Assembly objects use an `_asm.o` suffix so `foo.asm` and `foo.c` in the
+`video/`, `drivers/` + `drivers/virtio/` + `drivers/net/wifi/`, `net/` + `net/tls/`,
+`crypto/`, `fs/`, `gui/`, `exec/`, `dos/`, `proc/`, `security/`, `ipc/`, `sync/`,
+`vfs/`, `bt/`, plus the vendored media decoders under `media/`). `net/ssh/` is
+collected from an explicit file list rather than a wildcard, on purpose, so a new
+file cannot join the build unnoticed; `drivers/virtio/` and `fs/graphfs/` each get
+their own `$(wildcard ...)` variable because the parent `drivers/`/`fs/` wildcard
+does not descend into subdirectories. Adding a new `.c` file in a wildcarded
+directory is enough for the Makefile to pick it up; no source list needs editing.
+There is no `kernel/games` directory: DOOM and every game are Ring 3 userland apps. Assembly objects use an `_asm.o` suffix so `foo.asm` and `foo.c` in the
 same directory do not collide in `obj/`.
 
 **The build number is not bumped by `make`.** `kernel/version.h` carries
@@ -111,6 +115,34 @@ into the checkout it builds from. If you are building the kernel by hand for
 development, bump `MAYTERA_BUILD_NUMBER` yourself when it matters to you; a
 manual `make` will not do it, and `build-golden.sh`'s own bump does not depend on
 whatever you left in your working tree.
+
+### 3.0a Fast iteration: build and boot the kernel ALONE, not a golden
+
+If you are iterating on kernel code, do NOT go round the golden pipeline for
+every attempt. A golden build is queued and serialised on one build slot, and
+its recent median runtime is around 695 seconds BEFORE any queue wait. Almost
+none of that work is the kernel compile.
+
+There is already a worked kernel-only harness in the tree rather than a recipe
+to retype: `tools/smp-payoff/smppay-kbuild.sh`. It tars the `kernel/` subtree
+out of a worktree, builds it in the kernel build container with `make -j4`, and
+pulls back BOTH `kernel.elf` and `kernel.dbg.elf`. It is parameterised by the
+`SRC` and `OUT` variables in its first few lines; point those at your own
+worktree and it is reusable as-is.
+
+Its companion scripts (`smppay-setup.sh` to deploy onto a VM's boot paths,
+`smppay-run.sh` for one boot with serial capture plus a screendump) are a
+measurement rig for a specific campaign and are DELIBERATELY hard-gated to a
+single VM ID. Adapt that line, do not pass a different argument. Read
+`tools/smp-payoff/README.md` before reaching for them.
+
+**The caveat that will otherwise cost you a session: the shipped `kernel.elf` is
+STRIPPED** (section 3.2's strip gate enforces it), so a serial address means
+nothing to `addr2line` against it. Every address-printing diagnostic in the
+kernel (`mm/demand.c`, `sync/noblock.c`, `security/stack_guard.c`) expects to be
+resolved against `kernel.dbg.elf`. If the point of your run is to resolve an
+address, deploy a kernel you built yourself and keep the matching
+`kernel.dbg.elf` beside it.
 
 ### 3.1 Kernel target: soft-float, SSE disabled
 
@@ -577,7 +609,7 @@ one worth remembering.
   describe how to build one from scratch, since that has not been verified
   against a committed script.
 
-## 9. Boot-verifying an image, and what a VIRGIN image looks like
+## 11. Boot-verifying an image, and what a VIRGIN image looks like
 
 Section 7 checks an image's STRUCTURE. This section checks that it BOOTS, and it
 exists because the two are easy to confuse and the boot criterion was wrong for

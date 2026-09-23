@@ -29,6 +29,7 @@
 #define isfinite(x)  (!isnan((x) - (x)))
 #define signbit(x)   (__builtin_signbit(x))
 #define fpclassify(x) (isnan(x)?0:isinf(x)?1:((x)==0.0?2:4))
+#define isnormal(x)  (__builtin_isnormal(x))
 
 // Core (double)
 double fabs(double x);

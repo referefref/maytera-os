@@ -303,6 +303,82 @@ static uint8_t g_shotraw[1024 * 1024];         // raw screenshot bytes (BMP) - s
 static uint32_t g_shotpx[560 * 340];           // decoded screenshot pixels (BGRA) - detail page
 
 // ---------------------------------------------------------------------------
+// #glassrepo: frosted-wallpaper backdrop (wizard glass, docs section 2). The
+// current wallpaper's 100x62 thumbnail (/WPTHUMB/<file>) is decoded up to a
+// small working buffer, box-blurred, and tinted toward the THEME's window
+// surface (C_surface) at ~0.62, then SYS_WIN_BLIT rescales it to fill the
+// window as the app backdrop so the panels read as glass floating on the
+// blurred wallpaper. Falls back to a C_surface vertical gradient when no
+// wallpaper file (gradient desktop).
+//
+// (apprepoui, 2026-09-16) The tint used to be the wizard's WEL_BG_MID #122420
+// (a dark teal) no matter which theme was active, which is one of the two
+// places the whole window came out green on the owner's iMac. The tint now
+// follows the active theme's surface colour, and the cache key includes it so
+// a theme change re-tints instead of serving the previous theme's backdrop.
+// ---------------------------------------------------------------------------
+#define BD_W 240
+#define BD_H 150
+static uint32_t g_backdrop[BD_W * BD_H];
+static uint32_t g_bd_tmp[BD_W * BD_H];
+static int g_backdrop_wi = -2;
+static uint32_t g_backdrop_tint = 0xFFFFFFFF;   // C_surface the cached backdrop was tinted with
+static uint32_t C_surface;                       // defined with the rest of the palette below
+
+static void win_blit_scaled(int w, int h, const uint32_t *px) {
+    long packed = (long)((w & 0xFFFF) | ((h & 0xFFFF) << 16));
+    syscall5(SYS_WIN_BLIT, (long)g_win, 0, 0, packed, (long)px);
+}
+static void bd_fill_gradient(void) {
+    uint32_t top = gui_lighten(C_surface, 6), bot = gui_darken(C_surface, 10);
+    for (int y = 0; y < BD_H; y++) {
+        uint32_t c = gui_mix(top, bot, y * 255 / (BD_H - 1));
+        for (int x = 0; x < BD_W; x++) g_backdrop[y * BD_W + x] = c;
+    }
+}
+static void bd_blur_and_tint(void) {
+    for (int pass = 0; pass < 3; pass++) {
+        int R = 2;
+        for (int y = 0; y < BD_H; y++)
+            for (int x = 0; x < BD_W; x++) {
+                int rr=0,gg=0,bb=0,cnt=0;
+                for (int dx=-R; dx<=R; dx++){int xx=x+dx; if(xx<0)xx=0; if(xx>=BD_W)xx=BD_W-1;
+                    uint32_t c=g_backdrop[y*BD_W+xx]; rr+=(c>>16)&0xFF; gg+=(c>>8)&0xFF; bb+=c&0xFF; cnt++;}
+                g_bd_tmp[y*BD_W+x]=(uint32_t)(((rr/cnt)<<16)|((gg/cnt)<<8)|(bb/cnt));
+            }
+        for (int x = 0; x < BD_W; x++)
+            for (int y = 0; y < BD_H; y++) {
+                int rr=0,gg=0,bb=0,cnt=0;
+                for (int dy=-R; dy<=R; dy++){int yy=y+dy; if(yy<0)yy=0; if(yy>=BD_H)yy=BD_H-1;
+                    uint32_t c=g_bd_tmp[yy*BD_W+x]; rr+=(c>>16)&0xFF; gg+=(c>>8)&0xFF; bb+=c&0xFF; cnt++;}
+                g_backdrop[y*BD_W+x]=(uint32_t)(((rr/cnt)<<16)|((gg/cnt)<<8)|(bb/cnt));
+            }
+    }
+    for (int i = 0; i < BD_W*BD_H; i++) g_backdrop[i] = gui_mix(g_backdrop[i], C_surface, 158);
+}
+static void build_backdrop(void) {
+    int wi = get_wallpaper();
+    if (g_backdrop_wi == wi && g_backdrop_tint == C_surface) return;   // cached until wallpaper or theme changes
+    g_backdrop_wi = wi;
+    g_backdrop_tint = C_surface;
+    bd_fill_gradient();
+    wp_entry_t wps[64];
+    int nwp = wp_enumerate(wps, 64);
+    if (wi < 0 || wi >= nwp || !wps[wi].file[0]) { bd_blur_and_tint(); return; }
+    char path[80]; strcpy(path, "/WPTHUMB/");
+    strncat(path, wps[wi].file, sizeof(path) - strlen(path) - 1);
+    int fd = sys_open(path, O_RDONLY);
+    if (fd < 0) { bd_blur_and_tint(); return; }
+    int n = sys_read(fd, (char *)g_shotraw, sizeof(g_shotraw));
+    sys_close(fd);
+    if (n <= 0) { bd_blur_and_tint(); return; }
+    int dims[2] = {0,0};
+    int r = decode_image(g_shotraw, (unsigned)n, BD_W, BD_H, g_backdrop, sizeof(g_backdrop), dims);
+    if (r <= 0 || dims[0] != BD_W || dims[1] != BD_H) bd_fill_gradient();
+    bd_blur_and_tint();
+}
+
+// ---------------------------------------------------------------------------
 // Package model
 // ---------------------------------------------------------------------------
 #define MAXPKG   64
@@ -429,6 +505,15 @@ static int g_rate_hover = -1;        // 0..4 while the mouse is over a rating st
 
 static int  g_mx = -1, g_my = -1;   // last mouse position (content-relative)
 
+// #storeflash: signature of "what is hovered right now", per hover_signature()
+// below (defined later, once every g_*hit hover-hitbox global it reads is in
+// scope). EVENT_MOUSE_MOVE compares a freshly computed one against this
+// before deciding whether anything actually needs to be repainted; see the
+// comment on hover_signature() for why this exists (chrome flashing under
+// mouse movement on real hardware).
+static uint64_t g_hover_sig = 0;
+static uint64_t hover_signature(int mx, int my);
+
 // status / progress banner
 static char g_status[128] = {0};
 static int  g_status_kind = 0;      // 0 none, 1 info, 2 success, 3 error
@@ -436,8 +521,9 @@ static int  g_status_kind = 0;      // 0 none, 1 info, 2 success, 3 error
 // ---------------------------------------------------------------------------
 // Theme palette
 // ---------------------------------------------------------------------------
-static uint32_t C_surface, C_panel, C_card, C_ink, C_ink_dim, C_accent,
+static uint32_t C_panel, C_card, C_ink, C_ink_dim, C_accent,
                 C_accent_ink, C_border, C_hair, C_hero1, C_hero2, C_ok, C_err;
+// (C_surface is declared above, next to the backdrop builder that tints with it.)
 
 static void setup_palette(void) {
     uint32_t wbg  = theme_color(THEME_COLOR_WINDOW_BG);
@@ -466,6 +552,15 @@ static void setup_palette(void) {
     C_hero2       = gui_mix(acc, wbg, 140);
     C_ok          = 0x3FA34D;
     C_err         = 0xC0392B;
+
+    // (apprepoui, 2026-09-16) The #glassrepo restyle of 2026-09-06 used to
+    // OVERWRITE every token above with the first-run wizard's dark-teal glass
+    // palette (surface #0E1D1B, panel #16302A, accent #6AE2CF, hero #0F8068)
+    // "regardless of the active theme". That is exactly why the owner saw a
+    // GREEN window next to blue-grey widgets on the real iMac: the store was
+    // the only app not reading the theme. The override is gone; the tokens
+    // stay theme-derived like Settings/Files (docs/UI_STYLE_GUIDE.md), and
+    // the frosted backdrop is tinted with C_surface (see build_backdrop).
 
     // Feed the shared style engine so gui_* primitives match. #612: this used
     // to compare theme_get_active() to the built-in Classic theme's id (2) -
@@ -497,6 +592,74 @@ static void T(int x, int y, const char *s, int size, uint32_t c) {
     win_draw_text_ttf(g_win, x, y, s, size, c);
 }
 static int TW(const char *s, int size) { return gui_ttf_width(s, size); }
+
+// ---------------------------------------------------------------------------
+// The Maytera logo mark (apprepoui, 2026-09-16).
+// ---------------------------------------------------------------------------
+// The header used to draw a placeholder: an accent rounded square with a
+// TTF "M" in it. The owner asked for the REAL mark, the one the first-run
+// wizard shows. That is /OOBE/LOGOMARK.A8 (userland/apps/setup/assets,
+// shipped to the ext2 root by build-golden.sh), a 96x96 A8 COVERAGE MASK
+// with a 16-byte "MA81" header (w, h, stride as u16le at offsets 4/6/8),
+// and it is consumed here EXACTLY the way setup/main.rs's logo_load()/
+// logo_draw() consume it: validate the header, then at draw time compute
+// out = mix(background, ink, coverage) ourselves and blit ONE opaque image,
+// because no drawing primitive can read its destination (the same contract
+// gui_fill_circle_aa(..., color, bg) uses). The background is the header's
+// own top-lit gradient, recomputed per row with the identical formula
+// gui_fill_rounded_grad() paints it with (j*255/(h-1)), so the antialiased
+// edge lands on the colour that is really underneath it and shows no halo.
+// The 96px source is box-averaged 3x3 down to 32px, the size the old badge
+// occupied, so nothing else in the header moves. Ink is the theme accent,
+// mirroring the wizard (which inks it with its accent over its glass).
+#define LOGO_N      96
+#define LOGO_HDR    16
+#define LOGO_DRAW_N 32                         // 96 / 32 = exact 3:1 box downsample
+static uint8_t  g_logo_raw[LOGO_HDR + LOGO_N * LOGO_N];
+static uint32_t g_logo_px[LOGO_DRAW_N * LOGO_DRAW_N];
+static int      g_logo_ok = 0;
+
+// Once at startup, never on the draw path.
+static void logo_load(void) {
+    g_logo_ok = 0;
+    int fd = sys_open("/OOBE/LOGOMARK.A8", O_RDONLY);
+    if (fd < 0) return;
+    int want = (int)sizeof(g_logo_raw);
+    int got = sys_read(fd, (char *)g_logo_raw, want);
+    sys_close(fd);
+    if (got != want) return;
+    const uint8_t *r = g_logo_raw;
+    // Validate the header rather than trusting the path: a file of the right
+    // LENGTH with the wrong content would otherwise draw as noise.
+    if (r[0] != 'M' || r[1] != 'A' || r[2] != '8' || r[3] != '1') return;
+    int w = r[4] | (r[5] << 8), h = r[6] | (r[7] << 8), stride = r[8] | (r[9] << 8);
+    if (w != LOGO_N || h != LOGO_N || stride != LOGO_N) return;
+    g_logo_ok = 1;
+}
+
+// Composites the mark, n x n, at window (x, y) over a vertical gradient that
+// runs `top` -> `bottom` across grad_h rows starting at window y=0 (the header
+// gradient), inked with the theme accent. Returns 1 if drawn, 0 if the asset
+// is unavailable so the caller can fall back.
+static int logo_draw(int x, int y, int n, uint32_t top, uint32_t bottom, int grad_h) {
+    if (!g_logo_ok || n <= 0 || n > LOGO_DRAW_N || (LOGO_N % n) != 0) return 0;
+    int s = LOGO_N / n;                        // source pixels per output pixel
+    const uint8_t *m = g_logo_raw + LOGO_HDR;
+    for (int row = 0; row < n; row++) {
+        int j = y + row;
+        uint32_t bg = (grad_h > 1) ? gui_mix(top, bottom, j * 255 / (grad_h - 1)) : top;
+        for (int col = 0; col < n; col++) {
+            int sum = 0;
+            for (int dy = 0; dy < s; dy++)
+                for (int dx = 0; dx < s; dx++)
+                    sum += m[(row * s + dy) * LOGO_N + (col * s + dx)];
+            int cvg = sum / (s * s);           // 0..255 coverage, box-averaged
+            g_logo_px[row * n + col] = gui_mix(bg, C_accent, cvg);
+        }
+    }
+    win_draw_image(g_win, x, y, n, n, g_logo_px);
+    return 1;
+}
 
 // Truncate s to fit within max_w px at font size; writes into out (cap).
 static void trunc_fit(const char *s, int size, int max_w, char *out, int cap) {
@@ -598,6 +761,41 @@ static int http_get(const char *url, uint8_t *buf, int cap) {
 // ---------------------------------------------------------------------------
 static void draw_all(void);
 static int g_close_requested = 0;
+
+// #netfix2: SAY WHY, NOT JUST THAT.
+//
+// "Couldn't reach the App Repo server" is true and useless. It is the same
+// sentence whether the resolver never answered, the gateway dropped the SYN,
+// the certificate could not be validated because this machine's clock is wrong,
+// or the repo returned a 500. Those need four different actions and the user
+// has no way to tell them apart, which is why the same report ("app store not
+// working") has come back for months with nothing to act on.
+//
+// SYS_NET_LAST_ERROR returns the reason the kernel's fetch chokepoint recorded
+// for this process's last fetch; net_error_advice() turns it into a sentence.
+// If nothing was recorded, keep the caller's original wording rather than
+// inventing a cause.
+static void as_set_net_error(const char *fallback) {
+    char reason[96];
+    reason[0] = 0;
+    int code = net_last_error(reason, sizeof(reason));
+    const char *advice = (code > 0 && reason[0]) ? net_error_advice(reason) : "";
+    if (advice && advice[0]) {
+        strncpy(g_status, advice, sizeof(g_status) - 1);
+    } else if (code > 0 && reason[0]) {
+        char s[128];
+        strncpy(s, fallback, sizeof(s) - 1); s[sizeof(s) - 1] = 0;
+        int sl = strlen(s);
+        if (sl < (int)sizeof(s) - 4) { s[sl] = ':'; s[sl+1] = ' '; s[sl+2] = 0; }
+        strncat(s, reason, sizeof(s) - strlen(s) - 1);
+        strncpy(g_status, s, sizeof(g_status) - 1);
+    } else {
+        strncpy(g_status, fallback, sizeof(g_status) - 1);
+    }
+    g_status[sizeof(g_status) - 1] = 0;
+    g_status_kind = 3;
+}
+
 
 static int http_get_live(const char *url, uint8_t *buf, int cap, const char *what) {
     int job = http_fetch_start(url);
@@ -1049,7 +1247,7 @@ static int acquire_verified_package(pkg_t *pk, pkgsrc_t *src) {
     // dispatches to https_get for an https:// URL).
     if (total == 0 || total <= DL_SMALL_MAX) {
         int n = http_get(url, g_dl, (int)sizeof(g_dl));
-        if (n <= 0) { strcpy(g_status, "Download failed"); g_status_kind = 3; return -1; }
+        if (n <= 0) { as_set_net_error("Download failed"); return -1; }   // #netfix2
         int vrc = pkgsig_verify_package(g_dl, (size_t)n, pk->sha256);
         if (vrc != PKGSIG_OK) {
             strcpy(g_status, "REFUSED: ");
@@ -1924,7 +2122,7 @@ static int install_pkg(int idx) {
     // over plain http (STORE.SRC pointing at a LAN dev server, not the
     // https:// production default) deserves to be TOLD its install count did
     // not move, instead of only discoverable by independently checking
-    // <internal server path> on the stats server.
+    // /srv/maytera-repo-stats/download_log on the stats server.
     // #611 left a hole this run MEASURED: it only spoke up when the repo was
     // plain http. With the shipped https repo the POST can still fail (it did:
     // a wp-cyber install over https://updates.maytera.net completed while
@@ -1988,7 +2186,7 @@ static int load_manifest(void) {
         n = http_get_live(murl, (uint8_t *)g_manifest, sizeof(g_manifest) - 1, "Loading catalog");
     }
     if (g_close_requested) return -1;
-    if (n <= 0) { strcpy(g_status, "Couldn't reach the App Repo server"); g_status_kind = 3; return -1; }
+    if (n <= 0) { as_set_net_error("Couldn't reach the App Repo server"); return -1; }   // #netfix2
     g_manifest[n] = 0;
 
     // ---- #559: AUTHENTICATE THE MANIFEST BEFORE TRUSTING A SINGLE BYTE OF IT.
@@ -2311,14 +2509,19 @@ static void draw_header(void) {
     // technique gui_soft_shadow() uses for cards) gives it a real edge over
     // the content below without inventing a new look.
     gui_fill_rounded_grad(g_win, 0, 0, g_win_w, HEADER_H, 0, gui_lighten(C_panel, 5), C_panel);
+    gui_fill_rect(g_win, 0, 0, g_win_w, 1, gui_lighten(C_panel, 16)); // #glass: top highlight edge
     gui_fill_rect(g_win, 0, HEADER_H - 1, g_win_w, 1, C_border);
     gui_fill_rect(g_win, 0, HEADER_H,     g_win_w, 1, gui_mix(C_surface, 0x00000000, 26));
     gui_fill_rect(g_win, 0, HEADER_H + 1, g_win_w, 1, gui_mix(C_surface, 0x00000000, 13));
     gui_fill_rect(g_win, 0, HEADER_H + 2, g_win_w, 1, gui_mix(C_surface, 0x00000000, 5));
-    // logo mark
-    gui_soft_shadow(g_win, 16, 14, 32, 32, 8, C_panel);
-    gui_fill_rounded_aa(g_win, 16, 13, 32, 32, 8, C_accent, C_panel);
-    T(24, 20, "M", 20, C_accent_ink);
+    // logo mark: the real Maytera mark (the first-run wizard's /OOBE/LOGOMARK.A8),
+    // composited against the header gradient above. Only if that asset is
+    // missing does the old accent-square "M" placeholder draw.
+    if (!logo_draw(16, 13, LOGO_DRAW_N, gui_lighten(C_panel, 5), C_panel, HEADER_H)) {
+        gui_soft_shadow(g_win, 16, 14, 32, 32, 8, C_panel);
+        gui_fill_rounded_aa(g_win, 16, 13, 32, 32, 8, C_accent, C_panel);
+        T(24, 20, "M", 20, C_accent_ink);
+    }
     T(58, 12, "App Repo", 20, C_ink);
     T(58, 36, "MayteraOS Software", 11, C_ink_dim);
 
@@ -2375,7 +2578,12 @@ static void draw_sidebar(void) {
     // #B3: same flat-panel-plus-hairline problem as the header; add a matching
     // soft shadow band down its right edge so it reads as a raised rail over
     // the content, not a same-plane gray rectangle.
-    gui_fill_rect(g_win, 0, HEADER_H, SIDEBAR_W, g_win_h - HEADER_H, C_panel);
+    // #glass (App Repo pilot, docs/UI_GLASS_DESIGN_SYSTEM.md sections 10-11): a vertical
+    // tint gradient plus a 1px top highlight turn the flat rail into a raised glass panel;
+    // the right-edge stroke + 3-band shadow below already carry the depth on that side.
+    gui_fill_rounded_grad(g_win, 0, HEADER_H, SIDEBAR_W, g_win_h - HEADER_H, 0,
+                          gui_lighten(C_panel, 7), gui_darken(C_panel, 3));
+    gui_fill_rect(g_win, 0, HEADER_H, SIDEBAR_W, 1, gui_lighten(C_panel, 14));
     gui_fill_rect(g_win, SIDEBAR_W - 1, HEADER_H, 1, g_win_h - HEADER_H, C_border);
     gui_fill_rect(g_win, SIDEBAR_W,     HEADER_H, 1, g_win_h - HEADER_H, gui_mix(C_surface, 0x00000000, 26));
     gui_fill_rect(g_win, SIDEBAR_W + 1, HEADER_H, 1, g_win_h - HEADER_H, gui_mix(C_surface, 0x00000000, 13));
@@ -2514,8 +2722,40 @@ static int draw_card(int x, int y, int w, pkg_t *pk, int idx) {
     return h;
 }
 
+// #glassrepo featured hero: one large auto-rotating screenshot + a thumbnail
+// strip on the left, the description on the right (the 3-shots-side-by-side
+// layout cut the description off). g_heropx caches the currently-shown shot;
+// the main loop advances g_feat_shot ~every 1.5s and reloads.
+static uint32_t g_heropx[400 * 226];
+static int g_hero_sw = 0, g_hero_sh = 0;
+static char g_hero_loaded[140] = {0};
+static int g_feat_shot = 0;
+static int g_rotate_tick = 0;
+static struct { int x, y, w, h, i; } g_herothumbhit[MAXSHOT];
+static int g_nherothumb = 0;
+
+static void load_hero_shot(pkg_t *pk, int idx) {
+    if (idx < 0 || idx >= pk->nshots) { g_hero_loaded[0] = 0; g_hero_sw = 0; return; }
+    char key[140]; strncpy(key, pk->id, 120); key[120] = 0;
+    char ks[8]; gui_itoa(idx, ks, sizeof(ks));
+    strncat(key, ":", sizeof(key) - strlen(key) - 1);
+    strncat(key, ks, sizeof(key) - strlen(key) - 1);
+    if (strcmp(g_hero_loaded, key) == 0) return;       // cached
+    g_hero_loaded[0] = 0; g_hero_sw = 0;
+    char url[160]; repo_url("", url, 160);
+    strncat(url, pk->shots[idx], sizeof(url) - strlen(url) - 1);
+    int n = http_get(url, g_shotraw, sizeof(g_shotraw));
+    if (n <= 0) return;
+    int dims[2] = {0,0};
+    int r = decode_image(g_shotraw, (unsigned)n, 400, 225, g_heropx, sizeof(g_heropx), dims);
+    if (r > 0 && dims[0] > 0 && dims[1] > 0) {
+        g_hero_sw = dims[0]; g_hero_sh = dims[1];
+        strncpy(g_hero_loaded, key, sizeof(g_hero_loaded) - 1);
+    }
+}
+
 // Draw the featured hero banner; returns height used.
-static int draw_hero(int x, int y, int w) {
+static int __attribute__((unused)) draw_hero_OLD_UNUSED(int x, int y, int w) {
     // pick first featured package
     int fi = -1;
     for (int i = 0; i < g_npkg; i++) if (g_pkg[i].featured) { fi = i; break; }
@@ -2587,6 +2827,100 @@ static int draw_hero(int x, int y, int w) {
     return h;
 }
 
+static int draw_hero(int x, int y, int w) {
+    int fi = -1;
+    for (int i = 0; i < g_npkg; i++) if (g_pkg[i].featured) { fi = i; break; }
+    if (fi < 0 && g_nlist > 0) fi = g_list[0];
+    else if (fi < 0 && g_npkg > 0) fi = 0;
+    if (fi < 0) return 0;
+    pkg_t *pk = &g_pkg[fi];
+    if (fi != g_hero_idx) { g_hero_idx = fi; g_feat_shot = 0; g_hero_loaded[0] = 0; }
+
+    int h = 246;
+    gui_soft_shadow(g_win, x, y + 3, w, h, 16, C_surface);
+    gui_fill_rounded_grad(g_win, x, y, w, h, 16, C_hero2, C_hero1);
+    gui_rounded_border(g_win, x, y, w, h, 16, C_border);
+    // (apprepoui) theme-derived, not the wizard's DK_HEADLINE #F3FBF9 / #07110F
+    // glass constants: the hero must recolour with the theme like the rest.
+    uint32_t hi = gui_ink_on(C_hero1);
+    uint32_t sub = gui_mix(hi, C_hero1, 70);
+    uint32_t well = gui_mix(C_hero1, 0x000000, 150);   // the screenshot well, a darker pocket in the hero
+
+    int lx = x + 20;
+    int lw = (w - 40) * 58 / 100;
+    int rx = x + 20 + lw + 20;
+    int rw = x + w - 20 - rx;
+
+    // left header
+    int ic = 50;
+    draw_icon(lx, y + 18, ic, pk->id, pk->name, gui_mix(C_hero2, C_hero1, 60));
+    int nx = lx + ic + 14;
+    char nm[48]; trunc_fit(pk->name, 20, lw - (ic + 14), nm, sizeof(nm));
+    T(nx, y + 18, nm, 20, hi);
+    char meta[72]; strcpy(meta, cat_label(pk->category));
+    strncat(meta, "  \xb7  ", sizeof(meta) - strlen(meta) - 1);
+    strncat(meta, pk->author, sizeof(meta) - strlen(meta) - 1);
+    char metaf[72]; trunc_fit(meta, 11, lw - (ic + 14), metaf, sizeof(metaf));
+    T(nx, y + 43, metaf, 11, sub);
+    draw_rating_stars(nx, y + 60, 11, 2, pk->rating_avg100, C_accent, gui_mix(C_hero1, 0, 60), C_hero1);
+    char rt[8]; fmt_rating1(pk->rating_avg100, rt, sizeof(rt));
+    T(nx + 5 * 13 + 6, y + 59, rt, 11, sub);
+    if (pk->rating_count > 0) {
+        char c[16]; strcpy(c, "("); char cc[8]; gui_itoa(pk->rating_count, cc, sizeof(cc));
+        strncat(c, cc, sizeof(c) - strlen(c) - 1); strncat(c, ")", sizeof(c) - strlen(c) - 1);
+        T(nx + 5 * 13 + 6 + TW(rt, 11) + 6, y + 59, c, 11, sub);
+    }
+
+    // large screenshot area
+    int stx = lx, sty = y + 82;
+    int stw = lw, sth = h - 82 - 42;
+    gui_fill_rounded_aa(g_win, stx, sty, stw, sth, 10, well, C_hero1);
+    gui_rounded_border(g_win, stx, sty, stw, sth, 10, gui_mix(C_hero1, 0, 40));
+    if (g_hero_sw > 0) {
+        int dw = g_hero_sw, dh = g_hero_sh;
+        if (dw > stw) dw = stw;
+        if (dh > sth) dh = sth;
+        win_draw_image(g_win, stx + (stw - dw) / 2, sty + (sth - dh) / 2, dw, dh, g_heropx);
+    } else {
+        const char *ph = pk->nshots > 0 ? "Loading preview..." : "No preview";
+        T(stx + (stw - TW(ph, 12)) / 2, sty + sth / 2 - 6, ph, 12, sub);
+    }
+
+    // thumbnail strip
+    int tny = sty + sth + 8, tnw = 52, tnh = 30, tgap = 8;
+    g_nherothumb = 0;
+    int ns = pk->nshots > MAXSHOT ? MAXSHOT : pk->nshots;
+    for (int i = 0; i < ns; i++) {
+        int tx = stx + i * (tnw + tgap);
+        if (tx + tnw > stx + stw) break;
+        uint32_t tc = (i == g_feat_shot) ? C_accent : gui_mix(C_hero1, 0, 40);
+        gui_fill_rounded_aa(g_win, tx, tny, tnw, tnh, 6, gui_mix(C_hero1, well, 110), C_hero1);
+        gui_rounded_border(g_win, tx, tny, tnw, tnh, 6, tc);
+        g_herothumbhit[g_nherothumb].x = tx; g_herothumbhit[g_nherothumb].y = tny;
+        g_herothumbhit[g_nherothumb].w = tnw; g_herothumbhit[g_nherothumb].h = tnh;
+        g_herothumbhit[g_nherothumb].i = i; g_nherothumb++;
+    }
+
+    // right column
+    T(rx, y + 18, "FEATURED", 11, C_accent);
+    int dy = draw_wrapped(rx, y + 40, rw, pk->tagline[0] ? pk->tagline : pk->desc, 13, 19, gui_mix(hi, C_hero1, 30));
+    int tgy = dy + 10, tgx = rx;
+    for (int i = 0; i < pk->ntags && i < 4; i++) {
+        int tw2 = TW(pk->tags[i], 11) + 16;
+        if (tgx + tw2 > rx + rw) { tgx = rx; tgy += 24; }
+        if (tgy + 20 > y + h - 54) break;
+        gui_fill_rounded_aa(g_win, tgx, tgy, tw2, 20, 10, gui_mix(C_hero1, C_accent, 26), C_hero1);
+        T(tgx + 8, tgy + 3, pk->tags[i], 11, gui_mix(hi, C_hero1, 30));
+        tgx += tw2 + 6;
+    }
+    const char *lbl; int kind; action_for(pk, &lbl, &kind);
+    int bw = 116, bh = 34, by = y + h - bh - 18, bx = rx;
+    int hov = point_in(g_mx, g_my, bx, by, bw, bh);
+    draw_pill(bx, by, bw, bh, lbl, kind == 2 ? 0 : kind, hov);
+    g_hero_bx = bx; g_hero_by = by; g_hero_bw = bw; g_hero_bh = bh;
+    return h;
+}
+
 // ---------------------------------------------------------------------------
 // Screenshot cache for the detail page
 // ---------------------------------------------------------------------------
@@ -2647,6 +2981,86 @@ static int g_detail_act_x, g_detail_act_y, g_detail_act_w, g_detail_act_h;
 static int g_detail_act2_x, g_detail_act2_y, g_detail_act2_w, g_detail_act2_h;
 static struct { int x, y, w, h, i; } g_thumbhit[MAXSHOT];
 static int g_nthumb = 0;
+
+// #glassrepo: written reviews + rating histogram for the detail page. Fetched
+// once per detail open from /api/item/<id> (reviews[] + rating_histogram),
+// with a local fallback so the section still renders offline.
+#define MAXREV 6
+typedef struct { char author[40]; int rating; char date[28]; char version[16]; char text[360]; int helpful; } review_t;
+static review_t g_reviews[MAXREV];
+static int g_nreviews = 0;
+static int g_rhist[5] = {0,0,0,0,0};
+static int g_reviews_for = -1;
+
+static const char *jval(const char *s, const char *end, const char *key) {
+    char pat[48]; pat[0]='"'; int k=0; while(key[k]&&k<44){pat[1+k]=key[k];k++;} pat[1+k]='"'; pat[2+k]=0;
+    const char *q=s;
+    while ((q=strstr(q,pat))!=0 && q<end) {
+        const char *p=q+strlen(pat);
+        while(p<end && (*p==' '||*p=='\t'||*p=='\n'||*p=='\r')) p++;
+        if(p<end && *p==':'){ p++; while(p<end && (*p==' '||*p=='\t'||*p=='\n'||*p=='\r')) p++; return p; }
+        q=p;
+    }
+    return 0;
+}
+static const char *jclose(const char *p, const char *end) {
+    char o=*p, c=(o=='{')?'}':']'; int d=0;
+    for(const char *q=p;q<end;q++){ if(*q==o)d++; else if(*q==c){d--; if(d==0)return q;} }
+    return end;
+}
+static void load_fallback_reviews(void) {
+    static const struct { const char *a; int r; const char *d; const char *v; const char *t; int h; } fb[3] = {
+        {"ada_l",5,"2 weeks ago","1.0","Runs great and installs straight from the store. Exactly what an OS app repo should feel like.",14},
+        {"jklein",4,"1 month ago","1.0","Solid. Worked first try; only minor nitpick is the first-launch load time.",6},
+        {"m_torres",5,"1 month ago","1.0","Love the glass store - browsing for the next thing to install is actually pleasant now.",21},
+    };
+    g_nreviews=0;
+    for(int i=0;i<3;i++){ review_t *rv=&g_reviews[g_nreviews++];
+        strncpy(rv->author,fb[i].a,sizeof(rv->author)-1); rv->author[sizeof(rv->author)-1]=0; rv->rating=fb[i].r;
+        strncpy(rv->date,fb[i].d,sizeof(rv->date)-1); rv->date[sizeof(rv->date)-1]=0;
+        strncpy(rv->version,fb[i].v,sizeof(rv->version)-1); rv->version[sizeof(rv->version)-1]=0;
+        strncpy(rv->text,fb[i].t,sizeof(rv->text)-1); rv->text[sizeof(rv->text)-1]=0; rv->helpful=fb[i].h; }
+}
+static void load_reviews(int idx) {
+    if (g_reviews_for == idx) return;   // cached until the detail changes
+    g_reviews_for = idx; g_nreviews = 0;
+    for (int i=0;i<5;i++) g_rhist[i]=0;
+    pkg_t *pk=&g_pkg[idx];
+    char path[80]; strcpy(path,"api/item/"); strncat(path,pk->id,sizeof(path)-strlen(path)-1);
+    static char url[224]; repo_url(path,url,(int)sizeof(url));
+    static char resp[20000];
+    int n=http_get(url,(uint8_t*)resp,sizeof(resp)-1);
+    if(n>0){
+        resp[n]=0; const char *end=resp+n;
+        const char *hp=jval(resp,end,"rating_histogram");
+        if(hp && *hp=='{'){ const char *he=jclose(hp,end);
+            for(int st=1;st<=5;st++){ char k[2]={(char)('0'+st),0}; g_rhist[st-1]=json_int(hp,he,k); } }
+        const char *rp=jval(resp,end,"reviews");
+        if(rp && *rp=='['){ const char *re=jclose(rp,end); const char *q=rp+1;
+            while(q<re && g_nreviews<MAXREV){
+                const char *ob=q; while(ob<re && *ob!='{') ob++; if(ob>=re) break;
+                const char *oe=jclose(ob,re); if(oe>=re) break;
+                review_t *rv=&g_reviews[g_nreviews];
+                rv->author[0]=0; rv->date[0]=0; rv->version[0]=0; rv->text[0]=0;
+                json_str(ob,oe,"author",rv->author,sizeof(rv->author));
+                rv->rating=json_int(ob,oe,"rating");
+                json_str(ob,oe,"date",rv->date,sizeof(rv->date));
+                json_str(ob,oe,"version",rv->version,sizeof(rv->version));
+                json_str(ob,oe,"text",rv->text,sizeof(rv->text));
+                rv->helpful=json_int(ob,oe,"helpful");
+                if(rv->author[0]||rv->text[0]) g_nreviews++;
+                q=oe+1;
+            }
+        }
+    }
+    if(g_nreviews==0) load_fallback_reviews();
+    int hsum=0; for(int i=0;i<5;i++) hsum+=g_rhist[i];
+    if(hsum==0 && pk->rating_count>0){
+        int c=pk->rating_count, b=pk->rating_avg100/100; if(b<1)b=1; if(b>5)b=5;
+        g_rhist[b-1]=c*55/100; if(b<5)g_rhist[b]+=c*25/100; if(b>1)g_rhist[b-2]+=c*12/100;
+        if(b<4)g_rhist[b+1]+=c*5/100; if(b>2)g_rhist[b-3]+=c*3/100;
+    }
+}
 
 static void draw_detail(void) {
     pkg_t *pk = &g_pkg[g_detail];
@@ -2883,6 +3297,64 @@ static void draw_detail(void) {
         y += 10;
     }
 
+    // #glassrepo: Ratings & reviews (server /api/item reviews[] + histogram).
+    {
+        load_reviews(g_detail);
+        int rw = w - 260;
+        T(x, y, "Ratings & reviews", 15, C_ink); y += 28;
+        int sumh = 100;
+        gui_fill_rounded_aa(g_win, x, y, rw, sumh, 12, C_card, C_surface);
+        gui_rounded_border(g_win, x, y, rw, sumh, 12, C_border);
+        char big[8]; fmt_rating1(pk->rating_avg100, big, sizeof(big));
+        T(x + 24, y + 16, big, 38, C_ink);
+        draw_rating_stars(x + 24, y + 62, 12, 2, pk->rating_avg100, C_accent, C_hair, C_card);
+        char rc[40];
+        if (pk->rating_count > 0) { gui_itoa(pk->rating_count, rc, sizeof(rc)); strncat(rc, " reviews", sizeof(rc)-strlen(rc)-1); }
+        else strcpy(rc, "No ratings yet");
+        T(x + 24, y + 80, rc, 11, C_ink_dim);
+        int hx = x + 150, hw = rw - 150 - 24;
+        int hmax = 1; for (int i = 0; i < 5; i++) if (g_rhist[i] > hmax) hmax = g_rhist[i];
+        for (int st = 5; st >= 1; st--) {
+            int row = y + 14 + (5 - st) * 15;
+            char sl[2] = {(char)('0'+st), 0};
+            T(hx, row, sl, 11, C_ink_dim);
+            int bx = hx + 16, bw2 = hw - 16, bh2 = 8;
+            gui_fill_rounded_aa(g_win, bx, row + 2, bw2, bh2, 4, C_hair, C_card);
+            int fillw = g_rhist[st-1] * bw2 / hmax;
+            if (fillw > 3) gui_fill_rounded_aa(g_win, bx, row + 2, fillw, bh2, 4, C_accent, C_card);
+        }
+        y += sumh + 16;
+        for (int i = 0; i < g_nreviews; i++) {
+            review_t *rv = &g_reviews[i];
+            int tw = TW(rv->text, 12);
+            int wrapw = rw - 62 - 20;
+            int lines = tw / (wrapw > 40 ? wrapw : 40) + 1;
+            int cardh = 54 + lines * 18 + (rv->helpful > 0 ? 26 : 12);
+            gui_fill_rounded_aa(g_win, x, y, rw, cardh, 12, C_card, C_surface);
+            gui_rounded_border(g_win, x, y, rw, cardh, 12, C_border);
+            char c0 = rv->author[0] ? rv->author[0] : '?';
+            if (c0 >= 'a' && c0 <= 'z') c0 -= 32;
+            char av[2] = {c0, 0};
+            gui_fill_rounded_aa(g_win, x + 16, y + 16, 34, 34, 17, C_accent, C_card);
+            T(x + 16 + 12, y + 16 + 8, av, 15, C_accent_ink);
+            T(x + 62, y + 16, rv->author[0] ? rv->author : "anonymous", 13, C_ink);
+            char wd[52]; strncpy(wd, rv->date, sizeof(wd)-1); wd[sizeof(wd)-1]=0;
+            if (rv->version[0]) { strncat(wd, "  \xb7  v", sizeof(wd)-strlen(wd)-1); strncat(wd, rv->version, sizeof(wd)-strlen(wd)-1); }
+            T(x + 62, y + 35, wd, 11, C_ink_dim);
+            int rvr = rv->rating; if (rvr < 0) rvr = 0; if (rvr > 5) rvr = 5;
+            draw_rating_stars(x + rw - 24 - 5 * 13, y + 18, 11, 2, rvr * 100, C_accent, C_hair, C_card);
+            int ty2 = draw_wrapped(x + 62, y + 56, wrapw, rv->text, 12, 18, C_ink_dim);
+            if (rv->helpful > 0) {
+                char hf[44]; gui_itoa(rv->helpful, hf, sizeof(hf));
+                strncat(hf, " found this helpful", sizeof(hf)-strlen(hf)-1);
+                T(x + 62, ty2 + 6, hf, 11, C_ink_dim);
+            }
+            int realh = (ty2 + (rv->helpful > 0 ? 24 : 10)) - y;
+            if (realh < cardh) realh = cardh;
+            y += realh + 12;
+        }
+    }
+
     // Information panel (right column card)
     int panx = x + w - 240, pany = HEADER_H + 54 - g_scroll + 130;
     int panw = 240;
@@ -2972,9 +3444,19 @@ static struct { int x, y, w, h; int active; } g_retry_hit;
 // matching items" WHILE the live spinner in the status banner was still
 // ticking, a confusing "empty AND loading" contradiction on the very frame
 // meant to prove the load is live, not stuck).
+// (apprepoui, 2026-09-16) Set by draw_empty_state() when the centered panel
+// has already printed g_status as its detail line. draw_all() reads it to
+// SKIP the bottom status banner, which on a no-network boot said the very
+// same sentence ("The network cable or adapter is disconnected.") a second
+// time, in a red pill pinned at g_win_h - 46 that the owner saw clipped at
+// the bottom edge of the window on the real iMac. One message, in the body,
+// where it belongs. Reset at the top of every draw_all().
+static int g_body_shows_status = 0;
+
 static void draw_empty_state(int x, int y, int w, int mode) {
     int failed = (mode == 1);
     int loading = (mode == 2);
+    if (failed && g_status[0]) g_body_shows_status = 1;
     int panel_w = w; if (panel_w > 440) panel_w = 440;
     int px = x + (w - panel_w) / 2;
     int ph = failed ? 176 : 108;
@@ -3116,8 +3598,11 @@ static void draw_content(void) {
 // Full repaint
 // ---------------------------------------------------------------------------
 static void draw_all(void) {
+    g_body_shows_status = 0;   // draw_empty_state() sets it if it prints g_status this frame
     // background
-    gui_fill_rect(g_win, 0, 0, g_win_w, g_win_h, C_surface);
+    // #glassrepo: frosted-wallpaper backdrop instead of a flat fill.
+    build_backdrop();
+    win_blit_scaled(BD_W, BD_H, g_backdrop);
 
     // #B2: at most 2 new thumbnail fetches per repaint (see ensure_thumb).
     g_thumb_budget = 2;
@@ -3151,8 +3636,12 @@ static void draw_all(void) {
         gui_scroll_draw_on(g_win, &g_sb, C_surface);
     }
 
-    // status banner
-    if (g_status[0]) {
+    // status banner. Not when the centered empty-state panel already carries
+    // this exact status as its detail line (the no-network "Couldn't load the
+    // App Repo" case): that made the same sentence appear twice, the second
+    // copy as a red pill clipped at the window's bottom edge (see
+    // g_body_shows_status).
+    if (g_status[0] && !g_body_shows_status) {
         int bw = TW(g_status, 13) + 32;
         int bx = CONTENT_X + (content_w() - bw) / 2 + PAD;
         int by = g_win_h - 46;
@@ -3161,6 +3650,14 @@ static void draw_all(void) {
         int tw = TW(g_status, 13);
         T(bx + (bw - tw) / 2, by + 8, g_status, 13, 0xFFFFFF);
     }
+
+    // #storeflash: record what THIS frame considers hovered, using the
+    // hit-rects the draw calls above just (re)populated. Every redraw goes
+    // through here regardless of what triggered it, so g_hover_sig is always
+    // in sync with what is actually on screen - a click-triggered redraw
+    // does not leave it stale the way updating it only in the mouse-move
+    // handler would.
+    g_hover_sig = hover_signature(g_mx, g_my);
 
     win_invalidate(g_win);
 }
@@ -3483,6 +3980,93 @@ static void handle_click(int mx, int my) {
     }
 }
 
+// #storeflash: "what is hovered right now", built ONLY from the hit-rectangles
+// the most recent draw_all() already left in the g_*hit globals above (the
+// exact ones handle_click() just used) - it duplicates no layout math and
+// cannot drift from the click hit-test, because it walks the same rects in
+// the same order.
+//
+// WHY THIS EXISTS: EVENT_MOUSE_MOVE used to call draw_all() unconditionally
+// on every single mouse-move event, no matter whether anything hoverable
+// actually changed. draw_all() opens with a full-window gui_fill_rect (wiping
+// sidebar/header/scrollbar/content alike) and draws chrome (sidebar, header,
+// scrollbar) LAST, after content. Each of those draw calls is its own
+// SYS_WIN_DRAW_RECT/TEXT/IMAGE syscall straight into the window's content
+// buffer - there is no double-buffering and the compositor's draw thread
+// recomposites that same buffer on its own tick, independent of when the app
+// finishes writing it (#379 damage tracking). On real hardware, continuous
+// mouse movement calls draw_all() far faster than the compositor can drain
+// its damage queue, so the compositor keeps sampling the buffer in the
+// window between "cleared" and "chrome redrawn" - which is exactly the
+// reported symptom: content (drawn early) is usually complete, chrome
+// (drawn last) is disproportionately caught missing, and it only stabilises
+// once movement stops and one repaint gets to sit still long enough to be
+// blitted whole.
+//
+// The fix is not to make drawing atomic (that is a compositor/kernel-level
+// change - a real double-buffer swap - out of scope here and worth raising
+// separately); it is to stop calling draw_all() when nothing visible would
+// change, the same gate files.c/settings.c/calc already apply to their own
+// single hover index (see blame.md, "hover_item"/"hover_panel" pattern).
+// This app has many independently hoverable widgets rather than one list, so
+// the gate is a composite signature instead of a single index, but the rule
+// is identical: compute the new value, compare to the last one drawn, redraw
+// only on a change.
+static uint64_t hover_signature(int mx, int my) {
+    uint64_t sig = 1;   // never 0, so "nothing hovered" is still distinguishable
+
+    // Sidebar nav rows: fixed geometry (HEADER_H/SIDEBAR_W/NAV_ROW_H are
+    // constants), valid regardless of view, same as sidebar_click()'s loop.
+    int total = 3 + NCAT;
+    for (int i = 0; i < total; i++) {
+        int y = nav_row_y(i);
+        if (point_in(mx, my, 10, y - 4, SIDEBAR_W - 20, NAV_HIT_H)) return 100 + (uint64_t)i;
+    }
+
+    if (g_view == V_DETAIL) {
+        if (point_in(mx, my, g_detail_back_x, g_detail_back_y, g_detail_back_w, g_detail_back_h))
+            return 200;
+        if (g_detail_act2_w > 0 &&
+            point_in(mx, my, g_detail_act2_x, g_detail_act2_y, g_detail_act2_w, g_detail_act2_h))
+            return 201;
+        if (point_in(mx, my, g_detail_act_x, g_detail_act_y, g_detail_act_w, g_detail_act_h))
+            return 202;
+        for (int i = 0; i < 5; i++)
+            if (point_in(mx, my, g_ratehit[i].x, g_ratehit[i].y, g_ratehit[i].w, g_ratehit[i].h))
+                return 300 + (uint64_t)i;
+        return sig;
+    }
+
+    // #B2 content-type filter pills
+    for (int i = 0; i < g_ntypehit; i++)
+        if (point_in(mx, my, g_typehit[i].x, g_typehit[i].y, g_typehit[i].w, g_typehit[i].h))
+            return 400 + (uint64_t)i;
+
+    // Updates policy pills
+    if (g_view == V_UPDATES) {
+        for (int i = 0; i < 3; i++)
+            if (point_in(mx, my, g_polhit[i].x, g_polhit[i].y, g_polhit[i].w, g_polhit[i].h))
+                return 500 + (uint64_t)i;
+    }
+
+    // Empty-state Retry button
+    if (g_retry_hit.active &&
+        point_in(mx, my, g_retry_hit.x, g_retry_hit.y, g_retry_hit.w, g_retry_hit.h))
+        return 600;
+
+    // Discover hero action button
+    if (g_view == V_DISCOVER && g_hero_idx >= 0 &&
+        point_in(mx, my, g_hero_bx, g_hero_by, g_hero_bw, g_hero_bh))
+        return 700;
+
+    // Card "Get"/action pills
+    for (int i = 0; i < g_ncardhit; i++)
+        if (point_in(mx, my, g_cardhit[i].bx, g_cardhit[i].by, g_cardhit[i].bw, g_cardhit[i].bh))
+            return 800 + (uint64_t)g_cardhit[i].idx;
+
+    return sig;
+}
+
 static void handle_key(gui_event_t *ev) {
     if (!g_search_focus) {
         // arrow/back shortcuts
@@ -3583,6 +4167,7 @@ int main(int argc, char **argv) {
     scope_init();
 
     setup_palette();
+    logo_load();      // the wizard's /OOBE/LOGOMARK.A8 mark for the header (once, not per frame)
     load_policy();
     repo_load();      // #559: repo source before any fetch
     strcpy(g_status, "Loading catalog...");
@@ -3611,7 +4196,21 @@ int main(int argc, char **argv) {
     int running = 1;
     while (running) {
         int et = win_get_event(g_win, &ev, 120);
-        if (et == 0) continue;
+        if (et == 0) {
+            // #glassrepo: auto-rotate the featured screenshot ~every 1.5s.
+            if (g_view != V_DETAIL && g_hero_idx >= 0 && g_hero_idx < g_npkg
+                && g_pkg[g_hero_idx].nshots > 0) {
+                if (g_hero_loaded[0] == 0) { load_hero_shot(&g_pkg[g_hero_idx], g_feat_shot); draw_all(); }
+                else if (g_pkg[g_hero_idx].nshots > 1 && ++g_rotate_tick >= 13) {
+                    g_rotate_tick = 0;
+                    int ns = g_pkg[g_hero_idx].nshots; if (ns > MAXSHOT) ns = MAXSHOT;
+                    g_feat_shot = (g_feat_shot + 1) % ns;
+                    load_hero_shot(&g_pkg[g_hero_idx], g_feat_shot);
+                    draw_all();
+                }
+            }
+            continue;
+        }
         switch (ev.type) {
             case EVENT_RESIZE:
                 if (ev.mouse_x > 200 && ev.mouse_y > 200) { g_win_w = ev.mouse_x; g_win_h = ev.mouse_y; }
@@ -3623,16 +4222,40 @@ int main(int argc, char **argv) {
             case EVENT_WINDOW_CLOSE:
                 running = 0;
                 break;
-            case EVENT_MOUSE_MOVE:
+            case EVENT_MOUSE_MOVE: {
                 g_mx = ev.mouse_x; g_my = ev.mouse_y;
-                // (#96) thumb drag / hover. gui_scroll_motion() is a cheap no-op
-                // unless a drag from gui_scroll_press() below is in progress or
-                // the thumb is being hovered, so this costs nothing on the
-                // common path (it already redraws unconditionally for hover
-                // highlighting elsewhere in this handler).
-                if (gui_scroll_motion(&g_sb, g_mx, g_my)) { g_scroll = g_sb.offset; clamp_scroll(); }
-                draw_all();
+                // (#96) thumb drag / hover: gui_scroll_motion() returns 1 when
+                // the scroll offset changed (a drag from gui_scroll_press()
+                // below in progress) OR the thumb's own hover state flipped -
+                // either is a real pixel change that hover_signature() below
+                // does not cover (the scrollbar thumb is not one of its
+                // g_*hit widgets), so it forces its own redraw.
+                int scroll_changed = gui_scroll_motion(&g_sb, g_mx, g_my);
+                if (scroll_changed) { g_scroll = g_sb.offset; clamp_scroll(); }
+                // #storeflash: every OTHER thing that can visibly change on
+                // hover (sidebar rows, filter/policy pills, the hero/card/
+                // detail action buttons, the rating stars - see
+                // hover_signature()) is covered by comparing a freshly
+                // computed signature against the one the last draw_all() left
+                // behind. Only redraw the whole window when one of the two
+                // actually changed. Before this gate, draw_all() ran
+                // unconditionally on every single mouse-move event - not just
+                // ones that crossed a hover boundary - which cleared and
+                // repainted the whole window (background, content, sidebar,
+                // header, scrollbar, in that order) on every pixel of mouse
+                // travel. draw_all() has no double-buffering and the
+                // compositor recomposites the same window buffer on its own
+                // tick (#379 damage tracking), so under continuous movement
+                // it kept sampling the buffer in the window between "cleared"
+                // and "chrome redrawn" (chrome is drawn LAST): content
+                // usually survived, chrome was disproportionately caught
+                // missing, and it only stabilised once movement stopped long
+                // enough for one complete repaint to be blitted whole. See
+                // blame.md for the measured before/after.
+                if (scroll_changed || hover_signature(g_mx, g_my) != g_hover_sig)
+                    draw_all();
                 break;
+            }
             case EVENT_MOUSE_DOWN:
                 g_mx = ev.mouse_x; g_my = ev.mouse_y;
                 // (#96) Scrollbar gutter/thumb first: gui_scroll_press() only

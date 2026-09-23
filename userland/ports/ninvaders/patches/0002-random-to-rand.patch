@@ -1,0 +1,25 @@
+--- a/aliens.c	2003-05-08 19:19:50.000000000 +0000
++++ b/aliens.c	2026-09-07 10:05:51.915165834 +0000
+@@ -236,9 +236,9 @@
+ 			// start new missile if counter says so
+ 			if (alienshot_counter > shootThreshold && shipnum > 0) {// only shot if there's an alien left
+ 				alienshot_counter = 0;				// reset counter				
+-				tmp = random() % ALIENS_MAX_NUMBER_X;  		// randomly select one of the ...
++				tmp = rand() % ALIENS_MAX_NUMBER_X;  		// randomly select one of the ...
+ 				while (lowest_ship[tmp] == -1) {		// ...aliens at the bottom of ...
+-					tmp = random() % ALIENS_MAX_NUMBER_X;	// ...a column to launch missile
++					tmp = rand() % ALIENS_MAX_NUMBER_X;	// ...a column to launch missile
+ 				}
+ 				alienshoty[i]=aliens.posY+lowest_ship[tmp];		// set y position of missile
+ 				alienshotx[i]=aliens.posX+tmp*3;			// set x position of missile
+--- a/ufo.c	2003-05-08 19:19:50.000000000 +0000
++++ b/ufo.c	2026-09-07 10:05:51.915372639 +0000
+@@ -73,7 +73,7 @@
+ int ufoShowUfo()
+ {
+ 	if (aliens.posY > 0 && fShowUfo == 0) { // aliens one line down
+-		if ((random() % 200) == 0) {
++		if ((rand() % 200) == 0) {
+ 			fShowUfo = 1;
+ 		}
+ 	}

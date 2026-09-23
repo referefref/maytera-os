@@ -15,9 +15,9 @@ CFLAGS = -fPIE -m64 -ffreestanding -fno-builtin -nostdinc -nostdlib \
 LDFLAGS = -pie --no-dynamic-linker -z notext -T ../../user-pie.ld -nostdlib -z max-page-size=0x1000
 
 SRCS = main.c draw.c icons.c lockscreen.c desktop.c taskbar.c \
-       startmenu.c clock.c contextmenu.c screensaver.c screensaver_gfx.c wallpaper.c widgets.c traymenu.c profile.c \
+       startmenu.c clock.c contextmenu.c screensaver.c screensaver_gfx.c wallpaper.c wallpaper_anim.c widgets.c traymenu.c profile.c \
        stickies.c notif.c bt_impl.c screenshot.c vnc.c launcher.c ha_format.c \
-       elevate.c iconpicker.c confirmdialog.c perfframe.c volosd.c dragghost.c idleprof.c dosspeed.c
+       elevate.c capconsent.c iconpicker.c confirmdialog.c perfframe.c volosd.c dragghost.c idleprof.c dosspeed.c cardfile_model.c cardfile.c cardtext.c cardfile_host.c cardfile_glass.c traydev.c
 
 # #334 headless GUI verification hook (testhook.c). OFF by default - a plain
 # `make`/`make install` (what build/build-golden.sh always uses) builds
@@ -35,6 +35,14 @@ endif
 # can be driven by testhook verbs instead of mouse injection).
 ifdef FAVDEBUG
 CFLAGS += -DMAYTERA_FAVDEBUG=1
+endif
+
+# #compleak2: throwaway per-callsite heap-highwater profiler (main.c). OFF by
+# default, same idiom as TESTHOOK/FAVDEBUG above - never in the golden.
+# make LEAKPROFILE=1 for a measurement-only build; writes /LEAKWATCH.TXT
+# whenever a periodic call's malloc_heap_highwater() moves, naming the call.
+ifdef LEAKPROFILE
+CFLAGS += -DMAYTERA_LEAKPROFILE=1
 endif
 
 OBJS = $(SRCS:.c=.o)

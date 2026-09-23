@@ -1,0 +1,10 @@
+--- a/src/myman.c	2008-07-20 20:48:18.000000000 +0000
++++ b/src/myman.c	2026-09-07 10:08:11.535812656 +0000
+@@ -267,7 +267,6 @@
+ #include <time.h>
+ #ifndef WIN32
+ #ifndef macintosh
+-#include <langinfo.h>
+ #endif
+ #endif
+ 

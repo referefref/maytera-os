@@ -17,6 +17,9 @@
 #include "string.h"
 #include "stdio.h"
 #include "unistd.h"
+#include "stdlib.h"    // open() is declared here, not in fcntl.h (see ctinvoke.c)
+#include "fcntl.h"
+#include "userconf.h"  // #239: the ONE place that knows where a preference lives
 
 // ---------------------------------------------------------------------------
 // Output. Everything goes to fd 1 in one write() per line: the kernel's fd-1
@@ -25,8 +28,32 @@
 // serial socket. One write per line keeps lines from interleaving with an
 // app's own logging.
 // ---------------------------------------------------------------------------
+// When a capture buffer is active (contract_capture_begin), output is appended
+// there instead of going to fd 1. This is what lets contract_live_poll() run
+// the SAME get/set/call/describe path the CLI runs and hand the app's reply
+// lines back to the live caller, with zero second copy of the emit logic.
+static char *g_cap_buf = 0;
+static int   g_cap_max = 0;
+static int   g_cap_len = 0;
+
+void contract_capture_begin(char *buf, int cap) {
+    g_cap_buf = buf; g_cap_max = cap; g_cap_len = 0;
+    if (buf && cap > 0) buf[0] = 0;
+}
+int contract_capture_end(void) {
+    int n = g_cap_len;
+    g_cap_buf = 0; g_cap_max = 0; g_cap_len = 0;
+    return n;
+}
+
 static void ct_emit(const char *s) {
     size_t n = 0; while (s[n]) n++;
+    if (g_cap_buf) {
+        for (size_t i = 0; i < n && g_cap_len < g_cap_max - 1; i++)
+            g_cap_buf[g_cap_len++] = s[i];
+        if (g_cap_max > 0) g_cap_buf[g_cap_len] = 0;
+        return;
+    }
     if (n) write(1, s, n);
 }
 
@@ -116,6 +143,11 @@ int contract_at(const ct_contract_t *c, int idx, ct_item_t *out) {
     int ns = c->items ? c->n : 0;
     if (idx < ns) { *out = c->items[idx]; return 1; }
     if (!c->project) return 0;
+    // Zero the row before the app fills it, so a projector written before the
+    // tier-2 `needs` field existed leaves it NULL ("needs nothing") rather than
+    // stack garbage. A designated-initializer projector already does this; this
+    // makes it true for the field-by-field kind too.
+    for (unsigned i = 0; i < sizeof(*out); i++) ((char *)out)[i] = 0;
     return c->project(idx - ns, out);
 }
 
@@ -167,6 +199,83 @@ int contract_hash(const ct_contract_t *c) {
         for (int k = 0; k < 5; k++) { h ^= b[k]; h *= 16777619u; }
     }
     return (int)(h & 0x7FFFFFFF);
+}
+
+// ---------------------------------------------------------------------------
+// Derived per-app persistence (#239). See contract.h for why this is here and
+// not copied into each app.
+//
+// The file is trivially small (one "<key>=<int>" line per persisted row), so
+// both directions fit in one buffer and neither needs a parser. The format is
+// deliberately the same single-char-key shape /CONFIG/SETTINGS.CFG already
+// uses, rather than a new dialect.
+// ---------------------------------------------------------------------------
+#define CT_CFG_MAX 512
+
+// A row is persistable only if it has a key AND an integer backing store we can
+// both read and write. Stated once, so save and load can never disagree about
+// which rows are in the file.
+static int ct_persistable(const ct_item_t *it) {
+    if (!it->cfgkey) return 0;
+    if (it->type == CT_STR || it->type == CT_ACTION) return 0;
+    if (!(it->access & CT_READ) || !(it->access & CT_WRITE)) return 0;
+    return it->var || (it->getfn && it->setfn);
+}
+
+int contract_save_cfg(const ct_contract_t *c, const char *name) {
+    char buf[CT_CFG_MAX];
+    int used = 0;
+    ct_item_t it;
+    for (int i = 0; contract_at(c, i, &it); i++) {
+        if (!ct_persistable(&it)) continue;
+        char line[32];
+        snprintf(line, sizeof(line), "%c=%d\n", it.cfgkey, contract_get(&it));
+        int n = 0; while (line[n]) n++;
+        // Refuse rather than truncate: half a preference file is a file that
+        // silently loses whichever rows sorted last.
+        if (used + n >= CT_CFG_MAX) return -1;
+        for (int k = 0; k < n; k++) buf[used++] = line[k];
+    }
+    int fd = userconf_open_write(name);
+    if (fd < 0) return -1;
+    // userconf_finish_write() ALWAYS closes fd, on every path.
+    return userconf_finish_write(fd, buf, (unsigned long)used);
+}
+
+int contract_load_cfg(const ct_contract_t *c, const char *name,
+                      const char *legacy) {
+    int fd = userconf_open_read(name, legacy);
+    if (fd < 0) return -1;
+    char buf[CT_CFG_MAX];
+    long n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return -1;
+    buf[n] = 0;
+
+    for (long i = 0; i < n; ) {
+        long e = i;
+        while (e < n && buf[e] != '\n') e++;
+        buf[e] = 0;
+        // "<key>=<int>". Anything else in the file is ignored rather than
+        // rejected: an older build's key that no longer has a row must not
+        // stop the rows that do have one from loading.
+        if (e - i >= 3 && buf[i + 1] == '=') {
+            char key = buf[i];
+            int ok = 0;
+            int v = ct_atoi(buf + i + 2, &ok);
+            ct_item_t it;
+            if (ok && contract_by_key(c, key, &it) && ct_persistable(&it)) {
+                int lo = it.lo, hi = it.hi;
+                if (it.type == CT_BOOL) { lo = 0; hi = 1; }
+                // The file is INPUT. Range-check it exactly as ct_do_set()
+                // does: an unchecked index out of a corrupt file would run off
+                // the end of the app's own table.
+                if (v >= lo && v <= hi) contract_put(&it, v);
+            }
+        }
+        i = e + 1;
+    }
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -237,9 +346,24 @@ static void ct_describe(const ct_contract_t *c) {
         if (it.cfgkey) snprintf(keybuf, sizeof(keybuf), ", key: %c", it.cfgkey);
         char capbuf[80]; capbuf[0] = 0;
         if (it.cap) snprintf(capbuf, sizeof(capbuf), ", cap: %s", it.cap);
-        ct_line("  - {name: %s, type: %s, access: %s, risk: %s%s%s%s, desc: %s}\n",
+        // tier 2: the KERNEL capabilities the action reaches, as a flow list.
+        // Emitted even when empty ("needs: []") so a consumer can tell a
+        // cooperative action (no system capability) from one whose `needs`
+        // were simply never declared.
+        char needsbuf[192]; int nb = 0;
+        nb = (int)snprintf(needsbuf, sizeof(needsbuf), ", needs: [");
+        if (it.needs) {
+            for (const ct_cap_need_t *nd = it.needs; nd->cap; nd++) {
+                nb += snprintf(needsbuf + nb, sizeof(needsbuf) - nb, "%s%d:%s",
+                               nd == it.needs ? "" : "|",
+                               (int)nd->cap, nd->scope_tmpl ? nd->scope_tmpl : "");
+                if (nb > (int)sizeof(needsbuf) - 24) break;
+            }
+        }
+        snprintf(needsbuf + nb, sizeof(needsbuf) - nb, "]");
+        ct_line("  - {name: %s, type: %s, access: %s, risk: %s%s%s%s%s, desc: %s}\n",
                 it.name, ct_typename(it.type), ct_access_str(it.access),
-                ct_riskname(it.risk), extra, keybuf, capbuf,
+                ct_riskname(it.risk), extra, keybuf, capbuf, needsbuf,
                 it.desc ? it.desc : "");
     }
 }
@@ -415,17 +539,19 @@ int contract_is_invocation(int argc, char **argv) {
     return 0;
 }
 
-int contract_cli(int argc, char **argv, const ct_contract_t *c) {
-    int at = -1;
-    for (int i = 1; i < argc; i++)
-        if (argv[i] && !strcmp(argv[i], "--contract")) { at = i; break; }
-    if (at < 0) return CT_ERR_USAGE;
-
-    const char *verb = (at + 1 < argc) ? argv[at + 1] : "probe";
+// Run one already-parsed verb. args[0] is the item NAME for get/set/call; for
+// probe/list/describe nargs may be 0. This is the ONE place that maps a verb to
+// the engine, so contract_cli() (spawn path) and contract_live_poll() (live
+// path) cannot answer the same verb differently. Emits through ct_line, which
+// goes to fd 1 or to the active capture buffer.
+int contract_run_verb(const ct_contract_t *c, const char *verb,
+                      int nargs, char **args) {
+    if (!verb) verb = "probe";
 
     // Every verb reads live state, so pull persisted state in first. Without
     // this a headless `set` would save a table full of defaults over the
-    // user's other six preferences.
+    // user's other six preferences. (A live instance's load() is a no-op or
+    // re-reads its own store; either way the live document is the truth.)
     if (c->load) c->load();
 
     if (!strcmp(verb, "probe")) {
@@ -440,17 +566,29 @@ int contract_cli(int argc, char **argv, const ct_contract_t *c) {
     }
     if (!strcmp(verb, "describe")) { ct_describe(c); return CT_OK; }
     if (!strcmp(verb, "get")) {
-        if (at + 2 >= argc) { ct_line("err code=usage detail=get-needs-a-name\n"); return CT_ERR_USAGE; }
-        return ct_do_get(c, argv[at + 2]);
+        if (nargs < 1) { ct_line("err code=usage detail=get-needs-a-name\n"); return CT_ERR_USAGE; }
+        return ct_do_get(c, args[0]);
     }
     if (!strcmp(verb, "set")) {
-        if (at + 3 >= argc) { ct_line("err code=usage detail=set-needs-a-name-and-value\n"); return CT_ERR_USAGE; }
-        return ct_do_set(c, argv[at + 2], argv[at + 3]);
+        if (nargs < 2) { ct_line("err code=usage detail=set-needs-a-name-and-value\n"); return CT_ERR_USAGE; }
+        return ct_do_set(c, args[0], args[1]);
     }
     if (!strcmp(verb, "call")) {
-        if (at + 2 >= argc) { ct_line("err code=usage detail=call-needs-a-name\n"); return CT_ERR_USAGE; }
-        return ct_do_call(c, argv[at + 2], argc - (at + 3), argv + (at + 3));
+        if (nargs < 1) { ct_line("err code=usage detail=call-needs-a-name\n"); return CT_ERR_USAGE; }
+        return ct_do_call(c, args[0], nargs - 1, args + 1);
     }
     ct_line("err code=usage detail=unknown-verb verb=%s\n", verb);
     return CT_ERR_USAGE;
+}
+
+int contract_cli(int argc, char **argv, const ct_contract_t *c) {
+    int at = -1;
+    for (int i = 1; i < argc; i++)
+        if (argv[i] && !strcmp(argv[i], "--contract")) { at = i; break; }
+    if (at < 0) return CT_ERR_USAGE;
+
+    const char *verb = (at + 1 < argc) ? argv[at + 1] : "probe";
+    int nargs = argc - (at + 2);
+    if (nargs < 0) nargs = 0;
+    return contract_run_verb(c, verb, nargs, argv + (at + 2));
 }

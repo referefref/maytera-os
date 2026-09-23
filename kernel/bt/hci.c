@@ -19,6 +19,7 @@
 #include "bt_transport.h"
 #include "../serial.h"
 #include "../string.h"
+#include "../fs/bootlog.h"
 
 // ---------------------------------------------------------------------------
 // Little-endian helpers
@@ -68,6 +69,12 @@ static acl_reasm_t g_reasm[HCI_MAX_CONNECTIONS];
 #define HCI_DISC_MAX 24
 static hci_disc_dev_t g_disc[HCI_DISC_MAX];
 static int            g_disc_count = 0;
+
+// Address of an outbound classic Create_Connection in flight, so the resulting
+// Connection Complete can be recognised as OUR page (we are the master/central,
+// role 0) rather than a device that paged us (we are the slave, role 1).
+static bt_addr_t g_pending_classic;
+static int       g_have_pending_classic = 0;
 
 static hci_disc_dev_t *disc_find(const bt_addr_t *a, int is_le) {
     for (int i = 0; i < g_disc_count; i++)
@@ -325,6 +332,8 @@ static void ev_conn_request(const uint8_t *p, int plen) {
     uint8_t link_type = p[9];
     kprintf("[BT-HCI] connection request %02x:%02x:%02x:%02x:%02x:%02x link=%u\n",
             addr.b[5], addr.b[4], addr.b[3], addr.b[2], addr.b[1], addr.b[0], link_type);
+    bootlog_write("[BT-HCI] Classic connection request %02x:%02x:%02x:%02x:%02x:%02x link=%u",
+                  addr.b[5], addr.b[4], addr.b[3], addr.b[2], addr.b[1], addr.b[0], link_type);
     if (link_type == 0x01) {          // ACL
         uint8_t par[7];
         memcpy(par, addr.b, 6);
@@ -339,6 +348,8 @@ static void ev_conn_complete(const uint8_t *p, int plen) {
     uint16_t handle = rd16(p + 1);
     bt_addr_t addr; memcpy(addr.b, p + 3, 6);
     kprintf("[BT-HCI] connection complete status=0x%02x handle=0x%04x\n", status, handle);
+    bootlog_write("[BT-HCI] Classic connection complete status=0x%02x handle=0x%04x %02x:%02x:%02x:%02x:%02x:%02x",
+                  status, handle, addr.b[5], addr.b[4], addr.b[3], addr.b[2], addr.b[1], addr.b[0]);
     if (status != HCI_SUCCESS) return;
     hci_conn_t *c = hci_conn_by_addr(&addr);
     if (!c) c = conn_alloc();
@@ -347,9 +358,35 @@ static void ev_conn_complete(const uint8_t *p, int plen) {
     c->handle = handle;
     c->peer = addr;
     c->type = HCI_LINK_ACL_CLASSIC;
-    c->role = 1;
+    // Outbound (we paged the device via hci_classic_connect) => we are the
+    // master/central (role 0). Inbound (the device paged us) => role 1.
+    int outbound = (g_have_pending_classic && bt_addr_eq(&g_pending_classic, &addr));
+    if (outbound) g_have_pending_classic = 0;
+    c->role = outbound ? 0 : 1;
     bt_set_state(BT_STATE_CONNECTED);
     notify_conn(c, 1);
+
+    // [bthid] Classic link is up. A BR/EDR HID device will not deliver input
+    // until the link is authenticated + encrypted, and in practice it waits for
+    // the HOST to drive Secure Simple Pairing rather than starting it itself (an
+    // unauthenticated link is dropped in tens of ms, reason 0x13). So initiate
+    // authentication now: this triggers Link Key Request / IO Capability Request
+    // / User Confirmation / Simple Pairing Complete, all of which are HCI EVENTS
+    // on the interrupt endpoint (the working path), handled by pair.c. If a bond
+    // already exists we answer the Link Key Request from the store; if not,
+    // Just-Works SSP runs. Collision-safe if the remote also authenticates (the
+    // controller arbitrates). This fires on Connection Complete for BOTH
+    // directions: an inbound link (device paged us) AND an outbound link (we
+    // paged a discoverable-only device via hci_classic_connect), so a
+    // freshly-discovered classic HID keyboard/mouse authenticates the same way.
+    {
+        uint8_t par[2] = { (uint8_t)(handle & 0xFF), (uint8_t)((handle >> 8) & 0xFF) };
+        kprintf("[BT-HCI] %s Classic link up handle=0x%04x: initiating authentication (SSP)\n",
+                outbound ? "outbound" : "inbound", handle);
+        bootlog_write("[BT-HCI] %s Classic link up handle=0x%04x: initiating SSP authentication",
+                      outbound ? "outbound" : "inbound", handle);
+        hci_send_cmd(HCI_CMD_AUTH_REQUESTED, par, 2);
+    }
 }
 
 static void ev_disconn_complete(const uint8_t *p, int plen) {
@@ -357,6 +394,13 @@ static void ev_disconn_complete(const uint8_t *p, int plen) {
     uint16_t handle = rd16(p + 1);
     uint8_t reason = p[3];
     kprintf("[BT-HCI] disconnect handle=0x%04x reason=0x%02x\n", handle, reason);
+    {
+        hci_conn_t *dc = hci_conn_by_handle(handle);
+        bootlog_write("[BT-HCI] disconnect handle=0x%04x reason=0x%02x peer=%02x:%02x:%02x:%02x:%02x:%02x",
+                      handle, reason,
+                      dc ? dc->peer.b[5] : 0, dc ? dc->peer.b[4] : 0, dc ? dc->peer.b[3] : 0,
+                      dc ? dc->peer.b[2] : 0, dc ? dc->peer.b[1] : 0, dc ? dc->peer.b[0] : 0);
+    }
     hci_conn_t *c = hci_conn_by_handle(handle);
     if (c) {
         notify_conn(c, 0);
@@ -391,7 +435,9 @@ static void parse_adv_data(hci_disc_dev_t *d, const uint8_t *ad, int adlen) {
             case 0x03: { // complete list of 16-bit UUIDs
                 for (int k = 0; k + 1 < vlen; k += 2) {
                     uint16_t u = (uint16_t)(val[k] | (val[k + 1] << 8));
-                    if (u == 0x1812) d->is_hid = 1;   // HID service
+                    // HID service: LE HOGP is 0x1812, classic BR/EDR HID (in an
+                    // Extended Inquiry Response) is 0x1124.
+                    if (u == 0x1812 || u == 0x1124) d->is_hid = 1;
                 }
                 break;
             }
@@ -438,6 +484,9 @@ static void ev_adv_report(const uint8_t *p, int plen) {
             kprintf("[BT-HCI] HID device found %02x:%02x:%02x:%02x:%02x:%02x '%s' (type=%s ap=%u)\n",
                     addr.b[5], addr.b[4], addr.b[3], addr.b[2], addr.b[1], addr.b[0],
                     d->name, addr_type ? "random" : "public", d->appearance);
+            bootlog_write("[BT-HCI] LE HID device found %02x:%02x:%02x:%02x:%02x:%02x '%s' type=%s ap=%u",
+                          addr.b[5], addr.b[4], addr.b[3], addr.b[2], addr.b[1], addr.b[0],
+                          d->name, addr_type ? "random" : "public", d->appearance);
             if (g_hid_found_cb) g_hid_found_cb(d);
         }
     }
@@ -453,6 +502,8 @@ static void ev_le_meta(const uint8_t *p, int plen) {
         bt_addr_t addr; memcpy(addr.b, p + 6, 6);
         kprintf("[BT-HCI] LE connection complete status=0x%02x handle=0x%04x peer=%02x:%02x:%02x:%02x:%02x:%02x\n",
                 status, handle, addr.b[5], addr.b[4], addr.b[3], addr.b[2], addr.b[1], addr.b[0]);
+        bootlog_write("[BT-HCI] LE connection complete status=0x%02x handle=0x%04x peer=%02x:%02x:%02x:%02x:%02x:%02x",
+                      status, handle, addr.b[5], addr.b[4], addr.b[3], addr.b[2], addr.b[1], addr.b[0]);
         if (status != HCI_SUCCESS) { bt_set_state(BT_STATE_READY); return; }
         hci_conn_t *c = hci_conn_by_addr(&addr);
         if (!c) c = conn_alloc();
@@ -468,6 +519,115 @@ static void ev_le_meta(const uint8_t *p, int plen) {
         // hand to pairing (SMP) observers.
         fan_out(HCI_EVT_LE_META, p, (uint8_t)plen);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Classic BR/EDR inquiry results -> shared disc cache
+// ---------------------------------------------------------------------------
+// Add/refresh a classic device in the disc cache and classify HID from its
+// Class-of-Device (and, for an Extended Inquiry Result, its EIR). Fires the
+// HID-found callback (gatt.c auto-target) the first time it becomes HID, exactly
+// like the LE adv-report path.
+static void classic_disc_update(const bt_addr_t *addr, int8_t rssi, uint32_t cod,
+                                const uint8_t *eir, int eirlen) {
+    hci_disc_dev_t *d = disc_get_or_add(addr, 0);   // is_le = 0 => classic
+    if (!d) return;
+    int was_hid = d->is_hid;
+    d->addr_type = 0;       // classic BR/EDR has no LE address type
+    d->adv_type  = 0xFF;    // sentinel: not an LE advertising report
+    if (rssi) d->rssi = rssi;
+    d->cod = cod;
+
+    // Class-of-Device: major device class in bits [12:8], minor in the low byte.
+    // A Peripheral (major 0x05) with the keyboard bit (0x40) or the pointing bit
+    // (0x80) set in the minor field is a HID keyboard/mouse.
+    uint8_t major = (uint8_t)((cod >> 8) & 0x1F);
+    uint8_t minor = (uint8_t)(cod & 0xFF);
+    if (major == 0x05) {
+        d->is_hid = 1;
+        if (minor & 0x40)      d->appearance = 1;   // keyboard
+        else if (minor & 0x80) d->appearance = 2;   // pointing device / mouse
+    }
+
+    // EIR (Extended Inquiry Result) carries the same AD structures as LE adv
+    // data: reuse the parser for the device name + HID service UUID (0x1124).
+    if (eir && eirlen > 0) parse_adv_data(d, eir, eirlen);
+
+    if (d->is_hid && !was_hid) {
+        kprintf("[BT-HCI] Classic HID found %02x:%02x:%02x:%02x:%02x:%02x cod=0x%06x rssi=%d '%s' ap=%u\n",
+                addr->b[5], addr->b[4], addr->b[3], addr->b[2], addr->b[1], addr->b[0],
+                (unsigned)(cod & 0xFFFFFF), d->rssi, d->name, d->appearance);
+        bootlog_write("[BT-HCI] Classic HID found %02x:%02x:%02x:%02x:%02x:%02x cod=0x%06x rssi=%d '%s' ap=%u",
+                      addr->b[5], addr->b[4], addr->b[3], addr->b[2], addr->b[1], addr->b[0],
+                      (unsigned)(cod & 0xFFFFFF), d->rssi, d->name, d->appearance);
+        if (g_hid_found_cb) g_hid_found_cb(d);
+    }
+}
+
+// Inquiry Result (0x02): Num_Responses, then per-field arrays -
+//   BD_ADDR[N](6), PSRM[N](1), Reserved[N](1), Reserved[N](1), CoD[N](3), Clk[N](2)
+static void ev_inquiry_result(const uint8_t *p, int plen) {
+    if (plen < 1) return;
+    int num = p[0];
+    int base_cod = 1 + num * 9;   // after BD_ADDR + PSRM + 2*Reserved arrays
+    for (int i = 0; i < num; i++) {
+        int ao = 1 + i * 6;
+        int co = base_cod + i * 3;
+        if (co + 3 > plen) break;
+        bt_addr_t addr; memcpy(addr.b, p + ao, 6);
+        uint32_t cod = (uint32_t)(p[co] | (p[co + 1] << 8) | ((uint32_t)p[co + 2] << 16));
+        classic_disc_update(&addr, 0, cod, NULL, 0);
+    }
+}
+
+// Inquiry Result with RSSI (0x22): Num_Responses, then per-field arrays -
+//   BD_ADDR[N](6), PSRM[N](1), Reserved[N](1), CoD[N](3), Clk[N](2), RSSI[N](1)
+static void ev_inquiry_result_rssi(const uint8_t *p, int plen) {
+    if (plen < 1) return;
+    int num = p[0];
+    int base_cod  = 1 + num * 8;    // after BD_ADDR + PSRM + 1*Reserved arrays
+    int base_rssi = 1 + num * 13;   // after CoD(3N) + Clk(2N)
+    for (int i = 0; i < num; i++) {
+        int ao = 1 + i * 6;
+        int co = base_cod + i * 3;
+        int ro = base_rssi + i;
+        if (co + 3 > plen || ro + 1 > plen) break;
+        bt_addr_t addr; memcpy(addr.b, p + ao, 6);
+        uint32_t cod = (uint32_t)(p[co] | (p[co + 1] << 8) | ((uint32_t)p[co + 2] << 16));
+        int8_t rssi = (int8_t)p[ro];
+        classic_disc_update(&addr, rssi, cod, NULL, 0);
+    }
+}
+
+// Extended Inquiry Result (0x2F): always a single response -
+//   Num_Responses(1)=1, BD_ADDR(6), PSRM(1), Reserved(1), CoD(3), Clk(2),
+//   RSSI(1), Extended_Inquiry_Response(240)
+static void ev_ext_inquiry_result(const uint8_t *p, int plen) {
+    if (plen < 15) return;
+    bt_addr_t addr; memcpy(addr.b, p + 1, 6);
+    uint32_t cod = (uint32_t)(p[9] | (p[10] << 8) | ((uint32_t)p[11] << 16));
+    int8_t rssi = (int8_t)p[14];
+    const uint8_t *eir = p + 15;
+    int eirlen = plen - 15;
+    classic_disc_update(&addr, rssi, cod, eir, eirlen);
+}
+
+// Remote Name Request Complete (0x07): status(1), BD_ADDR(6), Name(<=248, NUL).
+static void ev_remote_name(const uint8_t *p, int plen) {
+    if (plen < 7) return;
+    bt_addr_t addr; memcpy(addr.b, p + 1, 6);
+    if (p[0] != HCI_SUCCESS) return;
+    const char *nm = (const char *)(p + 7);
+    int nmax = plen - 7;
+    hci_disc_dev_t *d = disc_find(&addr, 0);
+    if (d) {
+        int k = 0;
+        for (; k < nmax && k < (int)sizeof(d->name) - 1 && nm[k]; k++) d->name[k] = nm[k];
+        d->name[k] = 0;
+    }
+    kprintf("[BT-HCI] remote name %02x:%02x:%02x:%02x:%02x:%02x '%.*s'\n",
+            addr.b[5], addr.b[4], addr.b[3], addr.b[2], addr.b[1], addr.b[0],
+            nmax, nm);
 }
 
 static void hci_event(const uint8_t *data, int len) {
@@ -492,6 +652,8 @@ static void hci_event(const uint8_t *data, int len) {
                 if (c) c->encrypted = enabled ? 1 : 0;
                 kprintf("[BT-HCI] encryption change handle=0x%04x status=0x%02x enabled=%u\n",
                         h, p[0], enabled);
+                bootlog_write("[BT-HCI] encryption change handle=0x%04x status=0x%02x enabled=%u",
+                              h, p[0], enabled);
                 for (int i = 0; i < g_encrypt_observer_count; i++)
                     if (g_encrypt_observers[i]) g_encrypt_observers[i](h, enabled);
             }
@@ -499,8 +661,14 @@ static void hci_event(const uint8_t *data, int len) {
             break;
         }
         case HCI_EVT_NUM_COMPLETED_PKTS: break;  // ACL flow-control ack
-        case HCI_EVT_REMOTE_NAME_REQ_COMPLETE: break;
-        case HCI_EVT_INQUIRY_COMPLETE: break;
+        case HCI_EVT_REMOTE_NAME_REQ_COMPLETE: ev_remote_name(p, plen); break;
+        case HCI_EVT_INQUIRY_RESULT:      ev_inquiry_result(p, plen); break;
+        case HCI_EVT_INQUIRY_RESULT_RSSI: ev_inquiry_result_rssi(p, plen); break;
+        case HCI_EVT_EXT_INQUIRY_RESULT:  ev_ext_inquiry_result(p, plen); break;
+        case HCI_EVT_INQUIRY_COMPLETE:
+            kprintf("[BT-HCI] Classic inquiry complete\n");
+            bootlog_write("[BT-HCI] Classic inquiry complete");
+            break;
         // Pairing / security events go to observers (pair.c).
         case HCI_EVT_IO_CAP_REQUEST:
         case HCI_EVT_IO_CAP_RESPONSE:
@@ -543,6 +711,14 @@ static acl_reasm_t *reasm_for(uint16_t handle) {
 
 static void hci_on_acl(const uint8_t *data, uint16_t len) {
     if (len < 4) return;
+    {
+        // [bthid] prove the ACL reassembly upcall is reached and with what.
+        uint16_t dhf = rd16(data);
+        kprintf("[BT-HCI] ACL rx handle=0x%04x pb=%u dlen=%u totlen=%u (%02x %02x %02x %02x)\n",
+                HCI_ACL_HANDLE(dhf), HCI_ACL_PB(dhf), rd16(data + 2), len,
+                len > 4 ? data[4] : 0, len > 5 ? data[5] : 0,
+                len > 6 ? data[6] : 0, len > 7 ? data[7] : 0);
+    }
     uint16_t hf = rd16(data);
     uint16_t handle = HCI_ACL_HANDLE(hf);
     uint8_t pb = HCI_ACL_PB(hf);
@@ -660,6 +836,67 @@ int hci_le_connect(const bt_addr_t *addr, uint8_t addr_type) {
     return hci_send_cmd(HCI_CMD_LE_CREATE_CONNECTION, p, (uint8_t)i);
 }
 
+// ---------------------------------------------------------------------------
+// Classic BR/EDR discovery + outbound connect
+// ---------------------------------------------------------------------------
+int hci_classic_inquiry(void) {
+    // Inquiry (0x0401): LAP(3) = GIAC 0x9E8B33 (little-endian on the wire),
+    // Inquiry_Length(1) = 0x08 (~10.24s), Num_Responses(1) = 0 (unlimited).
+    // Results arrive asynchronously as Inquiry Result / RSSI / Extended events,
+    // routed into the disc cache by ev_inquiry_*; no wait here.
+    uint8_t p[5] = { 0x33, 0x8B, 0x9E, 0x08, 0x00 };
+    kprintf("[BT-HCI] Classic inquiry (GIAC, len=0x08, unlimited)\n");
+    return hci_send_cmd(HCI_CMD_INQUIRY, p, 5);
+}
+
+// Stop an in-flight classic inquiry (bt-settings-ux fix, 2026-09-16). Before
+// this existed, bt_scan_stop() only disabled the LE scan (hci_le_scan(0)) and
+// left any classic Inquiry running for its own Inquiry_Length (~10.24s here),
+// so clicking Stop looked like it did nothing on hardware that answered a
+// classic inquiry: results kept arriving and the Settings list kept growing
+// until the inquiry window expired on its own. hci_classic_connect() already
+// proved Inquiry_Cancel is safe to send speculatively (Command Disallowed,
+// harmlessly ignored, when no inquiry is active).
+int hci_classic_inquiry_cancel(void) {
+    return hci_send_cmd(HCI_CMD_INQUIRY_CANCEL, NULL, 0);
+}
+
+int hci_classic_connect(const bt_addr_t *addr) {
+    if (!addr) return BT_ERR_PARAM;
+    // A controller refuses Create_Connection (Command Disallowed) while an
+    // inquiry is running, so cancel any in-flight inquiry first. Harmless no-op
+    // (it just returns Command Disallowed) when no inquiry is active.
+    hci_send_cmd(HCI_CMD_INQUIRY_CANCEL, NULL, 0);
+
+    // Create_Connection (0x0405): BD_ADDR(6), Packet_Type(2) = 0xCC18 (all DM/DH
+    // baseband packet types), Page_Scan_Repetition_Mode(1) = 0x01 (R1),
+    // Reserved(1) = 0, Clock_Offset(2) = 0, Allow_Role_Switch(1) = 0x01.
+    uint8_t p[13];
+    memcpy(p, addr->b, 6);
+    p[6]  = 0x18; p[7] = 0xCC;   // packet type 0xCC18, little-endian
+    p[8]  = 0x01;                // page scan repetition mode R1
+    p[9]  = 0x00;                // reserved
+    p[10] = 0x00; p[11] = 0x00;  // clock offset (unknown)
+    p[12] = 0x01;                // allow role switch
+
+    g_pending_classic = *addr;
+    g_have_pending_classic = 1;
+    bt_set_state(BT_STATE_CONNECTING);
+    kprintf("[BT-HCI] Create_Connection -> %02x:%02x:%02x:%02x:%02x:%02x\n",
+            addr->b[5], addr->b[4], addr->b[3], addr->b[2], addr->b[1], addr->b[0]);
+    return hci_send_cmd(HCI_CMD_CREATE_CONNECTION, p, 13);
+}
+
+int hci_remote_name_req(const bt_addr_t *addr) {
+    if (!addr) return BT_ERR_PARAM;
+    // Remote_Name_Request (0x0419): BD_ADDR(6), Page_Scan_Repetition_Mode(1)=0x01,
+    // Reserved(1)=0, Clock_Offset(2)=0. Result is Remote Name Request Complete.
+    uint8_t p[10];
+    memcpy(p, addr->b, 6);
+    p[6] = 0x01; p[7] = 0x00; p[8] = 0x00; p[9] = 0x00;
+    return hci_send_cmd(HCI_CMD_REMOTE_NAME_REQ, p, 10);
+}
+
 int hci_le_start_encryption(hci_handle_t h, const uint8_t rand8[8],
                             uint16_t ediv, const uint8_t ltk16[16]) {
     uint8_t p[28];
@@ -693,6 +930,7 @@ int hci_init(void) {
     g_bringup_wait = 0;
 
     g_disc_count = 0;
+    g_have_pending_classic = 0;
 
     static const bt_transport_rx_t rx = { hci_on_event, hci_on_acl };
     bt_transport_set_rx(&rx);

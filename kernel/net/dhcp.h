@@ -125,6 +125,11 @@ int dhcp_discover(void);
 // Start DHCP discovery and wait for completion (blocking)
 int dhcp_discover_blocking(void);
 
+// #dhcpwake: wake any thread parked in dhcp_discover_blocking(). Called from the
+// DHCP RX/poll path (dhcp_handle/dhcp_poll) and, as the redundant always-armed
+// source, from net_worker() each ~1s pass. Safe from under net_lock.
+void dhcp_wake(void);
+
 // Get DHCP state
 int dhcp_get_state(void);
 

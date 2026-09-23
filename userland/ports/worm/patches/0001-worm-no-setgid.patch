@@ -1,0 +1,11 @@
+--- a/worm.c
++++ b/worm.c
+@@ -99,7 +99,7 @@
+ {
+ 
+ 	/* Revoke setgid privileges */
+-	setregid(getgid(), getgid());
++	/* MAYTERA CHANGE: no setgid privilege to revoke on this OS; call removed. */
+ 
+ 	setbuf(stdout, outbuf);
+ 	srand(getpid());

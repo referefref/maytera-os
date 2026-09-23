@@ -27,6 +27,15 @@ void blk_clear_root_usb(void);
 int blk_root_is_usb(void);
 int blk_root_usb_index(void);
 
+// #wallpersist2: issue SCSI SYNCHRONIZE CACHE to the root USB MSC device (a
+// no-op if the root is not USB, or the device is not ready). blk_write() is
+// already write-through at the OS level, but the physical USB stick's own
+// controller may still be holding recently written sectors in its own
+// onboard cache; this is the USB-MSC equivalent of ata_flush_all()/
+// ahci_flush() for the ATA/AHCI paths, and must be called from the same
+// shutdown/reboot flush sequence (see acpi_shutdown_flush()).
+void blk_flush_root_usb(void);
+
 // Sector I/O in 512-byte units. channel/drive give the ATA identity used on the
 // ATA path; they are ignored on the USB path. Returns the number of sectors
 // transferred (> 0) on success, <= 0 on error, matching the ata_*_dma calling

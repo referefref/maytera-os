@@ -119,6 +119,22 @@ typedef struct {
     uint8_t  interrupt_line;
     uint8_t  interrupt_pin;
     uint32_t bar[6];
+    // #imacnic: SUBSYSTEM VENDOR/DEVICE, read from config offsets 0x2C/0x2E.
+    //
+    // VALID ONLY FOR A TYPE-0 HEADER. On a type-1 (PCI-PCI bridge) header those
+    // same two offsets are secondary-bus timing registers, not an identity, so
+    // reading them there would invent a plausible-looking wrong answer. Both
+    // fields stay 0 for any other header type and every consumer prints "n/a".
+    //
+    // WHY IT IS WORTH FOUR BYTES. vendor:device names the SILICON; subsystem
+    // vendor:device names the BOARD it was soldered to. The same Broadcom
+    // 14e4:xxxx part appears in an Apple iMac, a Dell and an HP with different
+    // PHY wiring and different quirks, and the subsystem pair (0x106B = Apple)
+    // is the ONLY field in config space that distinguishes them. This kernel
+    // never read it, so no log it has ever produced could carry it, and every
+    // "which board is this" question had to be answered by guessing.
+    uint16_t subsys_vendor;
+    uint16_t subsys_id;
     // #418: set by pci_mark_claimed() once a driver successfully brings this
     // function up. Lets /DEVLOG.TXT show, for every enumerated PCI function,
     // whether ANY driver claimed it - closing out "does this device even
@@ -132,6 +148,41 @@ typedef struct {
 
 // Initialize PCI driver
 void pci_init(void);
+
+// #imacnic: WRITE THE DEVICE TABLE WHERE IT SURVIVES. One /BOOTLOG.TXT line per
+// PCI function: bus:slot.func, vendor:device, subsystem vendor:device, class,
+// revision, header type, IRQ line/pin, the command register and every non-zero
+// BAR with its type. Called at the end of pci_init().
+//
+// WHY THIS EXISTS AND WHY IT IS NOT OPTIONAL. Until now pci_init() logged
+// exactly one durable line, "[PCI] found=23 cap=256 dropped=0". The per-device
+// listing went to kprintf() (pci_print_devices()) and to /DEVLOG.TXT, and
+// BOTH of those channels can be unavailable on the machine that matters:
+// kprintf() is SERIAL-ONLY and neither of the owner's two physical machines has
+// a serial port, and /DEVLOG.TXT is written at boot stage 38, so any boot that
+// hangs before then leaves no inventory at all. The result, measured on the
+// real iMac14,4 (golden 2346, /root/imac-logs-hang/BOOTLOG.TXT): the count 23
+// survived and NOT ONE DEVICE DID, on the one machine whose built-in NIC we
+// were trying to identify.
+//
+// This is the sixth instance of the same fault in this tree (net/wget.c had 42
+// kprintf and zero bootlog_write; the lock and scheduler counters likewise).
+// Each previous fix promoted the ONE line someone happened to need. This one
+// promotes the whole subsystem, because the line you need next is never the
+// line you promoted last.
+void pci_bootlog_inventory(void);
+
+// #imacnic: a LATE companion to the inventory, called after the drivers have
+// had their chance to bring devices up. Reports how many functions any driver
+// claimed (see pci_mark_claimed) and names every unclaimed function of a class
+// that a user would expect to work: storage, network, display, multimedia,
+// serial bus, wireless. Unclaimed bridges and host bridges are only counted,
+// because those are expected and listing them would bury the ones that are not.
+//
+// A NETWORK-class function in that list is the exact shape of "this machine has
+// an Ethernet port that this kernel cannot use", which is otherwise
+// indistinguishable from "this machine has no Ethernet port".
+void pci_bootlog_claims(void);
 
 // #418: mark a PCI function as claimed by a driver (call on successful
 // bring-up, not merely on a vendor:device ID match - a device can be FOUND

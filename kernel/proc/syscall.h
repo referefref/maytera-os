@@ -202,6 +202,13 @@
 #define SYS_NET_MOUNT          269  // #317: mount an SMB share with creds (server,share,user,pass) -> 0/-1
 #define SYS_NET_LIST_SHARES    270  // #317: enumerate a server's shares (server,buf,maxlen) -> count
 #define SYS_NET_UNMOUNT        271  // #317: unmount an SMB share (server,share) -> 0/-1
+// #317 nfsbrowse: NFS export enumeration + on-demand mount for the Files /NET
+// view. Exports come from the MOUNT protocol EXPORT procedure (showmount -e);
+// the mount reuses the existing net/nfs.c NFSv3 client. NUMBER CHOICE: 458/459,
+// the SYS_MAX sentinel's own value upward, the first genuinely unallocated
+// numbers, with SYS_MAX bumped to 460 in the same edit.
+#define SYS_NET_LIST_EXPORTS   458  // #317: enumerate an NFS server's exports (server,buf,maxlen) -> count
+#define SYS_NFS_MOUNT          459  // #317: mount an NFS export on demand (server,export,mp_out,mp_outsz) -> 0/-1
 // #325 Device Manager: read-only hardware enumeration (structs in devinfo.h)
 #define SYS_DEV_PCI_LIST       272  // (devinfo_pci_t *buf, int max) -> count
 #define SYS_DEV_USB_LIST       273  // (devinfo_usb_t *buf, int max) -> count
@@ -605,8 +612,13 @@ typedef struct {
     uint32_t faulty;         // net_is_faulty() as 0/1 (#549)
     uint32_t driver;         // net_driver_type_t; 0 = NO NIC AT ALL
     uint32_t prefix_len;     // popcount(netmask), precomputed
+    // #netfix2: is dns_active an EXPLICIT choice that overrides DHCP on every
+    // network, or is it just what the network offered? Settings could not tell
+    // the difference and therefore could not show the difference, which is how
+    // a user ends up permanently pinned to a resolver he never knowingly chose.
+    uint32_t dns_pinned;     // dns_server_is_pinned() as 0/1
 } net_status_t;
-_Static_assert(sizeof(net_status_t) == 48,
+_Static_assert(sizeof(net_status_t) == 52,
                "net_status_t sizeof lock (Rust NetStatus in rustkern/netstat.rs, "
                "SZ_NET_STATUS in rustkern/argtab.rs, and the userland mirrors)");
 
@@ -968,6 +980,7 @@ int64_t sys_set_dblclick_ms(int ms);
 // userland/libc/syscall.h and with the Rust argument table.
 #define SYS_VOL_LIST                   283  // (sc_volume_t *buf, int max) -> count written, or -1
 #define SYS_VOL_EJECT                  284  // (int index) -> 0, or -1
+#define SYS_VOL_BUSY                   285  // (int index) -> open-handle count (>=0); 0 for non-removable/empty
 
 // Volume record. MUST match sc_volume_t in userland/libc/syscall.h and
 // ScVolume in kernel/rustkern/hotplug.rs; the size is locked by
@@ -1300,7 +1313,189 @@ typedef struct {
 #define DOS_FM_HOST_SELFTEST       9   // rustkern/fmq.rs self-test, then re-open
 #define DOS_FM_HOST_LAUNCH        10   // gui/desktop.c fm_launch_synth() -> pid
 
-#define SYS_MAX                        424  // #fmbridge: SYS_DOS_FM_HOST=423 is the new top, so the sentinel is 424
+// (#dosperm) SYS_ACCESS - POSIX access(2), THE MISSING PRIMITIVE THAT LET THE
+// TWO DOS HOSTS DISAGREE.
+//
+// The kernel decides "may this identity touch this path" in exactly one place,
+// perms_check() in fs/perms.c (POSIX component traversal via
+// rustkern/permpath.rs). Every in-kernel caller reaches it. NOTHING IN RING 3
+// COULD ASK IT, because the only way to find out was to attempt the operation
+// and read the failure, and a failure code is not the same information.
+//
+// MEASURED, and this is why it is worth a syscall number. The DOS interpreter
+// is ONE implementation compiled twice (kernel/dos/*.c; the Ring-3 host at
+// userland/apps/dosring3 relinks those same sources). Its INT 21h AH=3Ch
+// create asks the #708 guest gate first, and the gate calls perms_check(). In
+// Ring 3 there was no way to call perms_check(), so shim/kshim.c stubbed the
+// gate to ALLOW and let the later open() fail instead. Same source file, same
+// guest, two different answers to the same question:
+//
+//   in-kernel : gate DENIES -> [GUESTFS-DENY] -> DOS error 5 (access denied)
+//   Ring 3    : gate ALLOWS -> fat_write_file() fails on a kernel EACCES ->
+//               [int21:dos] "FAILED on the medium" -> DOS error 3 (path not
+//               found)
+//
+// Red Alert, launched by the default non-root desktop identity against its own
+// root-owned /DOS/RA, retried that create 112,423 times in 150 seconds on the
+// Ring-3 route (96% of the serial log). Telling a program "that path does not
+// exist" when the truth is "you may not write it" is an invitation to retry.
+//
+// With this syscall the shim implements perms_check() by ASKING THE KERNEL, so
+// both hosts run the same gate, log the same line and return the same DOS
+// error. It is also simply the POSIX call every userland program should have
+// had: "can I write here" without a destructive trial.
+//
+// SEMANTICS: access(path, mode) where mode is R_OK|W_OK|X_OK (the fs/perms.h
+// values, which are the POSIX ones), or F_OK (0) to test existence alone.
+// Checked against the caller's EFFECTIVE uid/gid, not the real ones: the
+// caller is asking what IT can do right now. Returns 0 if permitted, -1 if
+// not, -1 for a bad path. There is deliberately no "check as some other uid"
+// form; that would be a policy oracle for arbitrary identities and nothing
+// needs one.
+#define SYS_ACCESS                     424
+
+// #netfix2: SYS_NET_LAST_ERROR(char *ubuf, uint32 cap) -> reason code (0 = none)
+//
+// WHY THIS EXISTS. The browser could only ever draw the string "Fetch failed",
+// and it was not the browser's fault: the kernel DESTROYED the cause before
+// userland could see it. sys_http_fetch() collapses DNS, connect, TLS and
+// timeout to a flat -1; sys_http_fetch_poll() returns only 0/1/2 and an HTTP
+// status; and async_fetch_worker() overwrites the live phase with
+// HTTP_PHASE_ERROR the instant an attempt fails. So the one artifact the user
+// sees said nothing, on a machine whose owner has reported "the browser does
+// not work" for months.
+//
+// This returns the reason the LAST fetch belonging to THIS process failed with
+// (rustkern/netfail.rs, published at the fetch chokepoint), and copies a short
+// human-readable name into ubuf: "DNS-RESOLVER-ANSWERED-NOTHING",
+// "TLS-FAILED-BECAUSE-SYSTEM-CLOCK-IS-WRONG", "TCP-CONNECT-TIMEOUT". It does
+// NOT clear the reason: an app legitimately asks twice, once for a status bar
+// and once for an error page.
+//
+// It is keyed by thread-group id, the same identity fetchown uses, so an app
+// that starts a fetch on one thread and renders on another still gets its own
+// answer and can never read another app's.
+//
+// NUMBER CHOICE: 425, the SYS_MAX sentinel's own value and therefore the first
+// genuinely unallocated number, with SYS_MAX bumped to 426 in the same edit
+// (the standing precedent in this file). Re-check at merge time.
+#define SYS_NET_LAST_ERROR             425
+
+// #245: face-explicit TTF measure. arg1 = string, arg2 = face | size<<8 |
+// style<<24 (the SAME packing SYS_WIN_DRAW_TTF_EX and SYS_FONT_GLYPH use, so
+// one helper packs for measure and draw and they cannot disagree). Returns the
+// pixel width the matching win_draw_text_ttf_ex() would paint.
+//
+// This is the missing half of the face-aware text API: the face-aware DRAW has
+// existed since the Font Browser, but there was no way to ASK how wide a run
+// would be in a face other than the active one, so any app wanting a second
+// typeface had to measure in the wrong face and lay out on that answer.
+#define SYS_MEASURE_TTF_EX             427
+
+
+// ---------------------------------------------------------------------------
+// Stage 1 SYSTEM CAPABILITY API (proc/caps.h, docs/SYSTEM_CAPABILITY_API.md).
+// Two request syscalls plus per-class nouns; everything else is the existing
+// syscall, now gated at the dispatcher chokepoint by syscall_cap_check().
+// NUMBER CHOICE: 429-436, the SYS_MAX sentinel's own value (428) upward, the
+// first genuinely unallocated numbers, with SYS_MAX bumped to 437 in the same
+// edit. All pointer syscalls carry argtab descriptors (below) so #503 pointer
+// validation covers them from the first commit.
+#define SYS_CAP_QUERY                  429  // (uint32 cap, cap_state_t *out) -> 0 | CAP_E*
+#define SYS_CAP_REQUEST                430  // (const cap_req_t *req) -> seq(>0) | CAP_E*
+#define SYS_CAP_STATUS                 431  // (uint64 seq) -> CAP_ST_* | CAP_ESTALE
+#define SYS_CAP_VIEW                   432  // COMPOSITOR ONLY (cap_view_t *) -> 1 open / 0 none
+#define SYS_CAP_RESOLVE                433  // COMPOSITOR ONLY (uint64 seq, int action) -> 0 | CAP_E*
+#define SYS_CAP_REVOKE                 434  // (uint32 cap) -> 0 (self-revoke; manager revoke is Stage 2)
+// screen.capture, the one capability wired end to end in Stage 1. The ambient
+// /SCREENSHOT.REQ file drop is DELETED; a screenshot is now a cap-gated syscall.
+#define SYS_SCREENSHOT_REQUEST         435  // (const char *path) -> 0 | neg  [gated: screen.capture]
+#define SYS_SCREENSHOT_POLL            436  // COMPOSITOR ONLY (char *out, int cap) -> len | 0
+
+// Stage 2 capability API: the mediated serial-port gateway (drivers/serialport.c).
+// SERIAL_LIST names the published ports (a port name + class only, never a base
+// or a /dev path); SERIAL_OPEN(name) opens one and is gated by serial.port.
+#define SYS_SERIAL_LIST                437  // (serial_pub_t *out, u32 max) -> count   [NOCAP]
+#define SYS_SERIAL_OPEN                438  // (const char *name, int flags) -> fd|neg  [gated: serial.port]
+
+// Stage 3 capability API: input provenance and input.inject (docs/SYSTEM_CAPABILITY_API.md
+// section 10, Stage 3). The COMPOSITOR-ONLY SYS_INJECT_KEY (197) / SYS_INJECT_MOUSE (214)
+// are unchanged; these are the NON-compositor, capability-gated path. A synthetic event
+// posted through here is delivered ONLY to a window the CALLER OWNS (scope kind
+// CAP_SCOPE_WINDOW), never stamps the elevation input credit (INPUT_SRC_SYNTHETIC), and is
+// refused while a consent prompt or the lock screen is up: an app holding input.inject
+// therefore cannot manufacture the credit for, or answer the prompt of, its own next grant.
+#define SYS_CAP_INJECT_KEY             439  // (int win, int keycode) -> 0 | CAP_E*  [gated: input.inject]
+#define SYS_CAP_INJECT_MOUSE           440  // (int win, int x, int y, int type, uint button) -> 0 | CAP_E*  [gated: input.inject]
+
+#define SYS_FLOCK                      441  // #404 Stage 6: flock(fd,op) BSD advisory whole-file lock
+// #404 (cfhost): Cardfile window hosting. Sets an ARBITRARY window's bounds by
+// its wm_window_info_t.id, plus a managed/hide bit. COMPOSITOR ONLY (gated by
+// uw_caller_is_compositor(), like the input-inject/screen-capture syscalls).
+// (int win_id, int x, int y, int w, int h, uint32 flags) -> 0 | -1. flags:
+// CF_MANAGED (1) = window gets WINDOW_FLAG_NOCHROME so the deck draws the card
+// frame; CF_HIDDEN (2) = stowed, minimized and not composited. Placement policy
+// is rustkern/wm_bounds.rs (wm_bounds_plan_rs); the window-list lookup + apply
+// is sys_wm_set_bounds() in gui/window.c.  [NOCAP: compositor-gated]
+#define SYS_WM_SET_BOUNDS              442
+// (btui) Bluetooth control multiplexed syscall: arg1 = BT_CMD_* (bt/bt_ctrl.h),
+// arg2/arg3 = operands. Drives the Settings Bluetooth page (power/scan/state/
+// device-list/pair/connect/forget). All user pointers validated in-handler via
+// copy_from_user/copy_to_user, so no argtab descriptor is required.
+#define SYS_BT                         443
+// #tbclose (appqa Finding 1): close an ARBITRARY window by its
+// wm_window_info_t.id, the same id SYS_WM_FOCUS_WINDOW/SYS_WM_MINIMIZE_WINDOW
+// already take. Runs the EXACT same code the kernel's own titlebar close (X)
+// button runs - window_request_close() in gui/window.c, factored out of
+// wm_handle_mouse_down()'s close-button branch so there is ONE
+// implementation, not a second copy that could drift - so a chromed window
+// closes byte-for-byte as it always has. Unlike a synthetic click at the
+// close button's screen coordinates (what taskbar_close_window() used to do),
+// this needs no titlebar to exist: a WINDOW_FLAG_NOCHROME window has none, so
+// the coordinate click could never reach the kernel's close-button hit test
+// (wm_handle_mouse_down() skips that whole block for NOCHROME windows), which
+// is exactly why the taskbar's Close silently no-op'd on 9 borderless apps
+// (aichat, arena, classicube, install, launcher, musicplayer, squadron,
+// winswitch, setup). This is a GRACEFUL request, not a kill: it posts
+// EVENT_WINDOW_CLOSE to the window's owner and, for a user window, hides it
+// - the app decides whether to actually exit (every one of the 9 already
+// handles EVENT_WINDOW_CLOSE in its event loop; if an app ignored it, the
+// real titlebar X would behave identically). Ungated like its FOCUS_WINDOW/
+// MINIMIZE_WINDOW neighbors (same severity: any caller can already
+// minimize/focus any window by id). (int id) -> 0 | -1.  [NOCAP]
+#define SYS_WM_CLOSE_WINDOW            444
+// #246/#305 AI escrow kernel enforcement (fs/escrow_guard.{c,h}). ENTER marks
+// the calling process an escrow-contract actor and registers a kernel-side
+// GraphFS WRITE grant scoped to a path prefix; EXIT revokes the grant and
+// clears the marker. See docs/CONTRACT_ENFORCEMENT_PLAN.md.
+#define SYS_ESCROW_ENTER               445  // (const char *scope_path, uint64 ttl_ms) -> 0 | ESCROW_E*
+#define SYS_ESCROW_EXIT                446  // () -> 0
+#define SYS_ESCROW_ABORT               447  // () -> reverted count | ESCROW_E* (Stage 5B auto-revert)
+// getrandom(2): fill a user buffer with kernel CSPRNG output (HMAC-DRBG,
+// crypto/csprng.c). NUMBER CHOICE: 448, the SYS_MAX sentinel's own value and
+// therefore the first genuinely unallocated number, with SYS_MAX bumped to 449
+// in the same edit (the #216/#407 precedent). [NOCAP]: reading random bytes is
+// not a privileged act (cf. the world-readable /dev/urandom it shares a source
+// with). Handler: sys_getrandom_rs (rustkern/getrandom.rs).
+#define SYS_GETRANDOM                  448  // (void *buf, size_t len, uint32 flags) -> len | -EINVAL | -EFAULT
+// #404 disk-mgr: raw block device + partition-table syscalls (Stages 0-2).
+// Numbers MUST equal userland/libc/syscall.h (syscall-number-lint enforces it).
+// Handlers are Rust (rustkern/blkmgr.rs); safety model in fs/blkmgr.h.
+#define SYS_BLK_ENUM                   449  // (blk_dev_t *buf, int max, int elem_size) -> count | neg
+#define SYS_BLK_READ                   450  // (int kind,int index,u64 lba,u32 count,void *buf) -> sectors | neg  root-only
+#define SYS_BLK_WRITE                  451  // (int kind,int index,u64 lba,u32 count,const void *buf) -> sectors | neg  root-only, boot-disk REFUSED
+#define SYS_PART_PREPARE               452  // (int kind,int index,const part_spec_t*,int nparts,part_token_t*) -> 0 | neg  root-only
+#define SYS_PART_WRITE                 453  // (int kind,int index,const part_spec_t*,int nparts,const u8 nonce[16]) -> 1 | neg  root-only APPLY
+#define SYS_MKFS                       454  // (int kind,int index,int part_index,int fstype,const char *label) -> 0 | neg  root-only, boot-disk REFUSED
+// #404 disk-mgr Stage 4: general MOUNT / UNMOUNT with a mount table. Handlers
+// are Rust (rustkern/blkmgr.rs). SYS_MOUNT_LIST is a read-only list of the boot
+// mounts + aux mounts (the future GUI Mount tab). SYS_MOUNT / SYS_UMOUNT manage
+// a SELF-CONTAINED aux mount table confined to a "/MNT/" prefix, so a dynamic
+// mount can never shadow "/" or "/boot". Root-only for the two mutating calls.
+#define SYS_MOUNT_LIST                 455  // (mount_ent_t *buf, int max, int elem_size) -> count | neg
+#define SYS_MOUNT                      456  // (int kind,int index,int part_index,const char *path) -> 0 | neg  root-only
+#define SYS_UMOUNT                     457  // (const char *path) -> 0 | neg  root-only, /MNT/ only (boot mounts refused)
+#define SYS_MAX                        460  // top is SYS_NFS_MOUNT=459 (#317 nfsbrowse)
 
 // ============================================================================
 // Syscall Register Convention (AMD64 System V ABI)
@@ -1358,6 +1553,7 @@ int64_t sys_sleep(uint32_t ms);
 // File I/O
 int64_t sys_open(const char *path, int flags);
 int64_t sys_fcntl(int fd, int cmd, long arg);  // #359
+int64_t sys_flock(int fd, int operation);      // #404 Stage 6: BSD advisory whole-file lock
 int64_t sys_play_wav(const char *path);
 // Ring-3 PCM push (see drivers/audio_pcm.h). Additive; sys_play_wav unchanged.
 // (#182) Drain the DOS guest OPL2 register writes to the Ring-3 FM core.
@@ -1435,6 +1631,12 @@ int64_t sys_getsid(int64_t pid_arg);
 // (rustkern/pollsys.rs); the dispatcher calls it directly, so there is no C
 // wrapper to drift from it.
 int64_t sys_poll_rs(void *ufds, uint64_t nfds, int64_t timeout_ms);
+// SYS_GETRANDOM (#no-ticket). The whole handler is Rust
+// (rustkern/getrandom.rs); it fills a user buffer from the kernel CSPRNG
+// (crypto/csprng.c) through copy_to_user. getrandom_selftest_rs() is the
+// boot self-test main.c runs to prove the source is live and non-constant.
+int64_t sys_getrandom_rs(void *buf, uint64_t len, uint64_t flags);
+uint32_t getrandom_selftest_rs(void);
 int64_t sys_readdir(int fd, void *entry_buf);
 
 // Window/Graphics
@@ -1470,6 +1672,7 @@ int64_t sys_setegid(uint32_t egid);
 int64_t sys_chmod(const char *path, uint16_t mode);
 int64_t sys_chown(const char *path, uint32_t uid, uint32_t gid);
 int64_t sys_fs_perm_info(const char *path, int reserved, void *ubuf); // #554
+int64_t sys_access(const char *path, int mode);                        // #dosperm
 int64_t sys_theme_load_file(const char *path); // #565
 int64_t sys_theme_contrast_corrections(int64_t theme_id); // (themes ticket)
 int64_t sys_passwd_change(const char *username, const char *old_pass, const char *new_pass);

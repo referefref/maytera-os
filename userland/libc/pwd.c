@@ -9,6 +9,7 @@
 #include "syscall.h"
 #include "string.h"
 #include "stdio.h"
+#include "stdlib.h"   // atoi, for getpwent (#745)
 
 // Static storage for return values
 static struct passwd pw_result;
@@ -114,4 +115,89 @@ struct passwd *getpwuid(uid_t uid) {
 
 struct passwd *getpwnam(const char *name) {
     return parse_passwd(name, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Sequential enumeration of /CONFIG/PASSWD, added for the libedit port (#745):
+// filecomplete uses getpwent() to offer ~user tab completion. Each getpwent()
+// returns the next entry using the same static result buffers parse_passwd
+// fills, so a caller must copy fields it wants to keep across calls. The file
+// is tiny (a handful of users), so re-reading it per call is fine.
+// Format: username:uid:gid:home:display_name:shell
+// ---------------------------------------------------------------------------
+static int g_pwent_idx = 0;
+
+void setpwent(void)
+{
+	g_pwent_idx = 0;
+}
+
+void endpwent(void)
+{
+	g_pwent_idx = 0;
+}
+
+struct passwd *getpwent(void)
+{
+	int fd = sys_open("/CONFIG/PASSWD", 0);
+	if (fd < 0)
+		return NULL;
+	char buf[2048];
+	long nread = sys_read(fd, buf, sizeof(buf) - 1);
+	sys_close(fd);
+	if (nread <= 0)
+		return NULL;
+	buf[nread] = '\0';
+
+	int idx = 0;
+	char *line = buf;
+	while (*line) {
+		while (*line == '\n' || *line == '\r')
+			line++;
+		if (!*line)
+			break;
+		char *eol = line;
+		while (*eol && *eol != '\n' && *eol != '\r')
+			eol++;
+		char saved = *eol;
+		*eol = '\0';
+
+		if (idx == g_pwent_idx) {
+			// Parse this line into the static buffers.
+			char *fields[6] = {0};
+			int nf = 0;
+			char *p = line;
+			fields[nf++] = p;
+			while (*p && nf < 6) {
+				if (*p == ':') {
+					*p = '\0';
+					fields[nf++] = p + 1;
+				}
+				p++;
+			}
+			if (nf < 6) {
+				// Malformed line: skip it and keep scanning.
+				*eol = saved;
+				line = (saved ? eol + 1 : eol);
+				continue;
+			}
+			g_pwent_idx++;
+			// Copy into the static return buffers.
+			strlcpy(pw_name_buf, fields[0], sizeof(pw_name_buf));
+			strlcpy(pw_dir_buf, fields[3], sizeof(pw_dir_buf));
+			strlcpy(pw_gecos_buf, fields[4], sizeof(pw_gecos_buf));
+			strlcpy(pw_shell_buf, fields[5], sizeof(pw_shell_buf));
+			pw_result.pw_name = pw_name_buf;
+			pw_result.pw_uid = (uid_t)atoi(fields[1]);
+			pw_result.pw_gid = (gid_t)atoi(fields[2]);
+			pw_result.pw_dir = pw_dir_buf;
+			pw_result.pw_gecos = pw_gecos_buf;
+			pw_result.pw_shell = pw_shell_buf;
+			return &pw_result;
+		}
+		idx++;
+		*eol = saved;
+		line = (saved ? eol + 1 : eol);
+	}
+	return NULL;
 }

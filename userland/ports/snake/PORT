@@ -1,0 +1,60 @@
+# mports recipe: snake, from the bsd-games 2.17 collection (tuigames batch,
+# owner request 2026-09-18). BSD-3-Clause, dependency closure 1 (ncurses).
+# Shares the bsdgames_2.17.orig.tar.gz tarball with hangman/worm/robots/
+# bsdtetris; see userland/ports/hangman/PORT for the tarball provenance note.
+#
+# WHAT THIS PORT SHIPS. The classic BSD "snake" chase game (not to be
+# confused with worm - a different program in the same collection): a snake
+# chases a mouse across a field of money to a goal square while avoiding
+# it. ONE translation unit (snake.c), curses-driven. This port ships only
+# the interactive `snake` binary, NOT `snscore` (a separate setuid score-
+# viewing helper in the same upstream directory) - MayteraOS has no setuid
+# model for it to exercise and no other program needs it.
+#
+# SCOREFILE HONESTY. snake.c opens both _PATH_RAWSCORES and _PATH_LOGFILE
+# with O_CREAT and treats either failure as non-fatal (warn() + a 2-second
+# sleep, then continues) - upstream's own design. Pointed at /HOME, matching
+# the moon-buggy port's SCORE_DIR precedent, so both are expected to
+# actually succeed on a normal desktop session.
+
+name=snake
+version=2.17
+class=C
+homepage=https://tracker.debian.org/pkg/bsdgames
+
+source_url=https://snapshot.debian.org/file/8e48a9808908e2898126fdd285196ab71c9a59c0
+tarball=bsdgames_2.17.orig.tar.gz
+sha256=066f924aef6c1c5ea946f588e36f303021f5dfc093944738f025d8edbc6fff60
+srcdir=bsd-games-2.17/snake/snake
+
+licence=BSD-3-Clause
+licence_files=../../COPYING
+copyleft=none
+copyleft_note=BSD-3-Clause is permissive; the combined /APPS/SNAKE binary (this port + ncurses + userland/libc, all permissive) carries no copyleft obligation.
+
+# THE ADOPTION TEST (owner rule 2): USES. snake.c is one ordinary Ring-3
+# translation unit driven by ncurses screen/input plus libc file I/O and
+# math. Measured: the 2 objects (snake.c + our bsdgame_compat.c) link
+# against libncurses.a + userland/libc/libc.a with zero undefined symbols.
+# It calls getch() itself in mainloop() and owns its own game state; it
+# imposes no event loop or window system on anything else.
+adoption=USES. Measured: the 2 compiled objects (snake.c plus our bsdgame_compat.c, which also supplies getlogin()) link against the built libncurses.a + userland/libc/libc.a with zero undefined symbols. snake owns its own game state and calls getch() itself from mainloop(); it imposes no event loop or window system on any other program.
+needs=libc ncurses
+
+prepare=none
+
+# ONE PATCH: adds `#include <getopt.h>` (snake.c relies on <unistd.h> alone
+# declaring optarg/getopt the way glibc does; MayteraOS libc keeps those in
+# getopt.h - same gap hangman hit) and drops the setgid-revocation call
+# (same reasoning as the other four bsd-games ports in this batch).
+patches=0001-snake-no-setgid.patch
+
+# build=script: adds our own bsdgame_compat.c (err/warn/random/getlogin),
+# and writes pathnames.h (upstream ships only pathnames.h.in; see build.sh).
+build=script
+
+headers=none
+lib=libsnake.a
+
+# THE ANTI-NO-OP CHECK: main (snake.c) and err (bsdgame_compat.c, ours).
+symbols=main err

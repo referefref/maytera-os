@@ -243,6 +243,11 @@ typedef enum {
     // Ordinal 13; the name and severity tables in rustkern.rs carry the
     // matching arm (a new event without one logs as INFO UNKNOWN, #697).
     AUDIT_IO_BOUNDARY,
+    // Stage 1 capability API: a capability grant, refusal, or revocation.
+    // Ordinal 14; INFO severity via the default arm of sec_event_severity()
+    // (like ELEVATION: per-use refusals are rate-limited into the durable log
+    // and the GraphFS journal, not toasted). Named in rustkern.rs sec_event_name.
+    AUDIT_CAPABILITY,
 } audit_event_t;
 
 /**

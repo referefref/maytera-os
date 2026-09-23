@@ -104,6 +104,26 @@ static const char *g_ds_err = 0;
 // Detection
 // ---------------------------------------------------------------------------
 
+// #dosmouse2: the raw title-suffix test, factored out so a SECOND caller
+// (main.c's DOS-cursor-suppression check, see cursor_render()'s
+// dos_cursor_should_hide()) can ask "is this title a DOS guest's?" without a
+// win_id lookup or a second wm_get_windows() call per window checked. Same
+// six characters, one definition - the same discipline this file's own
+// header comment already asks for between taskbar.c and contextmenu.c; a
+// third title-suffix check drifting apart from this one would be the same
+// bug one file over.
+bool dos_title_is_dos_window(const char *t) {
+    if (!t) return false;
+    int tlen = 0;
+    while (t[tlen] && tlen < 64) tlen++;
+    const int slen = 6;   // strlen(" (DOS)")
+    return tlen > slen &&
+           t[tlen-6]==' ' && t[tlen-5]=='(' && t[tlen-4]=='D' &&
+           t[tlen-3]=='O' && t[tlen-2]=='S' && t[tlen-1]==')';
+    // Bare "DOS" fallback title (no directory segment) intentionally reads as
+    // false here too - see file header LIMITATION note.
+}
+
 // Returns 1 and fills game[] (the directory-under-/DOS name, NUL-terminated)
 // if win_id is a DOS guest window; 0 otherwise. game may be NULL to just test.
 int dosspeed_window_is_dos(int win_id, char *game, int cap) {
@@ -113,23 +133,17 @@ int dosspeed_window_is_dos(int win_id, char *game, int cap) {
     for (int i = 0; i < n; i++) {
         if (wins[i].id != win_id) continue;
         const char *t = wins[i].title;
+        if (!dos_title_is_dos_window(t))
+            return 0;   // includes the bare "DOS" fallback title - see file header
         int tlen = 0;
         while (t[tlen] && tlen < 64) tlen++;
-        static const char suf[] = " (DOS)";
-        int slen = 6;
-        if (tlen > slen &&
-            t[tlen-6]==' ' && t[tlen-5]=='(' && t[tlen-4]=='D' &&
-            t[tlen-3]=='O' && t[tlen-2]=='S' && t[tlen-1]==')') {
-            int glen = tlen - slen;
-            if (game && cap > 0) {
-                int c = glen < cap - 1 ? glen : cap - 1;
-                for (int k = 0; k < c; k++) game[k] = t[k];
-                game[c] = '\0';
-            }
-            return 1;
+        int glen = tlen - 6;   // strlen(" (DOS)")
+        if (game && cap > 0) {
+            int c = glen < cap - 1 ? glen : cap - 1;
+            for (int k = 0; k < c; k++) game[k] = t[k];
+            game[c] = '\0';
         }
-        (void)suf;
-        return 0;   // includes the bare "DOS" fallback title - see file header
+        return 1;
     }
     return 0;
 }

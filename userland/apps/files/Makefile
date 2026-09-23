@@ -19,7 +19,7 @@ LDFLAGS = -pie --no-dynamic-linker -z notext -nostdlib -z max-page-size=0x1000 -
 TARGET = files
 
 # Objects
-OBJS = main.o
+OBJS = main.o netscan.o
 
 # Libraries
 CRT0 = $(LIBC_DIR)/crt0.o

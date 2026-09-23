@@ -23,36 +23,75 @@ extern fat_fs_t g_fat_fs;   // main.c; the single mounted root
 #define DOSROUTE_CFG  "/CONFIG/DOSROUTE.CFG"
 #define DOSROUTE_APP  "/APPS/DOSUSER"
 
-// The pid of the Ring-3 DOS host THIS layer started, or 0. See
-// dosroute_ring3_live() for why a bare pid is enough here and why it is
-// re-validated rather than trusted.
-static volatile int g_dosroute_r3_pid = 0;
+// (dosconc5, Stage 5) The pids of the Ring-3 DOS hosts THIS layer started, one
+// per slot, 0 = free. WAS a single `int g_dosroute_r3_pid`: one guest at a time.
+// It is now a BOUNDED set so up to DOSROUTE_MAX_RING3 guests run concurrently,
+// the owner's requirement. Each Ring-3 host is a separate process, so its whole
+// DOS guest state (g_dos, MCB/XMS/EMS, PSP/DTA, the file-handle table, the LDT
+// and conventional-memory arena, diskimg drive maps, dospath CWD, doslinger's
+// CLOSE_REQ/HOLD_UNTIL_MS) is a PRIVATE per-process copy: isolation by address
+// space, not by refactor. The only genuinely shared host singletons (the raw
+// keyboard tap and the OPL2/FM sink) follow compositor FOCUS, not this table
+// (rustkern/rawsc.rs's single subscriber and the dos_inst focus-owner token).
+//
+// Each pid is re-validated through proc_get() rather than trusted, because slots
+// are REUSED (a stale pid could match an unrelated process that landed in the
+// same slot later); checking the state as well as the pointer is what makes a
+// zombie DOSUSER (exited, not yet reaped) count as gone rather than as live.
+//
+// IDENTITY-PRESERVING: with a lone guest exactly one slot is ever occupied and
+// the gate refuses nothing it refused before; the relaxation is observable only
+// once a SECOND guest is asked for while a first is live.
+#define DOSROUTE_MAX_RING3 2
+static volatile int g_dosroute_r3_pid[DOSROUTE_MAX_RING3];
 
 // ---------------------------------------------------------------------------
-// Cross-path mutual exclusion.
+// Cross-path arbitration.
 //
 // g_dos_busy has always guarded the in-kernel path against a second in-kernel
-// guest. It knows nothing about Ring 3, so before this existed a Ring-3 launch
-// could start while an in-kernel guest was running (and vice versa) and the two
-// would fight over the raw-scancode tap and the host window. One guest at a
-// time is the invariant the whole DOS subsystem is written against; routing
-// must not quietly break it by adding a second path that does not participate.
+// guest (that path shares one static g_dos and the raw-scancode ISR tap, so it
+// stays one-at-a-time until the heap-allocated-per-guest switch, plan Stage 6).
+// The RING-3 path is different: each host is its own address space, so N of them
+// are isolated by construction, and Stage 5 lets up to DOSROUTE_MAX_RING3 run at
+// once. What must still hold across BOTH paths is that an in-kernel guest and any
+// Ring-3 guest do not run together (they would fight over the ISR scancode tap
+// and host focus), which is why dosroute_launch() still refuses an in-kernel
+// launch while any Ring-3 host lives and refuses a Ring-3 launch while the
+// in-kernel guest is busy.
 //
-// A pid is re-validated through proc_get() rather than trusted, because slots
-// are REUSED: a stale pid could match an unrelated process that landed in the
-// same slot later. Checking the state as well as the pointer is what makes a
-// zombie DOSUSER (exited, not yet reaped) count as gone rather than as live.
+// dosroute_ring3_count() returns the number of LIVE Ring-3 hosts, reaping any
+// slot whose pid is gone. A pid is re-validated through proc_get() rather than
+// trusted, because slots are REUSED: a stale pid could match an unrelated
+// process that landed in the same slot later. Checking the state as well as the
+// pointer is what makes a zombie DOSUSER (exited, not yet reaped) count as gone
+// rather than as live. The scan is a bounded fixed loop over DOSROUTE_MAX_RING3,
+// not a wait on a condition (#426 / concurrency-lint).
 // ---------------------------------------------------------------------------
-static int dosroute_ring3_live(void) {
-    int pid = g_dosroute_r3_pid;
-    if (pid <= 0) return 0;
-    process_t *p = proc_get((uint32_t)pid);
-    if (!p) { g_dosroute_r3_pid = 0; return 0; }
-    if (p->state == PROC_STATE_UNUSED || p->state == PROC_STATE_ZOMBIE) {
-        g_dosroute_r3_pid = 0;
-        return 0;
+static int dosroute_ring3_count(void) {
+    int n = 0;
+    for (int i = 0; i < DOSROUTE_MAX_RING3; i++) {
+        int pid = g_dosroute_r3_pid[i];
+        if (pid <= 0) continue;
+        process_t *p = proc_get((uint32_t)pid);
+        if (!p || p->state == PROC_STATE_UNUSED || p->state == PROC_STATE_ZOMBIE) {
+            g_dosroute_r3_pid[i] = 0;   // reap a gone host so its slot frees up
+            continue;
+        }
+        n++;
     }
-    return 1;
+    return n;
+}
+
+// Record a freshly-started Ring-3 host pid in a free slot. Reaps first, so a
+// slot left by an exited host is reused. Returns 0 on success, -1 if the table
+// is full (the caller has already refused in that case: belt-and-braces).
+static int dosroute_ring3_record(int pid) {
+    if (pid <= 0) return -1;
+    (void)dosroute_ring3_count();   // reap dead slots before searching for a free one
+    for (int i = 0; i < DOSROUTE_MAX_RING3; i++) {
+        if (g_dosroute_r3_pid[i] <= 0) { g_dosroute_r3_pid[i] = pid; return 0; }
+    }
+    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +149,18 @@ static void dosroute_load(dos_policy_t *pol) {
 int dosroute_spawn_ring3(const char *line, proc_ident_t ident) {
     if (!line || !line[0]) return -1;
 
+    // (dosconc5) Cap concurrent Ring-3 hosts. Enforced HERE, the one definition of
+    // "spawn a Ring-3 DOS host", so both the routed SYS_DOS_RUN path and the
+    // /CONFIG/DOSRING3.CFG boot harness respect it. With a lone guest live is 0.
+    {
+        int live = dosroute_ring3_count();
+        if (live >= DOSROUTE_MAX_RING3) {
+            kprintf("[DOSROUTE] refusing Ring-3 host '%s': %d already running (max %d)\n",
+                    line, live, DOSROUTE_MAX_RING3);
+            return -1;
+        }
+    }
+
     uint32_t elf_sz = 0;
     void *elf = fat_read_file(&g_fat_fs, DOSROUTE_APP, &elf_sz);
     if (!elf || elf_sz == 0) {
@@ -133,7 +184,7 @@ int dosroute_spawn_ring3(const char *line, proc_ident_t ident) {
         kprintf("[DOSROUTE] proc_create_user_as refused the Ring-3 host (rc=%d)\n", pid);
         return -1;
     }
-    g_dosroute_r3_pid = pid;
+    dosroute_ring3_record(pid);
     return pid;
 }
 
@@ -184,20 +235,33 @@ int dosroute_launch(const char *line) {
     }
     kfree(pol);
 
-    // One guest at a time, across BOTH paths (see dosroute_ring3_live).
-    if (dosroute_ring3_live()) {
-        kprintf("[DOSROUTE] busy: the Ring-3 DOS host (pid %d) is still running\n",
-                g_dosroute_r3_pid);
-        return -1;
+    // (dosconc5, Stage 5) Cross-path arbitration, now that up to DOSROUTE_MAX_RING3
+    // Ring-3 hosts may coexist (each its own address space). See dosroute_ring3_count.
+    int r3live = dosroute_ring3_count();
+
+    if (route != DOSROUTE_RING3) {
+        // In-kernel route. It shares the single static g_dos and the ISR scancode
+        // tap, so it must not run beside a Ring-3 DOS host. UNCHANGED rule: with a
+        // lone guest r3live is 0 and this is exactly the old path.
+        if (r3live > 0) {
+            kprintf("[DOSROUTE] busy: %d Ring-3 DOS host(s) running; in-kernel launch refused\n",
+                    r3live);
+            return -1;
+        }
+        return dos_launch(line);
     }
 
-    if (route != DOSROUTE_RING3)
-        return dos_launch(line);
-
-    // Ring-3 route. Refuse rather than start a second guest beside an in-kernel
-    // one; dos_launch() makes the mirror-image check for us on the other branch.
+    // Ring-3 route. Refuse beside an in-kernel guest (mirror of the check above),
+    // and cap concurrent Ring-3 hosts at DOSROUTE_MAX_RING3. dosroute_spawn_ring3
+    // enforces the cap too (one definition), so a config-driven launch respects it
+    // as well; this check keeps the routed path's diagnostic specific.
     if (dos_is_busy()) {
         kprintf("[DOSROUTE] busy: an in-kernel DOS task is already running\n");
+        return -1;
+    }
+    if (r3live >= DOSROUTE_MAX_RING3) {
+        kprintf("[DOSROUTE] busy: %d Ring-3 DOS host(s) already running (max %d)\n",
+                r3live, DOSROUTE_MAX_RING3);
         return -1;
     }
 

@@ -79,6 +79,31 @@ typedef struct {
     unsigned char    connected;
 } bt_device_t;
 
+// (btui) Rich adapter/stack state (matches bt_ctrl.h bt_state_info_t exactly).
+typedef struct {
+    unsigned char    present;      // 1 = HCI transport/dongle present
+    unsigned char    driver_up;    // 1 = controller finished bring-up
+    unsigned char    enabled;      // 1 = g_bt_enable (the UI master toggle)
+    unsigned char    scanning;     // 1 = discovery running
+    int              state;        // bt_state_t value
+    bt_addr_t        local_addr;   // controller BD_ADDR (valid when driver_up)
+} bt_state_info_t;
+
+// (btui) SYS_BT subcommands (arg1). Mirror of kernel bt/bt_ctrl.h; the numbers
+// are the ABI between bt_client.c and the kernel handler.
+#define BT_CMD_POWER        1
+#define BT_CMD_IS_POWERED   2
+#define BT_CMD_SCAN_START   3
+#define BT_CMD_SCAN_STOP    4
+#define BT_CMD_SCAN_ACTIVE  5
+#define BT_CMD_GET_STATE    6
+#define BT_CMD_GET_DEVICES  7
+#define BT_CMD_PAIR         8
+#define BT_CMD_CONNECT      9
+#define BT_CMD_DISCONNECT   10
+#define BT_CMD_FORGET       11
+#define BT_CMD_STATUS       12
+
 // ---- Radio power (bt_ctrl.h) ---------------------------------------------
 int  bt_power(int on);       // 1 = on, 0 = off. Returns 0 (BT_OK) on success.
 int  bt_is_powered(void);    // 1 if powered on
@@ -98,10 +123,12 @@ int  bt_forget(const bt_addr_t *addr);
 // ---- Status (bt_ctrl.h) --------------------------------------------------
 bt_state_t bt_status(void);
 int  bt_get_device(const bt_addr_t *addr, bt_device_t *out);
+// (btui) Rich adapter/stack state for the UI. Returns 0 on success.
+int  bt_get_state_info(bt_state_info_t *out);
 
 // ---- Address helpers (bt.h) ----------------------------------------------
 int  bt_addr_eq(const bt_addr_t *a, const bt_addr_t *b);
-void bt_addr_fmt(const bt_addr_t *a, char *out);   // "00:00:5E:00:53:00" (18 bytes)
+void bt_addr_fmt(const bt_addr_t *a, char *out);   // "AA:BB:CC:DD:EE:FF" (18 bytes)
 
 // ---- Frontend-only helpers (NOT part of the kernel contract) -------------
 // bt_tick(): currently a no-op (no driver state to pump). Under the REAL
@@ -153,6 +180,12 @@ int bt_disconnect_dev(const bt_addr_t *addr){ (void)addr; return -2; }
 int bt_forget(const bt_addr_t *addr)        { (void)addr; return -2; }
 
 bt_state_t bt_status(void)           { return BT_STATE_OFF; }
+int bt_get_state_info(bt_state_info_t *out) {   // (btui) honest "nothing here" state
+    if (!out) return -6;
+    for (unsigned i = 0; i < sizeof(*out); i++) ((unsigned char *)out)[i] = 0;
+    out->state = BT_STATE_OFF;
+    return 0;
+}
 
 void bt_tick(void)                   { }   // nothing to pump; no state, no timers
 int bt_tray_state(void)              { return 0; }   // always "off": honestly, it is

@@ -114,6 +114,13 @@ int idt_get_vector_info(int vec, uint8_t *type_attr, int *has_handler);
 // when a fault is not a valid demand-paging / COW fault. Does not return.
 void exception_fatal(interrupt_frame_t *frame);
 
+// #smpreval2: record CR2 for the fault being handled RIGHT NOW, before
+// anything else on this CPU can fault and overwrite it. Called once, from
+// mm/fault.c's page_fault_handler(), which is the only place that sees CR2
+// while it still belongs to this fault. Every later print of a fault address
+// uses the recorded value. See the long comment at the definition in idt.c.
+void exception_note_cr2(uint64_t cr2);
+
 // External assembly functions
 extern void idt_load(idt_ptr_t *idt_ptr);
 

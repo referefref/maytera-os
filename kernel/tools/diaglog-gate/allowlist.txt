@@ -35,7 +35,6 @@ spawn_ident_selftest   [DEBT] spawn identity derivation over fixed inputs.
 tls12_selftest         [DEBT] TLS 1.2 primitives against RFC test vectors.
 tlspool_rust_selftest  [DEBT] TLS session-pool bookkeeping over fixed inputs.
 vfs_path_selftest      [DEBT] VFS path normalisation over fixed inputs.
-smp_selftest           [DEBT] Bluetooth SMP pairing crypto against fixed vectors.
 
 # CONVERTED and therefore NOT on this list any more:
 #   ext2_selftest - its entry claimed "18 lines about the root filesystem". The
@@ -47,6 +46,22 @@ smp_selftest           [DEBT] Bluetooth SMP pairing crypto against fixed vectors
 #   bootlog_defer_begin()/end() window, i.e. ONE flush. The per-check detail
 #   stays on serial. That is why it did not need the defer-batching treatment
 #   first: it does not emit 18 lines at all.
+#
+#   devlog_dump - #imacnic. Its entry said /USBLOG.TXT covered it "partially".
+#   It did not cover the part that mattered: the PCI function table. Only the
+#   RESULT of devlog_dump() is durable now (did /DEVLOG.TXT get written, how
+#   many bytes, the fat_write_file return code, and the not-mounted branch),
+#   which is two lines, not a replay of the inventory. The inventory itself is
+#   durable at its SOURCE instead: pci_bootlog_inventory() writes the whole PCI
+#   table to /BOOTLOG.TXT at boot stage 20, which also covers every boot that
+#   hangs before devlog_dump() runs at stage 38.
+#
+#   THE GATE'S OWN BLIND SPOT, worth stating because it let this through for
+#   months: the gate keys on a FUNCTION being serial-only, so pci_init() was
+#   never on this list - it had one bootlog_write() carrying the device COUNT.
+#   A function can be "durable" by that test while the evidence it exists to
+#   produce is entirely serial-only. Measured on the owner's iMac14,4: the count
+#   23 survived to /BOOTLOG.TXT and not one of the 23 devices did.
 
 # ---- [DEBT]: real machine state, and these ARE worth converting -----------
 # Each of these describes the state of THIS machine, so its value is highest on
@@ -58,5 +73,4 @@ smp_selftest           [DEBT] Bluetooth SMP pairing crypto against fixed vectors
 heap_print_stats [DEBT] kernel heap occupancy at boot; would answer "did this machine boot short of memory" off a returned stick.
 pmm_print_stats  [DEBT] physical memory map totals; same argument as heap_print_stats.
 sched_smp_selftest [DEBT] 8 lines about AP bring-up on THIS machine; core count and which APs answered is machine-specific evidence.
-devlog_dump      [DEBT] device-enumeration replay; overlaps /USBLOG.TXT, which is already durable, so partially covered.
 dlprof_report    [DEBT] one line of demand-load profiling; per-machine timing, would be cheap to convert.

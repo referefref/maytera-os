@@ -387,6 +387,18 @@ int ed25519_verify(const uint8_t sig[64], const uint8_t *m, size_t mlen,
     u8 *buf;
     u64 i;
 
+#ifdef ED25519_KAT_FAULT
+    /* HOST KAT RED-TEAM ONLY. The kernel build NEVER defines this flag
+       (grep the Makefiles: it appears nowhere). ed25519_verify_kat.sh
+       compiles a second copy WITH it to prove ed25519_verify_selftest()'s
+       forgery-rejection checks actually FIRE: an unconditional-accept
+       verifier is the single most dangerous verify bug, and a KAT that
+       could not catch it would be a no-op. See #658 / blame.md. */
+    (void)p; (void)q; (void)t; (void)h; (void)buf; (void)i;
+    (void)sig; (void)m; (void)mlen; (void)pk;
+    return 1;
+#endif
+
     if (unpackneg(q, pk)) return 0;  // invalid public key
 
     // h = SHA512(R || pk || message)
@@ -458,4 +470,96 @@ void ed25519_decode_selftest(void) {
 #endif
     bootlog_write("[RUST-DIFF] ed25519_decode rs==c %s mism=%d",
                   mism?"FAIL":"PASS", mism);
+}
+
+// =============================================================================
+// #658 precursor (secroadmap): ed25519_verify RFC 8032 known-answer self-test.
+//
+// The decode self-test above proves ONLY the point-DECODE differential
+// (unpack25519 rs==c). It is BLIND to any bug in the full verify: a decoder
+// that is byte-identical says nothing about whether ed25519_verify actually
+// REJECTS a forgery (an equivalence differential cannot catch a bug both arms
+// share). ed25519_verify is the trust anchor for SSH client-key auth
+// (net/ssh/ssh2_server.c), App Store package signing (#559), and the planned
+// bootloader->kernel Secure Boot (#658). Before any of those can be trusted the
+// tree must PROVE, on a re-runnable basis, that ed25519_verify
+//   (a) ACCEPTS the canonical RFC 8032 section 7.1 test vectors, and
+//   (b) REJECTS a signature / message / key with a single flipped bit.
+// This function is that proof. ed25519_verify_kat.sh runs it in the build
+// container (GREEN without, RED with -DED25519_KAT_FAULT); main.c runs it at
+// boot. Returns the number of FAILED checks (0 == every vector behaved).
+// =============================================================================
+static void kat_hex(uint8_t *out, const char *hex, int outlen) {
+    int i;
+    for (i = 0; i < outlen; i++) {
+        int hi = (unsigned char)hex[2 * i];
+        int lo = (unsigned char)hex[2 * i + 1];
+        hi = (hi <= '9') ? hi - '0' : (hi | 0x20) - 'a' + 10;
+        lo = (lo <= '9') ? lo - '0' : (lo | 0x20) - 'a' + 10;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+}
+
+int ed25519_verify_selftest(void) {
+    extern int kprintf(const char *fmt, ...);
+    // RFC 8032 section 7.1, TEST 1 / TEST 2 / TEST 3 (public key, signature,
+    // message-as-hex, message length). Only the verify path is exercised, so
+    // the secret keys are omitted.
+    static const struct { const char *pk; const char *sig; const char *msg; int mlen; } V[3] = {
+        { "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+          "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+          "", 0 },
+        { "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+          "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+          "72", 1 },
+        { "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+          "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+          "af82", 2 },
+    };
+    int fail = 0, checks = 0, i;
+    uint8_t pk[32], sig[64], msg[8];
+
+    // (a) ACCEPT: every canonical vector must verify (==1).
+    for (i = 0; i < 3; i++) {
+        kat_hex(pk, V[i].pk, 32);
+        kat_hex(sig, V[i].sig, 64);
+        kat_hex(msg, V[i].msg, V[i].mlen);
+        checks++;
+        if (ed25519_verify(sig, msg, (size_t)V[i].mlen, pk) != 1) fail++;
+    }
+
+    // (b) REJECT: single-bit tampers of TEST 2 must all fail (==0). This is the
+    // security property; the accept checks alone would pass an always-accept
+    // verifier.
+    kat_hex(pk, V[1].pk, 32);
+    kat_hex(sig, V[1].sig, 64);
+    kat_hex(msg, V[1].msg, 1);
+    {
+        uint8_t s2[64], p2[32], m2[1];
+        int k;
+        for (k = 0; k < 64; k++) { s2[k] = sig[k]; }
+        s2[0] ^= 0x01;                        // flip a bit in R
+        checks++;
+        if (ed25519_verify(s2, msg, 1, pk) != 0) fail++;
+
+        for (k = 0; k < 64; k++) { s2[k] = sig[k]; }
+        s2[32] ^= 0x01;                       // flip a bit in S
+        checks++;
+        if (ed25519_verify(s2, msg, 1, pk) != 0) fail++;
+
+        m2[0] = msg[0] ^ 0x01;                // flip a bit in the message
+        checks++;
+        if (ed25519_verify(sig, m2, 1, pk) != 0) fail++;
+
+        for (k = 0; k < 32; k++) { p2[k] = pk[k]; }
+        p2[0] ^= 0x01;                        // flip a bit in the public key
+        checks++;
+        if (ed25519_verify(sig, msg, 1, p2) != 0) fail++;
+    }
+
+    kprintf("[ED25519-KAT] verify RFC8032 accept+reject : %s (checks=%d fail=%d)\n",
+            fail ? "FAIL" : "PASS", checks, fail);
+    bootlog_write("[ED25519-KAT] verify %s checks=%d fail=%d",
+                  fail ? "FAIL" : "PASS", checks, fail);
+    return fail;
 }

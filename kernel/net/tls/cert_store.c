@@ -33,6 +33,7 @@
                               // is why cert_store_load_default_bundle() below
                               // uses fat_read_file() instead.
 
+#include "../netfail.h"   // #netfix2: name a clock fault as a clock fault
 // RTC read (gui/clock.c) - used for real notBefore/notAfter validity checks
 // instead of the old hardcoded "2026-01-15" placeholder clock.
 // ---------------------------------------------------------------------------
@@ -1252,15 +1253,41 @@ void cert_get_current_time(cert_time_t *time) {
 int cert_verify_validity(const cert_x509_t *cert) {
     cert_time_t now;
     cert_get_current_time(&now);
-    
+
+    // #netfix2: A WRONG CLOCK BREAKS EVERY HTTPS FETCH AND LEAVES PING PERFECT,
+    // which is indistinguishable, from the outside, from the resolver fault the
+    // owner has been reporting. It has to be nameable.
+    //
+    // MEASURED on his iMac (the build host:/root/imac-logs-20260902/BOOTLOG.TXT):
+    // "[RTC] raw ... decoded=2026-08-30 13:14:01" on an image built 2026-09-02,
+    // i.e. the machine's clock is three days slow. Three days is harmless. A
+    // dead CMOS battery on a 2013 iMac is not: it reads 2000-01-01 or similar,
+    // every certificate on the internet is then "not yet valid", and every
+    // HTTPS page fails with a message about a certificate, sending the user to
+    // look at the site instead of at the clock.
+    //
+    // cert_clock_is_implausible() is a SOUND test, not a heuristic: this image
+    // cannot be running before the day it was built. It does not clamp or
+    // bypass anything here; it only relabels the fault so the durable log names
+    // the clock.
     if (cert_time_compare(&now, &cert->not_before) < 0) {
+        netfail_note(cert_clock_is_implausible() ? NF_TLS_CLOCK_WRONG
+                                                 : NF_TLS_CERT_NOT_YET_VALID,
+                     (int)now.year);
         return CERT_ERR_NOT_YET_VALID;
     }
-    
+
     if (cert_time_compare(&now, &cert->not_after) > 0) {
+        // An implausible clock cannot produce this one by being too EARLY, so
+        // an expiry is reported as an expiry unless the clock is ahead of the
+        // build date by an absurd margin, which cert_clock_is_implausible()
+        // also covers.
+        netfail_note(cert_clock_is_implausible() ? NF_TLS_CLOCK_WRONG
+                                                 : NF_TLS_CERT_EXPIRED,
+                     (int)now.year);
         return CERT_ERR_EXPIRED;
     }
-    
+
     return CERT_SUCCESS;
 }
 

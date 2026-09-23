@@ -99,8 +99,12 @@ pub struct NetStatus {
     /// net_format_info() already prints, and a non-contiguous mask is a
     /// broken configuration either way.
     pub prefix_len: u32,
+    /// dns_server_is_pinned() as 0/1 (#netfix2). LAST, matching the C struct in
+    /// proc/syscall.h; a field inserted in the middle would keep the same
+    /// sizeof and silently reinterpret every field after it.
+    pub dns_pinned: u32,
 }
-const _: () = assert!(core::mem::size_of::<NetStatus>() == 48);
+const _: () = assert!(core::mem::size_of::<NetStatus>() == 52);
 const _: () = assert!(core::mem::align_of::<NetStatus>() == 4);
 
 extern "C" {
@@ -139,13 +143,16 @@ extern "C" {
     // flushes the cache) and net/net.c's persist-to-/CONFIG/NETIP.CFG.
     fn dns_set_server(server_ip: u32);
     fn net_persist_netcfg() -> i32;
+    // #netfix2 - net/dns.c: the way BACK from an explicit choice.
+    fn dns_set_server_auto();
+    fn dns_server_is_pinned() -> i32;
 }
 
 // ===========================================================================
 // #786 SYS_NET_SET_DNS - change the LIVE resolver, and make it stick.
 // ===========================================================================
 //
-// WHAT WAS BROKEN, MEASURED, NOT INFERRED (VM <vmid>, golden build 2054):
+// WHAT WAS BROKEN, MEASURED, NOT INFERRED (VM 2333, golden build 2054):
 //
 //   * Settings > Network > "Configure IP" has a "DNS Server" field. Clicking
 //     OK ran net_set_static() (which takes only ip/mask/gw - there has never
@@ -215,6 +222,37 @@ pub unsafe extern "C" fn net_set_dns_rs(dns: u64) -> i64 {
         return DNS_SET_EINVAL;
     }
     let v = dns as u32;
+
+    // #netfix2: 0 MEANS AUTOMATIC, and it is the whole reason a machine can now
+    // get out of a pinned resolver.
+    //
+    // #786 made an explicitly-chosen resolver PINNED so a DHCP lease could
+    // never overrule the user, which is right. What it did not do was provide
+    // any way back: `dns_server_pinned` was set in two places and cleared in
+    // none, so a resolver chosen once was chosen forever, on every network, and
+    // every DHCP offer was refused for the life of the machine. Move that
+    // machine to a network where the pinned resolver is unreachable and every
+    // name lookup fails while `ping 1.1.1.1` stays perfect.
+    //
+    // Worse, the user need not have chosen anything: Settings prefills the DNS
+    // field from the LIVE resolver and applies it unconditionally on OK, so
+    // opening the dialog, touching nothing and clicking OK pinned whatever DHCP
+    // had just handed out.
+    //
+    // 0 was previously rejected by dns_addr_sane() as "not a usable resolver
+    // address", which it is not - it is not an address at all, it is the
+    // absence of one, and that is exactly the right spelling for "I do not want
+    // to choose". net_persist_netcfg() then rewrites /CONFIG/NETIP.CFG without
+    // the dns= line, so the pin does not come back on the next boot either;
+    // leaving the file alone would have made this a one-boot fix.
+    if v == 0 {
+        dns_set_server_auto();
+        if net_persist_netcfg() != 0 {
+            return DNS_SET_EPERSIST;
+        }
+        return 0;
+    }
+
     if !dns_addr_sane(v) {
         return DNS_SET_EINVAL;
     }
@@ -252,6 +290,7 @@ pub unsafe extern "C" fn net_status_build_rs(out: *mut NetStatus) -> i32 {
         link_up: (nic_link_up() != 0) as u32,
         dhcp_state: dhcp_get_state() as u32,
         config_static: (g_net_static_configured != 0) as u32,
+        dns_pinned: (dns_server_is_pinned() != 0) as u32,   // #netfix2
         faulty: (net_is_faulty() != 0) as u32,
         driver: net_get_driver_type() as u32,
         prefix_len: nm.count_ones(),

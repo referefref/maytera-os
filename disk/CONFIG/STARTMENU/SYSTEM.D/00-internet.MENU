@@ -10,3 +10,5 @@ item: IRC | /APPS/IRC | icon=irc
 item: Maytera AI | /APPS/AICHAT | icon=aichat
 item: Weather | /APPS/WEATHER | icon=weather
 item: Feeds | /APPS/RSS | icon=feeds
+item: Downloads | /APPS/DLMGR | icon=folder
+item: HTTP Client | /APPS/RESTCLI | icon=browser

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none" stroke="#ffffff" stroke-width="32" stroke-linecap="butt" stroke-linejoin="miter">
+  <!-- MayteraOS office toolbar icon: original artwork, 32-unit grid, white on transparent -->
+  <g transform="translate(16 16)">
+    <path d="M48 80H432V336H48Z"/>
+    <path d="M192 128L320 208L192 288Z" fill="#ffffff" stroke="none"/>
+    <path d="M240 352V384"/>
+    <path d="M128 400H352"/>
+  </g>
+</svg>

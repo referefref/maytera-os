@@ -266,6 +266,13 @@ const SYS_NTP_SYNC_SERVER: i64 = 367;   // #797 SNTP client
 // userland/libc/syscall.h before use; none is guessed.
 const SYS_NET_STATUS: i64 = 371;         // structured live IPv4 status
 const SYS_NET_PROBE: i64 = 372;          // non-blocking ICMP / DHCP probe
+// #oobenet: the two syscalls that make apply()'s network write real. Both
+// pre-date this page's re-enablement (#786, #netfix2) and both already apply
+// LIVE and persist to /CONFIG/NETIP.CFG from Ring 0 via net_persist_netcfg(),
+// with no uid gate - Settings' own Network panel calls the identical pair.
+// Numbers verified against kernel/proc/syscall.h, not guessed.
+const SYS_NET_SET_STATIC: i64 = 217;     // (ip,mask,gw) C-strings -> 0/-1
+const SYS_NET_SET_DNS: i64 = 408;        // host-order u32 -> 0 ok, -2 EINVAL, -3 applied-not-saved
 const SYS_DNS_START: i64 = 215;          // non-blocking resolve: 1 now, 0 pending
 const SYS_DNS_POLL: i64 = 216;
 const SYS_HTTP_FETCH_START: i64 = 255;   // async fetch -> job id
@@ -322,7 +329,7 @@ const THEME_METRIC_CORNER_RADIUS: i64 = 7;
 // helper above); this just names the constant instead of spelling 298 twice.
 const SYS_BOOTLOG_WRITE: i64 = 298;
 fn bootlog(msg: &[u8]) { unsafe { syscall1(SYS_BOOTLOG_WRITE, msg.as_ptr() as i64); } }
-// (#745) Present a repaint the APP started. Measured on VM <vmid>: the staged
+// (#745) Present a repaint the APP started. Measured on VM 2617: the staged
 // connection test ran to completion (diagnostic counters proved the state
 // machine reached "reached the internet (HTTP 200)") while the SCREEN kept
 // showing a frame from 256ms after the page opened. This wizard never called
@@ -567,42 +574,45 @@ const PG_APPLY: usize = 9;
 const PG_DONE: usize = 10;
 
 // ---------------------------------------------------------------------------
-// TEMPORARY SWITCH: the Network page is currently OFF (owner request,
-// 2026-08-18, mid real-hardware test loop).
+// #oobenet (2026-09-03): RE-ENABLED. The page was OFF from 2026-08-18 (owner
+// request, mid real-hardware test loop) to 2026-09-03. The disabling commit
+// (ae3385b4) was explicit that this was temporary and gave the one-word
+// revert; nothing was ever deleted. See CHANGELOG.md for the full account of
+// why it is safe to turn back on now.
 //
-// TO TURN IT BACK ON: set NETWORK_PAGE_ENABLED to `true`. That is the ENTIRE
-// revert; there is nothing else to undo. NOTHING was deleted: PG_NETWORK,
-// dk_draw_network(), network_rule(), net_tick() and apply()'s
-// /CONFIG/NETIP.CFG writer are all still present and still compiled, they are
-// simply never reached while this is false.
+// THE REASON FOR RE-ENABLING: the owner asked for Network to move ahead of
+// Date & Time in the flow so NTP (which needs only a working link, not a
+// correct clock) can set the RTC before TLS-dependent things run. STEP_PAGES
+// below ALREADY orders PG_NETWORK (3) before PG_TIME (4) - that ordering
+// predates this flag and was never the reason it was off - so re-enabling is
+// the whole change; no reordering was needed.
 //
-// What `false` means, part by part:
-//   - STEP MODEL. page_enabled() filters whichever flow list is current
-//     (#126 gave the wizard two: STEP_PAGES and PERS_PAGES), so the
-//     header reads "Step N of 8" instead of "of 9", the footer draws 8 dots,
-//     and every page after Network renumbers itself. None of those three
-//     numbers is written down anywhere, so they cannot disagree.
-//   - NAVIGATION. next()/back() move via flow_next()/flow_prev(), which
-//     step OVER a disabled page in BOTH directions. Continue on Signing in
-//     lands on Date & Time; Back on Date & Time lands on Signing in. Neither
-//     direction can reach the hidden page, so Back cannot fall into it.
-//   - WHAT IT WOULD HAVE WRITTEN: NOTHING. apply() writes /CONFIG/NETIP.CFG
-//     only when `!self.dhcp`, and `dhcp` starts `true` in App::new() and is
-//     cleared ONLY by this page's own DHCP/static toggle (on_key / on_click,
-//     both unreachable now). So with the page off the wizard makes no
-//     statement about the network at all: whatever DHCP lease or static
-//     configuration the machine already had survives untouched. That is the
-//     safe side of #144 (the wizard overwriting a static IP configured after
-//     it ran), not a new exposure. Nothing downstream requires NETIP.CFG to
-//     exist: its absence is the ordinary "no static override, use DHCP"
-//     state that every machine that never ran the wizard is already in.
-//   - COSMETIC, LEFT ALONE DELIBERATELY: the PG_APPLY progress checklist
-//     still shows a "Configure network" row and a "Configuring network..."
-//     caption. That sub-step is not dead - it is also where the time zone is
-//     written - and re-labelling it would be extra surface to revert. It is
-//     noted here rather than silently changed.
+// What turning it on restores, part by part:
+//   - STEP MODEL / NAVIGATION unchanged in shape: page_enabled() and
+//     flow_next()/flow_prev() already handle a page coming back into the
+//     flow the same way they handle one leaving it (see #210's MERGE NOTE
+//     below) - "Step N of 9" now, 9 dots, Network reachable both ways.
+//   - WHAT APPLY() NOW WRITES. Previously this comment described a raw
+//     userland `userconf_write_all(/CONFIG/NETIP.CFG, ...)` as the intended
+//     revert path, gated on `machine_admin()` because /CONFIG is root-owned
+//     0711 and a plain open(O_CREAT) from this uid-1000 session would be
+//     refused exactly like the #229 defect this whole wizard exists to avoid.
+//     That call is NOT what ships: SYS_NET_SET_STATIC (217) and
+//     SYS_NET_SET_DNS (408) already exist (#786/#netfix2), already apply
+//     LIVE and persist to /CONFIG/NETIP.CFG from Ring 0 via
+//     net_persist_netcfg(), and already have NO uid gate (proc/syscall.c
+//     sys_net_set_static / rustkern/netstat.rs net_set_dns_rs). Settings'
+//     own Network panel calls the same two syscalls for the same reason.
+//     Using them here means this page needed ZERO new kernel code: the
+//     write-permission problem #229 exists to solve was already solved for
+//     this exact file, by a different ticket, before this page was ever
+//     turned back on. apply() still only calls them when `!self.dhcp`
+//     (dhcp starts `true`); the DHCP path writes nothing, which is the safe
+//     side of #144 unchanged.
+//   - COSMETIC: the PG_APPLY progress checklist's "Configure network" row
+//     and caption were never dead code (see below) and need no changes.
 // ---------------------------------------------------------------------------
-const NETWORK_PAGE_ENABLED: bool = false;
+const NETWORK_PAGE_ENABLED: bool = true;
 
 // ---------------------------------------------------------------------------
 // #OOBEAUTH (2026-08-23, supersedes the #229 version of this comment): CAN
@@ -1119,6 +1129,15 @@ struct App {
     ntp_on: bool,
     ntp_server: Field,
     ntp_preset: usize,
+    // #oobenet: has the user EVER changed the NTP server away from its
+    // startup default (preset 0, "pool.ntp.org")? See apply()'s ntp_on arm
+    // for why this matters: sntp_sync()'s fallback list (kernel/net/sntp.h)
+    // only runs when the caller passes NO server, and until this existed
+    // apply() always passed one (the preset text, filled in even before NTP
+    // is switched on), so the fallback list this page's own default relies
+    // on to survive an unreachable pool member (measured 2026-08-09, see
+    // sntp.h) could never fire from here.
+    ntp_touched: bool,
     dt_year: i32, dt_month: i32, dt_day: i32, dt_hour: i32, dt_min: i32, dt_sec: i32,
     // PG_APPEAR: dock-style picker (section 3).
     dock_style: usize,
@@ -1544,6 +1563,17 @@ static mut NPATCH_ROW: [u8; (CORNER_PATCH_MAX * 3) as usize] = [0; (CORNER_PATCH
 const STRIP_H: usize = 32;
 static mut STRIP: [u32; CARD_W as usize * STRIP_H] = [0; CARD_W as usize * STRIP_H];
 
+// (#wizflash pt.2, 2026-09-03) A second, smaller scratch buffer for
+// card_paint_patch() below: tall enough for the widest margin-expanded field
+// box in the wizard (PG_AI's 576x30 key field plus dk_focus_frame()'s 4px
+// ring on every side = 584x38) with headroom, wide enough to just use CARD_W
+// as the row stride like STRIP does, so the same simple row/col loop shape
+// works for both. Kept separate from STRIP rather than reused as scratch of
+// a different shape: STRIP is CARD_W x STRIP_H (32) elements and a 38-row
+// patch would not fit inside it (584x38 = 22,192 > 688x32 = 22,016).
+const PATCH_H: usize = 40;
+static mut PATCH: [u32; CARD_W as usize * PATCH_H] = [0; CARD_W as usize * PATCH_H];
+
 static mut NWALLS_G: usize = 0;        // wp_enumerate() count, for the sentinel
 
 // Translate BODY-local coordinates (what every existing page draw call uses)
@@ -1966,7 +1996,7 @@ fn wp_corner_native(x: i32, y: i32) -> Option<u32> {
 // wallpaper pixel one column outside the window, only against the true
 // wallpaper's OWN colour at that spot.
 //
-// MEASURED on a real boot (VM <vmid>, golden build 1843/cda94b8, wallpaper
+// MEASURED on a real boot (VM 2900, golden build 1843/cda94b8, wallpaper
 // BOATING.BMP): windows_render_shadows() (userland/apps/compositor/main.c)
 // draws its shadow onto the desktop wallpaper OUTSIDE this window's
 // rectangle before the window's own content is composited over it. At
@@ -2414,6 +2444,66 @@ fn card_paint_backdrop(win: i32) {
             draw_image_win(win, 0, y0, CARD_W, hh, core::ptr::addr_of!(STRIP) as i64);
             y0 += hh;
         }
+    }
+}
+
+// (#wizflash pt.2, 2026-09-03) Redraw a small MARGIN-EXPANDED patch of the
+// glass backdrop, for draw_focus_delta() below. dk_focus_frame() draws its
+// ring 4px OUTSIDE the box it decorates (frame_inward(x-4, y-4, w+8, h+8, 2,
+// DK_ACCENT) - see dk_focus_frame()'s own comment), so simply redrawing a
+// field's own (x, y, w, h) box with focused=false (dk_field()) leaves the
+// OLD ring's pixels sitting in that 4px margin untouched: an accent ring
+// stuck around a field that no longer holds focus, on every page-2/4/9 field
+// Tab ever visited. This restores the correct backdrop under that margin
+// FIRST (the same per-pixel card_pixel() sampler card_paint_backdrop() uses,
+// clipped to just this rectangle) so the caller's next dk_field() call
+// leaves a clean, unfocused field with nothing extra around it - exactly
+// what a page that was never focused there looks like.
+//
+// ONE self-committing SYS_WIN_DRAW_IMAGE call, not twenty: clipped to a few
+// hundred pixels rather than the whole 688x616 card. That is the same
+// bounded, acceptable overhead draw_field_delta()'s own comment already
+// accepts for the ONE win_invalidate() every delta path ends with - not the
+// twenty-strip, whole-window mechanism that causes the flash this ticket is
+// about.
+//
+// Takes BODY-local coordinates, same as dk_field()/dk_focus_frame()/every
+// other caller in this file - card_pixel() and draw_image_win() both want
+// WINDOW coordinates (card_pixel()'s own doc comment: "in WINDOW
+// coordinates"; draw_image_win(), unlike draw_image_body(), does not
+// translate - see card_paint_backdrop() above, which draws from window
+// origin (0,0) directly for the same reason), so the translation happens
+// once here via body_to_win(), rather than asking every call site to do it
+// and risk one that forgets.
+fn card_paint_patch(win: i32, x: i32, y: i32, w: i32, h: i32) {
+    let (wx, wy) = body_to_win(x, y);
+    let x0 = wx.max(0);
+    let y0 = wy.max(0);
+    let x1 = (wx + w).min(CARD_W);
+    let y1 = (wy + h).min(CARD_H).min(y0 + PATCH_H as i32);
+    if x1 <= x0 || y1 <= y0 { return; }
+    let pw = x1 - x0;
+    let ph = y1 - y0;
+    // STRIDE MUST MATCH `pw`, NOT CARD_W. sys_win_draw_image() (kernel/proc/
+    // syscall.c) reads its source row-major at exactly the `w` it was told
+    // (&src[sy * w]), not at some separately-known stride - card_paint_
+    // backdrop() gets this right "for free" because it always passes CARD_W
+    // as both the buffer's own layout AND the call's `w`. This patch is
+    // narrower than CARD_W, so packing it AT CARD_W stride while telling the
+    // syscall the row width is `pw` reads every row from the wrong offset -
+    // measured as a striped/garbled border on a field the patch had touched
+    // (screendump, real bug, not theoretical) before this line matched the
+    // two.
+    unsafe {
+        let mut row = 0i32;
+        while row < ph {
+            let yy = y0 + row;
+            let base = (row * pw) as usize;
+            let mut col = 0i32;
+            while col < pw { PATCH[base + col as usize] = card_pixel(x0 + col, yy); col += 1; }
+            row += 1;
+        }
+        draw_image_win(win, x0, y0, pw, ph, core::ptr::addr_of!(PATCH) as i64);
     }
 }
 
@@ -3783,7 +3873,7 @@ fn dk_line(win: i32, x0: i32, y0: i32, x1: i32, y1: i32, t: i32, color: u32) {
 // icon (rect(310,168,3,10)+rect(313,172,14,3) around a 48px circle) - that
 // shape is two PERPENDICULAR bars, which reads as an "I-beam"/dash at small
 // icon size but is unmistakably NOT a checkmark once scaled to the 72px
-// Finish-page circle (confirmed visually on VM <vmid>, screendump p_done).
+// Finish-page circle (confirmed visually on VM 2281, screendump p_done).
 // A real diagonal reads correctly at every size used here (13px status
 // icon, 16px thumbnail badge, 72px Finish circle).
 fn dk_checkmark(win: i32, cx: i32, cy: i32, scale_tenths: i32, color: u32) {
@@ -4353,6 +4443,48 @@ fn put_ip(dst: &mut [u8], at: usize, v: u32) -> usize {
         n += put_u32(dst, at + n, (v >> (24 - 8 * k)) & 0xFF);
         k += 1;
     }
+    n
+}
+
+// #oobenet: PG_NETWORK's static-address fields, parsed back into octets for
+// apply(). NOT a validator - network_rule() already refused Continue unless
+// ip/mask are is_dotted_quad() and gw/dns (if present) are too, so every
+// caller here is re-parsing text this page already accepted. Mirrors
+// is_dotted_quad()'s own digit accumulation exactly (same overflow-by-clamp
+// behaviour is unreachable here for the same reason it never returns false
+// through the field: the >255/>3-digit branches in is_dotted_quad() would
+// already have blocked Continue).
+fn field_octets(f: &Field) -> [u8; 4] {
+    let mut oct = [0u8; 4];
+    let mut idx = 0usize;
+    let mut val: u32 = 0;
+    let mut i = 0usize;
+    while i < f.n {
+        let c = f.b[i];
+        if c == b'.' {
+            if idx < 4 { oct[idx] = (val & 0xFF) as u8; }
+            idx += 1;
+            val = 0;
+        } else if c >= b'0' && c <= b'9' {
+            val = val * 10 + (c - b'0') as u32;
+        }
+        i += 1;
+    }
+    if idx < 4 { oct[idx] = (val & 0xFF) as u8; }
+    oct
+}
+
+fn octets_to_u32(o: [u8; 4]) -> u32 {
+    ((o[0] as u32) << 24) | ((o[1] as u32) << 16) | ((o[2] as u32) << 8) | (o[3] as u32)
+}
+
+// Octets -> NUL-terminated "a.b.c.d" in a caller-owned buffer, for the one
+// caller (apply()'s computed-gateway case) that needs a C-string SYS_NET_SET_
+// STATIC can take a pointer to, rather than a u32 SYS_NET_SET_DNS can take
+// directly.
+fn format_octets(o: [u8; 4], out: &mut [u8; 16]) -> usize {
+    let n = put_ip(out, 0, octets_to_u32(o));
+    if n < 16 { out[n] = 0; }
     n
 }
 
@@ -7074,26 +7206,76 @@ impl App {
         }   // #229 end of the ROOT-ONLY part of the machine-scope block
 
         self.substep = 2; self.draw();
-        // #229: `&& machine_admin()`. /CONFIG/NETIP.CFG is a write to the same
-        // root-owned directory as everything else this ticket moved, so a
-        // non-root session cannot make it. It is a guard rather than a move to
-        // SYS_FIRSTRUN because this branch is currently UNREACHABLE - the
-        // Network page is compile-disabled and `dhcp` starts true and is
-        // cleared only by that page - and an op with zero callers is a feature
-        // that has never run. When NETWORK_PAGE_ENABLED goes back to true, add
-        // FR_SET_NETIP (with a dotted-quad validator) in kernel/rustkern/
-        // firstrun.rs and call it from here; do not reach for open() again.
-        if !self.dhcp && machine_admin() {
-            let mut b: [u8; 200] = [0; 200];
-            let mut n = 0usize;
-            n += put(&mut b, n, b"ip=");   n += putf(&mut b, n, &self.ip);   n += put(&mut b, n, b"\n");
-            n += put(&mut b, n, b"mask="); n += putf(&mut b, n, &self.mask); n += put(&mut b, n, b"\n");
-            if !self.gw.is_empty() { n += put(&mut b, n, b"gw="); n += putf(&mut b, n, &self.gw); n += put(&mut b, n, b"\n"); }
-            // DNS empty means "same as gateway" per the spec's placeholder.
-            let d = if self.dns.is_empty() { &self.gw } else { &self.dns };
-            if !d.is_empty() { n += put(&mut b, n, b"dns="); n += putf(&mut b, n, d); n += put(&mut b, n, b"\n"); }
-            let r = unsafe { userconf_write_all(b"/CONFIG/NETIP.CFG\0".as_ptr(), b.as_ptr(), n as u64) };
-            if r != 0 { self.apply_err = b"Network settings could not be applied; see Settings > Network.\0"; }
+        // #oobenet: NOT `&& machine_admin()`. The network config is SYSTEM-
+        // WIDE (boot-time NTP, update checks, the login screen itself all
+        // need it before anyone signs in), not an account setting, so it does
+        // not belong behind the same gate as minting root's password. It runs
+        // for any session that reaches this page, exactly like Settings'
+        // identical Network panel call - PG_NETWORK is only ever reachable
+        // through STEP_PAGES (see flow()/personalise() above), never through
+        // the reduced PERS_PAGES flow a later, already-configured user's
+        // re-run of this wizard gets, so this cannot fire outside the one
+        // machine-setup flow it is drawn in.
+        //
+        // SYS_NET_SET_STATIC (217) and SYS_NET_SET_DNS (408, #786/#netfix2)
+        // replace the old raw `userconf_write_all(/CONFIG/NETIP.CFG, ...)`
+        // draft: both apply LIVE and persist to /CONFIG/NETIP.CFG from Ring 0
+        // via net_persist_netcfg(), with no uid gate, so the #229-class
+        // "refused because /CONFIG is root-owned 0711" failure this comment
+        // used to warn about cannot happen here - it was already fixed for
+        // this exact file by a different ticket before this page came back.
+        // See the NETWORK_PAGE_ENABLED comment above for the full account.
+        //
+        // DHCP (the default; `self.dhcp` starts true) writes NOTHING here,
+        // preserving the safe side of #144: this block cannot overwrite a
+        // static config set up after the wizard ran, because it does not run
+        // unless the user actively turned on "Use a static address".
+        if !self.dhcp {
+            // network_rule() already refused Continue unless ip/mask are
+            // valid dotted quads and gw/dns (if present) are too, so
+            // field_octets() below is a re-parse of already-validated text.
+            let ip_o = field_octets(&self.ip);
+            let mask_o = field_octets(&self.mask);
+            // Empty gateway defaults to x.x.x.1 on the entered network - the
+            // SAME fallback net_apply_static_config() uses when a saved file
+            // has no gw= line - so a config applied live here and the same
+            // file re-read at the next boot compute the identical address.
+            let gw_o = if self.gw.is_empty() {
+                let mut o = [0u8; 4];
+                let mut k = 0usize;
+                while k < 4 { o[k] = ip_o[k] & mask_o[k]; k += 1; }
+                o[3] |= 1;
+                o
+            } else {
+                field_octets(&self.gw)
+            };
+            let mut gwbuf: [u8; 16] = [0; 16];
+            format_octets(gw_o, &mut gwbuf);
+
+            let r = unsafe {
+                syscall3(SYS_NET_SET_STATIC,
+                         self.ip.cstr().as_ptr() as i64,
+                         self.mask.cstr().as_ptr() as i64,
+                         gwbuf.as_ptr() as i64)
+            };
+            if r != 0 {
+                self.apply_err = b"Network settings could not be applied; see Settings > Network.\0";
+            }
+
+            // DNS empty means "same as gateway", the DNS field's own
+            // placeholder text (network_field_geom() index 3).
+            let dns_o = if self.dns.is_empty() { gw_o } else { field_octets(&self.dns) };
+            let dr = unsafe { syscall1(SYS_NET_SET_DNS, octets_to_u32(dns_o) as i64) };
+            if dr == -3 {
+                // Applied to the running network but NOT saved: report it as
+                // its own outcome rather than folding it into the generic
+                // failure message above, per SYS_NET_SET_DNS's own contract
+                // (kernel/proc/syscall.h) - a write failure must be named,
+                // not swallowed into "could not be applied" when it WAS.
+                self.apply_err = b"Network applied, but the DNS server will revert to automatic after a reboot.\0";
+            } else if dr != 0 {
+                self.apply_err = b"DNS server could not be applied; see Settings > Network.\0";
+            }
         }
 
         self.substep = 3; self.draw();
@@ -7116,10 +7298,27 @@ impl App {
             // presenting a default as a decision.
         } else if self.ntp_on {
             let mut sbuf: [u8; 64] = [0; 64];
-            let mut sn = 0usize;
-            let mut i = 0usize;
-            while i < self.ntp_server.n && sn < 63 { sbuf[sn] = self.ntp_server.b[i]; sn += 1; i += 1; }
-            sbuf[sn] = 0;
+            // #oobenet: if the user never touched the NTP server field, send
+            // the KERNEL'S OWN fallback list instead of the preset text this
+            // page fills in even before NTP is switched on. sntp_sync()
+            // (kernel/net/sntp.c) only tries its ordered fallback (pool.ntp.org
+            // -> time.cloudflare.com -> time.nist.gov, each with a fair share
+            // of the budget) when `server` is NULL; sys_ntp_sync_server()
+            // (kernel/proc/syscall.c) maps an EMPTY string to NULL
+            // (`server[0] ? server : NULL`). Sending the preset text
+            // unconditionally, as this used to, queries pool.ntp.org ALONE and
+            // never falls back - measured 2026-08-09 (sntp.h) to be
+            // unreachable from the owner's own ICS network on two separate
+            // resolved addresses. An EXPLICIT server the user chose (a
+            // different preset, or typed text) is still sent alone: quietly
+            // asking someone else instead would be wrong for a server someone
+            // actually picked.
+            if self.ntp_touched {
+                let mut sn = 0usize;
+                let mut i = 0usize;
+                while i < self.ntp_server.n && sn < 63 { sbuf[sn] = self.ntp_server.b[i]; sn += 1; i += 1; }
+                sbuf[sn] = 0;
+            }
             let r = unsafe { syscall2(SYS_NTP_SYNC_SERVER, sbuf.as_ptr() as i64, 5000) };
             if r != 0 { self.apply_err = b"Could not sync time from the network; set it manually in Settings.\0"; }
         } else {
@@ -7546,6 +7745,99 @@ impl App {
             // than unreachable!() so a future page added to that guard
             // without a matching arm here fails safe (draws nothing extra)
             // instead of panicking the wizard.
+            _ => {}
+        }
+        win_invalidate(win);
+    }
+
+    // (#wizflash pt.2, 2026-09-03) Redraw ONLY the two fields whose focus
+    // ring changed, for the common case of Tab moving focus between fields
+    // on the SAME page with no text edit involved (see the call site in
+    // main()'s event loop for the exact guard: same page, no validation-
+    // message change, and for PG_AI never touching ai_focus 0). This is
+    // draw_field_delta()'s twin: that one redraws one field because its
+    // TEXT changed, this one redraws (up to) two fields because which one
+    // is FOCUSED changed. Both skip dk_page_chrome()/dk_fill_bg(), so
+    // neither ever calls card_paint_backdrop() - see draw_field_delta()'s
+    // own block comment for exactly why that is what stops the flash.
+    //
+    // old_focus/old_ai_focus are the pre-Tab values (self.focus/self.ai_focus
+    // already hold the POST-Tab ones by the time this runs) - old_focus is
+    // only read on PG_ACCOUNT/PG_NETWORK and old_ai_focus only on PG_AI, so
+    // the caller need not know which page it is drawing for.
+    //
+    // CARD_MODE ONLY. card_paint_patch() (used below to erase the OLD field's
+    // stale focus ring) samples the glass card via card_pixel(), which is
+    // undefined outside CARD_MODE - the small-screen fallback (below
+    // GLASS_MIN_W/GLASS_MIN_H, dk_fill_bg()'s non-card branch) paints a flat
+    // per-row gradient instead and has no equivalent patch-repair primitive.
+    // Falling back to a full draw() there is exactly this method's own
+    // starting point (still correct, just not flash-free) rather than
+    // guessing at glass-card content that is not on screen. Every screen
+    // this shipped on and was tested on (real hardware included) is well
+    // above the threshold, so this only matters for the legacy fallback.
+    fn draw_focus_delta(&mut self, old_focus: usize, old_ai_focus: usize) {
+        if !unsafe { CARD_MODE } { self.draw(); return; }
+        let win = self.win;
+        match self.page {
+            PG_ACCOUNT => {
+                let (ox, oy, ow, oh, oph) = Self::account_field_geom(old_focus);
+                card_paint_patch(win, ox - 4, oy - 4, ow + 8, oh + 8);
+                let of = self.field_ref(old_focus);
+                dk_field(win, ox, oy, ow, oh, of, oph, false, false);
+                let (x, y, w, h, ph) = Self::account_field_geom(self.focus);
+                let f = self.field_ref(self.focus);
+                dk_field(win, x, y, w, h, f, ph, true, false);
+            }
+            PG_NETWORK => {
+                let (ox, oy, ow, oh, oph) = Self::network_field_geom(old_focus);
+                card_paint_patch(win, ox - 4, oy - 4, ow + 8, oh + 8);
+                let of = self.field_ref(old_focus);
+                dk_field(win, ox, oy, ow, oh, of, oph, false, false);
+                let (x, y, w, h, ph) = Self::network_field_geom(self.focus);
+                let f = self.field_ref(self.focus);
+                dk_field(win, x, y, w, h, f, ph, true, false);
+            }
+            PG_AI => {
+                let is_custom = self.ai_provider == AI_CUSTOM;
+                match old_ai_focus {
+                    1 if is_custom => {
+                        let (x, y, w, h, ph) = Self::ai_field_geom(1, is_custom);
+                        card_paint_patch(win, x - 4, y - 4, w + 8, h + 8);
+                        dk_field(win, x, y, w, h, &self.ai_endpoint, ph, false, false);
+                    }
+                    2 => {
+                        let (x, y, w, h, ph) = Self::ai_field_geom(2, is_custom);
+                        card_paint_patch(win, x - 4, y - 4, w + 8, h + 8);
+                        dk_field(win, x, y, w, h, &self.ai_model, ph, false, false);
+                    }
+                    3 => {
+                        let (x, y, w, h, ph) = Self::ai_field_geom(3, is_custom);
+                        card_paint_patch(win, x - 4, y - 4, w + 8, h + 8);
+                        dk_field(win, x, y, w, h, &self.aikey, ph, false, false);
+                    }
+                    _ => {}
+                }
+                match self.ai_focus {
+                    1 if is_custom => {
+                        let (x, y, w, h, ph) = Self::ai_field_geom(1, is_custom);
+                        dk_field(win, x, y, w, h, &self.ai_endpoint, ph, true, false);
+                    }
+                    2 => {
+                        let (x, y, w, h, ph) = Self::ai_field_geom(2, is_custom);
+                        dk_field(win, x, y, w, h, &self.ai_model, ph, true, false);
+                    }
+                    3 => {
+                        let (x, y, w, h, ph) = Self::ai_field_geom(3, is_custom);
+                        dk_field(win, x, y, w, h, &self.aikey, ph, true, false);
+                    }
+                    _ => {}
+                }
+            }
+            // Kept exhaustive rather than unreachable!(), same reasoning as
+            // draw_field_delta() above: the event loop's guard only ever
+            // reaches here for PG_ACCOUNT/PG_NETWORK/PG_AI, so a future page
+            // added there without a matching arm here fails safe.
             _ => {}
         }
         win_invalidate(win);
@@ -8376,6 +8668,9 @@ impl App {
         let s = NTP_PRESETS[self.ntp_preset];
         let mut i = 0usize;
         while i < s.len() && s[i] != 0 { self.ntp_server.push(s[i]); i += 1; }
+        // #oobenet: an explicit choice, even one that lands back on preset 0 -
+        // see apply()'s ntp_on arm for what this flag controls.
+        self.ntp_touched = true;
     }
 
     // Up/Down step; Year clamps (1970-2099), Month/Day/Hour wrap, Minute/
@@ -8473,8 +8768,8 @@ impl App {
             _ => {
                 if ev.keycode == KC_UP { self.ntp_cycle(1); }
                 else if ev.keycode == KC_DOWN { self.ntp_cycle(-1); }
-                else if c == 8 || c == 127 { self.ntp_server.pop(); }
-                else if c >= 32 && c < 127 { self.ntp_server.push(c); }
+                else if c == 8 || c == 127 { self.ntp_server.pop(); self.ntp_touched = true; }
+                else if c >= 32 && c < 127 { self.ntp_server.push(c); self.ntp_touched = true; }
             }
         }
         true
@@ -8639,7 +8934,21 @@ pub extern "C" fn main() -> i32 {
         substep: 0, apply_err: b"\0",
         wel_btn: (0, 0, 0, 0), clock_skip: false, pers_skip_from: usize::MAX,
         tzc_sel: 0, tzc_first: 0, tz_search: Field::new(false),
-        time_focus: 0, ntp_on: false, ntp_server: Field::new(false), ntp_preset: 0,
+        // #oobenet: ntp_on now DEFAULTS ON (was off). This is a real UX
+        // default change, called out because it is one: Network now runs
+        // before Date & Time (STEP_PAGES order, unchanged by this ticket),
+        // so by the time this page draws, a link either works or the wizard
+        // already showed why not - "Set time automatically" defaulting off
+        // meant most people never touched it and kept whatever the RTC read
+        // at boot, which is the measured defect this whole reordering exists
+        // to close (the owner's own iMac RTC reads 3 days slow; see
+        // CHANGELOG.md). Safe to default on because sntp_sync() treats no
+        // carrier as an INSTANT no-op (#381, SNTP_E_NOLINK), never a stall,
+        // so a virgin machine with no cable plugged in degrades to exactly
+        // the same "set it manually, and the wizard says why" outcome this
+        // page already had for a manual toggle-on that failed.
+        time_focus: 0, ntp_on: true, ntp_server: Field::new(false), ntp_preset: 0,
+        ntp_touched: false,
         dt_year: 2026, dt_month: 1, dt_day: 1, dt_hour: 0, dt_min: 0, dt_sec: 0,
         dock_style: DOCK_XFCE_IDX, appear_zone: 0,
         // #745 task #15: apps_sel seeded to the compiled-in default here
@@ -8817,10 +9126,12 @@ pub extern "C" fn main() -> i32 {
                 let err_ptr_before = app.err.as_ptr();
                 let err_len_before = app.err.len();
                 if !app.on_key(&ev) { break; }
-                let simple_text_edit =
+                let same_page_no_err =
                     app.page == page_before
                     && app.err.as_ptr() == err_ptr_before
-                    && app.err.len() == err_len_before
+                    && app.err.len() == err_len_before;
+                let simple_text_edit =
+                    same_page_no_err
                     && (
                         ((app.page == PG_ACCOUNT || app.page == PG_NETWORK)
                             && app.focus == focus_before
@@ -8830,7 +9141,39 @@ pub extern "C" fn main() -> i32 {
                             && app.ai_focus != 0
                             && app.ai_key_show_saved() == ai_key_show_saved_before)
                     );
-                if simple_text_edit { app.draw_field_delta(); } else { app.draw(); }
+                // (#wizflash pt.2, 2026-09-03) Tab moving focus between the
+                // SAME page's fields was previously excluded from the cheap
+                // path by design (`app.focus == focus_before` above requires
+                // NO focus change) and fell all the way to the full app.draw()
+                // - card_paint_backdrop()'s twenty self-committing blits,
+                // paid on every single Tab press, which is exactly the
+                // "tab between elements to change focus" half of the owner's
+                // report. A focus move IS a real visual change (the focus
+                // ring has to move), so unlike the hover case above this
+                // cannot just be skipped - but it is still only TWO field
+                // boxes changing (old focus loses its ring, new focus gains
+                // one), so it gets the same delta treatment draw_field_delta()
+                // already proved out for a keystroke. Guarded the same way:
+                // same page, no validation-message change, and (for PG_AI)
+                // never crossing into or out of ai_focus 0 (the provider
+                // grid), which is a structural change like ai_key_show_saved()
+                // flipping - both stay on the full-draw path.
+                let focus_moved_only =
+                    !simple_text_edit
+                    && same_page_no_err
+                    && (
+                        ((app.page == PG_ACCOUNT || app.page == PG_NETWORK)
+                            && app.focus != focus_before
+                            && app.nfields > 0)
+                        || (app.page == PG_AI
+                            && app.ai_focus != ai_focus_before
+                            && app.ai_focus != 0
+                            && ai_focus_before != 0
+                            && app.ai_key_show_saved() == ai_key_show_saved_before)
+                    );
+                if simple_text_edit { app.draw_field_delta(); }
+                else if focus_moved_only { app.draw_focus_delta(focus_before, ai_focus_before); }
+                else { app.draw(); }
             }
             EV_MOUSE_DOWN => {
                 if ev.mouse_buttons & MOUSE_LEFT != 0 {
@@ -8885,7 +9228,35 @@ pub extern "C" fn main() -> i32 {
                         else if mx >= bx0 && mx <= bx1 { 1 } else { 0 }
                     } else { 0 }
                 };
-                if nv != app.hover_nav { app.hover_nav = nv; app.draw(); }
+                // (#wizflash pt.2, 2026-09-03) THE SAME "WASTED WORK AT REST"
+                // BUG THE COMMENT ABOVE DESCRIBES FOR PG_WELCOME, ON EVERY
+                // OTHER PAGE TOO - and this half was never fixed. Every dark
+                // page's footer (dk_back_button()/dk_primary_button(), the
+                // ONLY footer buttons any LIVE page draws) takes no hover
+                // parameter at all and renders identically regardless of
+                // hover_nav. The one function that DOES read hover_nav,
+                // draw_time_light(), is dead code (draw() never calls it -
+                // see its own "UNUSED as of the #745 follow-up dark port"
+                // comment). So on every page except Welcome, moving the
+                // mouse across the footer band still flipped hover_nav and
+                // ran a FULL app.draw() - card_paint_backdrop()'s twenty
+                // self-committing SYS_WIN_DRAW_IMAGE strips, the exact
+                // mechanism draw_field_delta()'s block comment measures at
+                // 20 incoherent intermediate publishes per call - to produce
+                // a frame that comes out pixel-identical to the one before
+                // it. THIS is the owner's "flashing ... when I move over any
+                // UI element i.e. over a button" report: crossing into the
+                // footer band on account/network/AI/etc IS moving over a UI
+                // element, and it paid the full backdrop-repaint cost for
+                // zero visual change, on every page, every time.
+                //
+                // hover_nav is still tracked (a future patch giving these
+                // buttons a real hover treatment has somewhere to read it
+                // from - and should redraw only the two footer button rects
+                // via a delta path when it does, not call app.draw()), but
+                // it no longer forces a redraw of anything, because there is
+                // currently nothing on screen a redraw would change.
+                app.hover_nav = nv;
             }
             // No window-close case: setup is not dismissable. Closing it would
             // leave a machine with no account and no way back to this wizard.

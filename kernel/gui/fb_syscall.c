@@ -35,6 +35,7 @@ extern void  wm_handle_mouse_move(int32_t x, int32_t y);
 extern void  wm_handle_mouse_down(int32_t x, int32_t y, uint32_t button);
 extern void  wm_handle_mouse_up(int32_t x, int32_t y, uint32_t button);
 extern void *window_get_at_point(int32_t x, int32_t y);
+extern bool wm_chrome_drag_active(void);  // #resizegrow: resize/move-drag in progress
 extern void wm_inject_app_mouse(int32_t x, int32_t y, int32_t type, uint32_t button);
 extern void wm_inject_app_scroll(int32_t x, int32_t y, int32_t delta);
 
@@ -244,7 +245,7 @@ void fb_unmap_proc_exit(uint32_t pid, uint64_t cr3) {
 // The back buffer's virtual and physical addresses.
 //
 // KEPT BECAUSE THE ANSWER IS NOT WHAT ANYONE ASSUMES, AND IT IS AN OPEN
-// QUESTION. MEASURED on VM <vmid>, 2026-08-26: fbvirt=0x10001000,
+// QUESTION. MEASURED on VM 2992, 2026-08-26: fbvirt=0x10001000,
 // fbphys=0x7a7000. The kernel heap is NOT identity-mapped - mm/heap.c maps it
 // at virtual 0x10000000 from whatever pages pmm_alloc_page() returned - so the
 // back buffer's virtual address is not its physical address. sys_fb_map() below
@@ -487,7 +488,7 @@ volatile uint64_t g_flip_net_calls    = 0;  // presents that actually ran net_po
 // the present-gap maximum - the [NETSTARVE] serial line and the enriched
 // /HEARTBEAT.TXT record - and they run in the SAME heartbeat loop iteration.
 // Sharing one variable meant whichever ran first zeroed it and the second read
-// 0 forever (MEASURED: gapmax=0ms in every sample on VM <vmid>, with the
+// 0 forever (MEASURED: gapmax=0ms in every sample on VM 2462, with the
 // compositor genuinely presenting only 8 frames in 132s, so the true value was
 // tens of seconds). Each consumer now owns its own accumulator, both updated
 // at the single producer site below.
@@ -1067,7 +1068,13 @@ int64_t sys_inject_mouse(int32_t x, int32_t y, int32_t type, int32_t button) {
     switch (type) {
         case 0:  // move
             wm_handle_mouse_move(x, y);
-            wm_inject_app_mouse(x, y, 0, (uint32_t)button);
+            // #resizegrow: a window resize (grip) or title-bar move drag is a
+            // WM-CHROME gesture, not a click inside the app's content - see
+            // wm_chrome_drag_active()'s comment (window.c) for the bug this
+            // closes (every sample of a resize used to ALSO reach the app as
+            // a genuine EVENT_MOUSE_MOVE, e.g. extending a text selection
+            // underneath the resize grip for the whole length of the drag).
+            if (!wm_chrome_drag_active()) wm_inject_app_mouse(x, y, 0, (uint32_t)button);
             break;
         case 1:  // button down
             if (window_get_at_point(x, y)) hit = 1;
@@ -1084,12 +1091,32 @@ int64_t sys_inject_mouse(int32_t x, int32_t y, int32_t type, int32_t button) {
             // cursor (for its own context menu); it must NOT drive window chrome
             // (focus/drag/resize/min/max/close all belong to the left button),
             // otherwise a right-press could start a drag with no matching up.
-            if (button != 2) wm_handle_mouse_down(x, y, (uint32_t)button);
-            wm_inject_app_mouse(x, y, 1, (uint32_t)button);
+            // #resizegrow: for the LEFT button, check wm_chrome_drag_active()
+            // AFTER wm_handle_mouse_down() runs - THIS is the call that can set
+            // resizing_window/dragging_window in the first place (grabbing a
+            // resize grip or starting a title-bar drag), so the state is only
+            // known once it has run. A press that grabbed chrome must not ALSO
+            // land as a content mouse-down (the app would start ITS OWN drag
+            // gesture, e.g. text selection, at the exact same point).
+            {
+                bool chrome = false;
+                if (button != 2) {
+                    wm_handle_mouse_down(x, y, (uint32_t)button);
+                    chrome = wm_chrome_drag_active();
+                }
+                if (!chrome) wm_inject_app_mouse(x, y, 1, (uint32_t)button);
+            }
             break;
         case 2:  // button up
-            wm_handle_mouse_up(x, y, (uint32_t)button);
-            wm_inject_app_mouse(x, y, 2, (uint32_t)button);
+            // #resizegrow: capture BEFORE wm_handle_mouse_up(), which is what
+            // CLEARS resizing_window/dragging_window as it ends the drag -
+            // checking after would always read false and let the final
+            // mouse-up leak through as a spurious content click every time.
+            {
+                bool chrome = wm_chrome_drag_active();
+                wm_handle_mouse_up(x, y, (uint32_t)button);
+                if (!chrome) wm_inject_app_mouse(x, y, 2, (uint32_t)button);
+            }
             break;
         case 3:  // scroll wheel (button carries the signed delta)
             wm_inject_app_scroll(x, y, button);

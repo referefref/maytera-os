@@ -149,6 +149,9 @@ int bind(int fd, const struct sockaddr *addr, socklen_t addrlen);
 int connect(int fd, const struct sockaddr *addr, socklen_t addrlen);
 int listen(int fd, int backlog);
 int accept(int fd, struct sockaddr *addr, socklen_t *addrlen);
+// getsockname: MayteraOS kernel has no SYS_SOCK_GETSOCKNAME; posixextra-style
+// stub in sys/socket.c returns -1/ENOSYS. Callers must tolerate failure.
+int getsockname(int fd, struct sockaddr *addr, socklen_t *addrlen);
 long send(int fd, const void *buf, unsigned long len, int flags);
 long recv(int fd, void *buf, unsigned long len, int flags);
 long sendto(int fd, const void *buf, unsigned long len, int flags,

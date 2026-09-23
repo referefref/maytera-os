@@ -439,6 +439,10 @@ uint8_t *arc_gzip_decompress(const uint8_t *gz, size_t gz_len, size_t *out_len) 
 // tar (ustar)
 // ========================================================================
 static size_t arc_strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
+static int arc_strcmp(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (int)((unsigned char)*a) - (int)((unsigned char)*b);
+}
 
 static void octal(char *dst, int width, uint32_t val) {
     // width includes the trailing NUL slot; write (width-1) octal digits + NUL.
@@ -621,7 +625,14 @@ static void mb_bytes(membuf *m, const void *p, size_t n) {
 static void mb_u16(membuf *m, uint16_t v) { uint8_t t[2]; put_le16(t, v); mb_bytes(m, t, 2); }
 static void mb_u32(membuf *m, uint32_t v) { uint8_t t[4]; put_le32(t, v); mb_bytes(m, t, 4); }
 
-uint8_t *arc_zip_create(const arc_entry *ents, int n, int use_deflate, size_t *out_len) {
+// arc_zip_create_ex: like arc_zip_create, but if store_first is non-NULL the
+// first entry whose name equals store_first is emitted FIRST in the archive
+// and always STORED (method 0, uncompressed). This exists for ODF packages
+// (.odt/.ods/.odp) whose `mimetype` part MUST be the first zip entry and MUST
+// be stored, per the ODF spec, so a conformant reader can sniff the media type
+// from a fixed offset. store_first == NULL reproduces arc_zip_create exactly.
+uint8_t *arc_zip_create_ex(const arc_entry *ents, int n, int use_deflate,
+                           const char *store_first, size_t *out_len) {
     membuf m; m.buf = NULL; m.cap = 0; m.len = 0; m.err = 0;
 
     // local header offsets + per-entry compressed payloads
@@ -632,14 +643,35 @@ uint8_t *arc_zip_create(const arc_entry *ents, int n, int use_deflate, size_t *o
     uint32_t *crc      = (uint32_t *)ARC_MALLOC(sizeof(uint32_t) * (n > 0 ? n : 1));
     uint16_t *method   = (uint16_t *)ARC_MALLOC(sizeof(uint16_t) * (n > 0 ? n : 1));
     int *owns          = (int *)ARC_MALLOC(sizeof(int) * (n > 0 ? n : 1));
-    if (!offsets || !payload || !csize || !usize || !crc || !method || !owns) goto fail_arrays;
+    // order[]: output position -> entry index. force_store[i]: entry i must be
+    // stored uncompressed regardless of use_deflate.
+    int *order         = (int *)ARC_MALLOC(sizeof(int) * (n > 0 ? n : 1));
+    int *force_store   = (int *)ARC_MALLOC(sizeof(int) * (n > 0 ? n : 1));
+    if (!offsets || !payload || !csize || !usize || !crc || !method || !owns
+        || !order || !force_store) goto fail_arrays;
+
+    // Compute the emit order and which entry (if any) is the forced-first store.
+    {
+        int first = -1;
+        for (int i = 0; i < n; i++) force_store[i] = 0;
+        if (store_first) {
+            for (int i = 0; i < n; i++) {
+                if (!ents[i].is_dir && arc_strcmp(ents[i].name, store_first) == 0) {
+                    first = i; force_store[i] = 1; break;
+                }
+            }
+        }
+        int p = 0;
+        if (first >= 0) order[p++] = first;
+        for (int i = 0; i < n; i++) if (i != first) order[p++] = i;
+    }
 
     for (int i = 0; i < n; i++) {
         const arc_entry *e = &ents[i];
         usize[i] = e->is_dir ? 0 : (uint32_t)e->size;
         crc[i]   = e->is_dir ? 0 : arc_crc32(0, e->data, e->size);
         payload[i] = NULL; owns[i] = 0; method[i] = 0; csize[i] = usize[i];
-        if (!e->is_dir && use_deflate && e->size > 0) {
+        if (!e->is_dir && use_deflate && e->size > 0 && !force_store[i]) {
             size_t dl = 0;
             uint8_t *def = arc_deflate(e->data, e->size, &dl);
             if (def && dl < e->size) {
@@ -653,8 +685,10 @@ uint8_t *arc_zip_create(const arc_entry *ents, int n, int use_deflate, size_t *o
         }
     }
 
-    // local file headers + data
-    for (int i = 0; i < n; i++) {
+    // local file headers + data (emitted in `order`, so a forced-first part
+    // like ODF `mimetype` leads the archive)
+    for (int p = 0; p < n; p++) {
+        int i = order[p];
         const arc_entry *e = &ents[i];
         offsets[i] = (uint32_t)m.len;
         size_t nl = arc_strlen(e->name);
@@ -673,9 +707,10 @@ uint8_t *arc_zip_create(const arc_entry *ents, int n, int use_deflate, size_t *o
         if (csize[i]) mb_bytes(&m, payload[i], csize[i]);
     }
 
-    // central directory
+    // central directory (same order as the local headers above)
     uint32_t cd_off = (uint32_t)m.len;
-    for (int i = 0; i < n; i++) {
+    for (int p = 0; p < n; p++) {
+        int i = order[p];
         const arc_entry *e = &ents[i];
         size_t nl = arc_strlen(e->name);
         uint32_t ext_attr = (e->mode ? e->mode : (e->is_dir ? 0755 : 0644)) << 16;
@@ -714,6 +749,7 @@ uint8_t *arc_zip_create(const arc_entry *ents, int n, int use_deflate, size_t *o
     for (int i = 0; i < n; i++) if (owns[i] && payload[i]) ARC_FREE(payload[i]);
     ARC_FREE(offsets); ARC_FREE(payload); ARC_FREE(csize);
     ARC_FREE(usize); ARC_FREE(crc); ARC_FREE(method); ARC_FREE(owns);
+    ARC_FREE(order); ARC_FREE(force_store);
 
     if (m.err) { if (m.buf) ARC_FREE(m.buf); return NULL; }
     *out_len = m.len;
@@ -727,7 +763,14 @@ fail_arrays:
     if (crc) ARC_FREE(crc);
     if (method) ARC_FREE(method);
     if (owns) ARC_FREE(owns);
+    if (order) ARC_FREE(order);
+    if (force_store) ARC_FREE(force_store);
     return NULL;
+}
+
+// Backward-compatible wrapper: no forced-first/stored part.
+uint8_t *arc_zip_create(const arc_entry *ents, int n, int use_deflate, size_t *out_len) {
+    return arc_zip_create_ex(ents, n, use_deflate, NULL, out_len);
 }
 
 arc_entry *arc_zip_extract(const uint8_t *zip, size_t len, int *out_count) {

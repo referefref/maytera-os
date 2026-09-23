@@ -45,30 +45,9 @@ extern "C" {
 
 // ---- syslog family: real, routed to stdout (this OS's serial console),
 // not a no-op, so `-e5,serverlog...` style logging is actually visible. ----
-static int g_syslog_facility = 0;
-static char g_syslog_ident[128] = "";
-
-void openlog(const char *ident, int option, int facility) {
-    (void)option;
-    g_syslog_facility = facility;
-    if (ident) {
-        int i = 0;
-        while (ident[i] && i < (int)sizeof(g_syslog_ident) - 1) { g_syslog_ident[i] = ident[i]; i++; }
-        g_syslog_ident[i] = 0;
-    } else {
-        g_syslog_ident[0] = 0;
-    }
-}
-void syslog(int priority, const char *format, ...) {
-    (void)priority;
-    printf("[syslog:%s] ", g_syslog_ident[0] ? g_syslog_ident : "assaultcube");
-    va_list ap;
-    va_start(ap, format);
-    vprintf(format, ap);
-    va_end(ap);
-    printf("\n");
-}
-void closelog(void) { g_syslog_ident[0] = 0; }
+// openlog/syslog/closelog are now provided by libc (posixextra.c, #745
+// darkhttpd port). The duplicate stubs that lived here were removed to fix
+// multiple-definition link errors (libc is canonical).
 
 // ---- locale: MayteraOS has no locale tables at all; "POSIX"/"C" is
 // already this platform's only behavior, so reporting success with

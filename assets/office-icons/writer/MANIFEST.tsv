@@ -1,0 +1,24 @@
+# Writer toolbar icon set: SVG master -> /ICONS 8.3 name (MICO .ICN, 64x64).
+# The WR prefix namespaces the set so a sibling toolbar (Calc, Slides) that
+# also has new/open/save/bold cannot clobber it in the flat /ICONS directory.
+# svg	icn	toolbar action
+new	WRNEW	New document
+open	WROPEN	Open
+save	WRSAVE	Save
+undo	WRUNDO	Undo
+redo	WRREDO	Redo
+bold	WRBOLD	Bold
+italic	WRITAL	Italic
+underline	WRUNDL	Underline
+strikethrough	WRSTRK	Strikethrough
+align-left	WRALNL	Align left
+align-center	WRALNC	Align centre
+align-right	WRALNR	Align right
+align-justify	WRALNJ	Justify
+list-bullet	WRLSTB	Bulleted list
+list-numbered	WRLSTN	Numbered list
+insert-table	WRTABLE	Insert table
+insert-image	WRIMAGE	Insert image
+indent-increase	WRINDP	Increase indent
+indent-decrease	WRINDM	Decrease indent
+find	WRFIND	Find

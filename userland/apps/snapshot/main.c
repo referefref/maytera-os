@@ -579,7 +579,15 @@ static void fb_box(int x0, int y0, int x1, int y1, int W, int H, uint32_t c) {
 
 // Compose the whole window content into g_fb and blit it in one syscall.
 // Chrome (toolbar / status cards) is drawn on top afterwards.
+//
+// #239: `win < 0` means there is no window, which is the state a --contract
+// invocation runs in (it answers and exits before win_create()). The toolbar
+// actions the contract projects are the SAME functions the click handler calls,
+// and two of them repaint; guarding here, at the four drawing entry points,
+// keeps that sharing honest instead of splitting every action into a
+// "state half" and a "draw half" that could drift apart.
 static void compose_view(void) {
+    if (win < 0) return;
     gui_palette_t *pal = gui_pal();
     int W = imin(g_win_w, FB_MAX_W);
     int H = imin(g_win_h, FB_MAX_H);
@@ -699,6 +707,7 @@ static void draw_btn(int id, const char *label, int active) {
 }
 
 static void draw_toolbar(void) {
+    if (win < 0) return;   // #239: headless --contract invocation, no window
     gui_palette_t *pal = gui_pal();
     win_draw_rect(win, 0, 0, g_win_w, TOOLBAR_H, pal->surface_raised);
     win_draw_rect(win, 0, TOOLBAR_H - 1, g_win_w, 1, pal->border);
@@ -731,6 +740,7 @@ static void draw_toolbar(void) {
 }
 
 static void draw_statusbar(void) {
+    if (win < 0) return;   // #239: headless --contract invocation, no window
     gui_palette_t *pal = gui_pal();
     int sy = g_win_h - STATUSBAR_H;
     win_draw_rect(win, 0, sy, g_win_w, STATUSBAR_H, pal->surface_raised);
@@ -760,6 +770,7 @@ static void draw_statusbar(void) {
 }
 
 static void draw_all(void) {
+    if (win < 0) return;   // #239: headless --contract invocation, no window
     compose_view();
     draw_toolbar();
     draw_statusbar();
@@ -786,7 +797,7 @@ static void start_capture(int delay_ms) {
     set_status(delay_ms > 0 ? "Capturing..." : "Capturing now...");
     draw_toolbar();
     draw_statusbar();
-    win_invalidate(win);
+    if (win >= 0) win_invalidate(win);   // #239: no window in a --contract run
 }
 
 static void capture_finish(int ok, const char *msg) {
@@ -886,8 +897,125 @@ static void capture_tick(void) {
 // ---------------------------------------------------------------------------
 // Toolbar interaction
 // ---------------------------------------------------------------------------
+// #239: one action per toolbar button, in ONE table that the click handler
+// walks. This used to be an if-chain of thirteen point_in() tests, which meant
+// the buttons existed in three separate places (the id enum, toolbar_btn_rect()
+// and the chain) and a fourth description would have been needed to give the
+// app a tool contract. The table is now the single dispatch structure, and the
+// contract is PROJECTED from it, so a button that is not here cannot be clicked
+// and cannot be described.
+//
+// Each fn does the STATE CHANGE ONLY; the redraw is the caller's job. That is
+// what lets a headless --contract call run exactly the same function a click
+// runs, and it is why the four drawing entry points guard on `win < 0` rather
+// than each action carrying its own headless variant.
+static void act_snap(void)  { start_capture(0); }
+static void act_d3(void)    { start_capture(3000); }
+static void act_d10(void)   { start_capture(10000); }
+static void act_pen(void)   { g_tool = TOOL_PEN; }
+static void act_line(void)  { g_tool = TOOL_LINE; }
+static void act_box(void)   { g_tool = TOOL_BOX; }
+static void act_arrow(void) { g_tool = TOOL_ARROW; }
+static void act_mark(void)  { g_tool = TOOL_MARK; }
+static void act_crop(void)  { g_tool = TOOL_CROP; }
+static void act_size(void)  { g_size = (g_size + 1) % (int)(sizeof(g_sizes) / sizeof(g_sizes[0])); }
+
+static void act_undo(void) {
+    if (!g_undo_valid) { set_status("Nothing to undo"); return; }
+    undo_swap();
+    set_status("Undone");
+}
+
+static void act_save(void) {
+    if (g_iw <= 0) { set_status("Nothing to save"); return; }
+    if (save_next() == 0) {
+        // #148 (local 164): g_saved now holds a full <home>/SCREENSHOTS/...
+        // path (up to 255 bytes), not a 12-byte /SNAPnnn.BMP - the old manual,
+        // unbounded char-by-char copy into msg[48] was a real stack overflow
+        // waiting for a long home path. snprintf into a buffer sized for the
+        // worst case truncates safely instead.
+        char msg[300];
+        snprintf(msg, sizeof(msg), "Saved %s", g_saved);
+        set_status(msg);
+    } else {
+        set_status("Save failed");
+    }
+}
+
+// #148 (local 164): "Gallery" - the reuse decision for deliverable 3. Gallery
+// already supports being launched pointed at an arbitrary directory
+// (userland/apps/gallery/main.c: `if (argc > 1 && argv[1][0] == '/')
+// strlcpy(g_path, argv[1], ...)`), so this is the SAME sys_spawn_args(path, av,
+// 2) shape Files/desktop.c already use to open an app on a specific folder -
+// not a second image-grid browser built inside Snapshot, which the ticket
+// explicitly asked to avoid unless reuse were "genuinely unworkable" (it
+// wasn't).
+static void act_gallery(void) {
+    char dir[256];
+    if (userhome_path(0, SAVE_SUB, dir, sizeof(dir)) != 0) return;
+    char *av[2];
+    av[0] = (char *)"/APPS/GALLERY";
+    av[1] = dir;
+    if (sys_spawn_args("/APPS/GALLERY", av, 2) < 0)
+        set_status("Could not open Gallery");
+}
+
+// tok is the STABLE dotted contract name; the button's drawn label is not, and
+// BTN_SIZE's changes with the selected size. cap is an aicap capability id (see
+// libc/aicap.c) and is required for a CT_GUARDED row; 0 means CT_SAFE.
+typedef struct {
+    int         id;
+    const char *tok;
+    void      (*fn)(void);
+    const char *cap;       // 0 = safe
+    const char *desc;
+} tb_act_t;
+
+static const tb_act_t TB_ACTS[] = {
+    // Capture is a DISCLOSURE of whatever is on screen, so it is guarded on the
+    // same axis docs/CONTRACT_ARCHITECTURE.md section 7 uses for the Storage
+    // deletes. Note honestly what a contract call to these does and does not
+    // do: it arms the capture state machine, which is then driven by the
+    // event-loop tick, so it completes in a RUNNING app and not in a headless
+    // one-shot invocation.
+    { BTN_SNAP,    "capture.now",     act_snap,    "snapshot.capture",
+      "Arm an immediate screen capture (driven to completion by the running app's tick)" },
+    { BTN_D3,      "capture.delay_3s", act_d3,     "snapshot.capture",
+      "Arm a screen capture after a 3 second countdown" },
+    { BTN_D10,     "capture.delay_10s", act_d10,   "snapshot.capture",
+      "Arm a screen capture after a 10 second countdown" },
+    { BTN_PEN,     "tool.pen",        act_pen,     0,
+      "Select the freehand pen annotation tool" },
+    { BTN_LINE,    "tool.line",       act_line,    0,
+      "Select the straight line annotation tool" },
+    { BTN_BOX,     "tool.box",        act_box,     0,
+      "Select the rectangle outline annotation tool" },
+    { BTN_ARROW,   "tool.arrow",      act_arrow,   0,
+      "Select the arrow annotation tool" },
+    { BTN_MARK,    "tool.marker",     act_mark,    0,
+      "Select the translucent highlighter annotation tool" },
+    { BTN_CROP,    "tool.crop",       act_crop,    0,
+      "Select the crop tool, which trims the image to the dragged rectangle" },
+    { BTN_SIZE,    "size.cycle",      act_size,    0,
+      "Cycle the annotation stroke size through Small, Medium and Large" },
+    { BTN_UNDO,    "edit.undo",       act_undo,    0,
+      "Undo the last annotation or crop (one level)" },
+    // Writing a BMP into the user's home is not cosmetic and not reversible by
+    // this app, so it takes the capability the AI tool table already carries
+    // for a file write rather than inventing a second name for the same thing.
+    { BTN_SAVE,    "file.save",       act_save,    "files.write",
+      "Save the current capture as a 24-bit BMP under <home>/SCREENSHOTS" },
+    { BTN_GALLERY, "file.open_gallery", act_gallery, "app.launch",
+      "Open the Gallery app on the <home>/SCREENSHOTS folder" },
+};
+#define TB_NACTS ((int)(sizeof(TB_ACTS) / sizeof(TB_ACTS[0])))
+
+// The colour swatch row. The count comes from g_colors[] itself, so the swatch
+// loop, the draw pass and the contract's colour range are all the same number.
+#define SWATCH_N ((int)(sizeof(g_colors) / sizeof(g_colors[0])))
+
 static int handle_toolbar_click(int x, int y) {
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < SWATCH_N; i++) {
         if (point_in(swatch_rect(i), x, y)) {
             g_color = i;
             draw_toolbar();
@@ -895,74 +1023,13 @@ static int handle_toolbar_click(int x, int y) {
             return 1;
         }
     }
-    if (point_in(toolbar_btn_rect(BTN_SNAP), x, y)) { start_capture(0);     return 1; }
-    if (point_in(toolbar_btn_rect(BTN_D3), x, y))   { start_capture(3000);  return 1; }
-    if (point_in(toolbar_btn_rect(BTN_D10), x, y))  { start_capture(10000); return 1; }
-
-    static const int tool_btn[TOOL_COUNT] =
-        { BTN_PEN, BTN_LINE, BTN_BOX, BTN_ARROW, BTN_MARK, BTN_CROP };
-    for (int t = 0; t < TOOL_COUNT; t++) {
-        if (point_in(toolbar_btn_rect(tool_btn[t]), x, y)) {
-            g_tool = t;
-            draw_toolbar();
-            win_invalidate(win);
-            return 1;
-        }
-    }
-
-    if (point_in(toolbar_btn_rect(BTN_SIZE), x, y)) {
-        g_size = (g_size + 1) % 3;
-        draw_toolbar();
-        win_invalidate(win);
-        return 1;
-    }
-    if (point_in(toolbar_btn_rect(BTN_UNDO), x, y)) {
-        if (g_undo_valid) {
-            undo_swap();
-            set_status("Undone");
-            draw_all();
-        }
-        return 1;
-    }
-    if (point_in(toolbar_btn_rect(BTN_SAVE), x, y)) {
-        if (g_iw > 0) {
-            if (save_next() == 0) {
-                // #148 (local 164): g_saved now holds a full <home>/SCREENSHOTS/...
-                // path (up to 255 bytes), not a 12-byte /SNAPnnn.BMP - the old
-                // manual, unbounded char-by-char copy into msg[48] was a real
-                // stack overflow waiting for a long home path. snprintf into a
-                // buffer sized for the worst case truncates safely instead.
-                char msg[300];
-                snprintf(msg, sizeof(msg), "Saved %s", g_saved);
-                set_status(msg);
-            } else {
-                set_status("Save failed");
-            }
-            draw_statusbar();
-            win_invalidate(win);
-        }
-        return 1;
-    }
-    // #148 (local 164): "Gallery" - the reuse decision for deliverable 3.
-    // Gallery already supports being launched pointed at an arbitrary
-    // directory (userland/apps/gallery/main.c: `if (argc > 1 && argv[1][0]
-    // == '/') strlcpy(g_path, argv[1], ...)`), so this is the SAME
-    // sys_spawn_args(path, av, 2) shape Files/desktop.c already use to open
-    // an app on a specific folder - not a second image-grid browser built
-    // inside Snapshot, which the ticket explicitly asked to avoid unless
-    // reuse were "genuinely unworkable" (it wasn't).
-    if (point_in(toolbar_btn_rect(BTN_GALLERY), x, y)) {
-        char dir[256];
-        if (userhome_path(0, SAVE_SUB, dir, sizeof(dir)) == 0) {
-            char *av[2];
-            av[0] = (char *)"/APPS/GALLERY";
-            av[1] = dir;
-            if (sys_spawn_args("/APPS/GALLERY", av, 2) < 0) {
-                set_status("Could not open Gallery");
-                draw_statusbar();
-                win_invalidate(win);
-            }
-        }
+    for (int i = 0; i < TB_NACTS; i++) {
+        if (!point_in(toolbar_btn_rect(TB_ACTS[i].id), x, y)) continue;
+        TB_ACTS[i].fn();
+        // draw_all() is the superset of the redraws the old per-button chain
+        // did (toolbar only, statusbar only, or everything). One repaint path
+        // for one dispatch path; a toolbar click is not a hot path.
+        draw_all();
         return 1;
     }
     return 0;
@@ -1022,6 +1089,142 @@ static void stroke_end(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Tool contract (#239) - PROJECTED FROM TB_ACTS[] AND g_colors[].
+//
+// Same move as apps/calc (#233). Nothing below lists a toolbar button or a
+// colour. The action surface is derived by walking TB_ACTS[], the ONE table
+// handle_toolbar_click() dispatches through, and the colour range is the size
+// of g_colors[], the ONE array both the swatch draw loop and the swatch hit
+// test walk. A button that is not in TB_ACTS[] cannot be clicked and cannot be
+// described; a colour that is not in g_colors[] cannot be drawn, swatched or
+// selected.
+//
+// COVERAGE, stated honestly (docs/CONTRACT_API.md section 6): 19 of the app's
+// 20 interactive targets.
+//
+//   COVERED  13 toolbar buttons  -> 13 projected actions.
+//   COVERED   6 colour swatches  -> the 6 values of `annotate.color`, whose
+//                                   upper bound is sizeof(g_colors) and whose
+//                                   store is the variable the swatch click
+//                                   assigns. Selecting a colour by index IS
+//                                   clicking its swatch.
+//   NOT       the canvas annotation DRAG (stroke_begin/stroke_move/stroke_end).
+//             It is a pointer gesture carrying coordinates, not a discrete
+//             control, and there is no honest way to express "drag from here to
+//             there" as a contract row today (ct_item_t has no coordinate
+//             shape - docs/CONTRACT_API.md section 9 records the same gap for
+//             list-valued rows). It is listed here rather than quietly omitted.
+//
+// on_key() is a strict SUBSET of the covered set: c/3/t arm the same captures,
+// p/l/b/a/m/x set the same g_tool the tool buttons set, and z/s are literally
+// implemented as synthetic clicks on BTN_UNDO / BTN_SAVE. Escape closes the
+// window, which is chrome.
+//
+// WHAT A HEADLESS CONTRACT CALL CANNOT DO, stated so nobody reads more into a
+// green line than it means: the capture.* actions ARM the capture state
+// machine, which is advanced by capture_tick() from the event loop. A one-shot
+// `--contract call` process exits before any tick, so it changes the app's
+// capture state and writes no image. They are declared because the surface
+// exists, with the limit in their own descriptions.
+// ---------------------------------------------------------------------------
+#include "../../libc/contract.h"
+
+static int ct_press(const ct_item_t *it, int argc, char **argv,
+                    char *out, int ocap) {
+    (void)argc; (void)argv;
+    if (!it->ctx) return -1;
+    const tb_act_t *a = (const tb_act_t *)it->ctx;
+    a->fn();                       // the SAME function a click on that button runs
+    // Report the app's own status line and tool state back, so the reply is an
+    // observation rather than an echo of the request.
+    snprintf(out, (size_t)ocap, "tool=%d color=%d size=%d image=%dx%d status=%s",
+             g_tool, g_color, g_size, g_iw, g_ih, g_status);
+    return 0;
+}
+
+static int snapshot_project(int idx, ct_item_t *out) {
+    if (idx < 0 || idx >= TB_NACTS) return 0;
+    const tb_act_t *a = &TB_ACTS[idx];
+    ct_item_t it;
+    __builtin_memset(&it, 0, sizeof(it));
+    it.name   = a->tok;
+    it.type   = CT_ACTION;
+    it.access = CT_WRITE;
+    it.risk   = a->cap ? CT_GUARDED : CT_SAFE;
+    it.cap    = a->cap;
+    it.actfn  = ct_press;
+    it.ctx    = a;
+    it.desc   = a->desc;
+    *out = it;
+    return 1;
+}
+
+static int ct_status_get(char *o, int n) { strlcpy(o, g_status, (size_t)n); return 0; }
+static int ct_saved_get(char *o, int n)  { strlcpy(o, g_saved[0] ? g_saved : "(unsaved)", (size_t)n); return 0; }
+
+static const ct_item_t SNAPSHOT_ITEMS[] = {
+    // The three annotation preferences. Each is the variable the toolbar itself
+    // assigns, and each is persisted, because "which pen and which colour" is a
+    // preference and forgetting it every launch is the bug this closes.
+    { "annotate.tool", CT_ENUM, CT_RW, CT_SAFE, 'p', 0, TOOL_COUNT - 1,
+      "Pen|Line|Box|Arrow|Marker|Crop",
+      &g_tool, 0, 0, 0, 0, 0, 0,
+      "Selected annotation tool; the same variable the six tool buttons set" },
+    { "annotate.color", CT_ENUM, CT_RW, CT_SAFE, 'k', 0, SWATCH_N - 1,
+      "Red|Yellow|Green|Blue|White|Black",
+      &g_color, 0, 0, 0, 0, 0, 0,
+      "Selected annotation colour; the same variable a swatch click sets" },
+    { "annotate.size", CT_ENUM, CT_RW, CT_SAFE, 'z', 0, 2, "Small|Medium|Large",
+      &g_size, 0, 0, 0, 0, 0, 0,
+      "Annotation stroke size; the same variable the S/M/L button cycles" },
+
+    { "image.width", CT_INT, CT_READ, CT_SAFE, 0, 0, IMG_MAX_W, 0,
+      &g_iw, 0, 0, 0, 0, 0, 0,
+      "Width in pixels of the capture currently loaded, 0 if none" },
+    { "image.height", CT_INT, CT_READ, CT_SAFE, 0, 0, IMG_MAX_H, 0,
+      &g_ih, 0, 0, 0, 0, 0, 0,
+      "Height in pixels of the capture currently loaded, 0 if none" },
+    { "image.zoom", CT_INT, CT_READ, CT_SAFE, 0, 0, 1000, 0,
+      &g_zoom, 0, 0, 0, 0, 0, 0,
+      "Zoom percent the view is fitted at, as the status bar shows it" },
+    { "edit.undo_available", CT_BOOL, CT_READ, CT_SAFE, 0, 0, 1, 0,
+      &g_undo_valid, 0, 0, 0, 0, 0, 0,
+      "Whether one level of undo is currently available" },
+    { "status", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
+      0, 0, 0, 0, ct_status_get, 0, 0,
+      "The status-bar line the window draws" },
+    { "file.last_saved", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
+      0, 0, 0, 0, ct_saved_get, 0, 0,
+      "Path of the most recent save, or (unsaved)" },
+};
+
+static const ct_contract_t *snapshot_contract(void);
+#define SNAPSHOT_CFG        "SNAPSHOT.CFG"
+#define SNAPSHOT_CFG_LEGACY "/CONFIG/SNAPSHOT.CFG"
+
+static void snapshot_load(void) {
+    contract_load_cfg(snapshot_contract(), SNAPSHOT_CFG, SNAPSHOT_CFG_LEGACY);
+}
+static void snapshot_commit(void) {
+    contract_save_cfg(snapshot_contract(), SNAPSHOT_CFG);
+}
+
+static const ct_contract_t SNAPSHOT_CONTRACT = {
+    "snapshot", "Snapshot",
+    "Toolbar actions are PROJECTED from TB_ACTS[], the same table "
+    "handle_toolbar_click() dispatches through, and the colour range is the "
+    "size of g_colors[], the same array the swatch row draws and hit-tests. "
+    "The canvas annotation DRAG is not covered: it is a pointer gesture with "
+    "coordinates, not a discrete control.",
+    SNAPSHOT_ITEMS, (int)(sizeof(SNAPSHOT_ITEMS) / sizeof(SNAPSHOT_ITEMS[0])),
+    snapshot_project,
+    snapshot_load,
+    snapshot_commit
+};
+
+static const ct_contract_t *snapshot_contract(void) { return &SNAPSHOT_CONTRACT; }
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 // #148 (local 164, 2026-08-18): the PrintScreen-on-a-normal-desktop path
@@ -1043,6 +1246,15 @@ static void stroke_end(void) {
 #define PREVIEW_BOTTOM_GAP   60
 
 int main(int argc, char **argv) {
+    // #233: a contract invocation must never open a window. Answering here,
+    // before win_create(), is what makes the API usable from a headless test
+    // harness and from the AI tool loop without a compositor. `win` stays -1,
+    // which is what the four drawing guards read.
+    if (contract_is_invocation(argc, argv))
+        return contract_cli(argc, argv, &SNAPSHOT_CONTRACT);
+
+    snapshot_load();
+
     int preview_mode = (argc > 2 && strcmp(argv[2], PREVIEW_ARG) == 0);
 
     if (preview_mode) {
@@ -1099,6 +1311,7 @@ int main(int argc, char **argv) {
 
     gui_event_t ev;
     int running = 1;
+    int cfg_hash = contract_hash(&SNAPSHOT_CONTRACT);
     while (running) {
         int got = win_get_event(win, &ev, 60);
         if (got == 0) {
@@ -1179,6 +1392,12 @@ int main(int argc, char **argv) {
             default:
                 break;
         }
+        // #239: persist when a PERSISTED row actually changed, using the
+        // contract's own DERIVED change signature rather than a hand-listed set
+        // of "things worth saving". This is what stops the GUI and a
+        // `--contract set` from holding two different ideas of the saved state.
+        { int h = contract_hash(&SNAPSHOT_CONTRACT);
+          if (h != cfg_hash) { cfg_hash = h; snapshot_commit(); } }
     }
 
     win_destroy(win);

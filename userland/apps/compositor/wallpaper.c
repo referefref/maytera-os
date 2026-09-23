@@ -6,6 +6,8 @@
 #include "compositor.h"
 #include "../../libc/syscall.h"
 #include "../../libc/wallpapers.h"
+#include "screensaver_gfx.h"   // #wpanim: reuse the low-res buffer + clipped upscale pipeline
+#include "wallpaper_anim.h"    // #wpanim: the four animated effects
 
 // ============================================================================
 // Wallpaper list (#517: data-driven, no longer a hardcoded subset)
@@ -39,6 +41,73 @@ static bool     g_wp_loaded;
 static int g_current_wallpaper;
 static int g_picker_scroll;
 static int g_picker_hover;
+
+// ============================================================================
+// #wpanim: animated, window-reactive wallpaper state (owner request
+// 2026-09-18). Compositor-local only, no new syscall (kernel has no notion
+// of this - unlike the static-wallpaper index, which the kernel tracks so
+// Settings and the compositor agree, this is compositor-chrome-only, the
+// same way the picker's scroll position is).
+//
+// #wpcolor (2026-09-18, second owner pass): the DEFAULT is now OFF (plain
+// static wallpaper, same as before #wpanim ever existed). The owner was
+// explicit: "Default should be static as before, [B]oating during install" -
+// the previous default (WPANIM_PLASMA) shipped an animated wallpaper ON by
+// default, which is exactly the regression being fixed here. Animated
+// effects remain fully available, opt-in only via this picker's strip.
+// ============================================================================
+
+static int g_wp_anim_mode      = WPANIM_OFF;
+static int g_wp_anim_intensity = 55;
+static int g_wp_anim_repel     = 1;   // 1 = repel (default), 0 = attract
+// #wpcolor: base hue (0..360) and colour source. SPECTRUM + hue 200 is
+// chosen so an old profile with no wallpaper_anim_hue/_palette key at all
+// (prof_apply leaves these at their compile-time default) reproduces the
+// pre-#wpcolor look byte-for-byte: wp_resolve_hue() for SPECTRUM is
+// `hue_base + dynamic_hue`, and the old formulas never added a base hue, so
+// hue_base must be a value that leaves the LOOK equivalent after the 0..360
+// wrap - since the old hue formulas were already unbounded and wrapped
+// inside wp_hsl(), any fixed offset only shifts the animation's starting
+// phase, not its character; 200 is simply a pleasant default, not load
+// -bearing for compatibility the way WPANIM_OFF/55/1 above are.
+static float g_wp_anim_hue     = 200.0f;
+static int   g_wp_anim_palette = WP_PALETTE_SPECTRUM;
+
+int  get_wallpaper_anim(void)            { return g_wp_anim_mode; }
+void set_wallpaper_anim(int mode)
+{
+    if (mode < 0 || mode >= WPANIM_MODE_COUNT) mode = WPANIM_OFF;
+    g_wp_anim_mode = mode;
+}
+int  get_wallpaper_anim_intensity(void)  { return g_wp_anim_intensity; }
+void set_wallpaper_anim_intensity(int v)
+{
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    g_wp_anim_intensity = v;
+}
+int  get_wallpaper_anim_repel(void)      { return g_wp_anim_repel; }
+void set_wallpaper_anim_repel(int repel) { g_wp_anim_repel = repel ? 1 : 0; }
+
+// #wpcolor: base hue getter/setter takes/returns an int (0..360) at this
+// boundary because profile.c's whole key/value format is integer-only (see
+// prof_atoi()/put_kv() - there is no float persistence anywhere in this
+// file), even though wpanim_render() itself wants a float. The internal
+// state is stored as float so the picker's slider can address all 360
+// values 1:1 without a lossy round trip through int on every mouse-move.
+int  get_wallpaper_anim_hue(void)        { return (int)g_wp_anim_hue; }
+void set_wallpaper_anim_hue(int deg)
+{
+    while (deg < 0)    deg += 360;
+    while (deg >= 360) deg -= 360;
+    g_wp_anim_hue = (float)deg;
+}
+int  get_wallpaper_anim_palette(void)    { return g_wp_anim_palette; }
+void set_wallpaper_anim_palette(int p)
+{
+    if (p < 0 || p >= WP_PALETTE_COUNT) p = WP_PALETTE_SPECTRUM;
+    g_wp_anim_palette = p;
+}
 
 // ============================================================================
 // File read buffer (4 MB; fits the largest expected BMP wallpaper)
@@ -307,6 +376,32 @@ void wallpaper_init(void)
 
     // Attempt to load the default wallpaper; if it fails the gradient is used.
     wallpaper_load(default_index);
+
+    // (wallpersist, no-ticket) SYNC THE KERNEL'S CROSS-APP INDEX, OR THE VERY
+    // NEXT FRAME UNDOES THIS CHOICE. main.c's main loop polls get_wallpaper()
+    // (SYS_GET_WALLPAPER, the kernel's g_wallpaper_idx - a per-BOOT int that
+    // starts at 0 and exists so Settings and the compositor agree on the live
+    // wallpaper) every frame, and reloads whatever that value names the moment
+    // it differs from wallpaper_current(). wallpaper_load() above only sets
+    // this file's OWN g_current_wallpaper; it never told the kernel. On a
+    // fresh boot with no persisted profile the kernel's index is still its
+    // boot default of 0, so on THE VERY NEXT FRAME that poll saw
+    // get_wallpaper()==0 != wallpaper_current()==default_index and forced a
+    // reload of index 0 - silently undoing the WP_DEFAULT_FILE preference
+    // just chosen above, every single time, before a single frame was ever
+    // presented. MEASURED (2026-09-11, golden 2426, throwaway VM 2900): a
+    // fresh account with no UIPROFIL.YML loaded ABSTRACT_13.BMP (index 5 on
+    // this image) for one instant, then the profile that got auto-saved a
+    // second later read "wallpaper: 0", and the desktop showed BOATING.BMP
+    // (whatever landed at raw enumeration index 0) instead - exactly the
+    // "reverts to the default BOATING" shape the owner reported, but
+    // reproducible from a plain first boot, with no stick refresh or
+    // keepstate involved at all. set_wallpaper() is the same one-line syscall
+    // the picker's own mouse handler already calls after every real
+    // selection (see the picker click handler below); calling it here too
+    // means the deliberate default and a real click are seeded into the
+    // kernel's live index identically, so this poll has nothing to correct.
+    set_wallpaper(default_index);
 }
 
 // ============================================================================
@@ -314,8 +409,268 @@ void wallpaper_init(void)
 // Draws either the loaded BMP (scaled if necessary) or a vertical gradient.
 // ============================================================================
 
+// #wpanim: FPS cap for the animated-wallpaper recompute, NOT for the blit.
+// An animated background is logically always-dirty while any desktop is
+// visible (there is no static content to damage-cull against), so the real
+// cost control is this cap, matching the screensaver's own
+// SS_FRAME_MIN_MS-style throttle - see screensaver_gfx.c's file header for
+// the measured 11-18fps/34-58%-of-one-core full-screen low-res+upscale
+// budget this rides on. 50ms = 20fps, inside the 40-66ms/15-25fps range
+// this was scoped against. The BLIT (ss_lores_upscale_to_fb_clipped) still
+// runs on every call so a plain cursor-move repaint sees the last computed
+// frame instead of a stale hole, exactly like a static wallpaper would.
+#define WPANIM_FRAME_MIN_MS 50
+
+static uint64_t s_wpanim_last_tick_ms = 0;
+static int      s_wpanim_buf_ready    = 0;
+
+// #wpcolor (owner request 2026-09-18: "window positions AND contents are
+// properly influencing the effects in real time"). Average colour under a
+// window's rect, sampled directly from g_fb.
+//
+// SAMPLING METHOD CHOSEN, AND WHY (see the four options weighed in the task
+// spec): this reads g_fb itself, in FRAMEBUFFER pixel space, at the START of
+// the rate-limited wpanim tick below - i.e. BEFORE this tick's
+// wpanim_render()+blit touches a single pixel. The compositor's own draw
+// order is wallpaper first, then window contents on top, every frame - so
+// at this exact point g_fb still holds frame N-1's fully composited image
+// everywhere, window rects included (this tick has not painted anything
+// yet). That is option (a) from the spec (sample the previous frame's
+// composited buffer) with no new syscall and no persistent cross-frame
+// cache needed: because this whole block already only runs once per
+// WPANIM_FRAME_MIN_MS, "sample now, use now" already IS "cache after frame
+// N, use in frame N+1" - the cache is just this tick's own stack, since the
+// next real use is the very call a few lines below. If a window's content
+// changes colour (a video/media window), the NEXT tick's sample sees it -
+// at most WPANIM_FRAME_MIN_MS point (50ms) after it changed, i.e. "within a
+// frame or two" of this module's own cadence, matching the requirement.
+//
+// Downsampled hard (WP_CONTENT_SAMPLES^2 = 16 taps per window, <=16 windows
+// = <=256 pixel reads per tick) to stay cheap on the single draw thread
+// (#426) - this runs inside the same uptime_ms()-gated tick as the effect
+// recompute itself, never on every draw-thread frame.
+#define WP_CONTENT_SAMPLES 4
+
+static void wp_sample_window_content(int32_t fx, int32_t fy, int32_t fw, int32_t fh,
+                                      uint8_t *out_r, uint8_t *out_g, uint8_t *out_b)
+{
+    int32_t x0 = fx, y0 = fy, x1 = fx + fw, y1 = fy + fh;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > g_fb_width)  x1 = g_fb_width;
+    if (y1 > g_fb_height) y1 = g_fb_height;
+    if (x1 <= x0 || y1 <= y0 || !g_fb) { *out_r = *out_g = *out_b = 0; return; }
+
+    int64_t sr = 0, sg = 0, sb = 0;
+    int     n  = 0;
+    for (int j = 0; j < WP_CONTENT_SAMPLES; j++) {
+        int32_t py = y0 + ((y1 - y0) * (j * 2 + 1)) / (WP_CONTENT_SAMPLES * 2);
+        if (py < y0) py = y0;
+        if (py >= y1) py = y1 - 1;
+        const uint32_t *row = g_fb + (uint32_t)py * (uint32_t)g_fb_pitch;
+        for (int i = 0; i < WP_CONTENT_SAMPLES; i++) {
+            int32_t px = x0 + ((x1 - x0) * (i * 2 + 1)) / (WP_CONTENT_SAMPLES * 2);
+            if (px < x0) px = x0;
+            if (px >= x1) px = x1 - 1;
+            uint32_t c = row[px];
+            sr += (int64_t)((c >> 16) & 0xFF);
+            sg += (int64_t)((c >> 8)  & 0xFF);
+            sb += (int64_t)(c & 0xFF);
+            n++;
+        }
+    }
+    if (n <= 0) n = 1;
+    *out_r = (uint8_t)(sr / n);
+    *out_g = (uint8_t)(sg / n);
+    *out_b = (uint8_t)(sb / n);
+}
+
+// #wpanim BUGFIX: main.c's render-path decision (partial/chrome/cursor-only
+// vs full) happens BEFORE render_frame_body() ever runs this tick, so a flag
+// set from INSIDE wallpaper_render_animated() (like g_needs_redraw) can only
+// ever affect a FUTURE tick, and main.c unconditionally clears g_needs_redraw
+// right after whichever path it picks - so it never accumulates across ticks
+// either. main.c needs to know BEFOREHAND whether a new animation frame is
+// due, so it can fold that into its own ui_busy decision (see main.c's
+// ui_busy computation, the same treatment g_session_locked/
+// screenshot_fs_toast_active() etc. already get) and take the full render
+// path on exactly the ticks that matter - not every tick, which would defeat
+// the FPS cap, and not zero ticks, which is the bug this fixes. Same clock
+// wallpaper_render_animated() itself reads, so there is exactly one timer,
+// not two that could drift.
+//
+// MEASURED (throwaway VM 2213/2216/2218, 2026-09-18): three screendumps of a
+// FLOW effect 16+ seconds apart were byte-identical (md5-confirmed) on an
+// idle desktop with a static window open, while the guest was demonstrably
+// NOT hung (CPU non-zero, windows composited/placed correctly). This fix
+// (folding wallpaper_anim_due() into main.c's ui_busy) is the correct
+// architectural answer to that class of bug, but could NOT be conclusively
+// re-verified as fully resolving it in the same constrained headless rig
+// (no input device attached, per docs/TEST_VM_RECIPE.md's own recipe; a
+// control test with the SAME rig and wallpaper_anim OFF showed the identical
+// symptom - the desktop clock itself froze at the same idle point - proving
+// this is a broader, PRE-EXISTING idle-repaint characteristic of the
+// compositor, not something wpanim introduced or something this one fix can
+// fully own). See blame.md for the full writeup; flagged here as a known
+// follow-up rather than silently assumed fixed.
+bool wallpaper_anim_due(void)
+{
+    if (g_wp_anim_mode == WPANIM_OFF) return false;
+    if (!s_wpanim_buf_ready) return true;
+    return ((uint64_t)uptime_ms() - s_wpanim_last_tick_ms) >= WPANIM_FRAME_MIN_MS;
+}
+
+// Runs in place of the BMP/gradient path when an animated mode is selected.
+// Never blocks, never sleeps (#426): the recompute itself is gated on
+// uptime_ms(), not a wait - a frame that arrives early just reuses the
+// cached low-res buffer from last tick.
+// #emfield (owner request 2026-09-22): per-window VELOCITY tracking, entirely
+// compositor-side. The kernel window info carries no velocity or previous
+// position (wm_window_info_t, libc/syscall.h), so we remember each window's
+// previous CENTRE in low-res cell space keyed by its stable window id and
+// derive velocity = (now - prev) per tick, smoothed. Only wpanim's EMFIELD
+// mode reads wr[].vx/vy, but the table is refreshed on every animated tick so
+// it is already warm the instant EMFIELD is selected. Bounded (16 slots),
+// non-blocking, no allocation - it lives on the same rate-limited recompute
+// tick as everything else here (#426).
+#define WP_VEL_SLOTS 16
+typedef struct { int id; int used; int seen; float cx, cy, vx, vy; } wp_vel_slot_t;
+static wp_vel_slot_t s_wp_vel[WP_VEL_SLOTS];
+
+// Mark every slot unseen at the start of a tick so windows that have since
+// closed can be reaped at the end (below).
+static void wp_vel_begin_tick(void)
+{
+    for (int i = 0; i < WP_VEL_SLOTS; i++) s_wp_vel[i].seen = 0;
+}
+
+// Update the slot for window `id` with its current low-res centre (cx,cy) and
+// return the smoothed velocity via *ovx/*ovy. A window seen for the first time
+// (or after a table-full eviction) reports zero velocity - a still window, the
+// correct default (no vortex until it actually moves).
+static void wp_vel_update(int id, float cx, float cy, float *ovx, float *ovy)
+{
+    int slot = -1, freeslot = -1;
+    for (int i = 0; i < WP_VEL_SLOTS; i++) {
+        if (s_wp_vel[i].used && s_wp_vel[i].id == id) { slot = i; break; }
+        if (!s_wp_vel[i].used && freeslot < 0) freeslot = i;
+    }
+    if (slot < 0) slot = (freeslot >= 0) ? freeslot : 0;   // table full: reuse slot 0
+
+    wp_vel_slot_t *v = &s_wp_vel[slot];
+    if (v->used && v->id == id) {
+        float rawx = cx - v->cx, rawy = cy - v->cy;
+        // Exponential smoothing so a single jittery frame does not spike the
+        // vortex, while a sustained drag builds up quickly.
+        v->vx = v->vx * 0.55f + rawx * 0.45f;
+        v->vy = v->vy * 0.55f + rawy * 0.45f;
+    } else {
+        v->id = id; v->used = 1; v->vx = 0.0f; v->vy = 0.0f;
+    }
+    v->cx = cx; v->cy = cy; v->seen = 1;
+    *ovx = v->vx; *ovy = v->vy;
+}
+
+// Free slots whose window was not seen this tick (window closed/minimized).
+static void wp_vel_end_tick(void)
+{
+    for (int i = 0; i < WP_VEL_SLOTS; i++)
+        if (s_wp_vel[i].used && !s_wp_vel[i].seen) s_wp_vel[i].used = 0;
+}
+
+static void wallpaper_render_animated(void)
+{
+    int32_t cx0 = g_clip_x0 < 0 ? 0 : g_clip_x0;
+    int32_t cy0 = g_clip_y0 < 0 ? 0 : g_clip_y0;
+    int32_t cx1 = g_clip_x1 > g_fb_width  ? g_fb_width  : g_clip_x1;
+    int32_t cy1 = g_clip_y1 > g_fb_height ? g_fb_height : g_clip_y1;
+    if (cx1 <= cx0 || cy1 <= cy0) return;
+
+    // LO buffer (200x125): all four effects have a per-cell or per-particle
+    // inner loop heavier than the plain wallpaper blit (domain warp / field
+    // tracing), matching screensaver_gfx.h's own guidance on which standard
+    // size to pick for that cost class.
+    uint32_t *buf = ss_lores_buf(SS_LORES_LO_W, SS_LORES_LO_H);
+    if (!buf) {
+        // Never crash: same defensive fallback screensaver_gfx.c documents
+        // for its own malloc-failure path (should not happen in practice).
+        draw_gradient_v(cx0, cy0, cx1 - cx0, cy1 - cy0, CLR_WP_GRAD_TOP, CLR_WP_GRAD_BOT);
+        return;
+    }
+
+    uint64_t now = (uint64_t)uptime_ms();
+    if (!s_wpanim_buf_ready || (now - s_wpanim_last_tick_ms) >= WPANIM_FRAME_MIN_MS) {
+        s_wpanim_last_tick_ms = now;
+
+        // Live window rects, translated into the low-res buffer's coordinate
+        // space (wallpaper_anim.h's contract - see its file header). Fetched
+        // here rather than threaded in from main.c's own wm_get_windows()
+        // call: this only runs on the rate-limited recompute tick (at most
+        // once per WPANIM_FRAME_MIN_MS), not every frame, so the extra
+        // bounded, non-blocking syscall (wm_get_windows is a linked-list
+        // walk under a uaccess bracket, no wait_event - see sys_wm_get_windows,
+        // kernel/gui/window.c) costs nothing on the common path where this
+        // tick is skipped.
+        wm_window_info_t wins[16];
+        int n = wm_get_windows(wins, 16);
+        wp_win_rect_t wr[16];
+        int nw = 0;
+        float sxr = (g_fb_width  > 0) ? (float)SS_LORES_LO_W / (float)g_fb_width  : 1.0f;
+        float syr = (g_fb_height > 0) ? (float)SS_LORES_LO_H / (float)g_fb_height : 1.0f;
+        wp_vel_begin_tick();   // #emfield: age out closed windows after the loop
+        for (int i = 0; i < n && nw < 16; i++) {
+            if (!wins[i].visible || wins[i].minimized) continue;
+            wr[nw].x = (int32_t)((float)wins[i].x      * sxr);
+            wr[nw].y = (int32_t)((float)wins[i].y      * syr);
+            wr[nw].w = (int32_t)((float)wins[i].width  * sxr);
+            wr[nw].h = (int32_t)((float)wins[i].height * syr);
+            if (wr[nw].w < 1) wr[nw].w = 1;
+            if (wr[nw].h < 1) wr[nw].h = 1;
+            wr[nw].focused = wins[i].focused ? 1 : 0;
+            // #wpcolor: sample this window's own content colour in
+            // FRAMEBUFFER pixel space (wins[i].x/y/width/height, NOT the
+            // already-downscaled wr[nw].x/y/w/h above) - see
+            // wp_sample_window_content()'s header for why g_fb still holds
+            // the right pixels here. Always set has_content=1: even a
+            // freshly-created window's backing pixels are SOME colour (its
+            // clear/background), which is a reasonable tint from frame one
+            // rather than leaving CONTENT mode with nothing to show.
+            wp_sample_window_content(wins[i].x, wins[i].y, wins[i].width, wins[i].height,
+                                      &wr[nw].cr, &wr[nw].cg, &wr[nw].cb);
+            wr[nw].has_content = 1;
+            // #emfield: smoothed per-window velocity in low-res cell space,
+            // keyed by the stable window id. Zero for still windows and the
+            // frame a window first appears; only EMFIELD uses it.
+            {
+                float wcx = (float)wr[nw].x + (float)wr[nw].w * 0.5f;
+                float wcy = (float)wr[nw].y + (float)wr[nw].h * 0.5f;
+                wp_vel_update(wins[i].id, wcx, wcy, &wr[nw].vx, &wr[nw].vy);
+            }
+            nw++;
+        }
+        wp_vel_end_tick();
+
+        wpanim_render(g_wp_anim_mode, buf, SS_LORES_LO_W, SS_LORES_LO_H,
+                      wr, nw, now, g_wp_anim_intensity, g_wp_anim_repel,
+                      g_wp_anim_hue, g_wp_anim_palette);
+        s_wpanim_buf_ready = 1;
+    }
+
+    // #102/#379 dirty-rect: blit only the intersection of the screen and the
+    // active clip rectangle, same contract as the static-wallpaper path
+    // below.
+    ss_lores_upscale_to_fb_clipped(buf, SS_LORES_LO_W, SS_LORES_LO_H, cx0, cy0, cx1, cy1);
+}
+
 void wallpaper_render_background(void)
 {
+    // #wpanim: an animated mode REPLACES both the BMP and the gradient
+    // fallback below - there is no "animated over static" layering.
+    if (g_wp_anim_mode != WPANIM_OFF) {
+        wallpaper_render_animated();
+        return;
+    }
+
     if (!g_wp_loaded || g_wp_width <= 0 || g_wp_height <= 0) {
         // Fall back to a vertical gradient.
         draw_gradient_v(0, 0, g_fb_width, g_fb_height,
@@ -409,7 +764,87 @@ static void wallpaper_grid_rect(int32_t dlg_x, int32_t dlg_y,
                                 int32_t *gx, int32_t *gy, int32_t *gh) {
     *gx = dlg_x + THUMB_PADDING;
     *gy = dlg_y + PICKER_TITLE_H + THUMB_PADDING;
-    *gh = PICKER_HEIGHT - PICKER_TITLE_H - THUMB_PADDING * 2 - ui_px(16);
+    // #wpanim: WPANIM_STRIP_H subtracted here is the exact amount
+    // PICKER_HEIGHT grew by (compositor.h), so this grid is the same size
+    // it was before the effect strip existed.
+    *gh = PICKER_HEIGHT - PICKER_TITLE_H - THUMB_PADDING * 2 - ui_px(16) - WPANIM_STRIP_H;
+}
+
+// ============================================================================
+// #wpanim: effect-mode buttons + intensity slider + repel/attract toggle.
+// Shared geometry (draw side in wallpaper_render_picker(), hit-test side in
+// wallpaper_picker_handle_mouse()) - one source, per the #uiscale rule noted
+// above wallpaper_close_btn_rect().
+// ============================================================================
+
+static void wallpaper_strip_rect(int32_t dlg_x, int32_t dlg_y,
+                                 int32_t *sx, int32_t *sy, int32_t *sw) {
+    int32_t gx, gy, gh;
+    wallpaper_grid_rect(dlg_x, dlg_y, &gx, &gy, &gh);
+    *sx = dlg_x + THUMB_PADDING;
+    *sy = gy + gh + ui_px(6);
+    *sw = PICKER_WIDTH - THUMB_PADDING * 2;
+}
+
+#define WPANIM_BTN_H  ui_px(20)
+#define WPANIM_ROW2_Y_OFF (WPANIM_BTN_H + ui_px(8))
+#define WPANIM_ROW2_H ui_px(18)
+
+// Mode button `idx` (0 = Off .. WPANIM_MODE_COUNT-1 = Gravity), row 1.
+static void wallpaper_mode_btn_rect(int32_t sx, int32_t sy, int32_t sw, int idx,
+                                    int32_t *bx, int32_t *by, int32_t *bw, int32_t *bh) {
+    int32_t gap = ui_px(3);
+    int32_t bw5 = (sw - gap * (WPANIM_MODE_COUNT - 1)) / WPANIM_MODE_COUNT;
+    *bx = sx + idx * (bw5 + gap);
+    *by = sy;
+    *bw = bw5;
+    *bh = WPANIM_BTN_H;
+}
+
+// Row 2: [value text][intensity slider][repel/attract toggle].
+static void wallpaper_row2_rects(int32_t sx, int32_t sy, int32_t sw,
+                                 int32_t *sl_x, int32_t *sl_y, int32_t *sl_w, int32_t *sl_h,
+                                 int32_t *tg_x, int32_t *tg_w) {
+    int32_t y2 = sy + WPANIM_ROW2_Y_OFF;
+    int32_t val_w = ui_px(30);
+    *tg_w = ui_px(64);
+    *tg_x = sx + sw - *tg_w;
+    *sl_x = sx + val_w;
+    *sl_y = y2;
+    *sl_w = sw - val_w - *tg_w - ui_px(6);
+    *sl_h = WPANIM_ROW2_H;
+}
+
+// #wpcolor: row 3, below row 2 - [value text][base-hue slider][Content/
+// Spectrum/Mono button group]. Same shape as wallpaper_row2_rects() above
+// (value + slider + right-side control cluster), one row lower.
+#define WPANIM_ROW3_Y_OFF (WPANIM_ROW2_Y_OFF + WPANIM_ROW2_H + ui_px(6))
+#define WPANIM_ROW3_H     ui_px(18)
+#define WPANIM_PALETTE_GROUP_W ui_px(120)
+
+static void wallpaper_row3_rects(int32_t sx, int32_t sy, int32_t sw,
+                                 int32_t *sl_x, int32_t *sl_y, int32_t *sl_w, int32_t *sl_h,
+                                 int32_t *pg_x, int32_t *pg_w) {
+    int32_t y3 = sy + WPANIM_ROW3_Y_OFF;
+    int32_t val_w = ui_px(30);
+    *pg_w = WPANIM_PALETTE_GROUP_W;
+    *pg_x = sx + sw - *pg_w;
+    *sl_x = sx + val_w;
+    *sl_y = y3;
+    *sl_w = sw - val_w - *pg_w - ui_px(6);
+    *sl_h = WPANIM_ROW3_H;
+}
+
+// One of the three palette buttons within the group rect from
+// wallpaper_row3_rects() above.
+static void wallpaper_palette_btn_rect(int32_t pg_x, int32_t pg_y, int32_t pg_w, int idx,
+                                       int32_t *bx, int32_t *by, int32_t *bw, int32_t *bh) {
+    int32_t gap = ui_px(2);
+    int32_t bw3 = (pg_w - gap * (WP_PALETTE_COUNT - 1)) / WP_PALETTE_COUNT;
+    *bx = pg_x + idx * (bw3 + gap);
+    *by = pg_y;
+    *bw = bw3;
+    *bh = WPANIM_ROW3_H;
 }
 
 // ============================================================================
@@ -541,6 +976,90 @@ void wallpaper_render_picker(void)
         }
     }
 
+    // #wpanim: effect-mode row + intensity slider + repel/attract toggle.
+    // Follows the Settings/Files design language (docs/UI_STYLE_GUIDE.md):
+    // same fill/outline/readable_ink idiom as every other control on this
+    // dialog, no bespoke look.
+    {
+        int32_t sx, sy, sw;
+        wallpaper_strip_rect(dlg_x, dlg_y, &sx, &sy, &sw);
+        draw_hline(dlg_x, sy - ui_px(4), PICKER_WIDTH, CLR_PICKER_BORDER);
+
+        for (int m = 0; m < WPANIM_MODE_COUNT; m++) {
+            int32_t bx, by, bw, bh;
+            wallpaper_mode_btn_rect(sx, sy, sw, m, &bx, &by, &bw, &bh);
+            uint32_t bg = (m == g_wp_anim_mode) ? CLR_PICKER_SEL : CLR_PICKER_THUMB;
+            draw_fill_rect(bx, by, bw, bh, bg);
+            draw_rect_outline(bx, by, bw, bh, CLR_PICKER_BORDER);
+            draw_text_centered(bx + bw / 2, by + (bh - FONT_CHAR_H) / 2,
+                               wpanim_mode_name(m), readable_ink(bg));
+        }
+
+        int32_t slx, sly, slw, slh, tgx, tgw;
+        wallpaper_row2_rects(sx, sy, sw, &slx, &sly, &slw, &slh, &tgx, &tgw);
+
+        // Value text ("0".."100") left of the slider.
+        char valbuf[8]; int vb = 0;
+        int val = g_wp_anim_intensity;
+        if (val >= 100)      { valbuf[vb++] = '1'; valbuf[vb++] = '0'; valbuf[vb++] = '0'; }
+        else if (val >= 10)  { valbuf[vb++] = (char)('0' + val / 10); valbuf[vb++] = (char)('0' + val % 10); }
+        else                 { valbuf[vb++] = (char)('0' + val); }
+        valbuf[vb] = '\0';
+        draw_text(sx, sly + (slh - FONT_CHAR_H) / 2, valbuf, CLR_PICKER_LABEL);
+
+        // Slider track + fill (disabled/greyed look when no effect is active,
+        // same visual language a disabled control uses elsewhere: still
+        // drawn, just not implying it does anything).
+        draw_fill_rect(slx, sly, slw, slh, CLR_PICKER_THUMB);
+        draw_rect_outline(slx, sly, slw, slh, CLR_PICKER_BORDER);
+        int32_t fillw = (slw * g_wp_anim_intensity) / 100;
+        if (fillw > 0) draw_fill_rect(slx, sly, fillw, slh, CLR_PICKER_SEL);
+
+        // Repel/attract toggle.
+        draw_fill_rect(tgx, sly, tgw, slh, CLR_PICKER_THUMB);
+        draw_rect_outline(tgx, sly, tgw, slh, CLR_PICKER_BORDER);
+        draw_text_centered(tgx + tgw / 2, sly + (slh - FONT_CHAR_H) / 2,
+                           g_wp_anim_repel ? "Repel" : "Attract", CLR_PICKER_LABEL);
+
+        // #wpcolor row 3: base-hue value + slider (fill shows the actual hue
+        // via wpanim_hue_preview_color()) + Content/Spectrum/Mono buttons.
+        int32_t hslx, hsly, hslw, hslh, pgx, pgw;
+        wallpaper_row3_rects(sx, sy, sw, &hslx, &hsly, &hslw, &hslh, &pgx, &pgw);
+
+        char huebuf[8]; int hb = 0;
+        int hue = get_wallpaper_anim_hue();
+        if (hue >= 100)     { huebuf[hb++] = (char)('0' + hue / 100); hue %= 100;
+                              huebuf[hb++] = (char)('0' + hue / 10);  huebuf[hb++] = (char)('0' + hue % 10); }
+        else if (hue >= 10) { huebuf[hb++] = (char)('0' + hue / 10);  huebuf[hb++] = (char)('0' + hue % 10); }
+        else                { huebuf[hb++] = (char)('0' + hue); }
+        huebuf[hb] = '\0';
+        draw_text(sx, hsly + (hslh - FONT_CHAR_H) / 2, huebuf, CLR_PICKER_LABEL);
+
+        draw_rect_outline(hslx, hsly, hslw, hslh, CLR_PICKER_BORDER);
+        // Fill the whole track with the hue's own colour (a live swatch),
+        // dimmer than full saturation so the thumb marker below reads
+        // clearly against it.
+        draw_fill_rect(hslx + 1, hsly + 1, hslw - 2, hslh - 2,
+                       wpanim_hue_preview_color((float)get_wallpaper_anim_hue()));
+        // Thumb marker at the current hue's position along the track.
+        int32_t thumb_x = hslx + (hslw * get_wallpaper_anim_hue()) / 360;
+        if (thumb_x > hslx + hslw - ui_px(3)) thumb_x = hslx + hslw - ui_px(3);
+        draw_fill_rect(thumb_x, hsly, ui_px(3), hslh, CLR_TEXT_WHITE);
+
+        for (int pidx = 0; pidx < WP_PALETTE_COUNT; pidx++) {
+            int32_t bx, by, bw, bh;
+            wallpaper_palette_btn_rect(pgx, hsly, pgw, pidx, &bx, &by, &bw, &bh);
+            uint32_t bg = (pidx == g_wp_anim_palette) ? CLR_PICKER_SEL : CLR_PICKER_THUMB;
+            draw_fill_rect(bx, by, bw, bh, bg);
+            draw_rect_outline(bx, by, bw, bh, CLR_PICKER_BORDER);
+            // Short label: the button is only ~ui_px(38) wide, too narrow
+            // for wpanim_palette_name()'s full "Spectrum"/"Content" text.
+            const char *lbl = (pidx == WP_PALETTE_CONTENT) ? "Cont" :
+                               (pidx == WP_PALETTE_MONO)    ? "Mono" : "Spec";
+            draw_text_centered(bx + bw / 2, by + (bh - FONT_CHAR_H) / 2, lbl, readable_ink(bg));
+        }
+    }
+
     // Scroll indicator at the bottom of the dialog (only if content overflows).
     if (total_rows > rows_vis) {
         int32_t ind_y  = dlg_y + PICKER_HEIGHT - 14;
@@ -605,6 +1124,79 @@ bool wallpaper_picker_handle_mouse(int32_t x, int32_t y, bool clicked)
     int32_t rows_vis = grid_h / THUMB_CELL_H;
     if (rows_vis < 1) rows_vis = 1;
 
+    // #wpanim: effect-mode row + intensity slider + repel/attract toggle.
+    // Sits below the grid, above the scroll-indicator zone - see
+    // wallpaper_strip_rect()'s comment for why the geometry lines up exactly.
+    {
+        int32_t sx, sy, sw;
+        wallpaper_strip_rect(dlg_x, dlg_y, &sx, &sy, &sw);
+        if (y >= sy - ui_px(4) && y < sy + WPANIM_STRIP_H) {
+            if (y < sy + WPANIM_BTN_H) {
+                for (int m = 0; m < WPANIM_MODE_COUNT; m++) {
+                    int32_t bx, by, bw, bh;
+                    wallpaper_mode_btn_rect(sx, sy, sw, m, &bx, &by, &bw, &bh);
+                    if (x >= bx && x < bx + bw && y >= by && y < by + bh) {
+                        if (clicked) {
+                            set_wallpaper_anim(m);
+                            profile_save();   // #wallpaperpersist idiom: persist immediately, same as the thumbnail pick below
+                            g_needs_redraw = true;
+                        }
+                        return true;
+                    }
+                }
+            } else {
+                int32_t slx, sly, slw, slh, tgx, tgw;
+                wallpaper_row2_rects(sx, sy, sw, &slx, &sly, &slw, &slh, &tgx, &tgw);
+                if (y >= sly && y < sly + slh) {
+                    if (x >= slx && x < slx + slw) {
+                        if (clicked) {
+                            int32_t v = ((x - slx) * 100) / (slw > 0 ? slw : 1);
+                            set_wallpaper_anim_intensity(v);
+                            profile_save();
+                            g_needs_redraw = true;
+                        }
+                        return true;
+                    }
+                    if (x >= tgx && x < tgx + tgw) {
+                        if (clicked) {
+                            set_wallpaper_anim_repel(!get_wallpaper_anim_repel());
+                            profile_save();
+                            g_needs_redraw = true;
+                        }
+                        return true;
+                    }
+                }
+                // #wpcolor row 3: base-hue slider + Content/Spectrum/Mono.
+                int32_t hslx, hsly, hslw, hslh, pgx, pgw;
+                wallpaper_row3_rects(sx, sy, sw, &hslx, &hsly, &hslw, &hslh, &pgx, &pgw);
+                if (y >= hsly && y < hsly + hslh) {
+                    if (x >= hslx && x < hslx + hslw) {
+                        if (clicked) {
+                            int32_t v = ((x - hslx) * 360) / (hslw > 0 ? hslw : 1);
+                            set_wallpaper_anim_hue(v);
+                            profile_save();
+                            g_needs_redraw = true;
+                        }
+                        return true;
+                    }
+                    for (int pidx = 0; pidx < WP_PALETTE_COUNT; pidx++) {
+                        int32_t bx, by, bw, bh;
+                        wallpaper_palette_btn_rect(pgx, hsly, pgw, pidx, &bx, &by, &bw, &bh);
+                        if (x >= bx && x < bx + bw) {
+                            if (clicked) {
+                                set_wallpaper_anim_palette(pidx);
+                                profile_save();
+                                g_needs_redraw = true;
+                            }
+                            return true;
+                        }
+                    }
+                }
+            }
+            return true;   // inside the strip but not on a live control: still consume it
+        }
+    }
+
     // Scroll indicator zone at the bottom.
     int32_t ind_y = dlg_y + PICKER_HEIGHT - 14;
     if (y >= ind_y) {
@@ -659,6 +1251,8 @@ bool wallpaper_picker_handle_mouse(int32_t x, int32_t y, bool clicked)
     if (clicked) {
         wallpaper_load(idx);
         set_wallpaper(idx);   // sync shared index so Settings reflects the choice
+        profile_save();       // #wallpaperpersist: write the choice to UIPROFIL.YML so
+                              // it survives a reboot (was runtime-only, never persisted)
         wallpaper_picker_close();
         g_needs_redraw = true;
     }

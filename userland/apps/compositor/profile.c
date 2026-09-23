@@ -18,6 +18,11 @@
 // clash with pwd.h/unistd.h), but uiscale.h only pulls in syscall.h and has
 // no such conflict.
 #include "../../libc/uiscale.h"
+// (cfdock) cardfile.h pulls in only cardfile_model.h (stdint.h only) - NOT
+// compositor.h, so it carries none of the bool-typedef clash the comment
+// above warns about. Needed for CF_MAX_DOCKS and the three dock persistence
+// accessors (cardfile_dock_count_for_profile() etc.).
+#include "cardfile.h"
 
 extern int g_show_clock, g_show_calendar, g_sheep_enabled;
 extern int g_aichat_enabled;   // #185
@@ -42,6 +47,7 @@ extern int g_sheep_speed, g_sheep_size, g_sheep_style, g_sheep_count;
 extern int g_dog_enabled;
 extern int g_brightness, g_nightlight;   // main.c
 extern int g_win_opacity;                // main.c
+extern int g_win_opacity_user_set;       // main.c (emfield-fix)
 extern int g_clock_cx, g_clock_cy, g_cal_x, g_cal_y;  // widgets.c positions
 extern int g_clock_locked, g_cal_locked;             // widgets.c lock flags
 extern int g_digclk_x, g_digclk_y, g_digclk_locked, g_digclk_secs, g_digclk_style; // clock.c
@@ -50,6 +56,26 @@ extern int g_dock_style;                   // taskbar.c (#387 dock layout)
 extern int g_dock_opacity;                 // draw.c (#745 glass opacity, percent OPAQUE)
 extern int g_dock_height;                  // taskbar.c (#123 marble dock height px)
 extern int g_dock_zoom;                    // taskbar.c (#123 hover zoom percent)
+// #wpanim (2026-09-18): animated, window-reactive wallpaper effect + slider.
+// Compositor-local state (wallpaper.c), not a syscall - unlike get_wallpaper()/
+// set_wallpaper() above (real syscall wrappers from syscall.h, kernel-tracked
+// so Settings agrees), these three just own their own int in wallpaper.c, so
+// they need an explicit extern here the way syscall.h's inline wrappers do not.
+extern int  get_wallpaper_anim(void);
+extern void set_wallpaper_anim(int mode);
+extern int  get_wallpaper_anim_intensity(void);
+extern void set_wallpaper_anim_intensity(int v);
+extern int  get_wallpaper_anim_repel(void);
+extern void set_wallpaper_anim_repel(int repel);
+// #wpcolor (2026-09-18): base hue (0..360) + colour source (WP_PALETTE_*,
+// see wallpaper_anim.h) for the four effects above. Same compositor-local,
+// int-only storage idiom as the three above - hue is stored as float inside
+// wallpaper.c, but this profile format is integer-only end to end (see
+// prof_atoi()/put_kv()), so the get/set pair at this boundary is int.
+extern int  get_wallpaper_anim_hue(void);
+extern void set_wallpaper_anim_hue(int deg);
+extern int  get_wallpaper_anim_palette(void);
+extern void set_wallpaper_anim_palette(int p);
 
 // NOTE: the FAT driver is 8.3-only (no long/leading-dot names), so the profile
 // is stored as <home>/UIPROFIL.YML rather than the literal ~/.ui-profile.yaml.
@@ -144,6 +170,16 @@ static int parse_icon_key(const char *k, int *idx, int *axis) {
 }
 
 static void prof_apply(const char *k, int v) {
+    // (cfdock) "cfd0".."cfd7" - one packed dock per key, see profile_build()'s
+    // own comment. Checked first, disjoint by construction from every other
+    // key shape below (no other key starts "cfd"). The trailing digit is not
+    // otherwise used (docks are appended in file order, matching how they
+    // were written - see cardfile_dock_add_from_profile()'s own comment);
+    // only its PRESENCE as a valid single digit distinguishes this key shape.
+    if (k[0] == 'c' && k[1] == 'f' && k[2] == 'd' && k[3] >= '0' && k[3] <= '7' && k[4] == '\0') {
+        cardfile_dock_add_from_profile(v);
+        return;
+    }
     int icoi, axis;
     if (parse_icon_key(k, &icoi, &axis)) {
         // (#745) LEGACY form, bounded to the system icons it was written for.
@@ -180,6 +216,17 @@ static void prof_apply(const char *k, int v) {
     else if (!strcmp(k, "font_size"))    set_font_size(v);
     else if (!strcmp(k, "icon_size"))    set_icon_size(v);
     else if (!strcmp(k, "screensaver"))  set_screensaver(v);
+    // #wpanim: an out-of-range mode/intensity from a hand-edited or
+    // future-build profile is clamped inside the setters themselves
+    // (set_wallpaper_anim/_intensity in wallpaper.c), not here - same
+    // "silent substitution, never an invisible wallpaper" idiom as
+    // dock_opacity above.
+    else if (!strcmp(k, "wallpaper_anim"))           set_wallpaper_anim(v);
+    else if (!strcmp(k, "wallpaper_anim_intensity")) set_wallpaper_anim_intensity(v);
+    else if (!strcmp(k, "wallpaper_anim_repel"))     set_wallpaper_anim_repel(v);
+    // #wpcolor: same "clamped inside the setter" idiom as the three above.
+    else if (!strcmp(k, "wallpaper_anim_hue"))       set_wallpaper_anim_hue(v);
+    else if (!strcmp(k, "wallpaper_anim_palette"))   set_wallpaper_anim_palette(v);
     else if (!strcmp(k, "volume"))       set_volume(v);
     // (#231r) The five graphic-EQ band positions, 0..100 with 50 flat, on
     // exactly the path "volume" above already uses. #231's complaint about
@@ -196,7 +243,7 @@ static void prof_apply(const char *k, int v) {
     // rather than mis-applied.
     else if (k[0] == 'e' && k[1] == 'q' && k[2] >= '0' && k[2] <= '9' && k[3] == 0)
         eq_band_set(k[2] - '0', v);
-    else if (!strcmp(k, "winopacity"))   { g_win_opacity = v; set_win_opacity(v); }
+    else if (!strcmp(k, "winopacity"))   { g_win_opacity = v; g_win_opacity_user_set = 1; set_win_opacity(v); }
     else if (!strcmp(k, "clkx"))         g_clock_cx = v;
     else if (!strcmp(k, "clky"))         g_clock_cy = v;
     else if (!strcmp(k, "calx"))         g_cal_x = v;
@@ -271,7 +318,7 @@ static void prof_apply(const char *k, int v) {
     else if (!strcmp(k, "wtz2"))           g_wt_off[2] = v;
     else if (!strcmp(k, "show_stickies"))  g_show_stickies = v;
     else if (!strcmp(k, "show_aichat"))     g_aichat_enabled = v;
-    else if (!strcmp(k, "dock_style"))      g_dock_style = (v >= 0 && v < 5) ? v : 0;  // #387 (#26: 5 = DOCK_COUNT in compositor.h, not included here)
+    else if (!strcmp(k, "dock_style"))      g_dock_style = (v >= 0 && v < 6) ? v : 0;  // #387 (#26/cardfilearch: was 5; now 6 with DOCK_CARDFILE. Keep in sync with compositor.h DOCK_COUNT, not included here)
     // #745 glass opacity, percent OPAQUE. The floor is DERIVED, not chosen, and
     // moved 60 -> 70 (dockgrey, 2026-08-12) in the same change that lightened
     // CLR_GLASS_TINT's dark-branch derivation (main.c glass_theme_apply(), 58%
@@ -397,6 +444,17 @@ static int profile_build(char *buf) {
     p = put_kv(p, "font_size",    get_font_size());
     p = put_kv(p, "icon_size",    get_icon_size());
     p = put_kv(p, "screensaver",  get_screensaver());
+    // #wpanim: persisted right next to wallpaper/screensaver, the other two
+    // "what's on the desktop background" keys this file already owns.
+    p = put_kv(p, "wallpaper_anim",           get_wallpaper_anim());
+    p = put_kv(p, "wallpaper_anim_intensity", get_wallpaper_anim_intensity());
+    p = put_kv(p, "wallpaper_anim_repel",     get_wallpaper_anim_repel());
+    // #wpcolor: persisted right alongside the three above, same file, same
+    // key-value format - this IS what makes the stick-refresh/keepstate path
+    // (which carries <home>/UIPROFIL.YML forward across a reflash) carry the
+    // colour choice too, with no extra plumbing on that side.
+    p = put_kv(p, "wallpaper_anim_hue",       get_wallpaper_anim_hue());
+    p = put_kv(p, "wallpaper_anim_palette",   get_wallpaper_anim_palette());
     p = put_kv(p, "volume",       get_volume());
     // (#231r) One key per graphic-EQ band, read back from the kernel's live
     // DSP state (there is no compositor-side copy to go stale). The count
@@ -412,8 +470,13 @@ static int profile_build(char *buf) {
             p = put_kv(p, ek, eq_band_get(i));
         }
     }
-    g_win_opacity = get_win_opacity();   /* capture live value (Settings slider) */
-    p = put_kv(p, "winopacity",   g_win_opacity);
+    g_win_opacity = get_win_opacity();   /* capture live value for widget blend */
+    // #emfield-fix (owner 2026-09-22): PERSIST winopacity ONLY when the user
+    // explicitly chose a global opacity. Otherwise the theme owns the default,
+    // and writing the theme-derived live value here would re-pin it as if the
+    // user had set it - silently defeating the theme window_opacity next boot.
+    if (g_win_opacity_user_set)
+        p = put_kv(p, "winopacity",   g_win_opacity);
     p = put_kv(p, "clkx",         g_clock_cx);
     p = put_kv(p, "clky",         g_clock_cy);
     p = put_kv(p, "calx",         g_cal_x);
@@ -487,6 +550,22 @@ static int profile_build(char *buf) {
     p = put_kv(p, "dock_height",    g_dock_height);  // #123
     p = put_kv(p, "dock_zoom",      g_dock_zoom);    // #123
     p = put_kv(p, "mouse_sens",     get_mouse_speed());  // mouse feel (kernel sensitivity 1-10)
+
+    // (cfdock) Cardfile dock bars: one key per dock ("cfd0".."cfd7"), each a
+    // single packed int (cf_dock_pack() - see cardfile_model.h's own note on
+    // why this format has no list/array value type to use instead). Default
+    // is zero docks, so an account that never used Cardfile writes none of
+    // these keys at all - unchanged file shape for every other layout.
+    {
+        int dc = cardfile_dock_count_for_profile();
+        if (dc > CF_MAX_DOCKS) dc = CF_MAX_DOCKS;
+        for (int i = 0; i < dc; i++) {
+            int packed = cardfile_dock_pack_for_profile(i);
+            if (packed < 0) continue;
+            char k[8] = { 'c', 'f', 'd', (char)('0' + i), 0 };
+            p = put_kv(p, k, packed);
+        }
+    }
 
     // Desktop icon positions. (#745) Keyed by the icon's STABLE IDENTITY, not
     // by its index in the list: the list is dynamic now, and an index-keyed

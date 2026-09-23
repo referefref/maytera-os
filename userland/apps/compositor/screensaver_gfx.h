@@ -82,6 +82,18 @@ void ss_lores_bloom(uint32_t *buf, int w, int h, int radius, int intensity_pct);
 // (the 1280x800 = 4x case for the HI buffer).
 void ss_lores_upscale_to_fb(const uint32_t *buf, int w, int h);
 
+// #wpanim: same upscale, but only the destination rows/columns inside
+// [cx0,cx1) x [cy0,cy1) (clamped to the framebuffer) are written. The
+// per-column source-mapping table is still keyed on the FULL destination
+// width (g_fb_width), so a caller alternating between a full-frame
+// screensaver present and a clipped animated-wallpaper blit does not thrash
+// the table. ss_lores_upscale_to_fb() is now a thin wrapper over this with
+// the full-screen rect - one implementation, per the "improve the shared
+// primitive, do not fork a private copy" rule (CLAUDE.md).
+void ss_lores_upscale_to_fb_clipped(const uint32_t *buf, int w, int h,
+                                     int32_t cx0, int32_t cy0,
+                                     int32_t cx1, int32_t cy1);
+
 // ----------------------------------------------------------------------------
 // Fractal flame histogram (design doc §4.1). Fixed 320x200 (SS_FLAME_W x
 // SS_FLAME_H). Malloc'd once here (never in screensaver.c). Returns 1 and

@@ -14,6 +14,8 @@
 #include "../fs/fat.h"
 #include "../gui/image.h"
 #include "../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
+#include "../sync/waitq.h" // #netpolls: wait_event_timeout() replaces the IPP polls (#426)
+#include "socket.h"        // #netpolls: net_rx_waitq() - woken on every delivered IP frame
 
 extern fat_fs_t g_fat_fs;
 extern void proc_sleep(uint32_t ms);
@@ -214,7 +216,18 @@ static int ipp_exchange(const char *host, uint16_t port, const char *resource,
             net_poll(); tcp_timer();
             if (tcp_is_connected(sock)) { connected = 1; break; }
             if (tcp_get_state(sock) == TCP_STATE_CLOSED) break;
-            proc_sleep(2);
+            // #netpolls / #426: park on the shared net RX wait queue instead of a
+            // proc_sleep(2) busy-poll. socket_net_wake() (net/ethernet.c) wakes
+            // this queue on every delivered IP frame, so the SYN-ACK that
+            // completes the 3-way handshake wakes us at once. tcp_is_connected()
+            // and tcp_get_state() are pure BSS reads (no lock/NIC), safe as the
+            // wait_event condition. ~100ms tier-2 slice bounds a lost/absent
+            // wake; the outer 5000ms deadline stays the real cap. Remote peer:
+            // a timeout is the correct semantics.
+            (void)wait_event_timeout(net_rx_waitq(),
+                                     tcp_is_connected(sock) ||
+                                       tcp_get_state(sock) == TCP_STATE_CLOSED,
+                                     wq_ms_to_ticks(100));
         }
         if (!connected) {
             net_lock(); tcp_close(sock); net_unlock();
@@ -258,7 +271,17 @@ static int ipp_exchange(const char *host, uint16_t port, const char *resource,
             if (n == TCP_ERR_CLOSED) { got_close = 1; break; }
             tcp_state_t st = tcp_get_state(sock);
             if (st == TCP_STATE_CLOSED || st == TCP_STATE_TIME_WAIT) { got_close = 1; break; }
-            proc_sleep(2);
+            // #netpolls / #426: park on the shared net RX wait queue instead of a
+            // proc_sleep(2) busy-poll. socket_net_wake() (net/ethernet.c) wakes
+            // this queue on every delivered IP frame, so buffered response data
+            // (or the peer FIN) wakes us at once. tcp_rx_pending() is the cheap
+            // BSS-only readiness probe (#524): >0 data queued, -1 terminal, 0
+            // keep waiting - the same predicate https_tcp_recv() uses. ~100ms
+            // tier-2 slice bounds a lost/absent wake; the outer 20000ms deadline
+            // stays the real cap. Remote peer: a timeout is correct semantics.
+            (void)wait_event_timeout(net_rx_waitq(),
+                                     tcp_rx_pending(sock) != 0,
+                                     wq_ms_to_ticks(100));
         }
         net_lock(); tcp_close(sock); net_unlock();
         (void)got_close;

@@ -1,10 +1,17 @@
-// calc - Windows 11 style Calculator for MayteraOS (Standard + Scientific)
+// calc - Calculator for MayteraOS (Standard + Scientific), glass edition
 //
-// A flat, dark, modern calculator inspired by the Windows 11 Calculator: a
-// large result display with an expression line above it, a memory row, mode
-// tabs (Standard / Scientific) and a flat button grid. Scientific mode adds
-// trig, logs, powers, roots, factorial, constants and parentheses, with a
-// 2nd toggle for inverse functions and a DEG/RAD toggle.
+// A large result display with an expression line above it, a memory row, mode
+// tabs (Standard / Scientific) and a button grid. Scientific mode adds trig,
+// logs, powers, roots, factorial, constants and parentheses, with a 2nd toggle
+// for inverse functions and a DEG/RAD toggle.
+//
+// (calcglass) The chrome is the shared dark-teal glass language
+// (docs/UI_GLASS_DESIGN_SYSTEM.md sections 1, 10, 11), the fourth surface in
+// that restyle after the App Repo, the browser chrome and the Task Manager
+// (tmglass): a frosted-wallpaper backdrop in the margins, two rounded glass
+// panels (display, keypad), pill tabs on the backdrop, and keys built from the
+// shared rounded primitives. Everything the calculator DOES (arithmetic,
+// keyboard, memory keys, the projected tool contract) is untouched.
 //
 // The userland C library is freestanding (no libm and no %f in printf), so
 // this file carries its own small double-precision math library and an
@@ -12,19 +19,20 @@
 
 #include "../../libc/maytera.h"
 #include "../../libc/gui.h"
-#include "../../libc/theme.h"   // #280: theme-aware colors
+#include "../../libc/gui_style.h"    // gui_fill_rounded_aa / gui_rounded_border / gui_soft_shadow / gui_mix / gui_glass_backdrop_*
 
-// #301: route all in-window text through the antialiased TrueType path so the
-// calculator matches the modern look of Settings/Files/Task Manager (which all
-// render via win_draw_text_ttf). The bitmap-font win_draw_text is replaced here.
-#define win_draw_text(h, x, y, s, c)        win_draw_text_ttf((h), (x), (y), (s), 15, (c))
-#define win_draw_text_small(h, x, y, s, c)  win_draw_text_ttf((h), (x), (y), (s), 12, (c))
-#define CALC_TTF_BTN   15   // button-face / general text size
-#define CALC_TTF_SMALL 12   // history / indicator size
-#define CALC_TTF_BIG   30   // large result display size
+// #301: all in-window text goes through the antialiased TrueType path
+// (SYS_WIN_DRAW_TTF, size packed in the top byte of the colour by the libc
+// wrapper). Sizes are TTF pixel sizes, one per role (glass doc section 5).
+#define TTF_TAB    12   // tab pill labels, memory row, history / echo lines
+#define TTF_IND    11   // DEG/RAD, M, 2nd indicators
+#define TTF_DIGIT  16   // digit and operator key faces
+#define TTF_FUNC   14   // function key faces
+#define TTF_EQ     18   // the "=" key face
+#define TTF_BIG    30   // large result
 
 // ---------------------------------------------------------------------------
-// Layout / palette (Windows 11 dark)
+// Layout
 // ---------------------------------------------------------------------------
 // #436: bumped from 460x600 (#301) to 460x624 for extra headroom, and the
 // window content size is now re-synced from the compositor every frame (see
@@ -41,45 +49,83 @@ static int g_win_w = 460, g_win_h = 624;  // #89/#301/#436: live window size
 #define WIN_H g_win_h
 #define MIN_WIN_W 340   // #436: floor so the grid never degenerates
 #define MIN_WIN_H 460
-#define PAD          8
 
-// #280: colors are theme-driven (see apply_theme); defaults are the dark theme.
-static uint32_t COL_BG     = 0x00202020;
-static uint32_t COL_DISP   = 0x00202020;
-static uint32_t COL_DIGIT  = 0x003B3B3B;
-static uint32_t COL_FUNC   = 0x00323232;
-static uint32_t COL_HOVER  = 0x004A4A4A;
-static uint32_t COL_EQ     = 0x00005FB8;
-static uint32_t COL_EQ_HOV = 0x000072D8;
-static uint32_t COL_TAB_ON = 0x00383838;
-static uint32_t COL_TEXT   = 0x00FFFFFF;
-static uint32_t COL_DIM    = 0x00A0A0A0;
-static uint32_t COL_BORDER = 0x00161616;
-static int g_last_theme = -1;
-static void apply_theme(void){
-    int kt = get_theme();   // 1=Dark 2=Light 4=Classic 5=Ocean 9=Nord
-    switch (kt) {
-    case 2: // Light
-        COL_BG=0x00F0F0F0; COL_DISP=0x00FFFFFF; COL_DIGIT=0x00FFFFFF; COL_FUNC=0x00E4E4E4;
-        COL_HOVER=0x00D8D8D8; COL_EQ=0x00005FB8; COL_EQ_HOV=0x000072D8; COL_TAB_ON=0x00D0D0D0;
-        COL_TEXT=0x00202020; COL_DIM=0x00707070; COL_BORDER=0x00B0B0B0; break;
-    case 4: // Classic gray
-        COL_BG=0x00C0C0C0; COL_DISP=0x00FFFFFF; COL_DIGIT=0x00C0C0C0; COL_FUNC=0x00B0B0B0;
-        COL_HOVER=0x00D0D0D0; COL_EQ=0x00000080; COL_EQ_HOV=0x000000A0; COL_TAB_ON=0x00A0A0A0;
-        COL_TEXT=0x00000000; COL_DIM=0x00505050; COL_BORDER=0x00000000; break;
-    case 5: // Ocean
-        COL_BG=0x001A3A4A; COL_DISP=0x00183040; COL_DIGIT=0x00224455; COL_FUNC=0x001E4050;
-        COL_HOVER=0x00305060; COL_EQ=0x0040C0E0; COL_EQ_HOV=0x0050D0F0; COL_TAB_ON=0x00305060;
-        COL_TEXT=0x00E0F0FF; COL_DIM=0x0090B0C0; COL_BORDER=0x000E2733; break;
-    case 9: // Nord
-        COL_BG=0x002E3440; COL_DISP=0x002B303B; COL_DIGIT=0x003B4252; COL_FUNC=0x00343B49;
-        COL_HOVER=0x00434C5E; COL_EQ=0x0088C0D0; COL_EQ_HOV=0x0098D0E0; COL_TAB_ON=0x00434C5E;
-        COL_TEXT=0x00ECEFF4; COL_DIM=0x00AEB6C5; COL_BORDER=0x0020242E; break;
-    default: // Dark
-        COL_BG=0x00202020; COL_DISP=0x00202020; COL_DIGIT=0x003B3B3B; COL_FUNC=0x00323232;
-        COL_HOVER=0x004A4A4A; COL_EQ=0x00005FB8; COL_EQ_HOV=0x000072D8; COL_TAB_ON=0x00383838;
-        COL_TEXT=0x00FFFFFF; COL_DIM=0x00A0A0A0; COL_BORDER=0x00161616; break;
-    }
+// (calcglass) ONE definition of every band, shared by the draw and hit-test
+// paths (glass doc section 8: "one definition for anything three places agree
+// about"). Before this, draw_tabs()/hit_tab() and draw_memory_row()/
+// hit_memory() each carried their own copy of the same literals. Values match
+// the Task Manager's logic.rs (PAD 10, TAB_H 26, TAB_W 96, TAB_GAP 6,
+// PANEL_R 12, PANEL_IN 12) so the two windows share one geometry.
+#define PAD       10                       // window margin: the backdrop shows here
+#define TAB_H     26                       // tab pill height (radius TAB_H/2)
+#define TAB_W     96
+#define TAB_GAP   6
+#define DISP_Y    (PAD + TAB_H + 10)       // display panel top (46)
+#define DISP_H    110
+#define KEY_Y     (DISP_Y + DISP_H + 8)    // keypad panel top (164)
+#define PANEL_R   12                       // panel corner radius
+#define PANEL_IN  12                       // inset from a panel edge to its content
+#define MEM_Y     (KEY_Y + 8)              // memory row top
+#define MEM_H     22
+#define GRID_X    (PAD + PANEL_IN)         // key grid left (22)
+#define GRID_W    (WIN_W - 2 * GRID_X)     // key grid width (416)
+#define GRID_TOP  (MEM_Y + MEM_H + 8)      // key grid top (202)
+#define KEY_GAP   6
+#define KEY_RAD     6                        // key corner radius (section 6 nested card)
+
+// (calcglass) Glass tokens: docs/UI_GLASS_DESIGN_SYSTEM.md section 1, the
+// exact names and values the Task Manager (tmglass) and App Repo use, so the
+// windows read as one material side by side. Fixed dark glass regardless of
+// the active theme (owner decision recorded at glasstm): the window carries
+// its own backdrop, so there is no light-theme surface for these to sit on.
+// Copy the NAMES as well as the values; a second name for the same hex is how
+// two surfaces drift apart.
+#define C_PANEL       0x00122420   // WEL_BG_MID: panel fill, the outer colour every key AA-blends toward
+#define C_CARD        0x000E1D1B   // DK_CARD_FILL: function / operator key fill
+#define C_EDGE        0x002C4A44   // DK_STROKE_UNSEL: panel border, card-key border
+#define C_INK         0x00F3FBF9   // DK_HEADLINE: result, digit faces
+#define C_INK_DIM     0x00A9D9CC   // DK_BODY: history, echo, function faces, tab labels
+#define C_ACCENT      0x006AE2CF   // DK_ACCENT: operator faces, selected pill, active toggle
+#define C_ACCENT_INK  0x0004231A   // text on the accent
+#define C_ERR         0x00FFAAA2   // DK_ERROR: the "Error" history line
+#define C_BTN_TOP     0x000F8068   // DK_BTN_TOP: "=" gradient top (section 6 primary button)
+#define C_BTN_BOTTOM  0x000A5D4C   // DK_BTN_BOTTOM: "=" gradient bottom
+#define WEL_BG_TOP    0x000A1614   // backdrop gradient fallback, top stop
+#define WEL_BG_BOTTOM 0x00050A09   // backdrop gradient fallback, bottom stop
+#define C_EQ_INK      0x00FFFFFF   // DK_BTN_TEXT
+
+// ---------------------------------------------------------------------------
+// (glasslib) The frosted-wallpaper backdrop: now the shared libc recipe
+// (userland/libc/gui_style.h gui_glass_backdrop_*), consolidated out of this
+// file, the Task Manager, the Media Player and the Image Viewer, which all
+// carried an identical copy (blame.md tmglass/calcglass/audglass/imgglass).
+// This app owns only the two small persistent pieces the API asks for; the
+// scratch (raw thumbnail bytes, blur temp plane) lives in gui.c.
+// ---------------------------------------------------------------------------
+static uint32_t g_bd[GUI_GLASS_BD_W * GUI_GLASS_BD_H];
+static int g_bd_wi = GUI_GLASS_BD_NEVER;   // wallpaper index the backdrop was built for
+static int g_chrome_dirty = 1;             // the ONLY thing that can make draw_all() blit the backdrop
+
+// The ONE self-committing call in this app (see draw_all()): SYS_WIN_BLIT
+// copies the backdrop into the window content scaled to the content rect
+// (x/y are ignored by the kernel) and publishes that frame on its own.
+static void bd_blit(int win){
+    gui_glass_backdrop_blit(win, g_bd);
+}
+
+// The backdrop colour under content pixel (x, y): what the kernel's nearest-
+// neighbour scale put there, to within the blur. Every AA edge and shadow
+// drawn onto the backdrop takes its outer colour from here; a flat guess is
+// what produces a square halo around a round corner (glass doc section 2).
+static uint32_t bd_at(int x, int y){
+    return gui_glass_backdrop_at(g_bd, WIN_W, WIN_H, x, y);
+}
+
+// Rebuild the backdrop if the wallpaper changed. SYS_GET_WALLPAPER is the
+// same poll the compositor makes; a changed index marks the chrome dirty.
+static void sync_backdrop(void){
+    if (gui_glass_backdrop_sync(g_bd, &g_bd_wi, C_PANEL, 158, WEL_BG_TOP, WEL_BG_BOTTOM))
+        g_chrome_dirty = 1;
 }
 
 // Button kinds (drive coloring only)
@@ -94,11 +140,22 @@ typedef struct {
     int kind;
 } btn_t;
 
+// (calcglass) FACE BYTES ARE LATIN-1, NOT CP437. The kernel TTF path
+// (kernel/gui/ttf.c ttf_draw_string: `ttf_get_glyph((unsigned char)str[i])`)
+// maps each BYTE straight to a codepoint, with no UTF-8 decoding, so a face
+// written in the old CP437 habit ("x\xfd" for x squared, "\xfb" for the
+// radical, "\xf6" for the divide sign, "\xe3" for pi) has been rendering as
+// "xý", "û", "ö" and "ã" ever since #301 moved the faces onto TTF. Latin-1
+// has ² (0xB2), ³ (0xB3), ÷ (0xF7), × (0xD7), ¯ (0xAF) and ¹ (0xB9); it has
+// no radical, pi or backspace glyph, so those three faces are STROKED in
+// draw_key() (glass doc section 6: "stroked, not typed. Nothing guarantees
+// the loaded TTF carries the codepoint"), keyed on the token, and the table
+// carries a readable ASCII face for the projected contract's descriptions.
 // Standard: 4 columns x 6 rows
 static const btn_t std_btns[] = {
-    {"%",  0,"pct",0,  0,0,1,K_FUNC}, {"CE",0,"CE",0, 1,0,1,K_FUNC}, {"C",0,"C",0, 2,0,1,K_FUNC}, {"\x7f",0,"back",0, 3,0,1,K_FUNC},
-    {"1/x",0,"inv",0, 0,1,1,K_FUNC}, {"x\xfd",0,"sqr",0, 1,1,1,K_FUNC}, {"\xfb""x",0,"sqrt(",0, 2,1,1,K_FUNC}, {"\xf6",0,"/",0, 3,1,1,K_OP},
-    {"7",0,"7",0, 0,2,1,K_DIGIT}, {"8",0,"8",0, 1,2,1,K_DIGIT}, {"9",0,"9",0, 2,2,1,K_DIGIT}, {"x",0,"*",0, 3,2,1,K_OP},
+    {"%",  0,"pct",0,  0,0,1,K_FUNC}, {"CE",0,"CE",0, 1,0,1,K_FUNC}, {"C",0,"C",0, 2,0,1,K_FUNC}, {"backspace",0,"back",0, 3,0,1,K_FUNC},
+    {"1/x",0,"inv",0, 0,1,1,K_FUNC}, {"x\xb2",0,"sqr",0, 1,1,1,K_FUNC}, {"sqrt x",0,"sqrt(",0, 2,1,1,K_FUNC}, {"\xf7",0,"/",0, 3,1,1,K_OP},
+    {"7",0,"7",0, 0,2,1,K_DIGIT}, {"8",0,"8",0, 1,2,1,K_DIGIT}, {"9",0,"9",0, 2,2,1,K_DIGIT}, {"\xd7",0,"*",0, 3,2,1,K_OP},
     {"4",0,"4",0, 0,3,1,K_DIGIT}, {"5",0,"5",0, 1,3,1,K_DIGIT}, {"6",0,"6",0, 2,3,1,K_DIGIT}, {"-",0,"-",0, 3,3,1,K_OP},
     {"1",0,"1",0, 0,4,1,K_DIGIT}, {"2",0,"2",0, 1,4,1,K_DIGIT}, {"3",0,"3",0, 2,4,1,K_DIGIT}, {"+",0,"+",0, 3,4,1,K_OP},
     {"+/-",0,"neg",0, 0,5,1,K_DIGIT}, {"0",0,"0",0, 1,5,1,K_DIGIT}, {".",0,".",0, 2,5,1,K_DIGIT}, {"=",0,"=",0, 3,5,1,K_EQ},
@@ -109,12 +166,12 @@ static const btn_t std_btns[] = {
 
 // Scientific: 6 columns x 7 rows
 static const btn_t sci_btns[] = {
-    {"2nd",0,"2nd",0, 0,0,1,K_FUNC}, {"\xe3",0,"pi",0, 1,0,1,K_FUNC}, {"e",0,"e",0, 2,0,1,K_FUNC}, {"C",0,"C",0, 3,0,1,K_FUNC}, {"CE",0,"CE",0, 4,0,1,K_FUNC}, {"\x7f",0,"back",0, 5,0,1,K_FUNC},
-    {"sin","sin\xc4","sin(","asin(", 0,1,1,K_FUNC}, {"x\xfd","x\xfc","sqr","cube", 1,1,1,K_FUNC}, {"1/x",0,"inv",0, 2,1,1,K_FUNC}, {"|x|",0,"abs(",0, 3,1,1,K_FUNC}, {"exp",0,"exp(",0, 4,1,1,K_FUNC}, {"\xf6",0,"/",0, 5,1,1,K_OP},
-    {"cos","cos\xc4","cos(","acos(", 0,2,1,K_FUNC}, {"\xfb""x","\xfb\xfd","sqrt(","cbrt(", 1,2,1,K_FUNC}, {"(",0,"(",0, 2,2,1,K_FUNC}, {")",0,")",0, 3,2,1,K_FUNC}, {"n!",0,"fact",0, 4,2,1,K_FUNC}, {"x",0,"*",0, 5,2,1,K_OP},
-    {"tan","tan\xc4","tan(","atan(", 0,3,1,K_FUNC}, {"x\xfe",0,"pow",0, 1,3,1,K_FUNC}, {"7",0,"7",0, 2,3,1,K_DIGIT}, {"8",0,"8",0, 3,3,1,K_DIGIT}, {"9",0,"9",0, 4,3,1,K_DIGIT}, {"-",0,"-",0, 5,3,1,K_OP},
-    {"log",0,"log(",0, 0,4,1,K_FUNC}, {"10\xfe",0,"tenx",0, 1,4,1,K_FUNC}, {"4",0,"4",0, 2,4,1,K_DIGIT}, {"5",0,"5",0, 3,4,1,K_DIGIT}, {"6",0,"6",0, 4,4,1,K_DIGIT}, {"+",0,"+",0, 5,4,1,K_OP},
-    {"ln","e\xfe","ln(","expe", 0,5,1,K_FUNC}, {"%",0,"pct",0, 1,5,1,K_FUNC}, {"1",0,"1",0, 2,5,1,K_DIGIT}, {"2",0,"2",0, 3,5,1,K_DIGIT}, {"3",0,"3",0, 4,5,1,K_DIGIT}, {"mod",0,"mod",0, 5,5,1,K_OP},
+    {"2nd",0,"2nd",0, 0,0,1,K_FUNC}, {"pi",0,"pi",0, 1,0,1,K_FUNC}, {"e",0,"e",0, 2,0,1,K_FUNC}, {"C",0,"C",0, 3,0,1,K_FUNC}, {"CE",0,"CE",0, 4,0,1,K_FUNC}, {"backspace",0,"back",0, 5,0,1,K_FUNC},
+    {"sin","sin\xaf\xb9","sin(","asin(", 0,1,1,K_FUNC}, {"x\xb2","x\xb3","sqr","cube", 1,1,1,K_FUNC}, {"1/x",0,"inv",0, 2,1,1,K_FUNC}, {"|x|",0,"abs(",0, 3,1,1,K_FUNC}, {"exp",0,"exp(",0, 4,1,1,K_FUNC}, {"\xf7",0,"/",0, 5,1,1,K_OP},
+    {"cos","cos\xaf\xb9","cos(","acos(", 0,2,1,K_FUNC}, {"sqrt x","cbrt x","sqrt(","cbrt(", 1,2,1,K_FUNC}, {"(",0,"(",0, 2,2,1,K_FUNC}, {")",0,")",0, 3,2,1,K_FUNC}, {"n!",0,"fact",0, 4,2,1,K_FUNC}, {"\xd7",0,"*",0, 5,2,1,K_OP},
+    {"tan","tan\xaf\xb9","tan(","atan(", 0,3,1,K_FUNC}, {"x^y",0,"pow",0, 1,3,1,K_FUNC}, {"7",0,"7",0, 2,3,1,K_DIGIT}, {"8",0,"8",0, 3,3,1,K_DIGIT}, {"9",0,"9",0, 4,3,1,K_DIGIT}, {"-",0,"-",0, 5,3,1,K_OP},
+    {"log",0,"log(",0, 0,4,1,K_FUNC}, {"10^x",0,"tenx",0, 1,4,1,K_FUNC}, {"4",0,"4",0, 2,4,1,K_DIGIT}, {"5",0,"5",0, 3,4,1,K_DIGIT}, {"6",0,"6",0, 4,4,1,K_DIGIT}, {"+",0,"+",0, 5,4,1,K_OP},
+    {"ln","e^x","ln(","expe", 0,5,1,K_FUNC}, {"%",0,"pct",0, 1,5,1,K_FUNC}, {"1",0,"1",0, 2,5,1,K_DIGIT}, {"2",0,"2",0, 3,5,1,K_DIGIT}, {"3",0,"3",0, 4,5,1,K_DIGIT}, {"mod",0,"mod",0, 5,5,1,K_OP},
     {"DEG",0,"deg",0, 0,6,1,K_FUNC}, {"+/-",0,"neg",0, 1,6,1,K_DIGIT}, {"0",0,"0",0, 2,6,1,K_DIGIT}, {".",0,".",0, 3,6,1,K_DIGIT}, {"=",0,"=",0, 4,6,2,K_EQ},
 };
 #define SCI_N ((int)(sizeof(sci_btns)/sizeof(sci_btns[0])))
@@ -135,6 +192,7 @@ static char prevline[160] = "";   // history / last expression
 static int  err = 0;
 static int  hover = -1;     // hovered button index, -1 none
 static int  hover_tab = -1; // 0 std tab, 1 sci tab, -1 none
+static int  hover_mem = -1; // (calcglass) hovered memory key 0..4, -1 none
 
 // ---------------------------------------------------------------------------
 // Minimal double math library (freestanding: no libm)
@@ -552,72 +610,125 @@ static void do_token(const char *tok){
 }
 
 // ---------------------------------------------------------------------------
-// Rendering
+// Geometry (one definition each; draw and hit-test both call these)
 // ---------------------------------------------------------------------------
-static void draw_text_center(int cx, int cy, const char *s, uint32_t color){
-    int w = gui_ttf_width(s, CALC_TTF_BTN);
-    win_draw_text_ttf(window_handle, cx - w / 2, cy, s, CALC_TTF_BTN, color);
-}
-
 static const btn_t *cur_btns(int *n, int *cols, int *rows){
     if (mode == 1){ *n = SCI_N; *cols = SCI_COLS; *rows = SCI_ROWS; return sci_btns; }
     *n = STD_N; *cols = STD_COLS; *rows = STD_ROWS; return std_btns;
 }
 
-// Grid geometry
-static int grid_top(void){ return 158; }
+// Tab pill i (0 = Standard, 1 = Scientific).
+static void tab_rect(int i, int *x, int *y, int *w, int *h){
+    *x = PAD + i * (TAB_W + TAB_GAP); *y = PAD; *w = TAB_W; *h = TAB_H;
+}
+
+// The two glass panels.
+static void disp_rect(int *x, int *y, int *w, int *h){
+    *x = PAD; *y = DISP_Y; *w = WIN_W - 2 * PAD; *h = DISP_H;
+}
+static void keys_rect(int *x, int *y, int *w, int *h){
+    *x = PAD; *y = KEY_Y; *w = WIN_W - 2 * PAD; *h = WIN_H - PAD - KEY_Y;
+}
+
+// Memory key i (0..4), five equal cells across the grid width.
+static void mem_rect(int i, int *x, int *y, int *w, int *h){
+    int cw = (GRID_W - 4 * KEY_GAP) / 5;
+    *x = GRID_X + i * (cw + KEY_GAP); *y = MEM_Y; *w = cw; *h = MEM_H;
+}
+
+// Key grid: fills the keypad panel below the memory row, inset PANEL_IN.
 static void cell_geom(int cols, int rows, int *cw, int *ch, int *ox, int *oy){
-    int gap = 5;
-    int gw = WIN_W - 2 * PAD;
-    int gh = WIN_H - grid_top() - PAD;
-    *cw = (gw - (cols - 1) * gap) / cols;
-    *ch = (gh - (rows - 1) * gap) / rows;
+    int gh = (KEY_Y + (WIN_H - PAD - KEY_Y) - PANEL_IN) - GRID_TOP;
+    *cw = (GRID_W - (cols - 1) * KEY_GAP) / cols;
+    *ch = (gh - (rows - 1) * KEY_GAP) / rows;
     if (*cw < 1) *cw = 1;   // #436: never let the grid go negative/zero-sized
     if (*ch < 1) *ch = 1;
-    *ox = PAD;
-    *oy = grid_top();
+    *ox = GRID_X;
+    *oy = GRID_TOP;
 }
 
 static void btn_rect(const btn_t *b, int cols, int rows, int *x, int *y, int *w, int *h){
     int cw, ch, ox, oy; cell_geom(cols, rows, &cw, &ch, &ox, &oy);
-    int gap = 5;
-    *x = ox + b->gx * (cw + gap);
-    *y = oy + b->gy * (ch + gap);
-    *w = b->gw * cw + (b->gw - 1) * gap;
+    *x = ox + b->gx * (cw + KEY_GAP);
+    *y = oy + b->gy * (ch + KEY_GAP);
+    *w = b->gw * cw + (b->gw - 1) * KEY_GAP;
     *h = ch;
 }
 
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+// Centred TTF label. The rasterizer's y is the top of the LINE box, so the
+// label is centred on the control by its nominal size (glass doc section 5).
+static void text_center(int x, int y, int w, int h, const char *s, int size, uint32_t color){
+    int tw = gui_ttf_width(s, size);
+    win_draw_text_ttf(window_handle, x + (w - tw) / 2, y + (h - size) / 2 - 1, s, size, color);
+}
+
+// (calcglass) One glass panel: soft shadow, AA rounded fill, 1px border, 1px
+// top highlight; the same layering the Task Manager's draw_panel() uses.
+// Every outer colour is sampled from the backdrop under that edge, so the
+// fringe and corners match what the blit put there. Drawn EVERY frame on
+// purpose: the same inputs give the same pixels, so the repaint is
+// idempotent and there is no static/dynamic chrome split to keep in step
+// (section 11: only the backdrop blit itself is a commit).
+static void draw_panel(int x, int y, int w, int h){
+    uint32_t below = bd_at(x + w / 2, y + h + 3);
+    // Mean of the four corner samples: gui_fill_rounded_aa takes ONE outer
+    // colour, and the blur keeps the four within a few levels of each other.
+    uint32_t c0 = bd_at(x + 4, y + 4),     c1 = bd_at(x + w - 4, y + 4),
+             c2 = bd_at(x + 4, y + h - 4), c3 = bd_at(x + w - 4, y + h - 4);
+    uint32_t outer = 0;
+    for (int sh = 0; sh <= 16; sh += 8){
+        uint32_t m = (((c0 >> sh) & 0xFF) + ((c1 >> sh) & 0xFF) + ((c2 >> sh) & 0xFF) + ((c3 >> sh) & 0xFF)) / 4;
+        outer |= m << sh;
+    }
+    gui_soft_shadow(window_handle, x, y + 2, w, h, PANEL_R, below);
+    gui_fill_rounded_aa(window_handle, x, y, w, h, PANEL_R, C_PANEL, outer);
+    gui_rounded_border(window_handle, x, y, w, h, PANEL_R, C_EDGE);
+    win_draw_rect(window_handle, x + PANEL_R, y + 1, w - 2 * PANEL_R, 1, gui_lighten(C_PANEL, 16));
+}
+
+// (calcglass) The tab strip: pills sitting directly on the frosted backdrop.
+// Selected = accent fill with the accent ink; the rest = panel-coloured glass
+// with the panel border (hover lightens the fill). Each pill's AA edge takes
+// the backdrop colour at its own centre, and the rectangle is tab_rect(), the
+// one the click handler tests.
 static void draw_tabs(void){
-    int tw = 110, th = 26, ty = 6;
-    // Standard
-    win_draw_rect(window_handle, PAD, ty, tw, th, (mode==0||hover_tab==0)?COL_TAB_ON:COL_BG);
-    draw_text_center(PAD + tw/2, ty + (th-FONT_HEIGHT)/2, "Standard", mode==0?COL_TEXT:COL_DIM);
-    // Scientific
-    win_draw_rect(window_handle, PAD + tw + 6, ty, tw, th, (mode==1||hover_tab==1)?COL_TAB_ON:COL_BG);
-    draw_text_center(PAD + tw + 6 + tw/2, ty + (th-FONT_HEIGHT)/2, "Scientific", mode==1?COL_TEXT:COL_DIM);
-    // accent underline for active tab
-    int ax = (mode==0) ? PAD : PAD + tw + 6;
-    win_draw_rect(window_handle, ax + 8, ty + th - 2, tw - 16, 2, COL_EQ);
+    static const char *names[2] = {"Standard", "Scientific"};
+    for (int i = 0; i < 2; i++){
+        int x, y, w, h; tab_rect(i, &x, &y, &w, &h);
+        int sel = (mode == i);
+        uint32_t outer = bd_at(x + w / 2, y + h / 2);
+        uint32_t fill = sel ? C_ACCENT : (hover_tab == i ? gui_lighten(C_PANEL, 18) : C_PANEL);
+        gui_fill_rounded_aa(window_handle, x, y, w, h, h / 2, fill, outer);
+        if (!sel) gui_rounded_border(window_handle, x, y, w, h, h / 2, C_EDGE);
+        text_center(x, y, w, h, names[i], TTF_TAB, sel ? C_ACCENT_INK : C_INK_DIM);
+    }
 }
 
 static void draw_display(void){
-    int dy = 38, dh = 96;
-    win_draw_rect(window_handle, 0, dy, WIN_W, dh, COL_DISP);
+    int px, py, pw, ph; disp_rect(&px, &py, &pw, &ph);
+    draw_panel(px, py, pw, ph);
+    int left = px + PANEL_IN, right = px + pw - PANEL_IN;
 
-    // history / previous line (small, right aligned, dim)
+    // history / previous line (top right, dim; "Error" in the error ink)
     if (prevline[0]){
-        int w = gui_ttf_width(prevline, CALC_TTF_SMALL);
-        win_draw_text_small(window_handle, WIN_W - PAD - w, dy + 6, prevline, COL_DIM);
+        int is_err = !__builtin_strcmp(prevline, "Error");
+        int w = gui_ttf_width(prevline, TTF_TAB);
+        win_draw_text_ttf(window_handle, right - w, py + 10, prevline, TTF_TAB, is_err ? C_ERR : C_INK_DIM);
     }
 
-    // mode indicators (DEG/RAD, 2nd, M) on the left, small
-    char ind[24]; int k = 0;
-    const char *dr = deg ? "DEG" : "RAD";
-    for (int i = 0; dr[i]; i++) ind[k++] = dr[i];
-    if (mem_set){ ind[k++]=' '; ind[k++]='M'; }
-    if (second){ ind[k++]=' '; ind[k++]='2'; ind[k++]='n'; ind[k++]='d'; }
-    ind[k] = '\0';
-    win_draw_text_small(window_handle, PAD, dy + 6, ind, COL_DIM);
+    // mode indicators (top left): DEG/RAD in the dim ink, M and 2nd in the
+    // accent so an armed modifier is visible at a glance.
+    {
+        int ix = left, iy = py + 10;
+        const char *dr = deg ? "DEG" : "RAD";
+        win_draw_text_ttf(window_handle, ix, iy, dr, TTF_IND, C_INK_DIM);
+        ix += gui_ttf_width(dr, TTF_IND) + 8;
+        if (mem_set){ win_draw_text_ttf(window_handle, ix, iy, "M", TTF_IND, C_ACCENT); ix += gui_ttf_width("M", TTF_IND) + 8; }
+        if (second)  win_draw_text_ttf(window_handle, ix, iy, "2nd", TTF_IND, C_ACCENT);
+    }
 
     // main line: live value if expr parses, else the expression text
     const char *show = expr[0] ? expr : "0";
@@ -625,50 +736,104 @@ static void draw_display(void){
     if (expr[0]){ double v = evaluate(expr, &ok); if (ok) fmt_double(v, live); }
     const char *big = (expr[0] && ok) ? live : show;
 
-    int w = gui_ttf_width(big, CALC_TTF_BIG);
-    int bx = WIN_W - PAD - w;
-    if (bx < PAD) bx = PAD;   // overflow guard (will clip on the left)
-    win_draw_text_ttf(window_handle, bx, dy + dh - CALC_TTF_BIG - 6, big, CALC_TTF_BIG, COL_TEXT);
+    int by = py + ph - PANEL_IN - TTF_BIG;
+    int w = gui_ttf_width(big, TTF_BIG);
+    int bx = right - w;
+    if (bx < left) bx = left;   // overflow guard (will clip on the right)
+    win_draw_text_ttf(window_handle, bx, by, big, TTF_BIG, C_INK);
 
     // if showing live preview, also echo the typed expression small above it
     if (expr[0] && ok){
-        int ew = gui_ttf_width(expr, CALC_TTF_SMALL);
-        win_draw_text_small(window_handle, WIN_W - PAD - ew, dy + dh - 40, expr, COL_DIM);
+        int ew = gui_ttf_width(expr, TTF_TAB);
+        win_draw_text_ttf(window_handle, right - ew, by - 16, expr, TTF_TAB, C_INK_DIM);
     }
 }
 
 static void draw_memory_row(void){
-    const char *mem[5] = {"MC","MR","M+","M-","MS"};
-    int y = 138, h = 18;
-    int gap = 4, w = (WIN_W - 2*PAD - 4*gap) / 5;
+    static const char *mem[5] = {"MC","MR","M+","M-","MS"};
     for (int i = 0; i < 5; i++){
-        int x = PAD + i * (w + gap);
-        uint32_t fg = (i==0 && !mem_set) ? 0x00606060 : COL_DIM;
-        draw_text_center(x + w/2, y + (h-FONT_HEIGHT)/2, mem[i], fg);
+        int x, y, w, h; mem_rect(i, &x, &y, &w, &h);
+        // MC/MR do nothing with an empty memory: dim them (still 3:1 on the panel).
+        int idle = (i <= 1 && !mem_set);
+        uint32_t fg = idle ? gui_mix(C_INK_DIM, C_PANEL, 140) : C_INK_DIM;
+        if (hover_mem == i && !idle){
+            gui_fill_rounded_aa(window_handle, x, y, w, h, h / 2, gui_lighten(C_PANEL, 8), C_PANEL);
+            fg = C_INK;
+        }
+        text_center(x, y, w, h, mem[i], TTF_TAB, fg);
     }
+}
+
+// (calcglass) One key. Four classes, each from the shared rounded primitives
+// (the same composition the Task Manager's tab pills use): digit = raised
+// panel fill; function = nested card (DK_CARD_FILL + DK_STROKE_UNSEL); operator
+// = nested card with the accent face; "=" = the section 6 primary button
+// gradient. An armed 2nd is the selected-pill grammar (accent fill, accent
+// ink). Hover lightens the fill by 18, gui_button()'s own rule. gui_button
+// itself is not used here because its five variants cannot express four key
+// classes with two face sizes, and its per-button soft shadow is 42 shadows
+// per frame on the scientific grid.
+static void draw_key(const btn_t *b, int x, int y, int w, int h, int hov){
+    const char *face = (second && b->face2) ? b->face2 : b->face;
+    if (!__builtin_strcmp(b->tok, "deg")) face = deg ? "DEG" : "RAD";
+    int on = (!__builtin_strcmp(b->tok, "2nd") && second);
+
+    if (b->kind == K_EQ && !on){
+        uint32_t top = C_BTN_TOP, bot = C_BTN_BOTTOM;
+        if (hov){ top = gui_lighten(top, 18); bot = gui_lighten(bot, 18); }
+        gui_fill_rounded_aa(window_handle, x, y, w, h, KEY_RAD, bot, C_PANEL);
+        gui_fill_rounded_grad(window_handle, x + 1, y + 1, w - 2, h - 2, KEY_RAD - 1, top, bot);
+        text_center(x, y, w, h, face, TTF_EQ, C_EQ_INK);
+        return;
+    }
+    uint32_t fill, ink; int size, bordered;
+    if (on)                    { fill = C_ACCENT;                 ink = C_ACCENT_INK; size = TTF_FUNC;  bordered = 0; }
+    else if (b->kind == K_DIGIT){ fill = gui_lighten(C_PANEL, 12); ink = C_INK;        size = TTF_DIGIT; bordered = 0; }
+    else if (b->kind == K_OP)  { fill = C_CARD;                   ink = C_ACCENT;     size = TTF_DIGIT; bordered = 1; }
+    else                       { fill = C_CARD;                   ink = C_INK_DIM;    size = TTF_FUNC;  bordered = 1; }
+    if (hov) fill = gui_lighten(fill, 18);
+    gui_fill_rounded_aa(window_handle, x, y, w, h, KEY_RAD, fill, C_PANEL);
+    if (bordered) gui_rounded_border(window_handle, x, y, w, h, KEY_RAD, C_EDGE);
+    win_draw_rect(window_handle, x + KEY_RAD, y + 1, w - 2 * KEY_RAD, 1, gui_lighten(fill, 16));  // top highlight
+
+    // Stroked faces (see the note above std_btns[]): the ACTIVE token decides,
+    // so the sqrt key shows the cube-root glyph while 2nd is armed.
+    const char *atok = (second && b->tok2) ? b->tok2 : b->tok;
+    int cx = x + w / 2, cy = y + h / 2;
+    if (!__builtin_strcmp(atok, "sqrt(") || !__builtin_strcmp(atok, "cbrt(")){
+        // radical: short down-stroke, long up-stroke, vinculum, then "x"
+        gui_thick_line(window_handle, cx - 13, cy,     cx - 9, cy + 7, 2, ink);
+        gui_thick_line(window_handle, cx - 9,  cy + 7, cx - 3, cy - 8, 2, ink);
+        gui_thick_line(window_handle, cx - 3,  cy - 8, cx + 9, cy - 8, 1, ink);
+        win_draw_text_ttf(window_handle, cx - 1, y + (h - TTF_FUNC) / 2, "x", TTF_FUNC, ink);
+        if (atok[0] == 'c') win_draw_text_ttf(window_handle, cx - 18, cy - 14, "3", TTF_IND, ink);
+        return;
+    }
+    if (!__builtin_strcmp(atok, "pi")){
+        gui_thick_line(window_handle, cx - 7, cy - 5, cx + 7, cy - 5, 2, ink);   // top bar
+        gui_thick_line(window_handle, cx - 4, cy - 5, cx - 4, cy + 7, 2, ink);   // left leg
+        gui_thick_line(window_handle, cx + 3, cy - 5, cx + 3, cy + 7, 2, ink);   // right leg
+        return;
+    }
+    if (!__builtin_strcmp(atok, "back")){
+        // backspace: left-pointing outline with an x inside
+        gui_thick_line(window_handle, cx - 11, cy,     cx - 5,  cy - 6, 1, ink);
+        gui_thick_line(window_handle, cx - 5,  cy - 6, cx + 11, cy - 6, 1, ink);
+        gui_thick_line(window_handle, cx + 11, cy - 6, cx + 11, cy + 6, 1, ink);
+        gui_thick_line(window_handle, cx + 11, cy + 6, cx - 5,  cy + 6, 1, ink);
+        gui_thick_line(window_handle, cx - 5,  cy + 6, cx - 11, cy,     1, ink);
+        gui_thick_line(window_handle, cx - 1,  cy - 3, cx + 5,  cy + 3, 1, ink);
+        gui_thick_line(window_handle, cx + 5,  cy - 3, cx - 1,  cy + 3, 1, ink);
+        return;
+    }
+    text_center(x, y, w, h, face, size, ink);
 }
 
 static void draw_buttons(void){
     int n, cols, rows; const btn_t *bs = cur_btns(&n, &cols, &rows);
     for (int i = 0; i < n; i++){
-        const btn_t *b = &bs[i];
-        int x, y, w, h; btn_rect(b, cols, rows, &x, &y, &w, &h);
-        uint32_t base;
-        switch (b->kind){
-            case K_DIGIT: base = COL_DIGIT; break;
-            case K_OP:    base = COL_FUNC;  break;
-            case K_EQ:    base = COL_EQ;    break;
-            default:      base = COL_FUNC;  break;
-        }
-        if (i == hover) base = (b->kind == K_EQ) ? COL_EQ_HOV : COL_HOVER;
-        // active toggles
-        if (!__builtin_strcmp(b->tok, "2nd") && second) base = COL_EQ;
-        win_draw_rect(window_handle, x, y, w, h, base);
-        win_draw_rect(window_handle, x, y, w, 1, 0x18FFFFFF);   // subtle top highlight
-        const char *face = (second && b->face2) ? b->face2 : b->face;
-        if (!__builtin_strcmp(b->tok, "deg")) face = deg ? "DEG" : "RAD";
-        uint32_t tc = (b->kind == K_EQ) ? COL_TEXT : COL_TEXT;
-        draw_text_center(x + w/2, y + (h - FONT_HEIGHT)/2, face, tc);
+        int x, y, w, h; btn_rect(&bs[i], cols, rows, &x, &y, &w, &h);
+        draw_key(&bs[i], x, y, w, h, i == hover);
     }
 }
 
@@ -685,42 +850,57 @@ static void draw_all(void){
       if (h < MIN_WIN_H) h = g_win_h > 0 ? g_win_h : MIN_WIN_H;
       g_win_w = w; g_win_h = h;
     }
-    win_draw_rect(window_handle, 0, 0, WIN_W, WIN_H, COL_BG);
+    // (calcglass) THE ANTI-FLASH CONTRACT (docs/UI_GLASS_DESIGN_SYSTEM.md
+    // section 11). SYS_WIN_BLIT self-commits: the kernel publishes the window
+    // the instant the backdrop lands, and a compositor sample taken between
+    // that commit and the win_invalidate() below would show a backdrop with
+    // no content on it. So the blit runs ONLY when the chrome is dirty (start,
+    // EVENT_RESIZE, EVENT_REDRAW, wallpaper change), never on a hover or a
+    // keystroke. Everything else is plain draws, which accumulate unpublished
+    // until the single invalidate at the end. The window is never cleared
+    // with a flat fill: the panels and pills cover every pixel that changes,
+    // and the margins are the backdrop.
+    sync_backdrop();
+    if (g_chrome_dirty){
+        bd_blit(window_handle);
+        g_chrome_dirty = 0;
+    }
     draw_tabs();
     draw_display();
+    { int x, y, w, h; keys_rect(&x, &y, &w, &h); draw_panel(x, y, w, h); }
     draw_memory_row();
     draw_buttons();
     win_invalidate(window_handle);
 }
 
 // ---------------------------------------------------------------------------
-// Hit testing
+// Hit testing (the same rect functions the draw path uses)
 // ---------------------------------------------------------------------------
+static int in_rect(int lx, int ly, int x, int y, int w, int h){
+    return lx >= x && lx < x + w && ly >= y && ly < y + h;
+}
+
 static int hit_button(int lx, int ly){
     int n, cols, rows; const btn_t *bs = cur_btns(&n, &cols, &rows);
     for (int i = 0; i < n; i++){
         int x, y, w, h; btn_rect(&bs[i], cols, rows, &x, &y, &w, &h);
-        if (lx >= x && lx < x + w && ly >= y && ly < y + h) return i;
+        if (in_rect(lx, ly, x, y, w, h)) return i;
     }
     return -1;
 }
 
 static int hit_tab(int lx, int ly){
-    int tw = 110, th = 26, ty = 6;
-    if (ly >= ty && ly < ty + th){
-        if (lx >= PAD && lx < PAD + tw) return 0;
-        if (lx >= PAD + tw + 6 && lx < PAD + tw + 6 + tw) return 1;
+    for (int i = 0; i < 2; i++){
+        int x, y, w, h; tab_rect(i, &x, &y, &w, &h);
+        if (in_rect(lx, ly, x, y, w, h)) return i;
     }
     return -1;
 }
 
 static int hit_memory(int lx, int ly){
-    int y = 138, h = 18, gap = 4, w = (WIN_W - 2*PAD - 4*gap) / 5;
-    if (ly >= y && ly < y + h){
-        for (int i = 0; i < 5; i++){
-            int x = PAD + i * (w + gap);
-            if (lx >= x && lx < x + w) return i;
-        }
+    for (int i = 0; i < 5; i++){
+        int x, y, w, h; mem_rect(i, &x, &y, &w, &h);
+        if (in_rect(lx, ly, x, y, w, h)) return i;
     }
     return -1;
 }
@@ -910,22 +1090,27 @@ int main(int argc, char **argv){
     window_handle = win_create("Calculator", 280, 90, WIN_W, WIN_H);
     if (window_handle < 0){ printf("calc: failed to create window\n"); return 1; }
 
-    apply_theme();
+    // (calcglass) the palette is the fixed dark glass (see the token block), so
+    // there is no theme poll: the window carries its own backdrop. draw_all()
+    // starts with g_chrome_dirty set, so the first frame blits the backdrop.
     draw_all();
 
     gui_event_t ev;
     int running = 1;
     while (running){
-        { int th = get_theme(); if (th != g_last_theme) { g_last_theme = th; apply_theme(); draw_all(); } }
         int et = win_get_event(window_handle, &ev, 100);
         if (et == 0) continue;
 
         switch (ev.type){
             case EVENT_RESIZE:
+                // (calcglass) a resize reallocates the content buffer, so the
+                // backdrop must be blitted again: chrome dirty.
                 if (ev.mouse_x > 0 && ev.mouse_y > 0) { g_win_w = ev.mouse_x; g_win_h = ev.mouse_y; }
+                g_chrome_dirty = 1;
                 draw_all();
                 break;
             case EVENT_REDRAW:
+                g_chrome_dirty = 1;
                 draw_all();
                 break;
             case EVENT_WINDOW_CLOSE:
@@ -941,7 +1126,8 @@ int main(int argc, char **argv){
                 int ly = ev.mouse_y;
                 int nb = hit_button(lx, ly);
                 int nt = hit_tab(lx, ly);
-                if (nb != hover || nt != hover_tab){ hover = nb; hover_tab = nt; draw_all(); }
+                int nm = hit_memory(lx, ly);
+                if (nb != hover || nt != hover_tab || nm != hover_mem){ hover = nb; hover_tab = nt; hover_mem = nm; draw_all(); }
                 break;
             }
             case EVENT_MOUSE_UP:

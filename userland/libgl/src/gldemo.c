@@ -15,6 +15,14 @@
 #define MAXW 1920
 #define MAXH 1080
 
+// gldemo_lavalamp.c (lavalamp): proper 3D lava lamp core entry points.
+void gldemo_lavalamp_setup(void);
+void gldemo_lavalamp_frame(void);
+
+// gldemo_aquarium.c (aquarium): 3D reef aquarium core entry points.
+void gldemo_aquarium_setup(void);
+void gldemo_aquarium_frame(void);
+
 static ZBuffer *g_zb = 0;
 static int g_mode = GLDEMO_CUBE;
 static int g_w = 0, g_h = 0;
@@ -710,6 +718,14 @@ int gldemo_init(int mode, int w, int h) {
             glBlendEquation(GL_FUNC_ADD);
             init_streams();
         }
+    } else if (mode == GLDEMO_LAVALAMP) {
+        // (lavalamp) the lava lamp core sets its own GL state and builds
+        // its precomputed lamp geometry + simulation seed itself.
+        gldemo_lavalamp_setup();
+    } else if (mode == GLDEMO_AQUARIUM) {
+        // (aquarium) the aquarium core sets its own GL state and reseeds
+        // its procedural scene (sand/rocks/coral/plants/fish) itself.
+        gldemo_aquarium_setup();
     } else {
         // #560: the ten new cores are all untextured (flat/wireframe), so
         // no texture unit is bound for them at all.
@@ -855,6 +871,8 @@ void gldemo_frame(uint32_t *dst, int dst_pitch) {
         case GLDEMO_HYPERCUBE:  draw_hypercube();   break;
         case GLDEMO_VORTEX:     draw_vortex();      break;
         case GLDEMO_LAVA:       draw_lava();        break;
+        case GLDEMO_LAVALAMP:   gldemo_lavalamp_frame(); break;
+        case GLDEMO_AQUARIUM:   gldemo_aquarium_frame(); break;
         default:                draw_cube();        break;
     }
     // #560 audit fix: copy row-by-row instead of ZB_copyFrameBuffer(), which

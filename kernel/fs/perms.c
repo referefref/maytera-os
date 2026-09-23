@@ -325,6 +325,94 @@ static const struct { const char *path; uint16_t mode; } perms_system_seed[] = {
 };
 
 // ============================================================================
+// STAGE 0 DEVICE NODE SEED (docs/SYSTEM_CAPABILITY_API.md 1.5, section 12)
+// ============================================================================
+// A THIRD TABLE, AND IT IS A THIRD KIND OF OBJECT. perms_system_seed[] above
+// TIGHTENS: every row takes something off the world-readable no-entry default.
+// perms_shared_state_seed[] below GRANTS: every row opens a write the default
+// would refuse. Neither description fits these rows, and putting them in either
+// table would make that table's one-line summary false.
+//
+// These paths had NO PERMISSION SEMANTICS AT ALL until Stage 0. proc/fdlayer.c
+// handled the "/dev/" prefix BEFORE the permission block and returned, so
+// perms_check() never saw a device node. An operator who wrote
+// "/DEV/TTYACM0:0:0:0600" into /CONFIG/PERMS.DB got exactly nothing: the entry
+// parsed, stored, listed, and was never consulted. So these rows are not a
+// loosening and not a tightening relative to any enforced prior state. They are
+// the FIRST policy these nodes have ever had, and they are chosen to preserve
+// today's effective access byte for byte.
+//
+// WHY PRESERVE RATHER THAN LOCK DOWN, WHICH IS THE OBVIOUS THING TO WANT.
+// Measured, not assumed: perms_check_leaf()'s no-entry default is root-owned
+// 0755, which DENIES W_OK to every non-root caller, and a desktop session is
+// uid 1000 (rustkern/sessionid.rs FIRST_ADMIN_UID, applied by
+// proc_create_user_as). Landing the ordering fix with no rows here would
+// therefore have broken, on the next boot, every one of these SHIPPING apps:
+//
+//   Terminal      open("/dev/ptmx", O_RDWR|O_NONBLOCK)  -> EACCES, and then
+//                 open("/dev/pts/N", O_RDWR)            -> EACCES.
+//                 Every shell, vi and pipeline in the Terminal, dead.
+//   print3d       open("/dev/ttyACM0", O_RDWR)          -> EACCES.
+//                 /APPS/PRINT3D ships and has a start-menu entry.
+//
+// A security change whose first effect is that the Terminal stops working is a
+// change that gets reverted, and the hole comes back with it. The modes below
+// are Linux's for the same nodes, which is where 0666 on ptmx/pts/null/zero/
+// random comes from.
+//
+// WHAT STAGE 0 DID AND WHAT STAGE 2 THEN DID. Stage 0 gave these nodes a policy
+// that is actually consulted (before it, the /dev/ prefix was handled ahead of
+// perms_check() and returned, so any PERMS.DB entry for /DEV/TTYACM0 was inert).
+// Stage 0 deliberately preserved TTYACM0's effective access at 0666 so no
+// shipping app regressed, and stated that it therefore did NOT yet take serial
+// out of ambient reach. STAGE 2 has now taken it: the TTYACM0 row below is
+// root-owned 0600, and docs/SYSTEM_CAPABILITY_API.md's `serial.port` capability
+// with its kernel-published port list (drivers/serialport.c) is the only way an
+// app reaches a serial adapter. /APPS/PRINT3D is re-plumbed onto that gateway.
+// The mechanism Stage 0 built is what made this a one-token value change.
+//
+// /DEV itself is 0755: the node paths need X_OK on their parent to traverse
+// (rustkern/permpath.rs walks every intermediate component), and a directory
+// nobody can create files in wants no write bit.
+static const struct { const char *path; uint16_t mode; } perms_dev_node_seed[] = {
+    { "/DEV",             0755 },
+    { "/DEV/PTS",         0755 },
+    // Pseudo-terminals. Ring-3 Terminal opens both ends O_RDWR. The pts slave
+    // keeps its own INDEPENDENT ownership gate (pts_attach_allowed() in
+    // drivers/pty.c, #fdguard), so 0666 here does not reopen that hole: a
+    // permissive mode gets you as far as the attach check and no further.
+    { "/DEV/PTMX",        0666 },
+    { "/DEV/PTS/0",       0666 },
+    { "/DEV/PTS/1",       0666 },
+    { "/DEV/PTS/2",       0666 },
+    { "/DEV/PTS/3",       0666 },
+    { "/DEV/PTS/4",       0666 },
+    { "/DEV/PTS/5",       0666 },
+    { "/DEV/PTS/6",       0666 },
+    { "/DEV/PTS/7",       0666 },
+    // The controlling terminal and the console. /DEV/CONSOLE is listed for
+    // completeness of the policy, NOT because process stdio depends on it:
+    // proc/process.c's init_proc() calls dev_open("console") directly and
+    // installs the file_t into fds 0/1/2 without going near sys_open_k(), so
+    // stdio was never at risk from the ordering fix. Verified before landing.
+    { "/DEV/CONSOLE",     0666 },
+    { "/DEV/TTY",         0666 },
+    // Data sources with no state to protect.
+    { "/DEV/NULL",        0666 },
+    { "/DEV/ZERO",        0666 },
+    { "/DEV/RANDOM",      0666 },
+    { "/DEV/URANDOM",     0666 },
+    // USB CDC-ACM serial. STAGE 2 (serial.port) TIGHTENED THIS to root-owned
+    // 0600 (MAYTERA-SEC-2026-0021): the desktop uid (1000) can no longer open
+    // /dev/ttyACM0 raw. The ONLY route to a serial adapter now is
+    // SYS_SERIAL_OPEN(name) under a serial.port grant that the compositor's
+    // consent produced (drivers/serialport.c). The node itself stays: root can
+    // open it, and it is the mediated gateway's backend, but it is out of
+    // AMBIENT reach. This is the one-token edit the Stage 0 note promised.
+    { "/DEV/TTYACM0",     0600 },
+};
+
+// ============================================================================
 // #221b SHARED GAME STATE SEED
 // ============================================================================
 // READ THIS BEFORE ADDING A LINE. Every entry in perms_system_seed[] above
@@ -446,6 +534,53 @@ static const struct { const char *path; uint16_t mode; } perms_shared_state_seed
     // exists. So the player names the writable location once and the game
     // remembers it for the session.
     { "/GAMES/SIMCITY",        0777 },
+    // #745 Tier 3 #15: Angband (userland/ports/angband, /APPS/ANGBAND). Same
+    // shape as NetHack/SimCity above and for the same reason: /APPS is
+    // root:root 0755 because it holds the ANGBAND binary, so a desktop
+    // session cannot create a save file beside it. UNLIKE NetHack/SimCity
+    // (DOS guests with no real per-user HOME), Angband is a native Ring-3
+    // app; the honest reason this is a MACHINE-WIDE seed rather than a
+    // %HOME%/GAMES/ANGBAND split is that Angband's own PRIVATE_USER_PATH is
+    // compiled in as this single fixed path (userland/ports/angband/PORT's
+    // cflags), not resolved per-user, because relying on getpwuid()+
+    // /CONFIG/PASSWD (the normal ~/.angband mechanism) FAILS OUTRIGHT on any
+    // image where the first-boot setup wizard has not yet run (no
+    // /CONFIG/PASSWD at all): MEASURED on golden 2414 pre-OOBE, Angband's own
+    // z-file.c tilde-expansion silently produced a mangled path and mkdir
+    // failed. A single shared save location that always exists, seeded here,
+    // is honest about that limitation instead of failing unpredictably
+    // depending on account state; per-user isolation is a documented
+    // follow-up once every shipped image is guaranteed to have run OOBE.
+    { "/GAMES/ANGBAND",       0777 },
+    // #dosperm: A LAUNCH TARGET THAT DOES NOT LOOK LIKE ONE.
+    //
+    // rustkern/dosstate.rs grants the write bit by default to a file under
+    // /DOS/<title>/ whose name is not program-shaped, and a name is all it can
+    // see. /DOS/RA/GAME.DAT is Red Alert's actual executable: a DOS/4GW LE
+    // image behind a data-file extension. This row restores the root-owned
+    // 0755 that the name-based rule cannot infer, and it wins because an
+    // explicit entry is checked before the default.
+    //
+    // THIS ROW IS NOT MAINTAINED BY HAND. build/build-golden.sh reads the
+    // shipped image, finds every file under /DOS/<title>/ that begins with an
+    // executable magic, and REFUSES TO BUILD if one of them has neither an
+    // executable extension nor a row here. The list stays short because the
+    // requirement is computed; it cannot go stale because a stale list stops
+    // the build.
+    { "/DOS/RA/GAME.DAT",      0755 },
+    // FOUND BY THE AUDIT ABOVE, not by reading the directory listing. Running
+    // it against the shipped asset base before wiring it in reported three
+    // MZ-magic files under /DOS whose names are not program-shaped, and only
+    // GAME.DAT was known. The other two are below. This is the whole argument
+    // for computing the requirement instead of maintaining a list: a list would
+    // have shipped with two holes in it and nobody would have known.
+    //
+    // Both are held at the root-owned 0755 the rest of the tree used to have,
+    // which is exactly today's behaviour for them. If either turns out to be a
+    // data file that merely begins with the two bytes "MZ", the correct fix is
+    // still an explicit row saying so, not a weaker audit.
+    { "/DOS/ALADDIN/LEVELS.SPE", 0755 },
+    { "/DOS/STUNTS/INSTALL.PDM", 0755 },
 };
 
 // #674: /CONFIG shipped as mode 0700 (verified on golden build 1018, commit
@@ -787,6 +922,31 @@ void perms_selftest(void) {
         } else {
             selftest_ran("selftest/register");
         }
+        // #dosperm: the /DOS game-state default. Proven as a PREDICATE here (18
+        // vectors over the shape rule itself), and then proven END TO END on
+        // the live database by the st_check() vectors further down, because a
+        // predicate that is right and a perms_check() that never calls it would
+        // look identical from a review.
+        extern uint32_t dosstate_selftest_rs(void);
+        bad = (int)dosstate_selftest_rs();
+        if (bad) {
+            bootlog_write("[PERMS-SELFTEST] FAIL /DOS game-state rule: %d bad vector(s); "
+                          "shipped DOS titles are either unwritable or too writable", bad);
+            st_fail += bad;
+        } else {
+            selftest_ran("perms/dosstate");
+        }
+        // #word6blank: the /WIN16 app-state default (the same rule, same
+        // predicate shape, applied to the Win16 tree instead of /DOS).
+        extern uint32_t win16state_selftest_rs(void);
+        bad = (int)win16state_selftest_rs();
+        if (bad) {
+            bootlog_write("[PERMS-SELFTEST] FAIL /WIN16 app-state rule: %d bad vector(s); "
+                          "shipped Win16 apps are either unwritable or too writable", bad);
+            st_fail += bad;
+        } else {
+            selftest_ran("perms/win16state");
+        }
     }
 
     // --- canonicalization: the walker must see the object the FS will open ---
@@ -798,6 +958,29 @@ void perms_selftest(void) {
     st_canon("/A/B/../../C",              "/C");
     st_canon("/..",                       "/");               // never above root
     st_canon("/../../..",                 "/");
+
+    // #dosperm: the /DOS game-state default, END TO END through perms_check()
+    // on the live database rather than through the predicate alone. uid 1000 is
+    // the default non-root desktop identity, which is the identity the shipped
+    // games are actually launched by.
+    //
+    // These use paths that do NOT have to exist: perms_check() is a decision
+    // about a name, and the no-entry default is exactly what is under test, so
+    // a synthetic title name proves the RULE rather than the state of one
+    // image. The one real path here is /DOS/RA/GAME.DAT, which must be denied
+    // by its explicit seed row and not by the rule.
+    st_check("/DOS/ZZTEST/GAME.INI",  1000, 1000, W_OK, 0,
+             "#dosperm: a DOS title must be able to write its own state file");
+    st_check("/DOS/ZZTEST/GAME.INI",  1000, 1000, R_OK, 0,
+             "#dosperm: and reading it must still work");
+    st_check("/DOS/ZZTEST/GAME.EXE",  1000, 1000, W_OK, -1,
+             "#dosperm: a program-shaped name must NOT become writable");
+    st_check("/DOS/ZZTEST",           1000, 1000, W_OK, -1,
+             "#dosperm: the title DIRECTORY must stay root-owned 0755");
+    st_check("/DOSZZ/GAME.INI",       1000, 1000, W_OK, -1,
+             "#dosperm: the rule is scoped to /DOS, not to a /DOS prefix");
+    st_check("/DOS/RA/GAME.DAT",      1000, 1000, W_OK, -1,
+             "#dosperm: a disguised launch target is held read-only by its seed row");
     st_canon("/",                         "/");
     st_canon("/CONFIG/",                  "/CONFIG");         // trailing slash
     selftest_ran("perms/canon");
@@ -1010,6 +1193,17 @@ void perms_selftest_session(const char *home, uint32_t uid, uint32_t gid) {
 }
 
 static void perms_seed_system(void) {
+    // Stage 0: device nodes. Seeded FIRST, and like every other seed pass an
+    // existing entry wins, so an operator who has already written a mode for a
+    // /DEV path in /CONFIG/PERMS.DB keeps it. That "operator wins" property is
+    // the whole reason these rows are safe to ship: they are a default, not a
+    // policy the kernel insists on.
+    unsigned nd = sizeof(perms_dev_node_seed) / sizeof(perms_dev_node_seed[0]);
+    for (unsigned i = 0; i < nd; i++) {
+        if (perms_lookup(perms_dev_node_seed[i].path)) continue;   // operator wins
+        perms_set(perms_dev_node_seed[i].path, 0, 0,
+                  perms_dev_node_seed[i].mode);
+    }
     unsigned ns = sizeof(perms_shared_state_seed) / sizeof(perms_shared_state_seed[0]);
     for (unsigned i = 0; i < ns; i++) {
         if (perms_lookup(perms_shared_state_seed[i].path)) continue;   // operator wins
@@ -1261,7 +1455,38 @@ int perms_check_leaf(const char *path, uint32_t proc_uid, uint32_t proc_gid, int
     if (!e) {
         // No entry means default permissions: owned by root, mode 0755
         // Everyone can read/execute, only root can write
-        if (access & W_OK) return -1;  // EACCES
+        if (access & W_OK) {
+            // #dosperm: ONE EXCEPTION, AND IT IS A RULE, NOT A LIST. A DOS-era
+            // game has one user and keeps its state beside its executable, so
+            // the root-owned default above makes every shipped title under /DOS
+            // unwritable for the default desktop identity. rustkern/dosstate.rs
+            // grants the write bit to /DOS/<title>/<name> when the name is not
+            // program-shaped; the title DIRECTORY is untouched and stays 0755,
+            // so no non-root account can add, delete or rename a name there.
+            // Read that file for what the rule deliberately does not cover.
+            //
+            // It is asked ONLY on the write path and ONLY when there is no
+            // explicit entry, so a real perms row (a seed, or an operator
+            // chmod) always wins and nothing else in the tree can be affected.
+            extern int dos_state_writable_rs(const char *p);
+            if (dos_state_writable_rs(path)) return 0;
+            // #word6blank (2026-09-12): the identical defect one level up the
+            // Win16 stack. A Win16 app (Word 6 here) has one user and keeps
+            // its scratch/state beside its own binary (its startup recovery
+            // file ~WRF0000.TMP, its own WINWORD6.INI, NORMAL.DOT), exactly
+            // like a DOS-era game does under /DOS/<title>. Measured: Word 6
+            // creates that recovery file, is refused, retries once more,
+            // gives up and exits -- which the compositor then shows as a
+            // permanently blank chrome-only window (W6PERSIST keeps the host
+            // window visible after the guest exits). This was mistaken for
+            // the #708 GUESTFS gate misbehaving; it is this same no-entry
+            // default doing exactly what it does for /DOS, just never
+            // extended to /WIN16. Same rule, same directory/program-shaped-
+            // name exceptions, shared decision code (rustkern/dosstate.rs).
+            extern int win16_state_writable_rs(const char *p);
+            if (win16_state_writable_rs(path)) return 0;
+            return -1;  // EACCES
+        }
         return 0;
     }
 
@@ -1536,4 +1761,27 @@ void perms_on_create(const char *path, uint32_t uid, uint32_t gid, int is_dir) {
 void perms_set_default(const char *path, uint32_t uid, uint32_t gid, int is_dir) {
     uint16_t mode = is_dir ? 0755 : 0644;
     perms_set(path, uid, gid, mode);
+}
+
+// (perms-orphan, no-ticket, wallpaperpersist-followup): does a PERMS.DB entry exist for `path` at all, checked under
+// the SAME canonicalization perms_check()/perms_on_create() use, so this
+// answers the identical question they would ask, not a re-implementation
+// that can drift from it (path key mismatches are exactly how #674 broke
+// perms_check() in the first place - see permpath.rs). Read-only: never
+// creates, changes or touches an entry.
+//
+// EXISTS FOR: distinguishing a real, deliberate PERMS.DB row (a seed, an
+// operator chmod, a prior perms_on_create()) from a path that has simply
+// never been stamped - which perms_check_leaf()'s no-entry default answers
+// identically to "root explicitly owns this and refuses everyone else",
+// even though nobody ever decided that. A caller that wants to tell those
+// two situations apart (see the O_CREAT self-heal in proc/fdlayer.c) needs
+// this, because perms_check()'s return code alone cannot: both cases return
+// the same deny.
+int perms_has_entry(const char *path) {
+    if (!path || !path[0]) return 0;
+    extern int perms_canon_rs(const char *src, char *out, uint32_t cap);
+    char canon[256];
+    if (perms_canon_rs(path, canon, sizeof(canon)) < 0) return 0;
+    return perms_lookup(canon) != NULL;
 }

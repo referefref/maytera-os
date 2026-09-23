@@ -1,0 +1,109 @@
+# mports recipe: libedit (the portable NetBSD editline). Tier 1 item #6 (the
+# last) of docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md section 9. Chosen
+# over GNU readline DELIBERATELY: readline is GPL-3.0 (a copyleft that would
+# flow into anything linking it), libedit is BSD-3-Clause. It gives the
+# Terminal's shell (msh) real line editing: up/down history, left/right cursor
+# editing, and the emacs-style keys, via el_gets()/history().
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA.
+#
+# build=script, like ncurses. libedit is an autotools+libtool project whose
+# library sources include files GENERATED at build time by the makelist awk/sh
+# generator (vi.h, emacs.h, common.h, fcns.h, help.h, func.h from the *.c
+# command tables). Freezing that generated output into a fixed `sources=` list
+# would rot at the first version bump, the exact failure this system exists to
+# avoid, so upstream's own build system produces them in ports/libedit/build.sh
+# and mports still enforces the outcome: lib=libedit.a must exist and every
+# symbol in `symbols` must be DEFINED in it.
+
+name=libedit
+version=20260512-3.1
+class=C
+homepage=https://thrysoee.dk/editline/
+
+# The portable editline distribution (Roy Marples / thrysoee.dk mirror of the
+# NetBSD source). The sha256 below is of THIS file and was MEASURED on the build container
+# with sha256sum, not copied from a web page:
+#   wget -O libedit-20260512-3.1.tar.gz https://thrysoee.dk/editline/libedit-20260512-3.1.tar.gz
+#   sha256sum libedit-20260512-3.1.tar.gz
+#   -> 432d5e7ea8b0116dd39f2eca7bc11d0eed77faa6b77ea526ace89907c23ea4a0
+# 20260512-3.1 was the current release listed on the thrysoee.dk index at port
+# time; the listing was read, not assumed. Matching ncurses 6.5, the pin is the
+# current upstream, not a stale one.
+source_url=https://thrysoee.dk/editline/libedit-20260512-3.1.tar.gz
+tarball=libedit-20260512-3.1.tar.gz
+sha256=432d5e7ea8b0116dd39f2eca7bc11d0eed77faa6b77ea526ace89907c23ea4a0
+srcdir=libedit-20260512-3.1
+
+# BSD-3-Clause. The verbatim grant is in COPYING (Regents of the University of
+# California, contributed by Christos Zoulas) and is reproduced in
+# ATTRIBUTION.md, copied out of THIS tarball. This version carries NO 4-clause
+# advertising files (measured: zero files match "advertising materials"); an
+# older narrow-char editline would have, which is one reason this port pins the
+# current wide-char release. Compatible with the GPLv2 base (permissive,
+# non-copyleft). This string must equal the components.tsv row exactly or the
+# attribution gate fails.
+licence=BSD-3-Clause
+licence_files=COPYING
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): does this library want to USE a platform
+# layer, or to BE one? It USES. Measured: libedit.a linked against
+# userland/libc + the ncurses termcap + the musl-regex POSIX regex resolves
+# with ZERO unresolved symbols (see build.sh's own check and the consumer app).
+# libedit owns the line-editing model - the edit buffer, the keymaps, the
+# history ring - but never owns main(), the process, or the event loop: the
+# HOST app calls el_gets() itself and decides what to do with the line. Its
+# platform demands are the ordinary libc surface (malloc/free, str/mem, stdio,
+# termios tcgetattr/tcsetattr, ioctl TIOCGWINSZ, open/read/write, sig*, the
+# wide-char C-locale layer) plus the termcap interface, all already present.
+adoption=USES. Measured: libedit.a linked against userland/libc + the ncurses termcap (tgetent/tgetstr) + the musl-regex POSIX regex resolved with zero unresolved symbols. libedit owns the line-editing model (edit buffer, keymaps, history ring) but never owns main(), the process or the event loop: the host app calls el_gets() and owns the input loop. Its only platform demands are the ordinary libc string/mem/stdio/termios/file/signal surface, the wide-char C-locale layer, and a termcap, every one already provided.
+
+# REAL dependency order (docs/MPORTS.md "needs"). libedit needs the termcap
+# interface (ncurses provides tgetent/tgetstr/tgetnum/tgetflag/tgoto even in its
+# --disable-termcap build) and POSIX regex (musl-regex provides regcomp/regexec/
+# regfree; libedit's sys.h hardcodes #define REGEX, so search.c always uses it).
+# musl-regex is listed first so that, when libedit is built on its own in a
+# fresh tree, an objects-port creates ports/out before the ncurses build=script
+# runs. libc is the shared platform library.
+needs=libc musl-regex ncurses
+
+# No pre-configure copies: libedit runs a real ./configure inside build.sh.
+prepare=none
+
+# THE ONE PATCH. src/el.c includes <langinfo.h> unconditionally, but nothing in
+# the tree calls nl_langinfo() or references CODESET (measured: zero hits across
+# all *.c). MayteraOS has one locale (C, byte-transparent) and no <langinfo.h>,
+# so the include is both unsatisfiable and unused. The patch removes exactly
+# that one line. It is load-bearing: el.c defines el_init/el_reset (both in the
+# `symbols` list below), so a patch that stopped applying would fail the build
+# rather than shipping silently. Everything else libedit needed from the
+# platform was ADDED TO THE SHARED LIBC (owner rule 1), not patched into
+# upstream: the wide-char string/conversion layer (wcstombs, mbstowcs, wcrtomb,
+# wctob, wcwidth, wmemcpy, wcsncpy, wcsncat, wcscspn, wcsstr, wcstol, mbsrtowcs),
+# <strings.h> (ffs et al), <sys/ttydefaults.h>, SA_ONSTACK, the S_I* mode bits,
+# the BSD u_* types, and fseeko/ftello/mkstemp/execlp/getpwent. See the #745
+# CHANGELOG entry.
+patches=0001-drop-unused-langinfo-include.patch
+
+# build=script: ports/libedit/build.sh runs configure with our freestanding
+# cross profile (pointing the tgetent/regex/curses.h checks at the built ncurses
+# and musl-regex), builds the static library, and installs it. See that file.
+build=script
+
+# The public header a consumer includes for the native (histedit) API. The
+# readline-compat header editline/readline.h is also installed by build.sh.
+headers=src/histedit.h
+
+# THE PRIMARY LIBRARY.
+lib=libedit.a
+
+# THE ANTI-NO-OP CHECK. Proven with nm to be DEFINED in libedit.a. The spread is
+# deliberate, one from each major translation unit so a wrong configure/generator
+# step cannot pass: lifecycle + configuration (el_init/el_end/el_reset/el_set/
+# el_get/el_source from el.c), the line reader itself (el_gets/el_getc, the
+# narrow wrappers in eln.c over read.c), buffer editing (el_line/el_insertstr
+# from eln.c/chared.c), the history ring (history_init/history_end/history from
+# history.c/historyn.c), the tokenizer (tok_init/tok_str/tok_end), and the
+# readline-compatibility layer (readline/add_history from readline.c).
+symbols=el_init el_end el_reset el_gets el_getc el_line el_set el_get el_source el_insertstr history_init history_end history tok_init tok_str tok_end readline add_history

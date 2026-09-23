@@ -367,15 +367,47 @@ unsigned long ata_drive_sectors(int idx) { return (idx >= 0 && idx < 4) ? (unsig
 const char *ata_drive_model(int idx)  { return (idx >= 0 && idx < 4) ? drives[idx].model : ""; }
 const char *ata_drive_serial(int idx) { return (idx >= 0 && idx < 4) ? drives[idx].serial : ""; }
 
-// #298: issue FLUSH CACHE to every present ATA (non-ATAPI) drive so any data
-// sitting in a drive write cache is committed before power-off. Best-effort and
-// bounded; never blocks forever (ata_wait_bsy has its own timeout).
+// #298/#wallpersist2: issue FLUSH CACHE to every present ATA (non-ATAPI) drive
+// so any data sitting in a drive write cache is committed before power-off.
+// Best-effort and bounded; never blocks forever (ata_wait_bsy has its own
+// timeout, ahci_flush()'s wait_cmd_complete() has its own timeout).
+//
+// #wallpersist2 FIX: this used to unconditionally speak legacy IDE PIO
+// (outb to io_base[channel]) for every drives[idx].exists slot, with no
+// check of disk_slot_is_ahci(). That is correct for a slot the legacy IDE
+// probe actually populated, but on real hardware with an AHCI/SATA
+// controller (every real Mac, and any q35 machine), the disk is enumerated
+// by ahci.c and registered into this same drives[] table via
+// g_ahci_slot_port[idx] (see ata_read_sectors_dma/ata_write_sectors_dma
+// above, which already branch on disk_slot_is_ahci() and route to
+// ahci_read()/ahci_write()). This function alone did not: it kept issuing
+// FLUSH CACHE to legacy ports 0x1F0/0x170 that an AHCI-mode machine never
+// decodes for the disk, so the drive's REAL write cache was never told to
+// commit before acpi_reboot()/acpi_shutdown() reset the box. QEMU/i440fx
+// test VMs use legacy IDE, so this bug was invisible there; the exact
+// drive that showed it was the one this function was named for.
+// ahci_flush() (kernel/drivers/ahci.c) existed and was already correct,
+// it simply had zero callers anywhere in the tree.
+//
+// A per-user settings write (e.g. profile.c's UIPROFIL.YML wallpaper
+// choice) is written write-through to the ext2 block layer well before
+// reboot, so this was never about losing the OS-level write. It is about
+// the PHYSICAL drive's own onboard write cache: without FLUSH CACHE (or
+// FLUSH CACHE EXT for AHCI/SATA), a drive is not required to have that
+// write on nonvolatile media yet, and a reset that disturbs the SATA link
+// (AHCI HBA re-init on next boot, or a real power-cycle) can lose it.
 void ata_flush_all(void) {
     for (int idx = 0; idx < 4; idx++) {
         if (!drives[idx].exists || drives[idx].type == ATA_TYPE_ATAPI) continue;
         uint8_t channel = drives[idx].channel;
         uint8_t drive   = drives[idx].drive;
         if (channel > 1) continue;
+        if (disk_slot_is_ahci(channel, drive)) {
+            int __rc = ahci_flush(g_ahci_slot_port[idx]);
+            kprintf("[ATA] AHCI port %d FLUSH CACHE EXT -> %s\n",
+                    g_ahci_slot_port[idx], __rc == 0 ? "OK" : "FAIL");
+            continue;
+        }
         uint16_t io = io_base[channel];
         outb(io + ATA_REG_DRIVE, drive ? ATA_DRIVE_SLAVE : ATA_DRIVE_MASTER);
         io_wait();

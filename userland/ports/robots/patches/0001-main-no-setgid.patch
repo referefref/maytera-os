@@ -1,0 +1,11 @@
+--- a/main.c
++++ b/main.c
+@@ -68,7 +68,7 @@
+ 		exit(1);
+ 
+ 	/* Revoke setgid privileges */
+-	setregid(getgid(), getgid());
++	/* MAYTERA CHANGE: no setgid privilege to revoke on this OS; call removed. */
+ 
+ 	show_only = FALSE;
+ 	Num_games = 1;

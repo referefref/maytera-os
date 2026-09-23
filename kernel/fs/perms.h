@@ -92,4 +92,11 @@ void perms_set_default(const char *path, uint32_t uid, uint32_t gid, int is_dir)
 // every non-root process for every path it creates, including in its own home.
 void perms_on_create(const char *path, uint32_t uid, uint32_t gid, int is_dir);
 
+// (perms-orphan, no-ticket, wallpaperpersist-followup): does a PERMS.DB entry exist for `path` at all (after the same
+// canonicalization perms_check()/perms_on_create() use)? Read-only. See
+// perms.c for why this differs from perms_get()'s -1-on-no-entry: this is
+// for a caller that must tell "no policy exists yet" apart from "a real
+// entry denies this", which a plain perms_check()/perms_get() failure cannot.
+int perms_has_entry(const char *path);
+
 #endif // PERMS_H

@@ -49,6 +49,17 @@ typedef struct {
 void win16_api_begin(const win16_loader_info_t *info,
                      const win16_import_t *imports, int import_count);
 
+// (#391) Update the dispatcher's cached view of ne.c's import table after a
+// RUNTIME LoadLibrary() applies relocations for a newly loaded companion DLL,
+// which can grow ne.c's import count beyond the snapshot win16_api_begin()
+// took at app-launch time. Without this, a genuinely resolved import created
+// by the new DLL's own relocations is misclassified as unknown by the
+// `off < g_import_count` bounds check in win16_api_dispatch(), which then
+// desyncs the Pascal stack (see win16_api_resync_import_count's definition
+// for the full account). Call after apply_module_relocs(), before running the
+// new module's LibEntry.
+void win16_api_resync_import_count(const win16_import_t *imports, int import_count);
+
 // Far-call trap target installed by ne.c for WIN16_THUNK_SEG. `off` is the
 // import id. Logs every call, dispatches to a handler when known, performs the
 // Pascal far-return with proper argument cleanup, and sets AX/DX. Returns

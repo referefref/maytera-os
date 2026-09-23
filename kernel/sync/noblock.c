@@ -7,6 +7,24 @@
 #include "../fs/panic.h"
 
 extern int kprintf(const char *fmt, ...);
+// #dosmem: THE PERSISTENT SINK, AND WHY IT DOES NOT BREAK THIS FILE'S RULE.
+//
+// The header says, in as many words, "SERIAL ONLY. It must never write to the
+// filesystem: #597 (file-write tracing corrupts ext2), and we may be inside the
+// block layer when we fire." That rule stands and is not relaxed here.
+// bootlog_fault_write() honours it exactly: it takes NO lock, allocates
+// nothing, and touches NO filesystem. It formats on the stack, reserves space
+// in a static 2 KB ring with one lock-free atomic add, and mirrors to
+// kprintf_nolock(). A later SAFE context (the 2 s heartbeat thread) drains that
+// ring to /BOOTLOG.TXT. So the fire site keeps every property this file
+// requires, and the report survives on a machine with no serial port - which is
+// both of the owner's machines, and the reason a week of #426-class findings
+// had to be reconstructed from fragments.
+//
+// Bounded by construction, not by hope: the de-duplication below reports each
+// distinct caller ONCE, at most WQ_NB_SITES_MAX (16) times per boot, plus one
+// table-full line. Seventeen short records is not a write storm.
+#include "../fs/bootlog.h"
 
 volatile uint64_t g_wq_noblock_violations = 0;
 
@@ -63,15 +81,19 @@ static int   g_nb_site_count = 0;
 static int   g_nb_overflow_logged = 0;
 
 // Returns 1 if this caller has not been reported before.
-static int nb_site_is_new(void *caller) {
+// #fmhang: unused when -DWQ_NOBLOCK_PANIC compiles out the reporting #else
+// branch below; keep it (and the globals it references) so make NOBLOCKPANIC=1
+// builds. The task depends on that build to catch a #426 violation as a panic.
+static int __attribute__((unused)) nb_site_is_new(void *caller) {
     for (int i = 0; i < g_nb_site_count; i++) {
         if (g_nb_sites[i] == caller) return 0;
     }
     if (g_nb_site_count >= WQ_NB_SITES_MAX) {
         if (!g_nb_overflow_logged) {
             g_nb_overflow_logged = 1;
-            kprintf("[WQBLOCK] site table full (%d distinct sites); further "
-                    "NEW sites are counted but not printed\n", WQ_NB_SITES_MAX);
+            bootlog_fault_write("[WQBLOCK] site table full (%d distinct sites); "
+                                "further NEW sites are counted but not printed",
+                                WQ_NB_SITES_MAX);
         }
         return 0;
     }
@@ -116,12 +138,12 @@ uint32_t wq_assert_may_block(const char *what, void *caller) {
     // Deliberately NOT fatal: an assertion that bricks a user's boot is an
     // assertion that gets compiled out, and then it protects nobody.
     if (nb_site_is_new(caller)) {
-        kprintf("[WQBLOCK] #426 VIOLATION: %s from a no-block context [%s] "
-                "caller=%p pid=%u '%s' (violation #%lu). "
-                "addr2line -e kernel.elf %p\n",
-                what ? what : "?", reasons, caller,
-                me ? me->pid : 0u, me ? me->name : "(none)",
-                (unsigned long)g_wq_noblock_violations, caller);
+        bootlog_fault_write("[WQBLOCK] #426 VIOLATION: %s from a no-block "
+                            "context [%s] caller=%p pid=%u '%s' (violation "
+                            "#%lu). addr2line -e kernel.elf %p",
+                            what ? what : "?", reasons, caller,
+                            me ? me->pid : 0u, me ? me->name : "(none)",
+                            (unsigned long)g_wq_noblock_violations, caller);
     }
 #endif
     return why;

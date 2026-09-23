@@ -127,12 +127,42 @@ enum {
     CT_ERR_ACCESS  = 3,   // read-only item written, or unreadable item read
     CT_ERR_DENIED  = 4,   // CT_DENIED, or the capability gate refused
     CT_ERR_USAGE   = 5,   // malformed invocation
-    CT_ERR_FAILED  = 6    // the setter/action ran and reported failure
+    CT_ERR_FAILED  = 6,   // the setter/action ran and reported failure
+    // ---- live-instance delivery (tier 2 wire) outcomes -------------------
+    CT_LIVE_NONE    = 7,  // no running instance of the app is listening
+    CT_LIVE_TIMEOUT = 8   // a live instance exists but did not answer in time
 };
 
 #define CT_NAME_MAX  64
 #define CT_DESC_MAX  128
 #define CT_OPTS_MAX  192
+
+// ---- capability binding (tier 2, docs/AI_ACTION_CAPABILITY_BINDING.md 3.3) --
+//
+// The kernel-capability an action's IMPLEMENTATION actually reaches, declared
+// on the row so the tier-2 union (3.4) is machine-readable and so a lint can
+// fail the build on a declared-but-unreached capability (#235 fictional-token
+// re-armed). This is NOT the same field as ct_item.cap: `cap` is the aicap id
+// that bounds what the AI may do THROUGH the contract API (the in-process
+// gate); `needs` is the KERNEL capability the app's own code calls a gated
+// syscall for (the real teeth, 4.4). A cooperative EDIT action (add_text,
+// invert) that the app performs through its own primitives needs NO system
+// capability, so its `needs` list is empty - that emptiness is section 0.1
+// made machine-readable. A PERCEIVE action (screen_check) needs
+// `screen.capture`, and THAT is where the kernel gate bites.
+//
+// scope_tmpl is a TEMPLATE the caller/kernel resolves at grant time from a
+// source the app does not freely control, never a literal the manifest picked:
+//   "self"       -> the app's own window
+//   "doc"        -> the app's current-document path
+//   "arg:<name>" -> a path taken from the action's own named argument
+// All-zero (needs == NULL) means "needs nothing", which every pre-tier-2 row
+// already is, so the field is backward compatible.
+typedef struct ct_cap_need {
+    unsigned char cap;         // kernel CAP_* class (kernel/proc/caps.h), or 0
+    unsigned char scope_kind;  // kernel CAP_SCOPE_* kind, or 0
+    const char   *scope_tmpl;  // "self" / "doc" / "arg:<name>", or 0
+} ct_cap_need_t;
 
 // One row. EXACTLY ONE of {var, getfn/setfn, actfn, getstrfn} backs it.
 //
@@ -164,6 +194,10 @@ typedef struct ct_item {
     const void   *ctx;
     const char   *cap;       // aicap capability id; REQUIRED when risk==CT_GUARDED
     const char   *desc;      // one line, >= 12 chars (contract-lint enforces)
+    // tier 2: the kernel capability the action's own code reaches, 0-terminated
+    // by {cap==0}. NULL means "needs nothing" (every pre-tier-2 row). See
+    // ct_cap_need_t above and docs/AI_ACTION_CAPABILITY_BINDING.md 3.3/3.4.
+    const ct_cap_need_t *needs;
 } ct_item_t;
 
 typedef struct ct_contract {
@@ -210,6 +244,39 @@ int  contract_put(const ct_item_t *it, int v);
 // DERIVED, so adding a row cannot leave a hand-written hash behind - the
 // exact fault #231 removed from the widget serializer.
 int  contract_hash(const ct_contract_t *c);
+
+// ---- derived per-app persistence (#239) --------------------------------
+//
+// Write / read every cfgkey row as one "<key>=<int>" line in the per-user
+// preference file <home>/CONFIG/<name>, through libc/userconf.c - the ONE
+// place that knows where a per-user preference lives.
+//
+// DERIVED FROM THE TABLE, for the same reason contract_hash() is: a row that
+// gains a cfgkey is persisted and restored in the same commit, with no second
+// key list to update. That is the fault #231 removed from the widget
+// serializer (a hand-maintained hash had silently stopped watching three
+// settings) and the fault #230 removed from the preference readers.
+//
+// This lives in libc rather than in an app because #239 wired THREE apps at
+// once (timers, convert, snapshot) and each of them needed exactly this. Three
+// private copies of "save my preferences" is how the four disagreeing
+// descriptions of the Settings surface came to exist in the first place.
+//
+// contract_load_cfg() RANGE-CHECKS every value against the row's own declared
+// lo/hi before writing it, because a config file is INPUT: convert's unit
+// indices address a per-category table of 3 to 8 entries, and an unchecked 7
+// read from a corrupt file would index a 3-entry table. Rows are applied in
+// TABLE ORDER, so a row whose range depends on an earlier row (convert's
+// from_unit depends on category) must appear after it.
+//
+// Rows that have no integer backing store (CT_STR, CT_ACTION) are skipped;
+// give them cfgkey 0.
+//
+// Returns 0 on success, -1 on failure. A failed save means the file on disk is
+// NOT known to hold the values.
+int  contract_save_cfg(const ct_contract_t *c, const char *name);
+int  contract_load_cfg(const ct_contract_t *c, const char *name,
+                       const char *legacy);
 
 // ---- the invoke path ---------------------------------------------------
 
@@ -273,5 +340,48 @@ int  contract_invoke(const char *app, int argc, char **argv, char *out, int ocap
 // and any diagnostic report the same answer the call path actually uses,
 // rather than recomputing the convention.
 void contract_app_path(const char *app, char *out, int ocap);
+
+// ---- the LIVE-INSTANCE call path (tier 2 wire, #<config-ref>) -------------
+//
+// docs/AI_ACTION_CAPABILITY_BINDING.md section 4.2. contract_invoke() above
+// SPAWNS a fresh process, which exits before drawing a window and so can only
+// touch a stateless copy of the app (CONTRACT_API.md section 3). The live path
+// delivers the SAME contract verb to an app instance ALREADY running with a
+// window, which runs the action's actfn against its live document and returns
+// the SAME machine-readable line contract_cli() would. It reuses the SAME
+// contract engine (contract_run_verb) and therefore the SAME gate and audit -
+// no drift, no second policy. Transport is a per-app request/reply mailbox in
+// the caller's home; see ctlive.c for the honest ceiling (it is the same
+// #679 uid-0 ceiling the whole contract API already states) and the seam to a
+// kernel-gated per-window mailbox syscall pair.
+//
+// contract_run_verb: run ONE already-parsed verb against a contract, writing
+// the same lines contract_cli() writes to whatever sink is active (fd 1, or a
+// capture buffer set by contract_capture_begin). argv[0] is the item NAME for
+// get/set/call; for probe/list/describe argc may be 0. Returns a CT_* code.
+int  contract_run_verb(const ct_contract_t *c, const char *verb,
+                       int argc, char **argv);
+
+// Redirect contract_cli/contract_run_verb output into buf until
+// contract_capture_end(). Not re-entrant (one capture at a time), which the
+// single-threaded event-loop serve path guarantees.
+void contract_capture_begin(char *buf, int cap);
+int  contract_capture_end(void);   // returns bytes captured
+
+// contract_live_poll: an app that opts into live delivery calls this ONCE per
+// event-loop tick (after win_get_event, on the timeout path too). It checks
+// the app's mailbox for a pending request keyed to c->app, and if one is
+// present dispatches it through contract_run_verb against LIVE state, writes
+// the reply, and returns 1 (so the caller can repaint). Returns 0 when there
+// was nothing to serve. Non-blocking; never spins.
+int  contract_live_poll(const ct_contract_t *c);
+
+// contract_invoke_live: the CLIENT half. Deliver `argv` (a verb and its args,
+// WITHOUT a leading "--contract") to a RUNNING instance of `app` and capture
+// its reply into out[]. Returns the app's CT_* reply code, or CT_LIVE_NONE if
+// no live instance is listening (the caller may then fall back to
+// contract_invoke()), or CT_LIVE_TIMEOUT if one exists but did not answer.
+int  contract_invoke_live(const char *app, int argc, char **argv,
+                          char *out, int ocap);
 
 #endif // _MAYTERA_CONTRACT_H

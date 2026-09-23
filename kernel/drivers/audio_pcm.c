@@ -43,7 +43,7 @@
 // producers into one hardware stream is called MIXING, and refusing the second
 // opener does not avoid the work, it moves the failure onto the user.
 //
-// MEASURED, on the owner's ASUS i7-4720HQ (build 2219, <workspace>
+// MEASURED, on the owner's ASUS i7-4720HQ (build 2219, /root/asus-logs-run3/
 // BOOTLOG.TXT): /APPS/FMSYNTH held the single stream from the first DOS game of
 // the session, and /APPS/MIDIPLAY's Play button was answered with EBUSY. The
 // refusal line said in as many words "Nothing else on this machine can play
@@ -711,12 +711,22 @@ static void pcm_mixer_worker(void *arg) {
                        g_eq_selftest ? "<<<< FAIL: the EQ does not filter as "
                                        "specified on this build"
                                      : "PASS");
+        // #imacnic: SPLIT IN TWO, and not for tidiness. As one call this was
+        // 269 characters against AUDIOLOG_LINE_MAX (256), so the shipped
+        // /AUDIOLOG.TXT lost the last 14 bytes and ended mid-word at "is
+        // reach~CUT 14~". That single cut is the entire content of the
+        // "1 line(s) TRUNCATED, 14 byte(s) lost" verdict that /BOOTLOG.TXT has
+        // been reporting on the owner's iMac (measured on the golden-2346 and
+        // 2026-08-30 log sets), and because the truncation counters are shared
+        // across all four sinks while the audit line lives in /BOOTLOG.TXT, it
+        // sent every reader looking for a ~CUT stamp in a file that does not
+        // contain one. Two lines that fit are worth more than one that does not.
         audiolog_write("[EQ] measured response, tenths of a dB. Row = the band "
-                       "boosted to +12.0 dB, column = probe frequency. The two "
-                       "END bands are SHELVES, whose corner frequency is by "
-                       "definition the HALF-gain point, so +60 on their "
-                       "diagonal is correct and +120 is reached out on the "
-                       "plateau.");
+                       "boosted to +12.0 dB, column = probe frequency.");
+        audiolog_write("[EQ] the two END bands are SHELVES, whose corner "
+                       "frequency is by definition the HALF-gain point, so +60 "
+                       "on their diagonal is correct and +120 is reached out on "
+                       "the plateau.");
         audiolog_write("[EQ]            60Hz   250Hz    1kHz    4kHz   12kHz");
         for (int r = 0; r < 5; r++) {
             audiolog_write("[EQ]  +%5d Hz %6d  %6d  %6d  %6d  %6d",

@@ -1,0 +1,66 @@
+# mports recipe: robots, from the bsd-games 2.17 collection (tuigames batch,
+# owner request 2026-09-18). BSD-3-Clause, dependency closure 1 (ncurses).
+# Shares the bsdgames_2.17.orig.tar.gz tarball with hangman/worm/snake/
+# bsdtetris; see userland/ports/hangman/PORT for the tarball provenance note.
+#
+# WHAT THIS PORT SHIPS. The classic BSD "robots" game: dodge killer robots
+# that home in on you and destroy each other on collision, with an
+# auto-play mode. 11 translation units (main/auto/extern/flush_in/
+# init_field/make_level/move/move_robs/play_level/query/rnd_pos/score),
+# curses-driven.
+#
+# SCOREFILE HONESTY. score.c opens _PATH_SCORE with O_RDWR (no O_CREAT) and
+# treats a failure as non-fatal (score_err is recorded, not fatal-exited;
+# score.c:224-225 warn()s and continues) - upstream's own design, not a
+# MayteraOS patch. This port therefore ships working gameplay with
+# best-effort high scores: if /HOME/.robots.scores does not exist yet, the
+# game still plays and simply never persists a score, exactly as upstream
+# behaves on a read-only or missing scores directory.
+
+name=robots
+version=2.17
+class=C
+homepage=https://tracker.debian.org/pkg/bsdgames
+
+source_url=https://snapshot.debian.org/file/8e48a9808908e2898126fdd285196ab71c9a59c0
+tarball=bsdgames_2.17.orig.tar.gz
+sha256=066f924aef6c1c5ea946f588e36f303021f5dfc093944738f025d8edbc6fff60
+srcdir=bsd-games-2.17/robots
+
+licence=BSD-3-Clause
+licence_files=../COPYING
+copyleft=none
+copyleft_note=BSD-3-Clause is permissive; the combined /APPS/ROBOTS binary (this port + ncurses + userland/libc, all permissive) carries no copyleft obligation.
+
+# THE ADOPTION TEST (owner rule 2): USES. All 11 translation units are
+# ordinary Ring-3 code driven by ncurses screen/input plus libc file I/O.
+# Measured: the 12 objects (11 upstream + our bsdgame_compat.c) link against
+# libncurses.a + userland/libc/libc.a with zero undefined symbols. It calls
+# getch() itself (move.c get_move()) and owns its own game state; it
+# imposes no event loop or window system on anything else.
+adoption=USES. Measured: the 12 compiled objects (11 upstream translation units plus our bsdgame_compat.c) link against the built libncurses.a + userland/libc/libc.a with zero undefined symbols. robots owns its own game state and calls getch() itself from get_move() in move.c; it imposes no event loop or window system on any other program.
+needs=libc ncurses
+
+prepare=none
+
+# ONE PATCH: main.c drops the setgid-revocation call, same reasoning as the
+# hangman and worm ports in this batch (no such privilege separation exists
+# on MayteraOS).
+patches=0001-main-no-setgid.patch
+
+# build=script: adds our own bsdgame_compat.c (err/warn - robots does not
+# call random()/srandom(), only rnd_pos.c's own rnd() wrapping rand()), and
+# writes pathnames.h (upstream ships only pathnames.h.in; see build.sh).
+build=script
+
+headers=none
+lib=librobots.a
+
+# THE ANTI-NO-OP CHECK. One symbol per upstream translation unit (11 files)
+# plus our own err, so a build that compiled the wrong source list, or lost
+# a file to a bad patch, cannot define them all: main.c (main), auto.c
+# (automove), extern.c is header-only (no .c symbol of its own - not
+# checked), flush_in.c (flush_in), init_field.c (init_field), make_level.c
+# (make_level), move.c (get_move), move_robs.c (move_robots), play_level.c
+# (play_level), query.c (query), rnd_pos.c (rnd_pos), score.c (show_score).
+symbols=main automove flush_in init_field make_level get_move move_robots play_level query rnd_pos show_score err

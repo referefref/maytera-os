@@ -247,6 +247,9 @@ static const theme_int_field_t g_theme_int_fields[] = {
     /* TM_TYPE_DISPLAY_W          */ { "type.display_weight", offsetof(theme_t, t_display_w), TM_ENUM },
     /* TM_TITLE_INSET             */ { "metric.title_inset", offsetof(theme_t, m_title_inset), TM_PX },
     /* TM_RADIUS_WINDOW           */ { "radius.window", offsetof(theme_t, r_window), TM_PX },
+    // #osglass: a plain 0-255 opacity byte, NOT a pixel count - TM_ENUM so it
+    // is never run through ui_px()'s scale multiply (see theme_get_metric_by_id).
+    /* TM_WINDOW_OPACITY          */ { "metric.window_opacity", offsetof(theme_t, m_window_opacity), TM_ENUM },
 };
 #define THEME_INT_COUNT (sizeof(g_theme_int_fields) / sizeof(g_theme_int_fields[0]))
 _Static_assert(THEME_INT_COUNT == (size_t)TM_COUNT,
@@ -389,6 +392,14 @@ static void theme_fill_v2_defaults(theme_t *t, const uint8_t *seen_c, const uint
     // Every shipped theme also states radius.window explicitly, so this
     // default only ever applies to a hand-written or App Store theme file.
     DEF_I(r_window, TM_RADIUS_WINDOW, retro ? 0 : 4);
+    // #osglass: OS-wide window glass opacity (0-255). retro-style themes
+    // (retro_unix, Classic, High Contrast) stay fully opaque - a 1990s CDE/
+    // Motif look has no glass. Every other shipped theme gets a SUBTLE 215
+    // (~84%) default: enough to be a real, visible, theme-driven effect on
+    // both the window body and titlebar without becoming the "heavy bespoke
+    // glass" look the owner explicitly rejected elsewhere. A theme file that
+    // states metric.window_opacity explicitly always wins over this default.
+    DEF_I(m_window_opacity, TM_WINDOW_OPACITY, retro ? 255 : 215);
     DEF_I(d_style, TM_DECOR_STYLE, retro ? TDECOR_BEVELED : TDECOR_GRADIENT);
     // Pre-#711 this decision was a case-insensitive substring match on the
     // theme NAME ("classic"/"retro"/"cde"/"motif") in window.c. The default
@@ -1071,6 +1082,19 @@ void theme_set(int theme_id) {
 
         // Notify font system of theme change
         theme_notify_font_system();
+
+        // #osglass (2026-09-16): push this theme's OS-wide glass opacity as
+        // the new default. wm_set_default_opacity() (kernel/gui/window.c)
+        // only touches windows WITHOUT an explicit per-window override (see
+        // window_t::opacity_override), so a window the user has deliberately
+        // set to its own opacity via the titlebar decorator popup survives a
+        // theme switch unchanged - only the OS-wide default moves. This is
+        // what makes the opacity value "come from the theme setting" rather
+        // than from whichever app or slider last called SYS_SET_WIN_OPACITY.
+        {
+            extern void wm_set_theme_default_opacity(int opacity);
+            wm_set_theme_default_opacity(theme_get_metric_by_id(theme_id, TM_WINDOW_OPACITY));
+        }
     } else {
         kprintf("[Themes] Invalid theme ID: %d\n", theme_id);
     }

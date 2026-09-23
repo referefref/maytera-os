@@ -21,6 +21,7 @@
 
 #include "../types.h"
 #include "../gui/installer.h"
+#include "../fs/blkmgr.h"      // #404 disk-mgr: blk_dev_t/part_spec_t/part_token_t
 #include "cron.h"
 #include "process.h"
 #include "procinfo.h"
@@ -55,7 +56,7 @@ _Static_assert(sizeof(drag_info_t) == 104,
                "#503 argtab: SZ_DRAG_INFO in rustkern/argtab.rs is stale. "
                "drag_info_t is duplicated in userland/libc/syscall.h and "
                "mirrored by DragInfo in rustkern/dragsess.rs; update all four.");
-_Static_assert(sizeof(wm_window_info_t) == 136,   /* #44: + int maximized (#41: + char app_id[32]) */
+_Static_assert(sizeof(wm_window_info_t) == 140,   /* #opacityglass: + int opacity (#44: + int maximized; #41: + char app_id[32]) */
                "#503 argtab: SZ_WM_WINDOW_INFO in rustkern.rs is stale");
 _Static_assert(sizeof(cron_job_t) == 128,
                "#503 argtab: SZ_CRON_JOB in rustkern.rs is stale");
@@ -185,6 +186,15 @@ _Static_assert(sizeof(dimg_vol_t) == 288,
 // claim and needs its own check.
 _Static_assert(sizeof(inst_target_t) == 16,
                "#306 argtab: SZ_INST_TARGET must match sizeof(inst_target_t)");
+// #404 disk-mgr: SZ_BLK_DEV / SZ_PART_SPEC / SZ_PART_TOKEN in rustkern/argtab.rs.
+_Static_assert(sizeof(blk_dev_t) == 56,
+               "#404 argtab: SZ_BLK_DEV must match sizeof(blk_dev_t)");
+_Static_assert(sizeof(part_spec_t) == 72,
+               "#404 argtab: SZ_PART_SPEC must match sizeof(part_spec_t)");
+_Static_assert(sizeof(part_token_t) == 40,
+               "#404 argtab: SZ_PART_TOKEN must match sizeof(part_token_t)");
+_Static_assert(sizeof(mount_ent_t) == 72,
+               "#404 argtab: SZ_MOUNT_ENT must match sizeof(mount_ent_t)");
 
 // #745: the sign-in screen mode is a WIRE VALUE. It crosses two boundaries -
 // C to Rust (rustkern/loginmode.rs LOGIN_MODE_LIST/TYPED) and Ring 0 to Ring 3
@@ -209,3 +219,30 @@ _Static_assert(sizeof(elev_request_t) == 160,
                "#745 argtab: SZ_ELEV_REQUEST in rustkern/argtab.rs is stale");
 _Static_assert(sizeof(elev_view_t) == 296,
                "#745 argtab: SZ_ELEV_VIEW in rustkern/argtab.rs is stale");
+
+#include "caps.h"   // Stage 1 capability API
+
+// Stage 1: the capability structs cross Ring 0 <-> Ring 3 and the argument
+// validator proves exactly SZ_CAP_* bytes. cap_grant_t is not an ABI struct but
+// its size is locked to CapGrant in rustkern/caps.rs (a drift silently
+// mis-lays-out a security field on process_t). If any of these grow and
+// rustkern (argtab.rs SZ_CAP_* or caps.rs) does not, FAIL THE BUILD.
+_Static_assert(sizeof(cap_grant_t) == 96,
+               "caps: CapGrant in rustkern/caps.rs is stale (process_t grant slot)");
+_Static_assert(sizeof(cap_state_t) == 96,
+               "caps argtab: SZ_CAP_STATE in rustkern/argtab.rs is stale");
+_Static_assert(sizeof(cap_req_t) == 200,
+               "caps argtab: SZ_CAP_REQ in rustkern/argtab.rs is stale");
+_Static_assert(sizeof(cap_view_t) == 288,
+               "caps argtab: SZ_CAP_VIEW in rustkern/argtab.rs is stale");
+_Static_assert(sizeof(cap_approve_info_t) == 88,
+               "caps: CapApproveInfo in rustkern/caps.rs is stale");
+
+#include "../drivers/serialport.h"   // Stage 2 serial.port mediated gateway
+
+// Stage 2: serial_pub_t crosses the SYS_SERIAL_LIST boundary and the validator
+// proves SZ_SERIAL_PUB * min(argN, cap) writable bytes. If the struct grows and
+// rustkern/argtab.rs SZ_SERIAL_PUB does not, the validator would prove fewer
+// bytes than the handler writes and the tail of each row would go unchecked.
+_Static_assert(sizeof(serial_pub_t) == 24,
+               "Stage 2 argtab: SZ_SERIAL_PUB in rustkern/argtab.rs is stale");

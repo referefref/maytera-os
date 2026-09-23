@@ -25,6 +25,8 @@ pid_t fork(void);
 int   execve(const char *path, char *const argv[], char *const envp[]);
 int   execv(const char *path, char *const argv[]);
 int   execvp(const char *file, char *const argv[]);
+int   execlp(const char *file, const char *arg0, ...);  // added for libedit (#745)
+int   issetugid(void);  // added for libedit (#745)
 void  _exit(int status) __attribute__((noreturn));
 
 // read/write/close come from stdlib.h (historical); lseek is new.
@@ -41,6 +43,8 @@ int     dup(int fd);
 int     dup2(int oldfd, int newfd);
 int     pipe(int fds[2]);
 int     chdir(const char *path);
+int     chroot(const char *path);   // #745: no chroot on MayteraOS; stub -1/ENOSYS
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);  // #745
 char   *getcwd(char *buf, size_t size);
 int     isatty(int fd);
 int     unlink(const char *path);

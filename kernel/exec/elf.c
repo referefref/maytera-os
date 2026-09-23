@@ -398,7 +398,7 @@ typedef struct {
 // the target CR3, store, restore CR3, popfq. Writing CR3 flushes the entire
 // TLB, so that is TWO FULL TLB FLUSHES PER RELOCATION.
 //
-// MEASURED (VM <vmid>, golden 998, kernel-only replacement): a PIE HEAPTEST with
+// MEASURED (VM2641, golden 998, kernel-only replacement): a PIE HEAPTEST with
 // 743 relocations spent ~6.6M cycles in the relocation phase against ~2.1M for
 // the same app built fixed-base with zero relocations, i.e. ~6,100 cycles to
 // write eight bytes, 1,486 TLB flushes for one 53KB utility. The #633
@@ -2044,7 +2044,7 @@ static uint32_t elf_build_wellformed(uint8_t *buf, uint32_t cap, uint32_t *seed)
 // killed the kernel, loads each into a THROWAWAY user address space through the
 // live elf_load_user(), and asserts the verdict.
 //
-// PROVING IT CAN FAIL (both halves of the fix, MEASURED 2026-08-03 on VM <vmid>
+// PROVING IT CAN FAIL (both halves of the fix, MEASURED 2026-08-03 on VM2633
 // booting golden 998 with only the kernel replaced):
 //
 //   -DELF633_UNSAFE     removes the pre-flight AND the writable mapping. Vector
@@ -2125,11 +2125,17 @@ static void elf_load_user_selftest(void) {
                                     320ULL*1024*1024, ET_EXEC, ELF_ERR_BAD_LOAD_ADDR, 0 },
         // F (#640 stage 2): a PIE declares base 0 and MUST land in the dedicated
         // userland window, NOT at the old 0x90000000 (which is the iMac's live
-        // framebuffer address). want_base is checked, because "it loaded" and
-        // "it loaded where we intended" are different claims and only the
-        // second one retires the #522/#650 hazard.
+        // framebuffer address). The landing base is checked below, because "it
+        // loaded" and "it loaded where we intended" are different claims and
+        // only the second one retires the #522/#650 hazard. The base is NOT a
+        // fixed value: #646 wired ASLR (#640 stage 3) into the PIE relocation,
+        // so the kernel places the image at a randomised 2MB-aligned slot inside
+        // the window. want_base is therefore 0 (no single expected address) and
+        // the ET_DYN arm of the verdict below asserts the window+alignment
+        // invariant instead. Before #646 this landed at exactly
+        // USER_WIN_IMAGE_BASE and an exact compare was correct; it no longer is.
         { "pie-lands-in-user-window", 0,           0x100, PF_R|PF_W|PF_X, 0,
-                                    ET_DYN,  ELF_SUCCESS, USER_WIN_IMAGE_BASE },
+                                    ET_DYN,  ELF_SUCCESS, 0 },
         // G: a PIE whose span would run past the end of the window.
         { "pie-absurd-span",          0,           0x100, PF_R|PF_W|PF_X,
                                     320ULL*1024*1024, ET_DYN, ELF_ERR_BAD_LOAD_ADDR, 0 },
@@ -2149,6 +2155,22 @@ static void elf_load_user_selftest(void) {
         if (rc != v[i].want) {
             kprintf("[ELF633] vector %s: got %d (%s), want %d\n",
                     v[i].name, rc, elf_strerror(rc), v[i].want);
+        } else if (v[i].want == ELF_SUCCESS && v[i].etype == ET_DYN) {
+            // #646: a PIE base is ASLR-randomised into 2MB slots within the
+            // userland window, so it has no single expected address. The
+            // genuine assertion (#640 stage 2) is that a PIE declaring base 0
+            // lands INSIDE the dedicated window [USER_WIN_IMAGE_BASE,
+            // USER_WIN_HEAP_BASE) and 2MB-aligned, never at the legacy
+            // 0x90000000 framebuffer address. Assert that, not an exact base
+            // that only held before ASLR was wired.
+            if (lb < USER_WIN_IMAGE_BASE || lb >= USER_WIN_HEAP_BASE ||
+                ((lb - USER_WIN_IMAGE_BASE) % 0x200000ULL) != 0) {
+                kprintf("[ELF633] vector %s: PIE landed at 0x%llX, outside the "
+                        "ASLR window [0x%llX,0x%llX) or not 2MB-aligned\n",
+                        v[i].name, lb, USER_WIN_IMAGE_BASE, USER_WIN_HEAP_BASE);
+            } else {
+                pass++;
+            }
         } else if (v[i].want == ELF_SUCCESS && v[i].want_base && lb != v[i].want_base) {
             kprintf("[ELF633] vector %s: loaded at 0x%llX, expected base 0x%llX\n",
                     v[i].name, lb, v[i].want_base);

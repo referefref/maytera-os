@@ -176,6 +176,19 @@ int swap_init(const char *swap_path, uint64_t size_bytes);
 struct process;
 int mm_fault(struct process *p, uint64_t fault_addr, uint64_t error_code);
 
+// #dosmem: say WHY the fault above could not be resolved. Call ONLY on the
+// unresolved path, from the #PF handler, on the same CPU that took the fault:
+// the reason lives in a per-CPU slot written by mm_fault() a few calls
+// earlier. Emits through bootlog_fault_write(), so it reaches /BOOTLOG.TXT on
+// a machine with no serial port, which is the only kind the owner has.
+void mm_fault_report(struct process *p, uint64_t cr2, uint64_t err);
+
+// #dosmem: how many spurious page faults have been swallowed since boot (the
+// CPU reported not-present on a PTE that was present and permitted the access).
+// Non-zero is NORMAL on SMP hardware; it is exported so the mechanism can be
+// SEEN to fire rather than assumed to.
+uint64_t mm_spurious_faults(void);
+
 // #510/#511: proactively resolve every page in [addr, addr+len) for process
 // `p` through the SAME resolver mm_fault() uses, before a Ring-0 syscall
 // handler memcpy()s real data into that user destination range. Fixes the

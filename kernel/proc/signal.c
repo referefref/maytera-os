@@ -451,8 +451,8 @@ int64_t sys_kill(int pid, int signo) {
     if ((signo == SIGKILL || signo == SIGTERM) &&
         tgt->privilege != PRIV_USER &&
         (strcmp(tgt->name, "dos") == 0 || strcmp(tgt->name, "dosrun") == 0)) {
-        extern void dos_request_close(void);
-        dos_request_close();
+        extern void dos_request_close_pid(uint32_t);
+        dos_request_close_pid(tgt->pid);
         kprintf("[dos] sig %d on Ring-0 worker pid %u '%s': SIGKILL cannot "
                 "reach it (#compkill), also sent dos_request_close()\n",
                 signo, (unsigned)tgt->pid, tgt->name);

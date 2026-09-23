@@ -229,6 +229,27 @@ void     gui_rounded_border(int handle, int x, int y, int w, int h, int r, uint3
 // white), and the hover cue is the hue change, which a luminance-only metric
 // cannot score and this one does not pretend to.
 #define GUI_HOVER_MIN      110
+// (widgetglass) A DISABLED control is bounded from ABOVE, not below. The
+// floors above say how far a live control must stand out; a disabled one has
+// to do the opposite and sit close to the surface it is on, and "close" was a
+// FIXED mix (150/255 toward p->surface) that means a different thing on every
+// palette because WCAG contrast is not linear in the mix: MEASURED with the
+// same maths as gui.c over the 14 shipped themes plus the glass palette, the
+// disabled PRIMARY fill landed anywhere from 1.24:1 (dark) through 1.56:1
+// (retro_unix) to 2.90:1 on the glass panel (a bright mint accent, 0x6AE2CF,
+// mixed 59% toward a near-black 0x122420 still has most of its luminance) and
+// 3.62:1 on high_contrast, i.e. above the floor a LIVE boundary needs. That is
+// the "disabled Empty Bin still reads teal" report (filesglass/calcglass). The
+// disabled outline was worse: it was never faded at all, 7.24:1 on glass.
+// GUI_DISABLED_MAX_FILL is the ceiling the disabled fill is walked down to
+// against the surface it sits on (1.50:1 is the value the libc default
+// palette and maytera_dark already produced, and one 8/255 step under
+// retro_unix's 1.56, so the classic anchor moves by at most one step), and
+// GUI_DISABLED_MAX_EDGE the ceiling for its outline (an outline at ~1.5-2:1
+// still shows the control's extent without claiming it is pressable; the
+// enabled outline clears 3:1 by construction, see gui_set_palette()).
+#define GUI_DISABLED_MAX_FILL  150
+#define GUI_DISABLED_MAX_EDGE  200
 uint32_t gui_luma_wcag(uint32_t rgb);
 int      gui_contrast_x100(uint32_t a, uint32_t b);
 // Return `fg` unchanged if it already clears `min_x100` against `bg`; else the
@@ -240,6 +261,20 @@ uint32_t gui_ensure_contrast(uint32_t fg, uint32_t bg, int min_x100);
 // ring can land on `surface` or on a card's `surface_raised`). Best-effort if
 // the two backgrounds are so far apart that no colour can satisfy both.
 uint32_t gui_ensure_contrast2(uint32_t fg, uint32_t bg1, uint32_t bg2, int min_x100);
+// (widgetglass) The mirror of gui_ensure_contrast(): return `fg` unchanged if
+// it already sits at or under `max_x100` against `bg`, else walk it TOWARD bg
+// in the same 8/255 steps until it does. Terminates at bg itself (1.00:1).
+uint32_t gui_limit_contrast(uint32_t fg, uint32_t bg, int max_x100);
+// (widgetglass) A hover/pressed shade of `base` that is guaranteed to READ as
+// a change: `base` walked toward white (prefer_lighter) or black until it
+// clears GUI_HOVER_MIN against base itself; if that direction saturates first
+// (lightening a white fill, darkening a black one) the other direction is
+// used, because a shade step nobody can see is not a state. MEASURED before
+// this existed: gui_button()'s hover (lighten 18) was 1.00-1.04:1 on every
+// light theme and its pressed shade (darken 18) 1.03-1.08:1 on every dark one,
+// including the glass palette, so half the tree's buttons gave no pointer
+// feedback in one theme family or the other.
+uint32_t gui_state_shade(uint32_t base, int prefer_lighter);
 // (#117) Two-tone bevel pair (shadow/highlight) for a sunken or raised edge:
 // walks `base` independently toward black and white until each side clears
 // GUI_AIM_NONTEXT against `base` itself, so a bevel's two sides land on
@@ -263,6 +298,63 @@ void     gui_fill_circle_aa(int handle, int x, int y, int d, uint32_t color, uin
 // star shape for its own rating UI).
 void     gui_fill_star_aa(int handle, int x, int y, int d, int fill_pct,
                           uint32_t fill_color, uint32_t empty_color, uint32_t bg);
+
+// --- (glasslib) Shared frosted-wallpaper glass backdrop --------------------
+// Consolidates the recipe that was copy-pasted verbatim into four apps
+// (Task Manager, Calculator, Media Player, Image Viewer - see blame.md
+// tmglass/calcglass/audglass/imgglass): decode the current wallpaper's
+// /WPTHUMB thumbnail at its NATIVE size (SYS_DECODE_IMAGE only ever
+// downscales into its target box, see syscall.h decode_image - a 100x62
+// thumbnail asked for at 240x150 comes back 100x62, which is why an earlier,
+// unrelated caller of this same recipe (App Repo) has been showing its
+// gradient fallback since it shipped), point-sample it UP to a fixed
+// GUI_GLASS_BD_W x GUI_GLASS_BD_H working size, box-blur (3 passes, r=2) and
+// tint toward a caller-supplied colour, then SYS_WIN_BLIT scales it to the
+// window's content rect. Any failure (a gradient desktop, no thumbnail, a
+// file too large to decode, a decode wider than the plane) leaves a vertical
+// gradient between two caller-supplied stops, so a window never comes up on
+// a blank surface. Integer arithmetic only.
+// (docs/UI_GLASS_DESIGN_SYSTEM.md sections 1, 10, 11.)
+//
+// The caller owns exactly two persistent objects, sized/typed to match:
+//   uint32_t bd[GUI_GLASS_BD_W * GUI_GLASS_BD_H];   // the finished backdrop
+//   int      bd_wi = GUI_GLASS_BD_NEVER;             // wallpaper index it was built for
+// The raw thumbnail bytes and the box-blur scratch plane are owned by gui.c,
+// not the caller: an app is single-threaded and only ever builds one
+// backdrop at a time, so there is nothing to gain from four private copies
+// of a combined ~400 KB of scratch, and it keeps the caller's own struct
+// small (no repeat of the #745 GuiPalette size-lock lesson: fewer shared
+// layouts crossing the C/Rust FFI boundary means fewer of them to keep in
+// sync).
+#define GUI_GLASS_BD_W     240
+#define GUI_GLASS_BD_H     150
+#define GUI_GLASS_BD_NEVER (-2)   // bd_wi sentinel meaning "never built"
+
+// Rebuild *bd for wallpaper index SYS_GET_WALLPAPER reports right now, IF
+// that differs from *wi_state (which is then updated to match). Returns 1
+// if it rebuilt - the caller MUST then mark its own chrome dirty so the next
+// frame's gui_glass_backdrop_blit() picks up the new pixels - or 0 if the
+// wallpaper had not changed and *bd is untouched. tint_color/tint_amt are
+// gui_mix()'s b/t for the final tint pass (all four current callers use
+// WEL_BG_MID / 158); grad_top/grad_bottom are the gradient fallback's two
+// stops (all four use WEL_BG_TOP / WEL_BG_BOTTOM). Always sets *wi_state and
+// returns 1 whether or not a real thumbnail decoded, matching the pre-
+// consolidation apps: a failed decode still commits to the gradient rather
+// than leaving stale pixels from the previous wallpaper.
+int      gui_glass_backdrop_sync(uint32_t *bd, int *wi_state, uint32_t tint_color,
+                                 int tint_amt, uint32_t grad_top, uint32_t grad_bottom);
+// The chrome's self-committing call (glass doc section 11): SYS_WIN_BLIT the
+// backdrop into `handle`'s content, scaled to its content rect (x/y are
+// ignored by the kernel). If anything else in the frame is also a self-
+// committing blit, call this one LAST so nothing overwrites it afterward.
+void     gui_glass_backdrop_blit(int handle, const uint32_t *bd);
+// The backdrop colour under content-space pixel (x, y) of a win_w x win_h
+// window: what the kernel's nearest-neighbour scale put there, to within the
+// blur. Every AA edge/shadow drawn onto the backdrop takes its outer colour
+// from here; a flat guess is what produces a square halo around a round
+// corner (glass doc section 2).
+uint32_t gui_glass_backdrop_at(const uint32_t *bd, int win_w, int win_h, int x, int y);
+
 // #306: arbitrary-angle line stroke (Bresenham), promoted out of gui.c's
 // private gs_line() so any app can draw a non-axis-aligned mark (a checkmark,
 // an X, a diagonal divider) without hand-rolling its own line rasterizer.

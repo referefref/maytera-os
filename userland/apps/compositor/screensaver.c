@@ -426,7 +426,8 @@ static void ss_gl_teardown(void) {
 // GLMATRIX plus the ten added in #560). Relies on the enum block in
 // compositor.h staying contiguous from SS_GLCUBE through SS_GLLAVA.
 static int ss_is_gl_type(int t) {
-    return t >= SS_GLCUBE && t <= SS_GLLAVA;
+    return (t >= SS_GLCUBE && t <= SS_GLLAVA) || t == SS_GLLAVALAMP
+        || t == SS_GLAQUARIUM;
 }
 
 // ============================================================================
@@ -738,6 +739,14 @@ void screensaver_render(void) {
     case SS_GLLAVA:       ss_gl_render(GLDEMO_LAVA);       break;
 
     // -----------------------------------------------------------------------
+    // (lavalamp) proper 3D lava lamp: metaball wax + buoyancy convection.
+    case SS_GLLAVALAMP:   ss_gl_render(GLDEMO_LAVALAMP);   break;
+
+    // -----------------------------------------------------------------------
+    // (aquarium) 3D reef aquarium: procedural fish + boids + depth-fog water.
+    case SS_GLAQUARIUM:   ss_gl_render(GLDEMO_AQUARIUM);   break;
+
+    // -----------------------------------------------------------------------
     // Psychedelic redesign lead trio (docs/SCREENSAVER_PSYCHEDELIC_DESIGN.md).
     // New IDs (>= 20, direct-pixel, NOT TinyGL - design doc principle 7).
     // -----------------------------------------------------------------------
@@ -832,7 +841,7 @@ void screensaver_render(void) {
                 for (int x = 0; x < SS_FLAME_W; x++) {
                     int i = y * SS_FLAME_W + x;
 
-                    // MEASURED FIX (the build host VM <vmid> live screendump): the first
+                    // MEASURED FIX (the build host VM 2410 live screendump): the first
                     // cut of this ambient term used x*2/y*3 (a MULTIPLY, not
                     // the divide every other low-res effect in this file
                     // uses), which wraps the 256-entry SS_SIN table 2-3
@@ -1089,8 +1098,8 @@ void screensaver_set_type(int t) {
     // #319 allow GL saver ids, extended #560; extended again for the
     // psychedelic redesign's two new direct-pixel IDs (SS_FLAME,
     // SS_STAINEDGLASS, both >= 20, both NOT TinyGL).
-    // #124: upper bound follows the last enumerator, now SS_PLASMACLASSIC.
-    if (t < 0 || t > SS_PLASMACLASSIC) return;
+    // #124: upper bound follows the last enumerator, now SS_GLAQUARIUM.
+    if (t < 0 || t > SS_GLAQUARIUM) return;
     // #560/#571 GATE REMOVED (was: `if (t >= SS_GLTUNNEL && t <= SS_GLLAVA)
     // return;`). History: GLTUNNEL was measured to crash COMPOSIT (page
     // fault in gl_M4_Mul, zmath.c:65) from a GL_LINE_LOOP vertex-cache
@@ -1115,7 +1124,7 @@ void screensaver_set_type(int t) {
     // (stock, unmodified) one. MEASURED: all ten effects (GLTUNNEL,
     // GLKALEIDO, GLPLATONIC, GLLORENZ, GLMOBIUS, GLWAVEMESH, GLSPIROGRAPH,
     // GLHYPERCUBE, GLVORTEX, GLLAVA) were boot-tested via testhook.c's
-    // `SAVER <id>` on VM <vmid> against this exact commit, two screendumps
+    // `SAVER <id>` on VM 2410 against this exact commit, two screendumps
     // (~4s apart, differing md5 proving live animation) per effect, all
     // rendering their intended geometry with no gradient, no crash, no
     // hang, and returning cleanly to the desktop on dismiss. INFERRED: the

@@ -175,6 +175,13 @@ void futex_wake_addr(uint32_t *addr, int count);
 /**
  * Print futex statistics
  */
+// #dosmem: the three counters futex_print_stats() prints, WITHOUT the print.
+// They were readable only by typing a command at a serial console, which is a
+// thing neither of the owner's machines has. sched_smp_report() folds them into
+// the periodic [SCHEDSTAT] record, so a wait/wake imbalance or a rising timeout
+// count is visible in /HEARTBEAT.TXT after the fact. NULL arguments allowed.
+void futex_get_counts(uint64_t *waits, uint64_t *wakes, uint64_t *timeouts);
+
 void futex_print_stats(void);
 
 /**

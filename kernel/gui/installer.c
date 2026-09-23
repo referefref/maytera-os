@@ -971,7 +971,7 @@ int inst_boot_index(void) {
 // widening enumeration alone would have changed nothing: an AHCI disk could be
 // listed and still not written.
 // ---------------------------------------------------------------------------
-static int inst_kind_read(uint8_t kind, uint8_t index, uint32_t lba, uint8_t cnt, void *buf) {
+int inst_kind_read(uint8_t kind, uint8_t index, uint32_t lba, uint8_t cnt, void *buf) {  // #404 disk-mgr: de-static'd for rustkern/blkmgr.rs
     if (kind == 1) {            /* AHCI */
         return ahci_read((int)index, lba, cnt, buf) == 0 ? cnt : -1;
     }
@@ -985,7 +985,7 @@ static int inst_kind_read(uint8_t kind, uint8_t index, uint32_t lba, uint8_t cnt
     if (ata_dma_available(ch, u)) return ata_read_sectors_dma(ch, u, lba, cnt, buf);
     return ata_read_sectors(ch, u, lba, cnt, buf);
 }
-static int inst_kind_write(uint8_t kind, uint8_t index, uint32_t lba, uint8_t cnt, const void *buf) {
+int inst_kind_write(uint8_t kind, uint8_t index, uint32_t lba, uint8_t cnt, const void *buf) {  // #404 disk-mgr: de-static'd for rustkern/blkmgr.rs
     if (kind == 1) {            /* AHCI */
         return ahci_write((int)index, lba, cnt, buf) == 0 ? cnt : -1;
     }

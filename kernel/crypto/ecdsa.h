@@ -33,6 +33,12 @@ int ecdsa_verify(ecdsa_curve_id_t curve,
                   const uint8_t *s, size_t s_len,
                   const uint8_t *qx, const uint8_t *qy, size_t coord_len);
 
+// #659 (crypkat): boot/host known-answer self-test of ecdsa_verify (RFC 6979
+// P-256 accept + single-bit forgery reject). Returns the number of FAILED
+// checks (0 == every vector behaved). Run at boot from main.c and, without a
+// VM, by crypto/ecdsa_verify_kat.sh.
+int ecdsa_verify_selftest(void);
+
 // =============================================================================
 // #502: ECDH on the same curves, for the TLS 1.2 ECDHE key exchange.
 //

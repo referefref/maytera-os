@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- MayteraOS Writer toolbar icon: list-bullet. Original artwork (GPLv2, same as the OS).
+       Authored on a 16-cell pixel grid, 1-cell stroke; the group maps cell k to
+       0.75 + 1.5k so the stroke is 1.5 viewBox units. White on transparent: the
+       toolbar tints it (draw_mico luminance-as-coverage). -->
+  <g transform="translate(0.75 0.75) scale(1.5)" fill="none" stroke="#ffffff" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M6 3h7M6 8h7M6 13h7"/>
+    <circle cx="3" cy="3" r="1.15" fill="#ffffff" stroke="none"/>
+    <circle cx="3" cy="8" r="1.15" fill="#ffffff" stroke="none"/>
+    <circle cx="3" cy="13" r="1.15" fill="#ffffff" stroke="none"/>
+  </g>
+</svg>

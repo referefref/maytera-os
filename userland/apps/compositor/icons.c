@@ -523,6 +523,33 @@ static const uint8_t icon_data_floppy[72] = {
     0x00, 0x00, 0x00,
 };
 
+static const uint8_t icon_data_planetarium[72] = {
+    0x00,0x00,0x00,
+    0x00,0x00,0x00,
+    0x00,0x00,0x00,
+    0x00,0x00,0x10,
+    0x00,0x10,0x38,
+    0x08,0x10,0x10,
+    0x1C,0x10,0x00,
+    0x08,0x38,0x00,
+    0x00,0x38,0x00,
+    0x00,0x38,0x00,
+    0x00,0xFE,0x00,
+    0x00,0xFE,0x00,
+    0x07,0xFF,0xC0,
+    0x3F,0xFF,0xF8,
+    0x07,0xFF,0xC0,
+    0x00,0xFE,0x00,
+    0x00,0xFE,0x00,
+    0x00,0x38,0x08,
+    0x00,0x38,0x1C,
+    0x00,0x38,0x08,
+    0x00,0x10,0x00,
+    0x00,0x10,0x00,
+    0x00,0x10,0x00,
+    0x00,0x00,0x00,
+};
+
 static const icon_t icons[ICON_COUNT] = {
     /* ICON_CATEGORIES    */ { icon_data_categories,  24, 24 },
     /* ICON_TERMINAL      */ { icon_data_terminal,    24, 24 },
@@ -560,10 +587,60 @@ static const icon_t icons[ICON_COUNT] = {
     /* ICON_CHEVD         */ { icon_data_cog,         24, 24 },
     /* ICON_CHEVR         */ { icon_data_cog,         24, 24 },
     // #723: designated (not positional) so this doesn't depend on counting
-    // through the ~30 "color-icon only" entries above (ICON_WIN3X..
-    // ICON_3DPRINT), which intentionally have NO entry here (they rely
-    // entirely on a runtime-loaded color icon; see icon_draw_color_if_present
-    // and the enum comments in compositor.h).
+    // through entries above.
+    //
+    // #pubboot (2026-09-02): ICON_WIN3X..ICON_3DPRINT used to have NO entry
+    // here at all - "intentionally", per this comment's own previous
+    // wording, because they "rely entirely on a runtime-loaded color icon".
+    // That was true only on a golden that ships the out-of-git .ICN asset
+    // base. On the published PUBLIC image, which deliberately has none of
+    // that asset base (see stage-public-image.sh's header), every
+    // icon_load_color() call for these ids in main.c fails to find its file,
+    // and every one of these ids is a hole: NULL data, 0x0 dimensions. Before
+    // this ticket, drawing one via icon_draw_scaled() with no color icon
+    // loaded was a guaranteed page fault (icon_draw_scaled() now guards
+    // against that regardless - see its #pubboot comment - so this is
+    // defence in depth, not the fix). Giving every one of them a REAL entry
+    // closes the hole at the data level too, and means a public image with
+    // no color icons shows a neutral placeholder glyph instead of nothing at
+    // all, which is what item 3 of #pubboot asks for.
+    //
+    // icon_data_window (a plain rectangle-outline "app window" glyph) is
+    // reused rather than new art: it is already compiled in, already used
+    // for ICON_WINDOW/ICON_COMPUTER above, and needs no new licensing
+    // review. It is a PLACEHOLDER, not real per-app art - GAME_ARENA,
+    // AICHAT, WEATHER etc. all render the same neutral glyph until someone
+    // draws real ones (see the graphic-designer backlog note in blame.md).
+    [ICON_WIN3X]         = { icon_data_window, 24, 24 },   // #pubboot placeholder
+    [ICON_DOSAPP]        = { icon_data_window, 24, 24 },   // #pubboot placeholder
+    [ICON_GAME_ARENA]    = { icon_data_game,   24, 24 },   // #pubboot placeholder (generic game glyph)
+    [ICON_GAME_CHESS]    = { icon_data_game,   24, 24 },   // #pubboot placeholder
+    [ICON_GAME_SQUADRON] = { icon_data_game,   24, 24 },   // #pubboot placeholder
+    [ICON_GAME_GLCUBE]   = { icon_data_game,   24, 24 },   // #pubboot placeholder
+    [ICON_GAME_GLMATRIX] = { icon_data_game,   24, 24 },   // #pubboot placeholder
+    [ICON_AICHAT]        = { icon_data_window, 24, 24 },   // #pubboot placeholder
+    [ICON_WEATHER]       = { icon_data_window, 24, 24 },   // #pubboot placeholder
+    [ICON_FEEDS]         = { icon_data_window, 24, 24 },   // #pubboot placeholder
+    [ICON_GALLERY]       = { icon_data_image,  24, 24 },   // #pubboot placeholder (generic image glyph)
+    [ICON_SNAPSHOT]      = { icon_data_image,  24, 24 },   // #pubboot placeholder
+    [ICON_NOTES]         = { icon_data_file,   24, 24 },   // #pubboot placeholder
+    [ICON_FONTBOOK]      = { icon_data_file,   24, 24 },   // #pubboot placeholder
+    [ICON_CONVERTER]     = { icon_data_window, 24, 24 },   // #pubboot placeholder
+    [ICON_TIMERS]        = { icon_data_clock,  24, 24 },   // #pubboot placeholder (generic clock glyph)
+    [ICON_PYTHON]        = { icon_data_window, 24, 24 },   // #pubboot placeholder
+    [ICON_AUTH]          = { icon_data_cog,    24, 24 },   // #pubboot placeholder
+    [ICON_HELP]          = { icon_data_info_circle, 24, 24 }, // #pubboot placeholder
+    [ICON_LAUNCHER]      = { icon_data_categories, 24, 24 },  // #pubboot placeholder
+    [ICON_TASKSWITCH]    = { icon_data_window, 24, 24 },   // #pubboot placeholder
+    [ICON_APPSTORE]      = { icon_data_window, 24, 24 },   // #pubboot placeholder
+    [ICON_SYSMON]        = { icon_data_task_manager, 24, 24 }, // #pubboot placeholder
+    [ICON_PLANETARIUM]   = { icon_data_planetarium, 24, 24 },
+    [ICON_WRITER]        = { icon_data_file,   24, 24 },   // placeholder: real art is /ICONS/WRITER.ICN
+    [ICON_SHEETS]        = { icon_data_file,   24, 24 },   // placeholder: /ICONS/SHEETS.ICN
+    [ICON_SLIDES]        = { icon_data_file,   24, 24 },   // placeholder: /ICONS/SLIDES.ICN
+    [ICON_OFFICE]        = { icon_data_file,   24, 24 },   // placeholder: /ICONS/OFFICE.ICN
+    [ICON_SERVICES]      = { icon_data_cog,    24, 24 },   // #pubboot placeholder
+    [ICON_3DPRINT]       = { icon_data_window, 24, 24 },   // #pubboot placeholder
     [ICON_HA_SUN]           = { icon_data_ha_sun,           24, 24 },
     [ICON_HA_MOON]          = { icon_data_ha_moon,          24, 24 },
     [ICON_HA_DOOR_OPEN]     = { icon_data_ha_door_open,     24, 24 },
@@ -599,6 +676,17 @@ void icon_draw(icon_id_t id, int32_t x, int32_t y, uint32_t color)
     const icon_t *ic = &icons[id];
     const uint8_t *data = ic->data;
     int row, col;
+
+    // #pubboot: ICON_WIN3X..ICON_3DPRINT (see the enum comments in
+    // compositor.h) are COLOR-ICON-ONLY and have no entry in the icons[]
+    // table below, so ic->data is NULL and ic->height is 0 for them. The
+    // `row < ic->height` loop already makes that a no-op rather than a
+    // crash (0 iterations), but the guard is written explicitly so this
+    // stays true if the loop is ever refactored, and so it reads the same
+    // as the guard icon_draw_scaled() below needs for real, not just by
+    // accident of a loop bound.
+    if (!data || ic->height <= 0)
+        return;
 
     for (row = 0; row < ic->height; row++) {
         // 3 bytes cover 24 columns: byte 0 = cols 0-7, byte 1 = cols 8-15,
@@ -653,6 +741,25 @@ void icon_draw_scaled(icon_id_t id, int32_t x, int32_t y, int32_t size, uint32_t
     int src_w = ic->width;   // 24
     int src_h = ic->height;  // 24
     int32_t dst_row, dst_col;
+
+    // #pubboot (2026-09-02): the crash that took down every session of the
+    // published v2.0.2-b2285 image. ICON_WIN3X..ICON_3DPRINT (see the enum
+    // comments in compositor.h) are COLOR-ICON-ONLY: they have NO entry in
+    // the icons[] table above, so for them `data` is NULL and src_w/src_h
+    // are both 0. Unlike icon_draw() above, the loop bound here is `size`
+    // (the DESTINATION size, always > 0, checked above), not src_h, so a
+    // hole in the table used to run at least one iteration with src_h == 0:
+    // `if (src_row >= src_h) src_row = src_h - 1;` clamped to -1, and
+    // `data[src_row * 3 + 1]` dereferenced NULL - 2, a guaranteed page
+    // fault. This is not a theoretical hole: it is exactly what happens the
+    // first time desktop_render() draws an app whose color icon failed to
+    // load, which is the ordinary case on a fresh filesystem with no MICO
+    // assets staged (measured: pid 24/30/33/36 all faulted here on the
+    // published image, RIP=icon_draw_scaled, CR2=0xfffffffffffffffe, which
+    // is exactly NULL + (-3) + 1). A missing icon must never be able to
+    // take the compositor down, so render nothing for it instead.
+    if (!data || src_w <= 0 || src_h <= 0)
+        return;
 
     // Scale factors in 8.8 fixed point: step per destination pixel.
     // step_x = (src_w << 8) / size

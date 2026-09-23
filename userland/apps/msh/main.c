@@ -7,6 +7,7 @@
 #include "../../libc/termios.h"
 #include "../../libc/aiclient.h"
 #include "../../libc/pipeline.h"   // #745 local 108: the ONE pipeline runner
+#include <histedit.h>          // #745: libedit line editing (el_gets/history)
 #include "../../libc/stdio.h"      // stderr: a pipeline's errors must not go
                                    // into the pipe it failed to build
 
@@ -1275,7 +1276,7 @@ static void editor_redraw(const char *buf, int len, int cur) {
     for (int i = cur; i < len; i++) putchar('\b');
 }
 
-static int read_line(char *buf, int max) {
+static int read_line_raw(char *buf, int max) {
     int len = 0, cur = 0;
     int h_pos = hist_count;           // history browse position
     char saved[MAX_LINE];             // in-progress line stashed when browsing up
@@ -1448,6 +1449,69 @@ static void ai_handle(const char *rest) {
         printf("\033[31mAI error:\033[0m %s\n", answer);
     else
         printf("\033[36mAI:\033[0m %s\n", answer);
+}
+
+// ---------------------------------------------------------------------------
+// libedit line editor (#745). el_gets() gives real emacs-style editing, cursor
+// movement, and Up/Down history recall through the pty, replacing the
+// hand-rolled read_line_raw() above. read_line_raw() is KEPT as the fallback
+// for the case where libedit could not initialise (no tty, or el_init failed),
+// so the interactive shell can never lose its prompt to a port problem. The
+// msh-side hist_buf ring and expand_history() ('!!', '!n', '!prefix') are
+// unchanged; libedit keeps its OWN parallel History for Up/Down, fed the same
+// accepted lines, so both views stay in step.
+// ---------------------------------------------------------------------------
+static EditLine *g_el = NULL;
+static History  *g_elhist = NULL;
+static HistEvent g_elev;
+static int       g_el_ready = 0;   // 0=untried, 1=ok, -1=failed
+
+static const char *el_prompt_cb(EditLine *e) {
+    (void)e;
+    static char pbuf[PATH_MAX + 64];
+    const char *user = env_get("USER");
+    if (!user || !user[0]) user = "user";
+    // \1 brackets the non-printing colour codes so EL_PROMPT_ESC does not count
+    // them toward the cursor column.
+    snprintf(pbuf, sizeof(pbuf),
+             "\1\033[32m\1%s@maytera\1\033[0m\1:\1\033[34m\1%s\1\033[0m\1$ ",
+             user, cwd);
+    return pbuf;
+}
+
+static void el_setup(void) {
+    if (g_el_ready != 0) return;
+    setenv("TERM", "maytera-256color", 0);   // a pty child has no environ; termcap needs a name
+    g_elhist = history_init();
+    if (g_elhist) history(g_elhist, &g_elev, H_SETSIZE, HISTORY_SIZE);
+    g_el = el_init("msh", stdin, stdout, stderr);
+    if (!g_el) { g_el_ready = -1; return; }
+    el_set(g_el, EL_PROMPT_ESC, el_prompt_cb, '\1');
+    el_set(g_el, EL_EDITOR, "emacs");
+    if (g_elhist) el_set(g_el, EL_HIST, history, g_elhist);
+    el_set(g_el, EL_SIGNAL, 1);
+    g_el_ready = 1;
+}
+
+static int read_line(char *buf, int max) {
+    // No tty (script / redirected stdin): keep the simple canonical path.
+    if (!isatty(0))
+        return read_line_raw(buf, max);
+    el_setup();
+    if (g_el_ready != 1)
+        return read_line_raw(buf, max);   // libedit unavailable: fall back
+
+    int count = 0;
+    const char *line = el_gets(g_el, &count);
+    if (line == NULL || count <= 0)
+        return -1;                        // EOF (Ctrl-D on an empty line)
+    int n = 0;
+    for (const char *p = line; *p && *p != '\n' && *p != '\r' && n < max - 1; p++)
+        buf[n++] = *p;
+    buf[n] = '\0';
+    if (n > 0 && g_elhist)
+        history(g_elhist, &g_elev, H_ENTER, buf);  // so Up recalls it next time
+    return n;
 }
 
 int main(int argc, char **argv) {

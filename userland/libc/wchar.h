@@ -59,4 +59,19 @@ int    wcsncmp(const wchar_t *a, const wchar_t *b, size_t n);
 wchar_t *wcschr(const wchar_t *s, wchar_t c);
 wchar_t *wcscpy(wchar_t *d, const wchar_t *s);
 
+// --- Added for the libedit port (#745). Byte-transparent C-locale wide layer,
+// --- same commitment as the rest of this header: one byte is one character.
+size_t   wcstombs(char *dst, const wchar_t *src, size_t n);
+size_t   mbstowcs(wchar_t *dst, const char *src, size_t n);
+size_t   wcrtomb(char *s, wchar_t wc, mbstate_t *st);
+int      wctob(wint_t c);
+int      wcwidth(wchar_t c);
+wchar_t *wmemcpy(wchar_t *d, const wchar_t *s, size_t n);
+wchar_t *wcsncpy(wchar_t *d, const wchar_t *s, size_t n);
+wchar_t *wcsncat(wchar_t *d, const wchar_t *s, size_t n);
+size_t   wcscspn(const wchar_t *s, const wchar_t *reject);
+wchar_t *wcsstr(const wchar_t *hay, const wchar_t *needle);
+long     wcstol(const wchar_t *nptr, wchar_t **endptr, int base);
+size_t   mbsrtowcs(wchar_t *dst, const char **src, size_t len, mbstate_t *st);
+
 #endif // LIBC_WCHAR_H

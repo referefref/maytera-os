@@ -414,7 +414,20 @@ int main(int argc, char **argv){
             if (ev.mouse_buttons & MOUSE_BUTTON_RIGHT) rmb_drag=1;
             else on_click(ev.mouse_x,ev.mouse_y);
         } else if (et==EVENT_MOUSE_UP){
-            if (!(ev.mouse_buttons & MOUSE_BUTTON_RIGHT)) rmb_drag=0;
+            // (#dosmouse) THE TEST WAS INVERTED. On a MOUSE_UP, mouse_buttons
+            // names the button being RELEASED (kernel/gui/window.c:3077 sets it
+            // to RIGHT when the compositor passes button 2, LEFT otherwise), not
+            // the set of buttons still held. So "!(buttons & RIGHT)" ended the
+            // right-drag on a LEFT release and never on releasing the right
+            // button, which is the one event it was written for.
+            //
+            // It was un-noticeable until now for a second reason: the
+            // compositor derived a right-button PRESS edge and no RELEASE edge
+            // at all, so no right MOUSE_UP was ever delivered to any app. That
+            // half is fixed in userland/apps/compositor/main.c; this is the
+            // consumer side, and fixing only one of the two would have left the
+            // camera still ending its drag on the wrong event.
+            if (ev.mouse_buttons & MOUSE_BUTTON_RIGHT) rmb_drag=0;
         } else if (et==EVENT_KEY_DOWN){
             on_key(ev.key_char, ev.keycode);
         }

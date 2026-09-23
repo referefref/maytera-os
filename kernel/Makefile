@@ -41,7 +41,6 @@ GUI_DIR = gui
 EXEC_DIR = exec
 DOS_DIR = dos
 PROC_DIR = proc
-IO_DIR = io
 SECURITY_DIR = security
 IPC_DIR = ipc
 SYNC_DIR = sync
@@ -367,6 +366,97 @@ CFLAGS += -DWQ_NOBLOCK_PANIC
 endif
 ifeq ($(NOBLOCKTEST),1)
 CFLAGS += -DWQ_NOBLOCK_SELFTEST
+endif
+# #745: `make EXCL_SELFTEST=1` compiles in the O_EXCL boot self-test
+# (proc/fdlayer.c), which drives sys_open_k() with O_CREAT|O_EXCL on the
+# FAT ESP and the ext2 root and prints PASS/FAIL to serial. It WRITES a
+# temp file at boot, so it is a reproducer kernel, NEVER for a golden.
+ifeq ($(EXCL_SELFTEST),1)
+CFLAGS += -DEXCL_SELFTEST
+$(info [#745] EXCL_SELFTEST=1: O_EXCL boot self-test compiled in (writes a temp file at boot). NEVER ship.)
+endif
+
+# #746-dir: `make EXT2_RENAME_SELFTEST=1` compiles in the ext2 rename boot
+# self-test (fs/ext2.c ext2_rename_selftest + the main.c hook). It builds a /RT
+# scratch tree on the mounted ext2 ROOT, drives ext2_rename() through every case
+# (same-dir, cross-dir, dir move with ".."/link-count fixes, replace-over-file,
+# negative, refuse) reading inodes back to prove no data copy / no leak, then
+# runs the in-kernel fsck. It MUTATES the ext2 root, so it is a reproducer
+# kernel, NEVER for a golden. ZERO code without the flag.
+ifeq ($(EXT2_RENAME_SELFTEST),1)
+CFLAGS += -DEXT2_RENAME_SELFTEST
+$(info [#746-dir] EXT2_RENAME_SELFTEST=1: ext2 rename boot self-test compiled in (mutates the ext2 root). NEVER ship.)
+endif
+
+# (opencreatenoent): \`make OPENCREATE_SELFTEST=1\` compiles in the O_CREAT
+# missing-parent boot self-test in main.c (mutates the ext2 root: creates then
+# removes /OCTDIR). Verification scaffolding only; NEVER ship (off by default,
+# ZERO code without the flag).
+ifeq ($(OPENCREATE_SELFTEST),1)
+CFLAGS += -DOPENCREATE_SELFTEST
+$(info [opencreatenoent] OPENCREATE_SELFTEST=1: O_CREAT missing-parent boot self-test compiled in (mutates the ext2 root). NEVER ship.)
+endif
+
+# #246 Stage 4: `make ESCROW_DEVICE_SELFTEST=1` compiles in the CAP_SCOPE_DEVICE
+# boot self-test (fs/escrow_device.c escdev_selftest + the escdev_test_set_override
+# hook). Verification scaffolding only; NEVER ship (off by default).
+ifeq ($(ESCROW_DEVICE_SELFTEST),1)
+CFLAGS += -DESCROW_DEVICE_SELFTEST
+$(info [#246 Stage 4] ESCROW_DEVICE_SELFTEST=1: CAP_SCOPE_DEVICE boot self-test compiled in. NEVER ship.)
+endif
+
+# #246 Stage 5 (part B): `make ESCROW_UNDO_SELFTEST=1` compiles in the escrow
+# rollback/undo engine boot self-test (fs/escrow_undo.c escrow_undo_selftest,
+# which drives the REAL fat_* FS primitives). Verification scaffolding only;
+# NEVER ship (off by default).
+ifeq ($(ESCROW_UNDO_SELFTEST),1)
+CFLAGS += -DESCROW_UNDO_SELFTEST
+$(info [#246 Stage 5B] ESCROW_UNDO_SELFTEST=1: escrow rollback/undo boot self-test compiled in. NEVER ship.)
+endif
+
+# #305 Stage 5A: the two read-only seals (the escrow principal page, and kernel
+# .text where the enforcement decision code lives) are now ALWAYS COMPILED IN and
+# ON BY DEFAULT, with a RUNTIME KILL-SWITCH. The old build flags
+# -DESCROW_IMMUTABLE_SEAL / -DESCROW_TEXT_SEAL are gone: the seals no longer gate
+# on a compile-time macro. To disable both seals for a boot (e.g. if one misbehaves
+# on real hardware) drop /CONFIG/ESCROWSEAL.OFF on the root fs; no rebuild needed.
+# See security/escrow_core.c. A seal is fail-safe: one that does not take leaves
+# the core writable, tamper-checked, and never bricks boot.
+
+# #305 Stage 5A: `make ESCROW_CORE_SELFTEST=1` compiles in the immutable-core boot
+# self-test (security/escrow_core.c escrow_core_selftest). Verification only; NEVER ship.
+ifeq ($(ESCROW_CORE_SELFTEST),1)
+CFLAGS += -DESCROW_CORE_SELFTEST
+$(info [#305 Stage 5A] ESCROW_CORE_SELFTEST=1: immutable-core boot self-test compiled in. NEVER ship.)
+endif
+
+# #tickdead: `make TICKACKFAULT=1` stalls ONE IRQ0 frame where bkl_acquire()
+# sits, so the [TICKSRC] NATIVE TICK DEAD event can be watched happening (with
+# /CONFIG/TICKEOI.CFG=0) and watched NOT happening (default) on ONE binary.
+# Same argument and same placement as NOBLOCKTEST above: the campaign that
+# measured this defect never once provoked the terminal verdict, so the new
+# BLOCKED-versus-ABSENT attribution was linked and never executed. NEVER SHIP.
+ifeq ($(TICKACKFAULT),1)
+CFLAGS += -DTICKACK_FAULT_TEST
+$(info [tickdead] TICKACKFAULT=1: one IRQ0 frame will STALL $(or $(TICKACKMS),3000) ms at the bkl_acquire() point. Reproducer kernel, NEVER ship.)
+endif
+ifdef TICKACKMS
+CFLAGS += -DTICKACK_FAULT_MS=$(TICKACKMS)u
+endif
+ifdef TICKACKAT
+CFLAGS += -DTICKACK_FAULT_AT_MS=$(TICKACKAT)u
+endif
+
+# #stackguard: `make KSTACKTEST=1` arms a DELIBERATE kernel-stack overflow so
+# the guard page can be SEEN to fire. Exactly the NOBLOCKTEST argument: a guard
+# that has only ever been reasoned about is indistinguishable from a guard that
+# cannot fire, and this tree has shipped several checks in that state. The
+# machine is expected to stop with [KSTACK] KERNEL STACK OVERFLOW and a #DF.
+# The $(info) is the receipt - a build flag that silently does nothing is the
+# failure class GUARD130_DISABLE was caught in above. NEVER for a golden.
+ifeq ($(KSTACKTEST),1)
+CFLAGS += -DKSTACK_OVERFLOW_SELFTEST
+$(info [stackguard] KSTACKTEST=1: a DELIBERATE kernel stack overflow is compiled in. Reproducer kernel, NEVER ship.)
 endif
 
 # AUDLEAD: `make AUDSTARVETEST=1` arms a DELIBERATE producer stall in
@@ -1284,6 +1374,19 @@ CFLAGS += -DFDRACE_TEST
 $(info [smpglobals] FDRACETEST=1: fs/fdrace_test.c is COMPILED IN and the fd_lock can be turned OFF at run time. Proof kernel, NEVER ship.)
 endif
 
+# #fmhang: `make FMHANGTEST=1` -- the #426 storage-stack-under-cli NEGATIVE
+# CONTROL. Spawns a kernel thread that, once the desktop is up, calls
+# audiolog_write() from inside a spinlock_acquire_irqsave() region (exactly
+# the no-block context dos_fm_proc_exit() reached under proc_exit() cli()).
+# GREEN with the bootlog_persist() guard (the write is declined, bldef moves,
+# no block); RED without it: with `NOBLOCKPANIC=1` the OLD code kpanics inside
+# the storage stack (ext2_lock_at / ata_dma_wait). A guard nobody has watched
+# fire is not evidence. NEVER for a golden.
+ifeq ($(FMHANGTEST),1)
+CFLAGS += -DFMHANGTEST
+$(info [fmhang] FMHANGTEST=1: fs/bootlog.c fmhang_selftest_worker is COMPILED IN. Proof kernel, NEVER ship.)
+endif
+
 ifeq ($(SIGFRAMEDIFF),1)
 CFLAGS  += -DSIGFRAME_DIFF
 ASFLAGS += -dSIGFRAME_DIFF
@@ -1372,8 +1475,6 @@ DOS_SOURCES = $(wildcard $(DOS_DIR)/*.c)
 PROC_SOURCES = $(wildcard $(PROC_DIR)/*.c)
 PROC_ASM = $(wildcard $(PROC_DIR)/*.asm)
 
-# Async I/O sources
-IO_SOURCES = $(wildcard $(IO_DIR)/*.c)
 
 # Security sources
 SECURITY_SOURCES = $(wildcard $(SECURITY_DIR)/*.c)
@@ -1454,7 +1555,6 @@ ALL_C_SOURCES = media/audio_decode.c media/mp3.c media/vorbis.c media/flac.c med
                 $(EXEC_SOURCES) \
                 $(DOS_SOURCES) \
                 $(PROC_SOURCES) \
-                $(IO_SOURCES) \
                 $(SECURITY_SOURCES) \
                 $(IPC_SOURCES) \
                 $(SYNC_SOURCES) \
@@ -1506,7 +1606,6 @@ dirs:
 	@mkdir -p $(OBJDIR)/$(EXEC_DIR)
 	@mkdir -p $(OBJDIR)/$(DOS_DIR)
 	@mkdir -p $(OBJDIR)/$(PROC_DIR)
-	@mkdir -p $(OBJDIR)/$(IO_DIR)
 	@mkdir -p $(OBJDIR)/$(SECURITY_DIR)
 	@mkdir -p $(OBJDIR)/$(IPC_DIR)
 	@mkdir -p $(OBJDIR)/$(SYNC_DIR)
@@ -1873,6 +1972,35 @@ syscall-ptr-lint:
 syscall-ptr-lint-selftest:
 	@python3 $(SYSCALL_PTRLINT) --header $(SYSCALL_HEADER) --dispatch $(SYSCALL_DISPATCH) --argtab $(SYSCALL_ARGTAB) --manifest $(SYSCALL_PTRMAN) --self-test
 
+# --- Syscall CAPABILITY classification lint (Stage 1 capability API) ---------
+# FAILS THE BUILD if a syscall dispatched in proc/syscall.c has no capability
+# classification in kernel/syscall-cap.manifest: every dispatched SYS_* must be
+# declared [NOCAP] (conscious "no capability required") or [CAP <CLASS>] (gated,
+# and the class is cross-checked against rustkern/caps.rs). A new syscall
+# defaults to UNGATED and builds clean; this lint makes that default a build
+# failure so an ambient capability cannot be added by omission (design
+# principle 4). Same placement/rationale as syscall-ptr-lint above: the tool
+# travels INSIDE kernel/ so it runs where the kernel is built.
+SYSCALL_CAPLINT  = tools/syscall-cap-lint/syscall-cap-lint
+SYSCALL_CAPRS    = rustkern/caps.rs
+SYSCALL_CAPMAN   = syscall-cap.manifest
+
+.PHONY: syscall-cap-lint
+syscall-cap-lint:
+	@if [ ! -f $(SYSCALL_CAPLINT) ]; then \
+	   echo "ERROR: $(SYSCALL_CAPLINT) is missing. The syscall capability lint"; \
+	   echo "       cannot run, and a gate that skips silently is how an ungated"; \
+	   echo "       ambient syscall ships (Stage 1 capability API)."; \
+	   exit 1; \
+	 fi
+	@python3 $(SYSCALL_CAPLINT) --header $(SYSCALL_HEADER) --dispatch $(SYSCALL_DISPATCH) --caps-rs $(SYSCALL_CAPRS) --manifest $(SYSCALL_CAPMAN)
+
+# Prove the gate is trustworthy: RED when a dispatched syscall is dropped from
+# the manifest, GREEN on the real tree.
+.PHONY: syscall-cap-lint-selftest
+syscall-cap-lint-selftest:
+	@python3 $(SYSCALL_CAPLINT) --header $(SYSCALL_HEADER) --dispatch $(SYSCALL_DISPATCH) --caps-rs $(SYSCALL_CAPRS) --manifest $(SYSCALL_CAPMAN) --self-test
+
 # --- Syscall copy_*_user adoption lint (#566, enforcing #509) ---------------
 # FAILS THE BUILD if a syscall handler in proc/syscall.c DIRECTLY DEREFERENCES a
 # user pointer (`*p`, `p->f`, `p[i]`, or a bare memcpy/memset on it) instead of
@@ -2205,7 +2333,7 @@ RUST_FORCE = -u rust_marker
 # but being order-only it does not mark kernel.elf out of date, so it never
 # forces a needless 15 MB relink. If the gate fails, make stops here and the
 # kernel is not linked.
-$(TARGET): $(OBJECTS) $(RUST_LIB) | increment_build dirs rust-symbol-gate syscall-dispatch-gate syscall-ptr-lint copy-user-lint smap-uaccess-lint concurrency-lint persist-extern-gate syscall-number-lint dup-const-lint diaglog-gate skipgate
+$(TARGET): $(OBJECTS) $(RUST_LIB) | increment_build dirs rust-symbol-gate syscall-dispatch-gate syscall-ptr-lint syscall-cap-lint copy-user-lint smap-uaccess-lint concurrency-lint persist-extern-gate syscall-number-lint dup-const-lint diaglog-gate skipgate
 	@echo "Linking $(DEBUG_TARGET)..."
 	$(LD) $(LDFLAGS) -o $(DEBUG_TARGET) $(OBJECTS) $(RUST_FORCE) $(RUST_LIB)
 	@# #670: the SHIPPED kernel is the stripped copy. Link once, strip into

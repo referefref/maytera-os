@@ -616,6 +616,154 @@ static inline long sys_elev_resolve(unsigned long long seq, int action, const ch
     return syscall3(SYS_ELEV_RESOLVE, (long)seq, (long)action, (long)pw); }
 static inline long sys_elev_may(void) {
     return syscall0(SYS_ELEV_MAY); }
+
+// ===========================================================================
+// Stage 1 SYSTEM CAPABILITY API (docs/SYSTEM_CAPABILITY_API.md).
+// Numbers mirror kernel/proc/syscall.h (locked by syscall-number-lint). An app
+// does not learn a new API to USE a capability: it makes the request it always
+// made (e.g. SYS_SCREENSHOT_REQUEST) and, once a grant is held, that request
+// starts succeeding. SYS_CAP_QUERY/REQUEST are the only new surface an ordinary
+// app touches; SYS_CAP_VIEW/RESOLVE are compositor-only.
+// ===========================================================================
+#define SYS_CAP_QUERY            429
+#define SYS_CAP_REQUEST          430
+#define SYS_CAP_STATUS           431
+#define SYS_CAP_VIEW             432
+#define SYS_CAP_RESOLVE          433
+#define SYS_CAP_REVOKE           434
+#define SYS_SCREENSHOT_REQUEST   435
+#define SYS_SCREENSHOT_POLL      436
+#define SYS_SERIAL_LIST          437   // Stage 2 serial.port: name published ports
+#define SYS_SERIAL_OPEN          438   // Stage 2 serial.port: open one (gated)
+#define SYS_CAP_INJECT_KEY       439   // Stage 3 input.inject: post a synthetic key to an OWNED window (gated)
+#define SYS_CAP_INJECT_MOUSE     440   // Stage 3 input.inject: post a synthetic pointer event to an OWNED window (gated)
+#define SYS_FLOCK                441   // #404 Stage 6: flock(fd,op) BSD advisory whole-file lock
+
+// Capability classes (mirror proc/caps.h / rustkern/caps.rs).
+#define CAP_NONE            0u
+#define CAP_INPUT_INJECT    1u
+#define CAP_INPUT_OBSERVE   2u
+#define CAP_SCREEN_CAPTURE  3u
+#define CAP_SCREEN_STREAM   4u
+#define CAP_AUDIO_OUTPUT    5u
+#define CAP_SERIAL_PORT     6u
+#define CAP_NET_CONNECT     7u
+#define CAP_NET_LISTEN      8u
+
+#define CAP_SCOPE_NONE   0u
+#define CAP_SCOPE_PATH   1u
+#define CAP_SCOPE_PORT   2u   // serial.port: a published port name
+#define CAP_SCOPE_WINDOW 3u   // input.inject: a window the caller owns (scope token "self")
+#define CAP_SCOPE_WINDOW_TARGET 4u   // input.inject: a consented window the caller does NOT own (Stage 4)
+
+#define CAP_ST_IDLE     0
+#define CAP_ST_OPEN     1
+#define CAP_ST_GRANTED  2
+#define CAP_ST_DENIED   3
+
+#define CAP_EARG        (-1)
+#define CAP_EBUSY       (-2)
+#define CAP_EDENIED     (-3)
+#define CAP_ENOINPUT    (-4)
+#define CAP_ENOCONSENT  (-5)
+#define CAP_ESCOPE      (-6)
+#define CAP_EPOLICY     (-7)
+#define CAP_EMAX        (-8)
+#define CAP_ESTALE      (-9)
+#define CAP_EPERM       (-10)
+
+#define CAP_ACT_DENY     0
+#define CAP_ACT_APPROVE  1
+
+// SYS_CAP_REQUEST in. reason is display text (sanitised in the kernel); scope
+// is the noun (validated against the kernel's terms). Nothing here decides
+// where the privilege applies except the scope, which is checked.
+typedef struct {
+    unsigned int cap;
+    unsigned int duration_ms;   // 0 = one use
+    unsigned int scope_kind;
+    unsigned int reason_len;
+    char         reason[120];
+    char         scope[64];
+} cap_req_t;
+
+// SYS_CAP_QUERY out.
+typedef struct {
+    unsigned int cap;
+    unsigned int held;
+    unsigned long long expires_ms;
+    unsigned int uses_left;
+    unsigned int scope_kind;
+    unsigned long long granted_seq;
+    char         scope[64];
+} cap_state_t;
+
+// SYS_CAP_VIEW out (compositor).
+typedef struct {
+    unsigned long long seq;
+    unsigned long long opened_ms;
+    unsigned int state;
+    unsigned int req_pid;
+    unsigned int req_uid;
+    unsigned int cap;
+    unsigned int duration_ms;
+    unsigned int scope_kind;
+    char         app[64];
+    char         reason[120];
+    char         scope[64];
+} cap_view_t;
+
+static inline long sys_cap_query(unsigned int cap, cap_state_t *out) {
+    return syscall2(SYS_CAP_QUERY, (long)cap, (long)out); }
+static inline long sys_cap_request(const cap_req_t *r) {
+    return syscall1(SYS_CAP_REQUEST, (long)r); }
+static inline long sys_cap_status(unsigned long long seq) {
+    return syscall1(SYS_CAP_STATUS, (long)seq); }
+static inline long sys_cap_view(cap_view_t *out) {
+    return syscall1(SYS_CAP_VIEW, (long)out); }
+static inline long sys_cap_resolve(unsigned long long seq, int action) {
+    return syscall2(SYS_CAP_RESOLVE, (long)seq, (long)action); }
+static inline long sys_cap_revoke(unsigned int cap) {
+    return syscall1(SYS_CAP_REVOKE, (long)cap); }
+static inline long sys_screenshot_request(const char *path) {
+    return syscall1(SYS_SCREENSHOT_REQUEST, (long)path); }
+static inline long sys_screenshot_poll(char *out, int cap) {
+    return syscall2(SYS_SCREENSHOT_POLL, (long)out, (long)cap); }
+
+// ---- Stage 2 serial.port: the mediated serial-port gateway ----------------
+#define SERIALPORT_CLS_NONE      0u
+#define SERIALPORT_CLS_UART16550 1u
+#define SERIALPORT_CLS_USB_CDC   2u
+#define SERIALPORT_F_READONLY    1u
+#define SERIALPORT_NAME_MAX      16
+
+// SYS_SERIAL_LIST out row. A port name and a class only: no base, no /dev path.
+typedef struct {
+    char         name[SERIALPORT_NAME_MAX];
+    unsigned int cls;
+    unsigned int flags;
+} serial_pub_t;
+
+// Name the published serial ports (NOT gated). Returns the count written.
+static inline long sys_serial_list(serial_pub_t *out, unsigned int max) {
+    return syscall2(SYS_SERIAL_LIST, (long)out, (long)max); }
+// Open a published port by name (GATED: serial.port). Returns an fd, or a
+// negative CAP_E* / -1. Reads and writes then use the ordinary sys_read/write.
+static inline long sys_serial_open(const char *name, int flags) {
+    return syscall2(SYS_SERIAL_OPEN, (long)name, (long)flags); }
+
+// ---- Stage 3/4 input.inject: mediated synthetic input into an authorized window
+// The event is delivered ONLY to the window win, which the caller must be
+// authorized for: either the caller OWNS it under a CAP_SCOPE_WINDOW ("self")
+// grant (Stage 3), or holds a CAP_SCOPE_WINDOW_TARGET grant the user consented to
+// for THAT window (Stage 4 cross-app). It is marked INPUT_SRC_SYNTHETIC so it
+// never stamps the elevation input credit for ANY target, and is refused
+// (CAP_EBUSY) while a consent prompt or the lock screen is up. Returns 0, or a
+// negative CAP_E* / -1.
+static inline long sys_cap_inject_key(int win, int keycode) {
+    return syscall2(SYS_CAP_INJECT_KEY, (long)win, (long)keycode); }
+static inline long sys_cap_inject_mouse(int win, int x, int y, int type, unsigned int button) {
+    return syscall5(SYS_CAP_INJECT_MOUSE, (long)win, (long)x, (long)y, (long)type, (long)button); }
 // Mode encoding, mirrored from kernel/proc/syscall.h (locked there by
 // _Static_assert) and from rustkern/loginmode.rs (locked there by the boot
 // self-test). ANY error is treated as TYPED by every caller: showing every
@@ -745,6 +893,36 @@ typedef struct {
 } fsperm_info_t;
 static inline int sys_fs_perm_info(const char *path, fsperm_info_t *out) {
     return (int)syscall3(SYS_FS_PERM_INFO, (long)path, 0, (long)out);
+}
+
+// ---------------------------------------------------------------------------
+// (#dosperm) SYS_ACCESS - POSIX access(2), against the caller's own EFFECTIVE
+// credentials. Answers the permission question WITHOUT attempting the
+// operation, which is the whole point: before this, the only way for a Ring-3
+// program to learn whether it may write a path was to try, and a failure code
+// is not the same information as a reason. The kernel answers from the one
+// perms_check() every in-kernel caller already uses, so a userland "can I
+// write here" and the kernel's own enforcement can never disagree.
+//
+// F_OK is deliberately NOT offered: existence is SYS_STAT's question. Passing
+// mode 0, or any bit outside R_OK|W_OK|X_OK, returns -1.
+// ---------------------------------------------------------------------------
+#define SYS_ACCESS          424
+// Guarded because several ported apps ship their own unistd.h with the same
+// three POSIX values (userland/apps/doom, rogue, python). Same values, so a
+// redefinition is harmless, but a warning-free build is worth two lines.
+#ifndef X_OK
+#define X_OK                1
+#endif
+#ifndef W_OK
+#define W_OK                2
+#endif
+#ifndef R_OK
+#define R_OK                4
+#endif
+// 0 if the access is permitted, -1 if not (or on a bad path/mode).
+static inline int sys_access(const char *path, int mode) {
+    return (int)syscall2(SYS_ACCESS, (long)path, (long)mode);
 }
 // #565: parse a /THEMES/*.mtheme file and add/update it in the kernel's live
 // theme table. Returns the resulting theme index (>=0), or -1 on failure.
@@ -1024,6 +1202,7 @@ static inline int futex(volatile unsigned int *addr, int op, unsigned int val,
 #define SYS_GET_DISPLAY_FX 220
 #define SYS_DRAW_TTF       221
 #define SYS_MEASURE_TTF    222
+#define SYS_MEASURE_TTF_EX 427   // #245 face-explicit measure
 #define SYS_SET_FONT_SIZE  223
 #define SYS_GET_FONT_SIZE  224
 #define SYS_SET_SCREENSAVER 225
@@ -1231,6 +1410,16 @@ static inline void ttf_text(int x, int y, const char *str, int size, unsigned in
 }
 static inline int ttf_measure(const char *str, int size) {
     return (int)syscall2(SYS_MEASURE_TTF, (long)str, size);
+}
+// #245: face-explicit measure. The missing half of the face-aware text API:
+// win_draw_text_ttf_ex() has been able to DRAW in any installed face for a long
+// time, but there was no way to ask how wide that would be, so anything wanting
+// a second typeface had to measure in the wrong face and lay out on that answer.
+// Pack face|size<<8|style<<24 exactly as win_draw_text_ttf_ex() does, so the
+// measure and the draw cannot be given different fields.
+static inline int ttf_measure_ex(const char *str, int face, int size, int style) {
+    long fss = (face & 0xFF) | (((long)size & 0xFFFF) << 8) | (((long)style & 0xFF) << 24);
+    return (int)syscall2(SYS_MEASURE_TTF_EX, (long)str, fss);
 }
 static inline int set_screensaver(int t) {
     return (int)syscall1(SYS_SET_SCREENSAVER, t);
@@ -1461,9 +1650,14 @@ typedef struct {
     // calling it on an already-maximized window restores it - without this
     // bit a menu could not tell which way the toggle was about to go.
     int  maximized;
+    // #opacityglass (2026-09-06): mirrors kernel/gui/window.h - this window's
+    // own opacity (0-255), which can differ from the global default via the
+    // titlebar decorator popup's per-window override. APPENDED, never
+    // reordered.
+    int  opacity;
 } wm_window_info_t;
-_Static_assert(sizeof(wm_window_info_t) == 136,
-               "#745/#41/#44: wm_window_info_t layout is duplicated in kernel/gui/window.h; "
+_Static_assert(sizeof(wm_window_info_t) == 140,
+               "#745/#41/#44/#opacityglass: wm_window_info_t layout is duplicated in kernel/gui/window.h; "
                "change both or neither");
 
 static inline int wm_get_windows(wm_window_info_t *buf, int n) {
@@ -1478,6 +1672,214 @@ static inline int wm_focus(int id) {
 static inline int wm_minimize(int id) {
     return (int)syscall1(SYS_WM_MINIMIZE_WINDOW, id);
 }
+
+// #tbclose (appqa Finding 1): close an ARBITRARY window by its
+// wm_window_info_t.id - same id space as wm_focus()/wm_minimize() above, NOT
+// the caller's own win_create() handle. Runs the exact same graceful request
+// a real click on that window's titlebar close (X) button runs
+// (window_request_close(), kernel/gui/window.c): posts EVENT_WINDOW_CLOSE to
+// the window's owner, which decides whether to actually exit. Unlike a
+// synthetic click at the close button's screen coordinates, this needs no
+// titlebar to exist, so it is the only way to close a WINDOW_FLAG_NOCHROME
+// window (win_set_nochrome()) from OUTSIDE that window's own process - the
+// kernel's close-button hit test is skipped entirely for a NOCHROME window,
+// at ANY coordinate. Use this for BOTH chromed and nochrome windows: the
+// chromed path is byte-identical to what a real click already does.
+// Returns 0 on success, -1 if the id was not found or the window is not
+// closable.
+#define SYS_WM_CLOSE_WINDOW 444
+static inline int wm_close_window(int id) {
+    return (int)syscall1(SYS_WM_CLOSE_WINDOW, id);
+}
+
+// #246/#305 AI escrow KERNEL enforcement (docs/CONTRACT_ENFORCEMENT_PLAN.md).
+// escrow_enter() marks THIS process an escrow-contract actor and registers a
+// kernel-side GraphFS WRITE grant scoped to `scope_path` (a canonical absolute
+// prefix such as "/MEDIA/USB") for `ttl_ms` milliseconds. While marked, the
+// KERNEL refuses any FS mutation this process makes outside the scope, and
+// refuses EVERY delete (no delete-scope grant is ever issued), even when the
+// process is uid 0 and issues the raw syscall directly - the userland aicap
+// layer is bypassed and the kernel still enforces. escrow_exit() revokes the
+// grant and clears the marker (the process becomes an ordinary process again).
+// A non-marked process is entirely unaffected. Numbers MUST match
+// kernel/proc/syscall.h (enforced by syscall-number-gate).
+#define SYS_ESCROW_ENTER 445
+#define SYS_ESCROW_EXIT  446
+static inline int escrow_enter(const char *scope_path, unsigned long ttl_ms) {
+    return (int)syscall2(SYS_ESCROW_ENTER, (long)scope_path, (long)ttl_ms);
+}
+static inline int escrow_exit(void) {
+    return (int)syscall0(SYS_ESCROW_EXIT);
+}
+
+// Stage 5B: escrow_abort() reverts THIS contract's recorded reversible effects
+// (moves back, empty dirs removed) then closes. A self-service actor uses it on a
+// failed promise; a mandatory (locked) actor is refused. Returns reverted count
+// (>=0) or a negative ESCROW_E* code.
+#define SYS_ESCROW_ABORT 447
+static inline int escrow_abort(void) {
+    return (int)syscall0(SYS_ESCROW_ABORT);
+}
+
+// getrandom(2): fill a user buffer with kernel CSPRNG output. MUST equal the
+// kernel number (kernel/proc/syscall.h SYS_GETRANDOM=448); the syscall-number
+// gate fails the land if they diverge. The getrandom()/getentropy() wrappers
+// live in sys/random.c over this number.
+#define SYS_GETRANDOM 448
+
+// #404 disk-mgr: raw block device + partition-table syscalls (Stages 0-2).
+// Numbers MUST equal kernel/proc/syscall.h (syscall-number-lint fails the land
+// if they diverge). is_boot/is_removable are stamped by the KERNEL; never trust
+// a device descriptor you filled yourself - the kernel re-resolves (kind,index).
+#define SYS_BLK_ENUM      449
+#define SYS_BLK_READ      450
+#define SYS_BLK_WRITE     451
+#define SYS_PART_PREPARE  452
+#define SYS_PART_WRITE    453
+#define SYS_MKFS          454
+// Stage 4: general mount table.
+#define SYS_MOUNT_LIST    455
+#define SYS_MOUNT         456
+#define SYS_UMOUNT        457
+
+#define BLK_KIND_ATA     0
+#define BLK_KIND_AHCI    1
+#define BLK_KIND_USB     2
+#define BLK_KIND_SCRATCH 3
+
+typedef struct {
+    unsigned char      kind;
+    unsigned char      index;
+    unsigned char      is_boot;
+    unsigned char      is_removable;
+    unsigned int       sector_size;
+    unsigned long long sectors;
+    char               model[40];
+} blk_dev_t;
+
+typedef struct {
+    unsigned char      type_guid[16];
+    unsigned long long start_lba;
+    unsigned long long size_lba;
+    char               name[40];
+} part_spec_t;
+
+typedef struct {
+    unsigned char      nonce[16];
+    unsigned long long layout_hash;
+    unsigned long long cur_hash;
+    unsigned long long dev_sectors;
+} part_token_t;
+
+// Enumerate every block device (fixed ATA/AHCI + removable USB + scratch).
+// Returns the count, or negative.
+static inline int blk_enum(blk_dev_t *out, int max) {
+    return (int)syscall3(SYS_BLK_ENUM, (long)out, (long)max, (long)sizeof(blk_dev_t));
+}
+// Raw sector read/write. Root only. WRITE is REFUSED on the boot disk. Returns
+// sectors transferred, or negative.
+static inline int blk_read_lba(int kind, int index, unsigned long long lba,
+                               unsigned int count, void *buf) {
+    return (int)syscall5(SYS_BLK_READ, kind, index, (long)lba, (long)count, (long)buf);
+}
+static inline int blk_write_lba(int kind, int index, unsigned long long lba,
+                                unsigned int count, const void *buf) {
+    return (int)syscall5(SYS_BLK_WRITE, kind, index, (long)lba, (long)count, (long)buf);
+}
+// Two-phase partition-table write. part_prepare() returns a nonce (in *out)
+// bound to the device + proposed layout + current on-disk table; part_write()
+// must echo that nonce AND re-present the identical layout or it is refused.
+// Root only; boot disk refused. Returns 0 (prepare) / 1 (write) or negative.
+static inline int part_prepare(int kind, int index, const part_spec_t *layout,
+                               int nparts, part_token_t *out) {
+    return (int)syscall5(SYS_PART_PREPARE, kind, index, (long)layout, nparts, (long)out);
+}
+static inline int part_write(int kind, int index, const part_spec_t *layout,
+                             int nparts, const unsigned char nonce[16]) {
+    return (int)syscall5(SYS_PART_WRITE, kind, index, (long)layout, nparts, (long)nonce);
+}
+
+// #404 disk-mgr Stage 3: create a filesystem IN a GPT partition. `part_index`
+// names a partition on the GPT the Stage-2 writer wrote (NOT a raw range), the
+// kernel re-resolves the device and REFUSES the boot disk / a busy removable,
+// and every write is bounded to the partition. `label` is an optional volume
+// label (NULL for none). Root only. Returns 0 or negative.
+#define MKFS_FAT   1
+#define MKFS_EXT2  2
+static inline int mkfs(int kind, int index, int part_index, int fstype,
+                       const char *label) {
+    return (int)syscall5(SYS_MKFS, kind, index, part_index, fstype, (long)label);
+}
+
+// #404 disk-mgr Stage 4: general MOUNT / UNMOUNT with a mount table.
+//
+// SYS_MOUNT_LIST is the cheap read-only cut for the GUI Mount tab: it lists the
+// two boot mounts (FAT ESP + ext2 root) PLUS every dynamic aux mount. Removable
+// / disk-image volumes stay under SYS_VOL_LIST (the tray already polls it).
+//
+// SYS_MOUNT / SYS_UMOUNT manage a SELF-CONTAINED aux mount table (root only).
+// Dynamic mount points are STRUCTURALLY confined to a "/MNT/" prefix, so a
+// dynamic mount can never shadow "/" or "/boot", and SYS_UMOUNT can never target
+// a boot mount. See docs/DISK_MANAGER_PLAN.md Stage 4 for what is fully general
+// (list / mount lifecycle / FAT file access proven in-kernel) vs deferred to 4b
+// (global-VFS path resolution through an aux mount; ext2 write-through-mount).
+
+// mount_ent_t flags.
+#define MNT_F_BOOT     0x01  // a fixed boot mount; NEVER unmountable
+#define MNT_F_RO       0x02  // mounted read-only
+#define MNT_F_DYNAMIC  0x04  // added via mount() (lives in the aux table)
+#define MNT_F_ROOT     0x08  // the "/" root mount
+
+typedef struct {
+    char               path[32];      // mount point, NUL-terminated
+    char               fstype[8];     // "fat16"/"fat32"/"ext2"/"fat", NUL-terminated
+    unsigned char      kind;          // BLK_KIND_* backing device (0xFF if n/a)
+    unsigned char      index;         // backing device index
+    unsigned char      part_index;    // partition index, 0xFF = n/a
+    unsigned char      flags;         // MNT_F_*
+    unsigned int       _pad;
+    unsigned long long total_bytes;   // volume size (0 if unknown)
+    unsigned long long free_bytes;    // free bytes (0 if not computed)
+    unsigned long long start_lba;     // absolute partition start LBA
+} mount_ent_t;
+
+// List all mounts. Returns the count (up to max), or negative.
+static inline int mount_list(mount_ent_t *out, int max) {
+    return (int)syscall3(SYS_MOUNT_LIST, (long)out, (long)max, (long)sizeof(mount_ent_t));
+}
+// Mount partition `part_index` of device (kind,index) at `path` (must be under
+// "/MNT/"). Root only. Returns 0 or negative.
+static inline int mount_at(int kind, int index, int part_index, const char *path) {
+    return (int)syscall4(SYS_MOUNT, kind, index, part_index, (long)path);
+}
+// Unmount a dynamic aux mount by path (must be under "/MNT/"). Root only.
+static inline int umount_at(const char *path) {
+    return (int)syscall1(SYS_UMOUNT, (long)path);
+}
+
+// #404 (cfhost): Cardfile window hosting. Set an ARBITRARY window's bounds by
+// its wm_window_info_t.id (NOT the caller's own handle - SYS_WIN_MOVE/_BY do
+// that). COMPOSITOR ONLY: the kernel gates this on uw_caller_is_compositor(),
+// so a non-compositor caller gets -1. Used by cardfile_host.c to place, resize
+// and show/hide the real app windows the deck's cards host. flags below.
+//   CF_MANAGED: the window is marked WINDOW_FLAG_NOCHROME (no kernel titlebar/
+//               border) so the Cardfile deck draws the card frame instead.
+//   CF_HIDDEN:  the window is minimized and not composited (a stowed card).
+// Returns 0 on success, -1 if not the compositor / window id not found / (when
+// shown) the w,h are out of range. Geometry is ignored for a hidden window.
+#define SYS_WM_SET_BOUNDS 442
+#define CF_MANAGED 0x1u
+#define CF_HIDDEN  0x2u
+static inline int wm_set_bounds(int win_id, int x, int y, int w, int h,
+                                unsigned int flags) {
+    return (int)syscall6(SYS_WM_SET_BOUNDS, (long)win_id, (long)x, (long)y,
+                         (long)w, (long)h, (long)flags);
+}
+
+// (btui) Bluetooth control multiplexed syscall. arg1 = BT_CMD_* (see
+// bt_client.h), arg2/arg3 = operands. The real bt_client.c wraps this; the
+// number MUST match kernel/proc/syscall.h (enforced by syscall-number-gate).
+#define SYS_BT 443
 
 // Non-blocking DNS (poll-split). dns_start: 1=resolved now (*ip set), 0=pending,
 // <0=error. dns_poll: 1=done (*ip set), 0=pending, -1=failed. IP is in
@@ -1695,6 +2097,7 @@ static inline int get_disk_info(int idx, disk_info_t *out) {
 // ===========================================================================
 #define SYS_VOL_LIST        283
 #define SYS_VOL_EJECT       284
+#define SYS_VOL_BUSY        285
 
 // MUST match sc_volume_t in kernel/proc/syscall.h (size locked there by
 // _Static_assert) and ScVolume in kernel/rustkern/hotplug.rs.
@@ -1740,6 +2143,11 @@ static inline int vol_list(sc_volume_t *buf, int max) {
 // Flush, unmount and tell the device it is safe to remove. 0 on success.
 static inline int vol_eject(int index) {
     return (int)syscall1(SYS_VOL_EJECT, (long)index); }
+// #708: number of open file handles on removable volume `index` (0 = not busy).
+// The AI safe-eject tool consults this to REFUSE ejecting a busy device instead
+// of force-invalidating its handles the way a user-driven Files/tray eject does.
+static inline int vol_busy(int index) {
+    return (int)syscall1(SYS_VOL_BUSY, (long)index); }
 
 #define SYS_SET_WALLPAPER   204
 #define SYS_GET_WALLPAPER   205
@@ -2096,7 +2504,12 @@ static inline int win16_run(const char *path) {
 // kernel spawns a dedicated proc + host window (non-blocking) and returns 0 on
 // spawn, <0 on error. Used by the Start menu to launch DOS games (TIM, Keen).
 static inline int dos_run(const char *path) {
-    return (int)syscall1(SYS_DOS_RUN, (long)path);
+    return (int)syscall2(SYS_DOS_RUN, (long)path, 0);
+}
+// (#dostitle) Same launch, plus a window title (the Start-menu item name), so a
+// DOS game is not labelled after its drive/dir. title may be NULL -> derived.
+static inline int dos_run_titled(const char *path, const char *title) {
+    return (int)syscall2(SYS_DOS_RUN, (long)path, (long)title);
 }
 
 #define SYS_SSH_CLIENT      242
@@ -2188,8 +2601,13 @@ typedef struct {
     unsigned int faulty;         // #549 persistently unreachable
     unsigned int driver;         // 0 = NO NIC AT ALL (distinct from no carrier)
     unsigned int prefix_len;     // popcount(netmask)
+    // #netfix2: is dns_active an EXPLICIT choice that overrides DHCP on every
+    // network, or just what this network offered? Without this the Settings
+    // panel could not tell the difference and so could not show it, which is
+    // how a user ends up permanently pinned to a resolver he never chose.
+    unsigned int dns_pinned;     // 0 = automatic, 1 = pinned by an explicit choice
 } net_status_t;
-_Static_assert(sizeof(net_status_t) == 48,
+_Static_assert(sizeof(net_status_t) == 52,
                "net_status_t sizeof lock: must match kernel/proc/syscall.h and "
                "SZ_NET_STATUS in kernel/rustkern/argtab.rs");
 
@@ -2336,7 +2754,7 @@ static inline int sys_net_status(net_status_t *out) {
 // There was NO way to do this from Ring 3 at all. net_set_static() (217) takes
 // ip/mask/gw only, so Settings' "DNS Server" field went nowhere: the app copied
 // the typed text into its own display variable and the resolver never changed.
-// Proven on VM <vmid> / build 2054 - after a real OK click, [NETDIAG] still read
+// Proven on VM 2333 / build 2054 - after a real OK click, [NETDIAG] still read
 // dns=8.8.8.8 and a host packet capture showed a fresh hostname resolved
 // through the old server.
 //
@@ -2349,6 +2767,8 @@ static inline int sys_net_status(net_status_t *out) {
 //   -> -2  not a usable resolver address
 //   -> -3  applied LIVE but NOT saved: it will revert on reboot. Say so.
 #define SYS_NET_SET_DNS 408
+// #netfix2. Kernel mirror: kernel/proc/syscall.h.
+#define SYS_NET_LAST_ERROR 425
 
 #define NET_SET_DNS_OK        0
 #define NET_SET_DNS_EINVAL  (-2)
@@ -2383,6 +2803,95 @@ static inline int net_set_dns(const char *dotted) {
     unsigned int v = net_parse_ipv4(dotted);
     if (v == 0) return NET_SET_DNS_EINVAL;
     return (int)syscall1(SYS_NET_SET_DNS, (long)v);
+}
+
+// #netfix2: go back to whatever the network offers, and REMOVE the pin from
+// /CONFIG/NETIP.CFG so it does not return on the next boot.
+//
+// Until this existed there was no way back from an explicitly-chosen resolver:
+// the pin flag was set in two places and cleared in none. A machine that had
+// once been given a DNS server used it on every network forever, and if that
+// server was unreachable on the network it was later moved to, every name
+// lookup failed while ping kept working perfectly.
+static inline int net_set_dns_auto(void) {
+    return (int)syscall1(SYS_NET_SET_DNS, 0);
+}
+
+// #netfix2: WHY did this process's last fetch fail?
+//
+// Returns a NF_* reason code (0 = nothing recorded) and fills `buf` with a
+// short name such as "DNS-RESOLVER-ANSWERED-NOTHING", "TCP-CONNECT-TIMEOUT" or
+// "TLS-FAILED-BECAUSE-SYSTEM-CLOCK-IS-WRONG".
+//
+// It exists because the kernel used to throw the cause away: sys_http_fetch()
+// collapses every transport failure to -1 and the async poll returns only
+// running/done/error, so the browser could truthfully say nothing except
+// "Fetch failed" - which is exactly what the user has been reporting for
+// months, in those words. It does not clear the reason, so an app may ask
+// twice (a status bar and an error page).
+static inline int net_last_error(char *buf, unsigned int cap) {
+    return (int)syscall2(SYS_NET_LAST_ERROR, (long)buf, (long)cap);
+}
+
+// Local prefix compare; the reason names are stable prefixes, so matching the
+// prefix means a name gaining a suffix later does not silently lose its advice.
+static inline int nf_name_is(const char *s, const char *pfx) {
+    while (*pfx) { if (*s != *pfx) return 0; s++; pfx++; }
+    return 1;
+}
+
+// A sentence for the user, chosen from the reason name. Deliberately a plain
+// string map and not a lookup table shared with the kernel: the kernel's names
+// are stable identifiers for a LOG, and what a person should be told is a
+// different question with a different answer.
+static inline const char *net_error_advice(const char *name) {
+    if (!name || !name[0]) return "";
+    if (nf_name_is(name, "DNS-RESOLVER-ANSWERED-NOTHING"))
+        // #dnsfallback: THIS SENTENCE USED TO SEND THE USER TO THE THING THAT
+        // BROKE THEM. It said "Settings > Network > DNS Server > Automatic
+        // usually fixes it", and on the owner's Windows ICS segment Automatic
+        // IS the dead resolver: the gateway serves DHCP and is silent on port
+        // 53, so automatic selects it and nothing resolves. He had pinned
+        // 1.1.1.1, that pin was removed as a bug, and this sentence then told
+        // him to choose the broken setting. Advice that names a specific
+        // setting is only as good as the assumption that the setting is the
+        // problem, and here it was the opposite.
+        //
+        // The OS now escalates to a public resolver on its own, so the honest
+        // sentence says what the computer is doing and names the real cause,
+        // which is on the network and not in this machine's settings.
+        return "Your DNS server is not responding on this network. This "
+               "computer is trying a public resolver instead. If pages still "
+               "fail, your router or firewall is blocking DNS (UDP port 53).";
+    if (nf_name_is(name, "DNS-NXDOMAIN"))
+        return "That host name does not exist. Check the spelling.";
+    if (nf_name_is(name, "DNS-NEGATIVE-CACHED"))
+        return "A recent lookup for this host failed, so it was not retried yet. "
+               "Wait a few seconds, or check Settings > Network.";
+    if (nf_name_is(name, "DNS-NO-RESOLVER"))
+        return "No DNS server is configured. Set one in Settings > Network.";
+    if (nf_name_is(name, "TLS-FAILED-BECAUSE-SYSTEM-CLOCK"))
+        return "This computer's clock is wrong, so no secure site can be "
+               "verified. Fix the date in Settings > Date and Time.";
+    if (nf_name_is(name, "TLS-CERT-EXPIRED"))
+        return "The site's security certificate has expired.";
+    if (nf_name_is(name, "TLS-CERT-NO-TRUSTED-CA"))
+        return "The site's certificate is not signed by a CA this system trusts.";
+    if (nf_name_is(name, "TLS-CERT-WRONG-HOSTNAME"))
+        return "The site's certificate is for a different host name.";
+    if (nf_name_is(name, "NO-CARRIER"))
+        return "The network cable or adapter is disconnected.";
+    if (nf_name_is(name, "NO-IP-ADDRESS"))
+        return "This computer has no IP address. DHCP has not completed.";
+    if (nf_name_is(name, "TCP-CONNECT-TIMEOUT") ||
+        nf_name_is(name, "TCP-REFUSED"))
+        return "The server did not accept a connection.";
+    if (nf_name_is(name, "ARP-UNRESOLVED"))
+        return "The gateway did not answer; the local network may be down.";
+    if (nf_name_is(name, "INTERFACE-TRIPPED"))
+        return "Networking is disabled by the connectivity breaker. "
+               "Reconnect in Settings > Network.";
+    return "";
 }
 
 // NEVER BLOCKS, by design. Unlike sys_ping() (66), which sleeps the caller for
@@ -2505,6 +3014,22 @@ static inline int net_list_shares(const char *server, char *buf, unsigned int ma
 }
 static inline int net_unmount(const char *server, const char *share) {
     return (int)syscall2(SYS_NET_UNMOUNT, (long)server, (long)share);
+}
+
+// ---- #317 nfsbrowse: NFS export enumeration + on-demand mount ----
+#define SYS_NET_LIST_EXPORTS 458
+#define SYS_NFS_MOUNT        459
+// Enumerate an NFS server's exports (MOUNT EXPORT / showmount -e). Fills buf
+// with newline-separated export paths; returns the export count (>=0) or -1.
+static inline int net_list_exports(const char *server, char *buf, unsigned int maxlen) {
+    return (int)syscall3(SYS_NET_LIST_EXPORTS, (long)server, (long)buf, (long)maxlen);
+}
+// Mount an NFS export on demand; writes the resulting "/NFS/<server>/<label>"
+// mount point into mp_out (navigate there to browse). Returns 0 / -1.
+static inline int net_nfs_mount(const char *server, const char *export_path,
+                                char *mp_out, unsigned int mp_outsz) {
+    return (int)syscall4(SYS_NFS_MOUNT, (long)server, (long)export_path,
+                         (long)mp_out, (long)mp_outsz);
 }
 
 // ---- Task Manager: process table snapshot (#159) ----

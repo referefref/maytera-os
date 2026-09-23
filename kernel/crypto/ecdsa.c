@@ -28,6 +28,7 @@
 #include "crypto.h"
 #include "../string.h"
 #include "../mm/heap.h"
+#include "fs/bootlog.h"   // #659 (crypkat): owning header for bootlog_write, NOT a private extern
 #include "../serial.h"
 
 // =============================================================================
@@ -306,6 +307,18 @@ int ecdsa_verify(ecdsa_curve_id_t curve_id,
                   const uint8_t *r_bytes, size_t r_len,
                   const uint8_t *s_bytes, size_t s_len,
                   const uint8_t *qx_bytes, const uint8_t *qy_bytes, size_t coord_len) {
+#ifdef ECDSA_KAT_FAULT
+    /* HOST KAT RED-TEAM ONLY. The kernel build NEVER defines this flag (grep the
+       Makefiles: it appears nowhere). ecdsa_verify_kat.sh compiles a second copy
+       WITH it to prove ecdsa_verify_selftest()'s forgery-rejection checks
+       actually FIRE: an unconditional-accept verifier is the single most
+       dangerous verify bug, and is EXACTLY the original cert_store.c stub this
+       code replaced. A KAT that could not catch it would be a no-op.
+       See #659 / blame.md. */
+    (void)curve_id; (void)hash; (void)hash_len; (void)r_bytes; (void)r_len;
+    (void)s_bytes; (void)s_len; (void)qx_bytes; (void)qy_bytes; (void)coord_len;
+    return 1;
+#endif
     if (curve_id != ECDSA_CURVE_P256 && curve_id != ECDSA_CURVE_P384) return 0;
     const curve_params_t *cp = &CURVE_TABLE[curve_id];
     if ((int)coord_len != cp->coord_len) return 0;
@@ -530,4 +543,135 @@ done:
     crypto_zero(pts, 2 * sizeof(ecp_t));
     kfree(w); kfree(pts);
     return ret;
+}
+
+// =============================================================================
+// #659 (crypkat): ecdsa_verify RFC 6979 known-answer self-test (accept +
+// forgery-reject).
+//
+// WHY THIS EXISTS. ecdsa_verify above is the X.509 certificate SIGNATURE
+// verifier: net/tls/cert_store.c (ecdsa_verify_cert / verify_chain) calls it to
+// authenticate every ECDSA-signed certificate in a TLS chain. It is the trust
+// anchor for "is this the real server". Before this commit the tree had NO
+// self-test of it AT ALL: no known-answer vector, and crucially nothing that
+// proves it REJECTS a forgery. The ed25519_verify KAT (#658) closed the same
+// gap for ed25519; the twin gap for the ECDSA cert path was still open. A
+// decoder/differential test cannot substitute: the danger is precisely an
+// ecdsa_verify that ACCEPTS a bad signature (the original cert_store.c bug was
+// literally "return 0" -> "unconditionally accept every ECDSA cert"), and only
+// a tamper-reject KAT catches that class.
+//
+// This proves, on a re-runnable basis (ecdsa_verify_kat.sh in the build
+// container, plus a boot self-test in main.c) that ecdsa_verify
+//   (a) ACCEPTS the canonical RFC 6979 A.2.5 P-256/SHA-256 vectors, and
+//   (b) REJECTS a signature / hash / public key with a single flipped bit, and
+//       rejects the degenerate r=0 / s=0 signatures.
+//
+// C, not Rust (policy justification): this is a boot self-test OF an existing C
+// primitive. It must call the existing C ecdsa_verify and it lives in the same
+// translation unit so it can build the "r == group order n" out-of-range reject
+// vector directly from the file-static CURVE_TABLE. Re-expressing it in Rust
+// would mean FFI-exposing verify plus duplicating the vector plumbing for zero
+// security benefit. Reuses the shared ecdsa_verify; it does NOT fork a verifier.
+// The KAT vectors are public (RFC 6979); NO private key is committed.
+// =============================================================================
+static void ecdsa_kat_hex(uint8_t *out, const char *hex, int outlen) {
+    int i;
+    for (i = 0; i < outlen; i++) {
+        int hi = (unsigned char)hex[2 * i];
+        int lo = (unsigned char)hex[2 * i + 1];
+        hi = (hi <= '9') ? hi - '0' : (hi | 0x20) - 'a' + 10;
+        lo = (lo <= '9') ? lo - '0' : (lo | 0x20) - 'a' + 10;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+}
+
+int ecdsa_verify_selftest(void) {
+    // kprintf is declared by serial.h (included above); no private extern.
+
+    // RFC 6979 A.2.5, NIST P-256 with SHA-256. Two messages ("sample","test")
+    // share the same public key. Only public values (key, hash, signature) are
+    // used; the private key / nonce k are deliberately omitted (verify-only).
+    // coord_len = 32 for P-256; the hash is the 32-byte SHA-256 digest of the
+    // message. The verifier is curve-table-driven, so this P-256 vector drives
+    // the entire ecdsa_verify body; P-384 shares the identical code path.
+    static const char *QX =
+        "60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6";
+    static const char *QY =
+        "7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299";
+    static const struct { const char *h, *r, *s; } V[2] = {
+        // "sample"
+        { "AF2BDBE1AA9B6EC1E2ADE1D694F41FC71A831D0268E9891562113D8A62ADD1BF",
+          "EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716",
+          "F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8" },
+        // "test"
+        { "9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08",
+          "F1ABB023518351CD71D881567B1EA663ED3EFCF6C5132B354F28D3B0B7D38367",
+          "019F4113742A2B14BD25926B49C649155F267E60D3814B4C0CC84250E46F0083" },
+    };
+
+    int fail = 0, checks = 0, i;
+    uint8_t qx[32], qy[32], h[32], r[32], s[32];
+    ecdsa_kat_hex(qx, QX, 32);
+    ecdsa_kat_hex(qy, QY, 32);
+
+    // (a) ACCEPT: every canonical vector must verify (== 1).
+    for (i = 0; i < 2; i++) {
+        ecdsa_kat_hex(h, V[i].h, 32);
+        ecdsa_kat_hex(r, V[i].r, 32);
+        ecdsa_kat_hex(s, V[i].s, 32);
+        checks++;
+        if (ecdsa_verify(ECDSA_CURVE_P256, h, 32, r, 32, s, 32, qx, qy, 32) != 1) fail++;
+    }
+
+    // (b) REJECT: single-bit tampers and degenerate signatures on vector 0 must
+    // all FAIL (== 0). This is the security property; the accept checks alone
+    // would pass an always-accept verifier.
+    ecdsa_kat_hex(h, V[0].h, 32);
+    ecdsa_kat_hex(r, V[0].r, 32);
+    ecdsa_kat_hex(s, V[0].s, 32);
+    {
+        uint8_t r2[32], s2[32], h2[32], q2[32];
+        int k;
+
+        for (k = 0; k < 32; k++) r2[k] = r[k];
+        r2[0] ^= 0x01;                                    // flip a bit in r
+        checks++;
+        if (ecdsa_verify(ECDSA_CURVE_P256, h, 32, r2, 32, s, 32, qx, qy, 32) != 0) fail++;
+
+        for (k = 0; k < 32; k++) s2[k] = s[k];
+        s2[31] ^= 0x01;                                   // flip a bit in s
+        checks++;
+        if (ecdsa_verify(ECDSA_CURVE_P256, h, 32, r, 32, s2, 32, qx, qy, 32) != 0) fail++;
+
+        for (k = 0; k < 32; k++) h2[k] = h[k];
+        h2[16] ^= 0x01;                                   // flip a bit in the hash
+        checks++;
+        if (ecdsa_verify(ECDSA_CURVE_P256, h2, 32, r, 32, s, 32, qx, qy, 32) != 0) fail++;
+
+        for (k = 0; k < 32; k++) q2[k] = qx[k];
+        q2[0] ^= 0x01;                                    // flip a bit in the public key X
+        checks++;
+        if (ecdsa_verify(ECDSA_CURVE_P256, h, 32, r, 32, s, 32, q2, qy, 32) != 0) fail++;
+
+        for (k = 0; k < 32; k++) r2[k] = 0;               // r == 0 is invalid
+        checks++;
+        if (ecdsa_verify(ECDSA_CURVE_P256, h, 32, r2, 32, s, 32, qx, qy, 32) != 0) fail++;
+
+        for (k = 0; k < 32; k++) s2[k] = 0;               // s == 0 is invalid
+        checks++;
+        if (ecdsa_verify(ECDSA_CURVE_P256, h, 32, r, 32, s2, 32, qx, qy, 32) != 0) fail++;
+
+        // r == group order n (out of range [1, n-1]) must be rejected. Built
+        // from the file-static curve table so the check exercises the real n.
+        checks++;
+        if (ecdsa_verify(ECDSA_CURVE_P256, h, 32, CURVE_TABLE[ECDSA_CURVE_P256].n, 32,
+                         s, 32, qx, qy, 32) != 0) fail++;
+    }
+
+    kprintf("[ECDSA-KAT] verify RFC6979 P-256 accept+reject : %s (checks=%d fail=%d)\n",
+            fail ? "FAIL" : "PASS", checks, fail);
+    bootlog_write("[ECDSA-KAT] verify %s checks=%d fail=%d",
+                  fail ? "FAIL" : "PASS", checks, fail);
+    return fail;
 }

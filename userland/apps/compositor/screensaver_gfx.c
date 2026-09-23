@@ -336,7 +336,7 @@ static inline uint32_t ss_bilerp(uint32_t c00, uint32_t c10, uint32_t c01, uint3
 // each it is ~60-80 Mcycle/frame, which accounts for essentially the whole
 // measured cost.
 //
-// MEASURED before this change (throwaway VM <vmid>, golden-998 kernel, plasma
+// MEASURED before this change (throwaway VM 2630, golden-998 kernel, plasma
 // saver, serial logging silenced over the timed region):
 //     1280x800   18.0 fps   COMPOSIT 34%   18.4 ms-core per Mpx
 //     1920x1080  11.5 fps   COMPOSIT 58%   24.3 ms-core per Mpx
@@ -377,19 +377,31 @@ static int32_t ss_xtab[SS_XTAB_MAX];
 static int32_t ss_xtab_dw = -1;   // dw the table was built for
 static int32_t ss_xtab_w  = -1;   // source w the table was built for
 
-void ss_lores_upscale_to_fb(const uint32_t *buf, int w, int h) {
+void ss_lores_upscale_to_fb_clipped(const uint32_t *buf, int w, int h,
+                                     int32_t cx0, int32_t cy0,
+                                     int32_t cx1, int32_t cy1) {
     if (!buf || w <= 0 || h <= 0 || !g_fb) return;
     int32_t dw = g_fb_width, dh = g_fb_height;
     if (dw <= 0 || dh <= 0) return;
+
+    if (cx0 < 0) cx0 = 0;
+    if (cy0 < 0) cy0 = 0;
+    if (cx1 > dw) cx1 = dw;
+    if (cy1 > dh) cy1 = dh;
+    if (cx1 <= cx0 || cy1 <= cy0) return;
 
     int32_t dxm1  = (dw > 1) ? (dw - 1) : 1;
     int32_t dym1  = (dh > 1) ? (dh - 1) : 1;
     int32_t sxnum = (w > 1) ? (w - 1) : 0;
     int32_t synum = (h > 1) ? (h - 1) : 0;
 
-    // Build the per-column table once per (dw, w) pair. The screensaver holds
-    // both fixed for its whole run, so in practice this runs on the first
-    // frame only and every later frame is pure table reads.
+    // Build the per-column table once per (dw, w) pair, keyed on the FULL
+    // destination width regardless of the clip - a caller that alternates
+    // between a full-frame present and a clipped one (#wpanim's animated
+    // wallpaper interleaved with an ordinary screensaver run) still gets a
+    // stable table instead of rebuilding it every call. The screensaver
+    // holds both dw and w fixed for its whole run, so in practice this runs
+    // on the first frame only and every later frame is pure table reads.
     const int use_tab = (dw <= SS_XTAB_MAX);
     if (use_tab && (ss_xtab_dw != dw || ss_xtab_w != w)) {
         for (int32_t dx = 0; dx < dw; dx++) {
@@ -402,8 +414,8 @@ void ss_lores_upscale_to_fb(const uint32_t *buf, int w, int h) {
         ss_xtab_w  = w;
     }
 
-    for (int32_t dy = 0; dy < dh; dy++) {
-        // One divide per ROW (dh per frame), not per pixel.
+    for (int32_t dy = cy0; dy < cy1; dy++) {
+        // One divide per ROW (visible rows in this call), not per pixel.
         int32_t syf = (h > 1) ? (int32_t)(((int64_t)dy * synum * 256) / dym1) : 0;
         int32_t sy0 = syf >> 8, wy = syf & 0xFF;
         if (sy0 >= h) sy0 = h - 1;
@@ -413,14 +425,14 @@ void ss_lores_upscale_to_fb(const uint32_t *buf, int w, int h) {
         uint32_t *drow = &g_fb[dy * g_fb_pitch];
 
         if (use_tab) {
-            for (int32_t dx = 0; dx < dw; dx++) {
+            for (int32_t dx = cx0; dx < cx1; dx++) {
                 int32_t e   = ss_xtab[dx];
                 int32_t sx0 = e >> 8, wx = e & 0xFF;
                 int32_t sx1 = sx0 + 1; if (sx1 >= w) sx1 = w - 1;
                 drow[dx] = ss_bilerp(row0[sx0], row0[sx1], row1[sx0], row1[sx1], wx, wy);
             }
         } else {
-            for (int32_t dx = 0; dx < dw; dx++) {
+            for (int32_t dx = cx0; dx < cx1; dx++) {
                 int32_t sxf = (w > 1) ? (int32_t)(((int64_t)dx * sxnum * 256) / dxm1) : 0;
                 int32_t sx0 = sxf >> 8, wx = sxf & 0xFF;
                 if (sx0 >= w) sx0 = w - 1;
@@ -429,4 +441,8 @@ void ss_lores_upscale_to_fb(const uint32_t *buf, int w, int h) {
             }
         }
     }
+}
+
+void ss_lores_upscale_to_fb(const uint32_t *buf, int w, int h) {
+    ss_lores_upscale_to_fb_clipped(buf, w, h, 0, 0, g_fb_width, g_fb_height);
 }

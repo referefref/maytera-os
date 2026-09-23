@@ -81,8 +81,6 @@ NCCS	[DEBT]	CONSEQUENCE STATED: kernel/drivers/tty.h says 20 and userland/libc/t
 NSIG	[DEBT]	kernel/proc/signal.h 64 versus userland/libc/signal.h 32. The kernel is the larger side, which is the safe direction for a sigset copy, but userland cannot express signals 33-64 and silently truncates any mask it builds. Same ABI-change caution as NCCS.
 THEME_NAME_LEN	[DEBT]	kernel/gui/theme.h 64 and kernel/gui/themes.h 32, both used to size a char name[] in a DIFFERENT struct in the same kernel. Each translation unit is internally consistent today (theme_parser.c includes theme.h, themes.c includes themes.h), so nothing overflows now; it becomes a 32-byte overflow the moment a theme.h struct is written by code that sees themes.h. Two theme systems in one kernel is the underlying problem.
 USER_STACK_TOP	[DEBT]	kernel/mm/vmm.h says 0xBFFF0000, which is correct for the 2-3GB user window; process.c:6242 carries an #ifndef fallback of 0x00007FFFFFFFE000ULL, an address that is not mapped at all. The #ifndef means vmm.h wins wherever it is included first, so it is a landmine rather than a live fault, but a fallback that differs from the real value is the worst possible fallback.
-JPEG_MAX_WIDTH	[DEBT]	kernel/media/jpeg.h 16384 versus kernel/gui/jpeg.c 4096. TWO JPEG decode paths in the kernel with different accepted-size ceilings, so whether an image loads depends on which decoder the caller reached. The twin-decoder problem, not the constant.
-JPEG_MAX_HEIGHT	[DEBT]	Same pair as JPEG_MAX_WIDTH: 16384 in kernel/media/jpeg.h, 4096 in kernel/gui/jpeg.c.
 SSH_MAX_SESSIONS	[DEBT]	kernel/net/ssh/ssh.h 8, which sizes ssh_session_t *sessions[8]; ssh2_server.c defines its own 4 and uses it for g_sess_pids[] and the tcp_listen backlog. Two session limits in one subsystem; the server accepts 4 where the header advertises 8.
 SS_MAX_STARS	[DEBT]	compositor.h 1600 versus kernel/gui/screensaver.h 300. The kernel screensaver is the pre-compositor fallback; the userland one is what ships. Same shape as the two Task Managers.
 SS_MAX_BUBBLES	[DEBT]	compositor.h 10 versus kernel/gui/screensaver.h 30. Same dead-kernel-fallback pair as SS_MAX_STARS.
@@ -119,3 +117,12 @@ TERM_COLOR_BRIGHT_MAGENTA	[DEBT]	0xFFFF55FF kernel vs 0x00FF55FF libc: same RGB,
 TERM_COLOR_BRIGHT_CYAN	[DEBT]	0xFF55FFFF kernel vs 0x0055FFFF libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
 TERM_COLOR_BRIGHT_WHITE	[DEBT]	0xFFFFFFFF kernel vs 0x00FFFFFF libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
 TERM_BG_COLOR	[DEBT]	0xFF1E1E1E kernel vs 0x001E1E1E libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+SDL_BUTTON_X1	[LEGIT]	SDL 1.2 (libSDL=6) vs SDL2 (assaultcube/openarena app compat shims=4): different SDL API versions; the mouse-button constants correctly differ.
+SDL_BUTTON_X2	[LEGIT]	SDL 1.2 (libSDL=7) vs SDL2 (app compat shims=5): different SDL API versions; values correctly differ.
+SDL_MAJOR_VERSION	[LEGIT]	SDL 1.2 (libSDL=1) vs SDL2 (app compat shims=2): the libSDL backend is SDL 1.2, the assaultcube/openarena shims are SDL2; different versions by design.
+SDL_MINOR_VERSION	[LEGIT]	SDL 1.2 (libSDL=2) vs SDL2 (app compat shims=0): different SDL versions by design.
+SDL_PATCHLEVEL	[LEGIT]	SDL 1.2.76 (libSDL=76) vs SDL 2.0.16 (app compat shims=16): different SDL versions by design.
+M_PI	[LEGACY]	Vendored XaoS engine (formulas.c/fractal.c) uses a coarse 3.1415 for its own fractal math; libc/math.h, calc and print3d use the full 3.14159265358979323846 (XaoS ui-hlp already uses the precise value). The coarse copy is internal to the vendored fractal code and visually irrelevant.
+bpp	[LEGIT]	XaoS bytes-per-pixel differs by design per color-mode header: c256=1, true24=3, hicolor/truecolor=4; each header describes a distinct pixel format.
+ethreads	[LEGACY]	Vendored XaoS threading flag: xthread.h default 0 vs a local 1 in btraced.c; internal to the XaoS thread shim, not a shared contract.
+EINVAL	[LEGIT]	errno 22 in libc versus -22 in rustkern/getrandom.rs, which returns NEGATIVE errno values to the syscall boundary by kernel convention (same rationale as EFAULT). Same number, opposite sign, both deliberate.

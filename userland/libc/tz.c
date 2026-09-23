@@ -345,3 +345,12 @@ void tz_local_stamp(char *out, unsigned long cap) {
     snprintf(out, cap, "%04d%02d%02d-%02d%02d%02d",
              t.year, t.month, t.day, t.hour, t.min, t.sec);
 }
+
+// POSIX tzset()/tzname globals (declared in time.h since #359 Phase 3a but
+// never defined until now: a declared-but-undefined pair that only bit when the
+// jq port linked its strptime %Z/%z fallback, which references both). MayteraOS
+// keeps wall-clock in UTC with no DST, so tzname is fixed and tzset() has
+// nothing to compute. Defining them here makes the whole libc self-consistent
+// with its own header rather than leaving a link-time trap for the next caller.
+char *tzname[2] = { (char *)"UTC", (char *)"UTC" };
+void tzset(void) { }

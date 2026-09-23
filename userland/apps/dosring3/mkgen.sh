@@ -88,6 +88,15 @@ inc_re = re.compile(rb'^\s*#\s*include\s+"([^"]+)"', re.M)
 SHIMMED = {'serial.h'}          # provided by shim/inc, never copied from kernel
 # Seeds: the sources we compile, addressed by their path INSIDE the kernel tree.
 seeds = [os.path.join('dos', f) for f in os.listdir(os.path.join(K,'dos'))]
+# fs/guestfs.c is a SEED, not a special case (#dosperm). It is the C surface
+# of the #708 guest filesystem gate: the deny logging, the flood control and
+# the arm/finish reporting that int21svc.c's dos_svc_allow() reaches. It used
+# to be reimplemented in shim/kshim.c as an unconditional ALLOW, which is how
+# the two DOS hosts came to log different lines and return different DOS
+# errors for the identical permission denial. Compiling the real file is what
+# makes that impossible rather than merely discouraged. Being a seed also
+# pulls its own include closure (proc/process.h for PROC_AS_CALLER).
+seeds += ['fs/guestfs.c']
 seeds += ['exec/x86_16.c','exec/x86_16.h','exec/softfpu.c','exec/softfpu.h',
           'string.c','string.h','types.h',
           'video/font.c','video/font.h','drivers/keymap.c','drivers/keymap.h']

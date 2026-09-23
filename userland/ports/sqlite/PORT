@@ -1,0 +1,124 @@
+# mports recipe: SQLite 3.53.4. Tier 1 item #4 of
+# docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md section 9.
+#
+# WHY THIS PORT IS build=script AND NOT build=objects. Every port before it
+# archives a list of UPSTREAM translation units. SQLite is different in one
+# structural way: the shipped library must contain BOTH the upstream
+# amalgamation (sqlite3.c) AND a MayteraOS-specific sqlite3_vfs, because SQLite
+# built with SQLITE_OS_OTHER=1 ships NO built-in VFS and NO sqlite3_os_init at
+# all (the application must supply them). Our VFS lives at
+# ports/sqlite/maytera_vfs.c - OUR code, tracked in git beside this recipe, not
+# upstream source - so it cannot appear in a `sources` list, which mports.sh
+# verifies is present IN THE UNPACKED TARBALL. build=script compiles the two
+# objects into one libsqlite3.a; the anti-no-op symbol check below then proves
+# BOTH halves are really in the archive (sqlite3_os_init and maytera_vfs_register
+# are defined by OUR file, so a build that dropped the VFS fails here).
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA.
+
+name=sqlite
+version=3.53.4
+
+# CLASS B ("CLI tool, file I/O: class A plus open/read/write/stat"). SQLite the
+# LIBRARY is not a CLI tool, but its platform surface is exactly class B's: it
+# needs open/read/write/lseek/fstat/unlink/fsync/ftruncate, reached THROUGH the
+# sqlite3_vfs we provide. It is beyond class A (pure computation) precisely
+# because it touches the filesystem; it is nowhere near a process model, argv,
+# sockets or a window, so B is the honest letter.
+class=B
+homepage=https://www.sqlite.org/
+
+# The "autoconf" package (NOT the .zip amalgamation, which mports cannot unpack:
+# do_build uses `tar -xf`). This tarball carries the pre-built amalgamation
+# sqlite3.c plus sqlite3.h and sqlite3ext.h at its root, so no TCL and no code
+# generation is needed. The sha256 below is of THIS file and was MEASURED on
+# the build container:
+#   wget -O sqlite-autoconf-3530400.tar.gz https://www.sqlite.org/2026/sqlite-autoconf-3530400.tar.gz
+#   sha256sum sqlite-autoconf-3530400.tar.gz
+#   -> 0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c  (3,283,177 bytes)
+# 3.53.4 (2026) is the current release read off https://www.sqlite.org/download.html
+# at port time, not assumed.
+source_url=https://www.sqlite.org/2026/sqlite-autoconf-3530400.tar.gz
+tarball=sqlite-autoconf-3530400.tar.gz
+sha256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
+srcdir=sqlite-autoconf-3530400
+
+# SQLite is public domain, released under the "blessing" (see ATTRIBUTION.md).
+# There is no LICENSE file in the tarball: the disclaimer-plus-blessing text
+# lives at the top of sqlite3.h (exactly as Lua's grant lives at the top of
+# src/lua.h). If a future upstream moves it, mports fails rather than shipping
+# an unattributed library.
+licence=blessing (public domain)
+licence_files=sqlite3.h
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): does this library want to USE a platform
+# layer, or to BE one? SQLite USES. It is an embedded library: the HOST program
+# owns main(), the process and the allocator, and SQLite reaches the filesystem
+# ONLY through a sqlite3_vfs the host registers. We provide that VFS
+# (maytera_vfs.c). SQLite imposes no event loop, no main() and no window system.
+# It is the textbook USES case, which is exactly why a custom VFS is "the escape
+# hatch we need" (section 9 item 4) for the OS's missing cwd, O_EXCL and fcntl.
+adoption=USES. Embedded library: the host owns main(), the process and the allocator, and SQLite touches the filesystem only through the sqlite3_vfs the host registers. We supply that VFS over open/read/write/lseek/fstat/unlink/fsync/ftruncate; SQLite imposes no event loop, no main() and no window system.
+
+# `libc` is not a port; it is the shared platform library. The VFS calls only
+# functions libc already exports (open/read/write/close/lseek/fstat/unlink/
+# fsync/ftruncate/usleep/clock_gettime), so SQLite needs no other port.
+needs=libc
+
+# Upstream ships the amalgamation pre-built; no configure, no generated file to
+# copy into place.
+prepare=none
+
+# No patches. The MayteraOS adaptation is NOT a diff against upstream sqlite3.c:
+# it is (a) the compile-time option set in build.sh, which SQLite is explicitly
+# designed to be configured by, and (b) our own sqlite3_vfs in a separate file.
+# So the upstream amalgamation ships byte-for-byte unaltered, and there is no
+# patch series to rot at the next version bump.
+patches=none
+
+# build=script: ports/sqlite/build.sh compiles sqlite3.c + maytera_vfs.c into
+# libsqlite3.a. See the header comment above for why this port cannot be
+# build=objects.
+build=script
+
+# The option set build.sh applies, recorded here so it is reviewable as DATA
+# even though the compile lives in build.sh. WHY EACH ONE (smallest correct set
+# for a freestanding-ish target with the section 2.3/2.4/2.5 gaps):
+#   SQLITE_OS_OTHER=1        No built-in unix/win VFS is compiled, so nothing
+#                            depends on fcntl(F_SETLK) locking, O_EXCL, a cwd,
+#                            or a temp directory. We supply the ONE VFS.
+#   SQLITE_THREADSAFE=0      Single-threaded: no mutex backend is needed (OS_OTHER
+#                            provides none), and it matches the single-writer
+#                            contract the VFS documents. Smallest correct choice.
+#   SQLITE_TEMP_STORE=3      Temp tables/indices/files live in memory ALWAYS.
+#                            MayteraOS has no cwd and no temp directory (2.4), so
+#                            an on-disk anonymous temp file cannot be opened
+#                            honestly; keeping temp content in RAM avoids ever
+#                            asking the VFS for one.
+#   SQLITE_OMIT_WAL          WAL needs shared memory (xShmMap), which needs mmap;
+#                            our VFS is iVersion=1 and implements no xShm*.
+#                            Rollback-journal mode is complete without it.
+#   SQLITE_OMIT_LOAD_EXTENSION  No dlopen on this OS (dlfcn.h absent, 2.1); the
+#                            VFS xDl* pointers are therefore NULL.
+#   SQLITE_MAX_MMAP_SIZE=0   No memory-mapped I/O (no public mmap, 2.2); the VFS
+#                            implements no xFetch/xUnfetch.
+#   SQLITE_OMIT_DEPRECATED   Drop the deprecated API surface; nothing needs it.
+#   SQLITE_DQS=0             Reject double-quoted string literals (the modern,
+#                            safer default).
+#   SQLITE_DEFAULT_MEMSTATUS=0  Skip per-allocation accounting; a small speed win.
+#   NDEBUG                   Release build: compile out assert().
+cflags=-DSQLITE_OS_OTHER=1 -DSQLITE_THREADSAFE=0 -DSQLITE_TEMP_STORE=3 -DSQLITE_OMIT_WAL -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_OMIT_DEPRECATED -DSQLITE_DQS=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -DNDEBUG
+
+# Installed for consumers: the public API header and the extension header.
+headers=sqlite3.h sqlite3ext.h
+
+lib=libsqlite3.a
+
+# THE ANTI-NO-OP CHECK. mports.sh proves with nm that every one of these is a
+# DEFINED symbol in libsqlite3.a. The last two are the important ones:
+# sqlite3_os_init and maytera_vfs_register are defined by OUR maytera_vfs.c, so
+# a build that compiled sqlite3.c but dropped the VFS object fails HERE rather
+# than at some consumer's link six weeks later. The sqlite3_* names prove the
+# amalgamation itself was compiled with the API present (not #ifdef'd away).
+symbols=sqlite3_open sqlite3_open_v2 sqlite3_close sqlite3_exec sqlite3_prepare_v2 sqlite3_step sqlite3_finalize sqlite3_column_int sqlite3_column_text sqlite3_column_count sqlite3_errmsg sqlite3_libversion sqlite3_vfs_register sqlite3_vfs_find sqlite3_os_init maytera_vfs_register

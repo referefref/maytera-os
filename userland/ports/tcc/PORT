@@ -1,0 +1,132 @@
+# mports recipe: TinyCC (tcc) 0.9.27. Tier 2 item #7 of
+# docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md: a small, self-contained C
+# compiler that is ALSO its own assembler and linker (it emits ELF directly with
+# no external toolchain), which is exactly why it can run as a single MayteraOS
+# userland app. This makes MayteraOS self-hosting for small C programs: /APPS/TCC
+# compiles a .c file to a runnable MayteraOS ELF, on the device, over the
+# terminal.
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA; the only
+# executable part is ports/tcc/build.sh, and mports.sh has no idea what tcc is.
+#
+# WHAT THIS PORT DELIVERS. libtcc.a, built from tcc.c compiled with ONE_SOURCE=1
+# so the WHOLE compiler (preprocessor tccpp.c, code generator tccgen.c +
+# x86_64-gen.c, the built-in ELF assembler/linker tccelf.c + x86_64-link.c, and
+# main()) is one translation unit inside one archive. crt0's reference to main
+# pulls it out, exactly the darkhttpd / jq / angband shape (main() in the
+# archive, the app Makefile only links). The port ALSO ships a small runtime
+# tree to /APPS/TCCLIB (install_data=dist:TCCLIB, assembled by build.sh): tcc's own
+# fixed-point/vararg support library libtcc1.a, tcc's bundled headers
+# (stddef.h/stdarg.h/float.h/...), and a COPY of this repository's freestanding
+# libc.a + crt0.o, so a program compiled on the device has something to link
+# against. Without those files on the image, /APPS/TCC could preprocess and
+# generate code but could not produce a runnable executable.
+
+name=tcc
+version=0.9.27
+
+# CLASS B ("CLI tool, file I/O: class A plus open/read/write/stat"). tcc reads a
+# .c file, reads #include headers off disk, and writes an object or executable
+# file. That filesystem surface is exactly B; it is nowhere near a process
+# model, sockets or a window. It does NOT need -run (in-process JIT): the
+# MAYTERAOS build below deliberately compiles it as a CROSS-style compiler that
+# only writes files, because -run needs mmap-executable memory and a signal
+# runtime MayteraOS userland does not provide. See the patch note.
+class=B
+homepage=https://bellard.org/tcc/
+
+# The GitHub mirror's tag archive for release_0_9_27. Same source shape the
+# quickjs port uses (github archive/refs/tags), chosen because the canonical
+# download.savannah.gnu.org mirror was returning 502 at port time. The sha256
+# below is of THIS file and was MEASURED on the build container, not copied from a web page:
+#   wget -O tcc-0.9.27.tar.gz \
+#     https://github.com/TinyCC/tinycc/archive/refs/tags/release_0_9_27.tar.gz
+#   sha256sum tcc-0.9.27.tar.gz
+#   -> 439760025dcb2df0281566bb2b98fead52cb6bafa697f2147d94d2222ef71363  (737,644 bytes)
+# The archive unpacks to tinycc-release_0_9_27/. It ships tcc's pre-generated
+# bits (the token tables are inline, the bundled headers under include/ are
+# checked in), so no code generation is needed to build it.
+source_url=https://github.com/TinyCC/tinycc/archive/refs/tags/release_0_9_27.tar.gz
+tarball=tcc-0.9.27.tar.gz
+sha256=439760025dcb2df0281566bb2b98fead52cb6bafa697f2147d94d2222ef71363
+srcdir=tinycc-release_0_9_27
+
+# tcc links only against the shared freestanding libc (one missing symbol,
+# strtold, supplied WEAK in maytera_compat.c). No other port.
+needs=libc
+
+# LGPL-2.1-or-later (the tarball's COPYING is the GNU LESSER GPL v2.1). This is
+# MORE permissive than the GPLv2 base this programme allows, so it is fine.
+# CC-BY-SA is the banned family; this is not it.
+licence=LGPL-2.1-or-later
+licence_files=COPYING
+copyleft=combined
+copyleft_note=libtcc.a (LGPL-2.1-or-later) is statically combined into one binary (/APPS/TCC) with this repository's permissively-licensed userland/libc (crt0.o + user-pie.ld); under the LGPL the combined program may be conveyed provided the LGPL portion can be relinked, which holds here because the corresponding source (the pinned tcc-0.9.27.tar.gz, the one patch in patches/, and this repository's own libc source) is all available and /APPS/TCC is a whole program, not a proprietary app hiding a library. userland/libc is not thereby made LGPL; it remains available under its own permissive terms and is not modified by this port. The libtcc1.a + libc.a + crt0.o shipped to /APPS/TCCLIB are the runtime a device-compiled program links against, provided for the same relink-ability reason.
+
+# THE ADOPTION TEST (owner rule 2): does this want to USE a platform layer, or
+# to BE one? tcc USES. Measured: tcc.c compiled with ONE_SOURCE links against
+# userland/libc/libc.a (crt0.o + user-pie.ld) with EXACTLY ONE otherwise-missing
+# symbol, strtold (see build.sh / maytera_compat.c). It owns main(), its own
+# compile state and its own ELF writer; it imposes no event loop, no main() on
+# the host, and no window system. Textbook USES.
+adoption=USES. tcc.c (ONE_SOURCE=1, the whole compiler in one object) links against userland/libc/libc.a with a single otherwise-missing symbol, strtold, supplied WEAK in maytera_compat.c. It owns main(), its own compiler state and its own built-in ELF assembler/linker; it imposes no event loop, host main() or window system, and reaches nothing but libc's file I/O, malloc, string/mem and math.
+
+# Nothing to copy into place before patching.
+prepare=none
+
+# ONE patch, tcc-native-guard.patch, and it is a target adaptation, not a bug
+# fix. tcc.h derives TCC_IS_NATIVE purely from the HOST compiler predefining
+# __x86_64__, which the cross gcc always does, so tcc would build as a NATIVE
+# compiler: that pulls in tccrun.c's -run path (sys/mman.h, an executable mmap,
+# a SIGSEGV/ucontext backtrace handler) and bcheck, none of which the MayteraOS
+# freestanding userland provides (there is no <sys/mman.h> at all). The patch
+# adds `!defined MAYTERAOS &&` to that one #if so -DMAYTERAOS (in cflags below)
+# builds tcc as a file-writing CROSS-style compiler with the -run machinery
+# #ifdef'd out. Two tokens on one line; the compiler source is otherwise
+# byte-for-byte unaltered, so there is no patch series to rot at the next
+# version bump.
+patches=tcc-native-guard.patch
+
+# build=script: ports/tcc/build.sh generates config.h, compiles tcc.c (ONE
+# translation unit) plus OUR maytera_compat.c into libtcc.a, builds libtcc1.a,
+# and assembles the dist/ runtime tree. It cannot be build=objects because
+# maytera_compat.c is OUR file (tracked beside this recipe), not upstream
+# source, so it cannot appear in a `sources=` list, which mports verifies
+# against the unpacked tarball. Same structural reason as the quickjs port's
+# maytera_compat.c and the sqlite port's maytera_vfs.c.
+build=script
+
+# -DMAYTERAOS selects the patch's cross-compiler branch (no -run/mmap/backtrace).
+# -DTCC_TARGET_X86_64 is the code-generator/linker backend.
+# -DCONFIG_TCC_STATIC keeps tcc.h off <dlfcn.h> (there is no dlopen here).
+# -DONE_SOURCE=1 makes tcc.c include the whole compiler as one object.
+# The CONFIG_TCC_* path defines below tell the SHIPPED compiler where its runtime
+# lives on the device (/APPS/TCCLIB), so `tcc -I/APPS/TCCLIB/include ...` and the crt/
+# library search resolve against the tree this port installs. They are -D here
+# rather than in config.h because that is where tcc's own Makefile puts them.
+cflags=-DMAYTERAOS -DTCC_TARGET_X86_64 -DCONFIG_TCC_STATIC -DONE_SOURCE=1 -DCONFIG_TCCDIR="/APPS/TCCLIB" -DCONFIG_TCC_SYSINCLUDEPATHS="/APPS/TCCLIB/include" -DCONFIG_TCC_LIBPATHS="/APPS/TCCLIB/lib" -DCONFIG_TCC_CRTPREFIX="/APPS/TCCLIB/lib" -w
+
+# headers=none: this is an APP port (like darkhttpd/jq), not a library other
+# apps compile against. tcc's OWN headers ship to the device via install_data
+# (the dist/ tree build.sh assembles), not as a consumer -I header.
+headers=none
+
+# The runtime tree build.sh assembles under the unpacked srcdir as dist/. mports
+# copies it to ports/out/data/tcc, and build-golden.sh overlays that onto the
+# ext2 root at /APPS/TCCLIB. It contains include/ (tcc's bundled headers),
+# lib/libtcc1.a (tcc's own support routines), and lib/{libc.a,crt0.o} (a copy of
+# this repo's freestanding libc for a device-compiled program to link against).
+install_data=dist:TCCLIB
+
+lib=libtcc.a
+
+# THE ANTI-NO-OP CHECK. mports proves with nm that every one of these is a
+# DEFINED symbol in libtcc.a. The set proves ALL THREE layers of the compiler
+# really landed in the one object, so a build that #ifdef'd the backend away, or
+# dropped main(), fails HERE and not at a confused runtime:
+#   main                 the CLI driver (tcc.c)
+#   tcc_new tcc_add_file tcc_compile_string  the libtcc API (the front end)
+#   tcc_set_output_type tcc_output_file      the built-in assembler+linker that
+#                                            writes the ELF (the whole point)
+#   tcc_error            the diagnostics path
+symbols=main tcc_new tcc_add_file tcc_compile_string tcc_set_output_type tcc_output_file tcc_error

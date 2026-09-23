@@ -2,24 +2,17 @@
 // Copyright (c) MayteraOS contributors.
 // Full license text: userland/libc/LICENSE (MIT License).
 //
-// sys/file.h - flock() for MayteraOS userland.
+// sys/file.h - flock() for MayteraOS userland: BSD advisory whole-file locks.
 //
-// READ THIS BEFORE YOU USE IT: flock() ALWAYS FAILS, with errno ENOSYS, and it
-// will keep failing until this OS grows a locking primitive.
-//
-// MayteraOS has NO file locking of any kind. Not advisory, not mandatory, not
-// fcntl(F_SETLK), not a lock file: even O_EXCL is unimplemented on both local
-// filesystems (see kernel/fs/fat_vfs.c), so the open(O_CREAT|O_EXCL) trick
-// people fall back on SUCCEEDS ON AN EXISTING FILE and locks nothing either.
-//
-// So this function does the only honest thing available: it refuses. It is
-// declared, rather than left out of the tree, for two reasons. A port that
-// includes <sys/file.h> for the LOCK_* constants compiles, and a port that
-// actually calls flock() and checks the return - which is the only way to use
-// a lock correctly - finds out at once and loudly that it has no mutual
-// exclusion here. What it must never do is return 0, because a caller that
-// believes it holds an exclusive lock and does not is the worst of the three
-// outcomes by a distance.
+// As of #404 Stage 6 MayteraOS HAS an advisory lock manager in the kernel
+// (POSIX fcntl record locks via fcntl(F_SETLK/F_SETLKW/F_GETLK) plus BSD
+// flock()), so flock() is a real, working call now. It takes a whole-file
+// shared (LOCK_SH) or exclusive (LOCK_EX) lock keyed on the open file, blocks
+// until grantable unless LOCK_NB is given (then it returns -1/EAGAIN on
+// conflict), releases on LOCK_UN, and is released automatically on close of the
+// fd and on process exit. The lock is ADVISORY: it excludes only other callers
+// that also lock, exactly like POSIX. flock and fcntl locks are independent
+// lock spaces (they do not conflict with each other), matching Linux.
 #ifndef LIBC_SYS_FILE_H
 #define LIBC_SYS_FILE_H
 

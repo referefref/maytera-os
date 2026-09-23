@@ -72,6 +72,7 @@ void scp_irq_tick(void) {
 scp_frame_t scp_enter(void) {
     uint32_t c = scp_cpu();
     scp_frame_t f;
+    f.cpu = c;
     f.t0 = mono_us();
     f.i0 = g_scp_irq[c];
     f.b0 = g_bkl_brk[c];
@@ -80,7 +81,7 @@ scp_frame_t scp_enter(void) {
 }
 
 void scp_exit(uint64_t num, scp_frame_t f) {
-    uint32_t c = scp_cpu();
+    uint32_t c = f.cpu;   /* stage 0b: enter-core, so per-cpu deltas cannot underflow on migration */
     uint64_t now = mono_us();
     // mono_us() returns 0 until the TSC is calibrated (cpu/mono.h), and syscalls
     // are dispatched before that on the boot path. Dropping those samples keeps
@@ -185,6 +186,27 @@ void scp_report(void) {
                 (unsigned long long)e->unbrk_max_irqs, ph);
         scp_phases(ph, sizeof(ph), e->unbrk_sum_ph);
         kprintf("[SCPROF-HOLD] #%u sc=%u sumph:%s\n", i, idx[i], ph);
+    }
+    // #168 stage 0 follow-up: THE RANKING THE DECOMPOSITION PLAN SEQUENCES
+    // ON. [SCPROF-HOLD] above ranks by unbrk_max_us, the worst SINGLE
+    // unbroken hold, so a rare one-off (a first-touch SYS_WIN_CREATE) can
+    // rank #0 above the syscall that actually consumed the most BKL time
+    // (docs/BKL_DECOMPOSITION_PLAN.md 0.3: "Read total=, not #N"). That
+    // workaround asks the reader to ignore the printed order; this line
+    // makes the order answer the plan's question - largest CUMULATIVE
+    // unbroken hold, i.e. the biggest BKL holder - so #0 IS the syscall to
+    // narrow next. percall = unbrk_total/unbrk_count is the input to the
+    // BKL_FULL/BKL_NONE decision stage 3 will table-drive. Trusted columns
+    // only (unbrk_total/count/max come from mono_us() deltas per 0.1); no
+    // phase dump here because worstph/sumph are not trusted on SMP.
+    k = scprof_top(g_scprof, SCPROF_N, 3 /* BY_UNBRK_TOTAL */, idx, 4);
+    for (uint32_t i = 0; i < k; i++) {
+        scstat_t *e = &g_scprof[idx[i]];
+        uint64_t per = e->unbrk_count ? e->unbrk_total_us / e->unbrk_count : 0;
+        kprintf("[SCPROF-BKLHOLD] #%u sc=%u total=%lluus n=%llu percall=%lluus max=%lluus\n",
+                i, idx[i], (unsigned long long)e->unbrk_total_us,
+                (unsigned long long)e->unbrk_count, (unsigned long long)per,
+                (unsigned long long)e->unbrk_max_us);
     }
     // Cumulative per-phase totals, which need no unbroken qualification: each
     // phase's own inclusive time, summed over the whole run and every thread.

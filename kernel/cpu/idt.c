@@ -6,6 +6,8 @@
 #include "../gui/crashhandler.h"
 #include "../string.h"
 #include "../fs/panic.h"
+#include "smp.h"        // #smpreval2: smp_get_cpu_id() for the per-CPU captured CR2
+#include "../mm/kstack.h"   // #stackguard: kstack_addr_is_guard() for the #DF attribution
 
 // IDT and pointer
 static idt_entry_t idt[IDT_ENTRIES] __attribute__((aligned(16)));
@@ -251,6 +253,26 @@ static inline void smpfix_note_cpl0_user_stack(interrupt_frame_t *frame) {
 }
 
 void isr_handler(interrupt_frame_t *frame) {  // #279 3b-3C BKL wrapper
+    // ======================================================================
+    // #stackguard: THE KERNEL-STACK OVERFLOW GUARD, AND IT IS FIRST ON PURPOSE.
+    //
+    // Ring-0 stacks come from mm/kstack.c as 64 KiB blocks aligned to 64 KiB
+    // whose lowest 4 KiB is a poisoned guard band. Alignment == size means the
+    // band is derivable from RSP with one AND, so this costs a mask, a load of
+    // an already-hot cache line and a compare - no per-CPU state, no lock, and
+    // it is correct on every core and every task without any plumbing.
+    //
+    // It runs BEFORE bkl_acquire() because the defect it catches is nested ISR
+    // frames piling onto a task stack while this core waits for the BKL: by the
+    // time bkl_acquire() returns, several hundred more frames may have landed.
+    // Checking after the lock would be checking after the damage.
+    //
+    // `frame` is this ISR's own frame and sits at the current stack pointer, so
+    // its address is the RSP to test - the value in frame->rsp is the
+    // INTERRUPTED context's, which for a Ring-3 interrupt is a user address.
+    if (kstack_rsp_in_band((uint64_t)frame))
+        kstack_overflow_panic((uint64_t)frame, frame->rip);
+    // ======================================================================
     extern int g_smp_bkl_full; extern void bkl_acquire(void); extern void bkl_release(void);
     smpfix_note_cpl0_user_stack(frame);   // #smpfix (#75)
     // #67 pass 5: tag what this core is doing so a long BKL hold can be blamed
@@ -272,6 +294,42 @@ void isr_handler(interrupt_frame_t *frame) {  // #279 3b-3C BKL wrapper
     // comment on bkl_wake_rescue() in cpu/smp.c. In the healthy case this is
     // one load of a hot word and no ICR write.
     { extern void bkl_wake_rescue(void); bkl_wake_rescue(); }
+    // #tickdead: ACKNOWLEDGE THE TICK BEFORE THE LOCK, NEVER AFTER, AND THIS IS
+    // THE ONLY PLACE THAT CAN DO IT.
+    //
+    // bkl_acquire() below is an unbounded wait, and every handler that owns an
+    // End Of Interrupt sends it on the far side. For a device that is latency.
+    // For the three TIMER vectors it is self-destroying, because the EOI is the
+    // interrupt controller's permission to deliver the line again: the 8259
+    // will not raise IRQ0 while its in-service bit is set, and an in-service
+    // Local APIC vector blocks the next one of equal priority. So a core
+    // waiting here has SWITCHED ITS OWN CLOCK OFF, and it stays off for as long
+    // as the lock is held. Worse, the wait re-enables interrupts (cpu/smp.c
+    // bkl_take_locked), so a nested vector 0x41 can reach sched_schedule() and
+    // context-switch AWAY from this frame, parking the un-acknowledged
+    // interrupt on a task stack. If that task then exits, the tick never comes
+    // back at all.
+    //
+    // This is the same family as cpu/idt.asm's irq_smp_tlb and irq_bkl_wake,
+    // both of which already refuse to route through isr_common because reaching
+    // a handler through bkl_acquire() is fatal for what they do. The tick
+    // vectors needed the same treatment and did not have it. They keep the
+    // shared stub (they need the #645 CLD/CLAC hardening and the #stackguard
+    // check above, which those two hand-rolled stubs each had to re-state) and
+    // get the acknowledgement moved up here instead.
+    //
+    // rustkern/tickack.rs owns which vectors qualify. It is deliberately only
+    // the three timers: an early EOI on a level-triggered device line whose
+    // device has not been serviced yet invites a storm.
+    { extern void tick_ack_pre_dispatch(uint64_t vec);
+      tick_ack_pre_dispatch(frame->int_no); }
+#ifdef TICKACK_FAULT_TEST
+    // #tickdead: stall exactly one IRQ0 frame where bkl_acquire() sits, so the
+    // terminal [TICKSRC] NATIVE TICK DEAD event can be watched happening and
+    // watched NOT happening on one binary. See cpu/tickack.h. Not in the golden.
+    { extern void tick_ack_fault_stall(uint64_t vec);
+      tick_ack_fault_stall(frame->int_no); }
+#endif
     if (g_smp_bkl_full) {
         bkl_acquire();
         bkl_set_reason(0x0100u | (uint32_t)(frame->int_no & 0xFF));
@@ -356,6 +414,78 @@ static void isr_handler_impl(interrupt_frame_t *frame) {
     kprintf("[IRQ] Unhandled interrupt %lu\n", int_no);
 }
 
+// ===========================================================================
+// #smpreval2: CR2 IS CAPTURED AT THE FAULT, NOT RE-READ WHEN IT IS PRINTED.
+//
+// MEASURED, and it produced a crash report that was simply wrong. An 8-core
+// boot killed COMPCEIL with
+//
+//   [EXCEPTION] Page Fault (INT 14) USER err=0x6 RIP=0x802d205af0 CR2=0x0
+//
+// The faulting instruction, decoded from that binary at that RIP, is
+// `mov %ecx,(%rsi,%rax,4)`, and the SAME dump reports RSI=0x8040b1e790 and
+// RAX=0x61c. The address the CPU faulted on was therefore RSI + RAX*4 =
+// 0x8040b20000: page-aligned, 11.67 MB into a 27.82 MB heap buffer whose
+// non-NULL check is right there in the disassembly. The report said 0x0.
+//
+// The cause is that CR2 was read TWICE. mm/fault.c's page_fault_handler()
+// reads it correctly on entry; then, on the unrecoverable path, it runs
+// mm_fault(), deliver_segv_handler() - which builds a signal frame ON THE USER
+// STACK and can therefore take and resolve a page fault of its own - and
+// sig_raise(), before reaching exception_fatal(), which read CR2 AGAIN. CR2 is
+// one per-CPU register that EVERY fault overwrites, including the ones the
+// kernel resolves successfully, so the second read returns the last fault this
+// core took rather than the one being reported.
+//
+// This is not cosmetic. A fault address is the primary evidence in a crash
+// report and this tree quotes it constantly, in /BOOTLOG.TXT, in /PANIC.TXT
+// and in the crash dialog. A wrong one sends the next reader after the wrong
+// bug: this one read as a NULL dereference and was in fact an unbacked page
+// in the middle of a large, successfully-allocated buffer, which is a
+// completely different defect in a completely different subsystem.
+//
+// So CR2 is captured once, where it is still correct, and every print uses the
+// captured value.
+//
+// THE PRINT IS SELF-EVIDENCING. Where the captured value and a fresh read
+// disagree, BOTH are printed. If this fix is right the extra line appears in
+// exactly the cases where the old code lied; if the two never disagree it
+// never appears and nothing is claimed. For a fault that reproduces about once
+// in twenty-four boots that is worth more than an assertion nobody can check.
+//
+// WRITTEN IN C, and the Rust-first rule wants that said. This is six lines
+// threaded between two existing C functions on the #PF fatal path: it runs
+// with interrupts off, must not allocate, must not itself fault, and must not
+// add an FFI hop between a fault and the report of it. That is the
+// "entanglement with paging/asm" exemption, not "the surrounding code is C".
+// ===========================================================================
+static volatile uint64_t g_fault_cr2[MAYTERA_MAX_CPUS];
+static volatile uint8_t  g_fault_cr2_live[MAYTERA_MAX_CPUS];
+
+void exception_note_cr2(uint64_t cr2) {
+    uint32_t c = smp_get_cpu_id();
+    if (c < MAYTERA_MAX_CPUS) { g_fault_cr2[c] = cr2; g_fault_cr2_live[c] = 1; }
+}
+
+// The address to REPORT for this exception. Non-#PF exceptions have no fault
+// address at all, which is why every existing site already tested for vector
+// 14. The read_cr2() fallback covers a vector 14 that somehow did not come
+// through mm/fault.c, which would be no worse than the old behaviour.
+static uint64_t exception_cr2(uint64_t int_no) {
+    if (int_no != EXCEPTION_PF) return 0;
+    uint32_t c = smp_get_cpu_id();
+    if (c < MAYTERA_MAX_CPUS && g_fault_cr2_live[c]) return g_fault_cr2[c];
+    return read_cr2();
+}
+
+// 0 when a fresh read agrees with the captured value, otherwise the fresh
+// value: the witness described above.
+static uint64_t exception_cr2_drift(uint64_t int_no) {
+    if (int_no != EXCEPTION_PF) return 0;
+    uint64_t now = read_cr2();
+    return (now == exception_cr2(int_no)) ? 0 : now;
+}
+
 // #429: shared fatal-exception tail (declared in idt.h). Extracted from
 // isr_handler_impl so the page-fault handler (mm/fault.c) can fall back here
 // for an unrecoverable fault. For a user-mode fault it records a panic log,
@@ -407,7 +537,14 @@ void exception_fatal(interrupt_frame_t *frame) {
                             ((frame->cs & 0x3) != 0) ? "USER" : "KERNEL",
                             frame->error_code, frame->rip, frame->cs,
                             frame->rsp, frame->rflags,
-                            (int_no == EXCEPTION_PF) ? read_cr2() : 0UL);
+                            exception_cr2(int_no));
+        // The witness. Silent unless the two disagree, which is exactly the
+        // case the capture above exists for.
+        { uint64_t _drift = exception_cr2_drift(int_no);
+          if (_drift) bootlog_fault_write("[EXCEPTION] CR2 CAPTURED-AT-FAULT=0x%lx "
+                                          "but a read NOW gives 0x%lx: another fault "
+                                          "overwrote CR2 between the fault and this report",
+                                          exception_cr2(int_no), _drift); }
         // ==================================================================
         // #COMPRESPAWN: A FAULTING RIP IS USELESS UNDER PIE+ASLR ON ITS OWN.
         //
@@ -415,7 +552,7 @@ void exception_fatal(interrupt_frame_t *frame) {
         // base within a 1 GB window at 2 MB granularity (#640 stage 3). The
         // line above prints RIP=0x8001ebe772; to turn that into a function you
         // must first know which of up to 512 ASLR slots this run got, and
-        // nothing recorded it. MEASURED 2026-08-25 on the owner's VM <vmid>: the
+        // nothing recorded it. MEASURED 2026-08-25 on the owner's a test VM: the
         // slot had to be brute-forced by hand (the only value for which
         // RIP-base lands inside .text was slot 15, giving image+0xBE772 =
         // memcpy). That is not a thing anyone can do on a machine they cannot
@@ -513,7 +650,7 @@ void exception_fatal(interrupt_frame_t *frame) {
 
         // Page fault has special handling
         if (int_no == EXCEPTION_PF) {
-            uint64_t cr2 = read_cr2();
+            uint64_t cr2 = exception_cr2(int_no);
             kprintf_nolock("  CR2 (fault address): 0x%lx\n", cr2);
             kprintf_nolock("  Error bits: %s%s%s%s\n",
                     (frame->error_code & 1) ? "P " : "",
@@ -534,7 +671,7 @@ void exception_fatal(interrupt_frame_t *frame) {
         
         // Get CR2 for page faults
         if (int_no == EXCEPTION_PF) {
-            regs.cr2 = read_cr2();
+            regs.cr2 = exception_cr2(int_no);
         }
         
         // Map exception to crash type
@@ -555,7 +692,7 @@ void exception_fatal(interrupt_frame_t *frame) {
             kprintf_nolock("[KERNEL PANIC] %s at RIP=0x%lx\n", name, frame->rip);
             uint64_t cr2_val = 0;
             if (int_no == 14) {
-                cr2_val = read_cr2();
+                cr2_val = exception_cr2(int_no);
                 kprintf_nolock("[KERNEL PANIC] CR2=0x%lx err=0x%lx\n", cr2_val, frame->error_code);
             }
             kprintf_nolock("[KERNEL PANIC] RSP=0x%lx  Halting CPU.\n", frame->rsp);
@@ -629,7 +766,7 @@ void exception_fatal(interrupt_frame_t *frame) {
         // worst-case double/triple fault inside the dialog still leaves a
         // readable, correctly-sized /PANIC.TXT from the ORIGINAL fault.
         panic_log_write(frame->rip,
-                         (int_no == EXCEPTION_PF) ? read_cr2() : 0,
+                         exception_cr2(int_no),
                          frame->error_code, read_cr3(), name, 1);
         // User-mode fault: show crash dialog, then kill the process
         crashhandler_report(crash_type, &regs, -1);

@@ -55,16 +55,18 @@ endif
 TARGET = browser
 
 # Local objects: app + NetSurf bindings + our layout engine
-OBJS = main.o $(NS)/dom_hubbub_bind.o $(NS)/css_select_bind.o $(NS)/layout.o
+OBJS = main.o $(NS)/dom_hubbub_bind.o $(NS)/css_select_bind.o $(NS)/layout.o \
+       $(NS)/cssvar.o $(NS)/fontmap.o $(NS)/rrect.o
 
 CRT0 = $(LIBC_DIR)/crt0.o
 LIBC = $(LIBC_DIR)/libc.a
 
 all: $(TARGET)
 
-$(TARGET): main.o $(NS)/dom_hubbub_bind.o $(NS)/css_select_bind.o $(NS)/layout.o $(DUK_OBJS) $(CRT0) $(LIBC)
+$(TARGET): main.o $(NS)/dom_hubbub_bind.o $(NS)/css_select_bind.o $(NS)/layout.o $(NS)/cssvar.o $(NS)/fontmap.o $(NS)/rrect.o $(DUK_OBJS) $(CRT0) $(LIBC)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) main.o $(NS)/dom_hubbub_bind.o \
-	    $(NS)/css_select_bind.o $(NS)/layout.o \
+	    $(NS)/css_select_bind.o $(NS)/layout.o $(NS)/cssvar.o \
+	    $(NS)/fontmap.o $(NS)/rrect.o \
 	    --start-group $(NS_LIBS) $(DUK_OBJS) $(LIBC) --end-group
 	@echo "Built $(TARGET)"
 	@ls -lh $(TARGET)
@@ -86,6 +88,15 @@ $(NS)/css_select_bind.o: $(NS)/css_select_bind.c
 	cd $(NS) && ./cc.sh $(NS_PERF) $(NS_INC) -c css_select_bind.c -o css_select_bind.o
 $(NS)/layout.o: $(NS)/layout.c
 	cd $(NS) && ./cc.sh $(NS_PERF) $(NS_INC) -c layout.c -o layout.o
+$(NS)/cssvar.o: $(NS)/cssvar.c $(NS)/cssvar.h
+	cd $(NS) && ./cc.sh $(NS_PERF) $(NS_INC) -c cssvar.c -o cssvar.o
+# #245 font-family resolution and rounded-rect span geometry. fontmap.o is
+# platform-free (main.c supplies the three fm_plat_* hooks); rrect.o is shared
+# byte for byte with the host-side harness so the two cannot round differently.
+$(NS)/fontmap.o: $(NS)/fontmap.c $(NS)/fontmap.h
+	cd $(NS) && ./cc.sh $(NS_PERF) $(NS_INC) -c fontmap.c -o fontmap.o
+$(NS)/rrect.o: $(NS)/rrect.c $(NS)/rrect.h
+	cd $(NS) && ./cc.sh $(NS_PERF) $(NS_INC) -c rrect.c -o rrect.o
 
 clean:
 	rm -f main.o $(TARGET)

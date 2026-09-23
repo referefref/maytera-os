@@ -1,0 +1,61 @@
+# mports recipe: LZ4 1.10.0 (library only), the fast BSD-2 compression codec.
+# Item 4 of the 2026-09 library-ports batch. LZ4 is a byte-oriented
+# compress/decompress codec: extremely fast, modest ratio; useful for on-device
+# caches, log/asset packing and IPC payloads.
+#
+# The LZ4 repository is dual-licensed: the command-line PROGRAMS are GPLv2, the
+# LIBRARY (lib/) is BSD-2-Clause. This recipe builds ONLY the library and takes
+# the BSD grant; licence_files points at lib/LICENSE, the library's own grant.
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA.
+
+name=lz4
+version=1.10.0
+class=A
+homepage=https://lz4.org/
+
+# The official GitHub release asset for tag v1.10.0. sha256 below is of THIS
+# file and was MEASURED on the build container, not copied from a web page:
+#   wget -O lz4-1.10.0.tar.gz https://github.com/lz4/lz4/releases/download/v1.10.0/lz4-1.10.0.tar.gz
+#   sha256sum -> 537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b
+source_url=https://github.com/lz4/lz4/releases/download/v1.10.0/lz4-1.10.0.tar.gz
+tarball=lz4-1.10.0.tar.gz
+sha256=537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b
+srcdir=lz4-1.10.0
+
+# The LIBRARY grant only (lib/LICENSE, BSD-2-Clause). The GPLv2 programs under
+# programs/ are NOT built by this recipe.
+licence=BSD-2-Clause
+licence_files=lib/LICENSE
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): USES. LZ4 is pure computation over
+# caller-supplied buffers; block API is buffer-in/buffer-out, frame API takes
+# caller-provided buffers too. The only platform surface the files we build
+# touch is malloc/free and memcpy/memmove/memset. No event loop, no main(), no
+# filesystem model (lz4file.c, the FILE* wrapper, is excluded).
+adoption=USES. Pure buffer-in/buffer-out compression over caller-supplied memory; the only platform surface is malloc/free and memcpy/memmove/memset. It never wants to own the process.
+
+needs=libc
+
+prepare=none
+patches=none
+
+build=objects
+
+# The block codec (lz4.c), the high-compression variant (lz4hc.c), the framed
+# format (lz4frame.c) and the xxHash checksum lz4frame needs. lz4file.c (the
+# FILE*-based convenience wrapper) is excluded: it wants stdio FILE* semantics
+# this port does not promise.
+sources=lib/lz4.c lib/lz4hc.c lib/lz4frame.c lib/xxhash.c
+
+exclude=lib/lz4file.c
+exclude_reason=lz4file.c is a FILE*-based convenience wrapper over the frame API (fopen/fread/fwrite semantics). The block and frame APIs (buffer-in/buffer-out) are the promised surface; the stdio wrapper is excluded rather than shipped and left to surprise a consumer.
+
+headers=lib/lz4.h lib/lz4hc.h lib/lz4frame.h
+lib=liblz4.a
+
+# THE ANTI-NO-OP CHECK. Proven defined in liblz4.a by nm: the version query,
+# the block compress/decompress + bound, the HC compressor, and the frame
+# compress/decompress lifecycle.
+symbols=LZ4_versionNumber LZ4_compress_default LZ4_decompress_safe LZ4_compressBound LZ4_compress_HC LZ4F_compressFrame LZ4F_compressFrameBound LZ4F_createDecompressionContext LZ4F_freeDecompressionContext LZ4F_decompress

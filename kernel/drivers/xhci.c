@@ -1389,6 +1389,11 @@ int xhci_init(pci_device_t *pci) {
 
     xhc->initialized = 1;
     xhci_controller_count++;
+    // #imacnic: claim the PCI function. Same argument as ahci.c: an unclaimed
+    // xHCI controller in /DEVLOG.TXT or in the [PCI] UNCLAIMED report is
+    // supposed to mean "no driver brought this up", and it could not mean that
+    // while the driver that DID bring it up never said so.
+    if (pci) pci_mark_claimed(pci, "xhci");
 
     // #307 real-HW (b577): decisive on-screen controller-state dump, printed
     // ONCE right after the controller is running and every DMA structure is
@@ -5021,7 +5026,7 @@ int xhci_rescan_ports(xhci_controller_t *xhc) {
             // cooldown. From the artifact that is indistinguishable from the
             // fault this ticket is about - a connected device that never comes
             // up and nothing explaining why - which is the exact ambiguity the
-            // rest of this change exists to remove. Measured on VM <vmid>: an
+            // rest of this change exists to remove. Measured on VM 2698: an
             // unplug/replug arm at ~13s intervals trips XHCI_FLAP_THRESHOLD on
             // a port within 8 cycles and then produces three "connected but
             // never enumerated" cycles with no explanation anywhere.

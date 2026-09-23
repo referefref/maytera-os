@@ -55,6 +55,12 @@
 #include "compositor.h"
 #include "../../libc/syscall.h"
 #include "../../libc/string.h"
+// #removdev: devinfo.h -> types.h would re-typedef bool (_Bool) and clash
+// with compositor.h (typedef int bool); satisfy the guard first.
+#ifndef __bool_true_false_are_defined
+#define __bool_true_false_are_defined 1
+#endif
+#include "../../libc/devinfo.h"   // sys_dev_usb_list() for REMOVDEMO
 // (#123) write(1,...) serial mirror. Declared here rather than including
 // libc/unistd.h: that header pulls in libc/types.h, whose `bool` typedef
 // collides with compositor.h/stdbool in this translation unit.
@@ -62,8 +68,15 @@ long write(int fd, const void *buf, unsigned long n);
 #include "../../libc/gui_theme.h"
 #include "../../libc/userconf.h"   // #745 GLASSTHEME
 #include "../../libc/dock_opacity.h"  // #132: shared DOCK_OPACITY_MIN/MAX
+#include "../../libc/wallpapers.h"  // (wallpersist) wp_entry_t / WP_MAX_ENTRIES for SETWALL
 #include "../../libc/stdio.h"    // (#231r) vsnprintf for th_logf below
+#include "cardfile.h"   // (cfrender) CFCLICK/CFDOWN/CFMOVE/CFUP/CFKEY verbs below
 #include <stdarg.h>
+// #404 (cfhost) window-hosting verification: drive cf_host_apply() against a
+// hand-built deck so the SYS_WM_SET_BOUNDS placement path is provable on-VM
+// before agent A's deck render/input lands. NEVER in a golden (TESTHOOK gate).
+#include "cardfile_model.h"
+#include "cardfile_host.h"
 
 // (#123) Provided by taskbar.c under the same MAYTERA_TESTHOOK guard.
 void taskbar_dock_debug_dump(int force);
@@ -100,6 +113,15 @@ static int32_t  s_th_pcclick_x = 0, s_th_pcclick_y = 0;
 // by the SEQ verb itself.
 int g_seq_running = 0;
 int g_th_mouse_pinned = 0;   // (#123) see poll_input() in main.c
+// (cfrender) Same idea as g_th_mouse_pinned, but for the BUTTON state.
+// poll_input() in main.c overwrites g_mouse_buttons from the real (always
+// unpressed, in a headless VM) hardware every frame regardless of
+// g_th_mouse_pinned, which only ever protected position - so a synthetic
+// CFDOWN press was clobbered back to "released" before the next testhook
+// verb (CFMOVE) even ran, collapsing every scripted drag into an instant
+// no-drag click. See poll_input()'s own comment at the g_mouse_buttons
+// assignment. Set for the duration of a CFDOWN..CFUP pair only.
+int g_th_buttons_pinned = 0;
 // (#123) Extra SEQ hold, in polls, requested by the HOLD verb. A host-side
 // screendump watcher with a fixed delay CANNOT reliably capture a step whose
 // hold is shorter than its own lag - runs 2 and 3 both produced captures of
@@ -440,6 +462,254 @@ static void th_glass_all(int iters) {
     g_needs_redraw = true;
 }
 
+// ===========================================================================
+// #404 (cfhost): Cardfile window-hosting harness. Builds a two-card deck by
+// hand, launches the two apps ONCE, and each frame drives cf_host_apply() so
+// the real app windows are placed / tiled / hidden by SYS_WM_SET_BOUNDS to
+// match the deck's open state. Proves agent C's deliverable without agent A's
+// deck render. Verbs: CFHOST SINGLE|GROUP|COLUMNS|STOW  (see below).
+// ===========================================================================
+static cf_deck_t th_cf_deck;
+static int       th_cf_armed = 0;      // 1 => cf_host_apply() runs every frame
+static int       th_cf_launched = 0;   // 1 => the two apps have been spawned
+static int       th_cf_mode = -1;      // last-built mode; -1 forces a (re)build
+
+// Build the already-resolved pixel geometry the model's deck walk needs, the
+// same way agent A will for cf_layout(). Raw metrics (100% ui scale on the
+// throwaway VM); edge_w/tab_step go through the model's own compression.
+static cf_geom_t th_cf_geom(int nslots) {
+    extern int g_glass_enable;
+    int modern = g_glass_enable ? 1 : 0;
+    cf_geom_t g;
+    g.rail_w   = modern ? 30 : 28;
+    g.tab_w    = modern ? 32 : 30;
+    g.tab_top  = modern ? 52 : 48;
+    g.foot     = modern ? 100 : 96;
+    g.screen_w = g_fb_width;
+    g.screen_h = g_fb_height;
+    int theme_edge = modern ? 30 : 28;
+    int theme_step = modern ? 34 : 30;
+    g.edge_w   = cf_edge_width(theme_edge, g.rail_w, nslots, g.screen_w);
+    g.tab_step = cf_tab_step(theme_step, g.tab_top, g.foot, CF_TAB_MAX_H, nslots, g.screen_h);
+    return g;
+}
+
+// Rebuild the deck for `mode` (0 single, 1 group, 2 columns, 3 stow). The two
+// cards are re-created with win_id 0 every time; cf_host_apply()'s reconcile
+// re-binds the two ALREADY-RUNNING windows to them by app identity, so the
+// apps are never respawned when switching modes.
+static void th_cf_build(int mode) {
+    unsigned long now = uptime_ms();
+    cf_deck_init(&th_cf_deck);
+    uint32_t a = cf_add_card(&th_cf_deck, "/APPS/FILES", "Files",
+                             CF_CAT_SYSTEM, CF_COLOR_SLATE, now, 0, 0);
+    uint32_t bslot = cf_add_card(&th_cf_deck, "/APPS/CALC", "Calc",
+                             CF_CAT_ACCESSORIES, CF_COLOR_SAGE, now, 0, 0);
+    cf_slot_t *sb = cf_find_slot(&th_cf_deck, bslot);
+    uint32_t bcard = sb ? sb->cards[0].id : 0;
+    // (cfmaxwidth) cf_host_launch() now takes (deck, card_id, path) so it can
+    // record the pre-launch snapshot exclusion floor on the REAL card - moved
+    // here (the first rebuild after CFHOST arms) instead of the CFHOST verb
+    // itself, which fired before any card existed. Every LATER rebuild
+    // (mode switch) creates fresh card ids in a fresh th_cf_deck but does
+    // NOT re-launch - cf_host_apply()'s reconcile re-binds the two already-
+    // running windows to the new cards by app identity, exactly as before
+    // this change; those cards' launch_floor_id is 0 (never launched),
+    // which imposes no restriction and matches the existing window as it
+    // always did.
+    if (!th_cf_launched) {
+        cf_host_launch(&th_cf_deck, a, "/APPS/FILES");
+        cf_host_launch(&th_cf_deck, bcard, "/APPS/CALC");
+        th_cf_launched = 1;
+    }
+    if (mode == 0) {            // SINGLE: Files fills the body, Calc stowed
+        cf_open_single(&th_cf_deck, a, now);
+    } else if (mode == 1) {     // GROUP: Files+Calc tiled 1x2 in one slot
+        cf_group_card_into(&th_cf_deck, bcard, a, now);
+        cf_open_as_group_split(&th_cf_deck, a, now);
+    } else if (mode == 2) {     // COLUMNS: Files | Calc side by side
+        cf_open_single(&th_cf_deck, a, now);
+        cf_open_second_as_column(&th_cf_deck, bslot, 0, now);
+    } else {                    // STOW: both hidden
+        cf_stow_slot(&th_cf_deck, a);
+        cf_stow_slot(&th_cf_deck, bslot);
+    }
+}
+
+// ==========================================================================
+// #removdev (THROWAWAY-ONLY, never shipped): self-driving removable-device
+// verification. `REMOVDEMO` arms a monitor that, on each ~1s poll:
+//   - logs SYS_VOL_LIST and SYS_DEV_USB_LIST to serial whenever either
+//     changes, so a headless VM leaves a persistent trace of a drive or NIC
+//     arriving; and
+//   - when a removable, mounted volume appears that was NOT present when the
+//     monitor armed (a hot-plugged stick), waits 5s (so the desktop icon and
+//     toast can be screendumped) then EJECTS it once via vol_eject() - the
+//     same path the desktop/File-Manager right-click uses: SYS_VOL_EJECT ->
+//     hotplug_eject -> usb_msc_safe_remove -> usb_msc_sync (SYNCHRONIZE
+//     CACHE) - logging the return code. One baked command drives the whole
+//     flow, since the live VM disk cannot be written from the host to deliver
+//     a second command.
+static int      s_rd_armed = 0;
+static int      s_rd_primed = 0;
+static uint64_t s_rd_last = 0;
+static unsigned s_rd_volsig = 0, s_rd_devsig = 0;
+static int32_t  s_rd_base_idx[SC_VOL_MAX];
+static int      s_rd_nbase = 0;
+static uint64_t s_rd_eject_at = 0;
+static int      s_rd_target = -1;
+static int      s_rd_ejected = 0;
+
+static void removdemo_tick(void) {
+    uint64_t now = uptime_ms();
+    if (s_rd_last != 0 && (now - s_rd_last) < 1000) return;
+    s_rd_last = now;
+
+    sc_volume_t vols[SC_VOL_MAX];
+    int nv = vol_list(vols, SC_VOL_MAX);
+    if (nv < 0) nv = 0;
+    devinfo_usb_t devs[24];
+    int nd = sys_dev_usb_list(devs, 24);
+    if (nd < 0) nd = 0;
+
+    unsigned vsig = 2166136261u;
+    for (int i = 0; i < nv; i++) {
+        vsig = (vsig ^ (unsigned)vols[i].index) * 16777619u;
+        vsig = (vsig ^ vols[i].flags) * 16777619u;
+    }
+    vsig ^= (unsigned)nv;
+    if (vsig != s_rd_volsig) {
+        s_rd_volsig = vsig;
+        th_logf("REMOVDEMO vols=%d", nv);
+        for (int i = 0; i < nv; i++)
+            th_logf("REMOVDEMO   vol idx=%d flags=0x%02x name='%s' mount='%s'",
+                    vols[i].index, vols[i].flags, vols[i].name, vols[i].mount);
+    }
+    unsigned dsig = 2166136261u;
+    for (int i = 0; i < nd; i++) {
+        if (devs[i].is_controller) continue;
+        dsig = (dsig ^ (((unsigned)devs[i].vendor_id << 16) | devs[i].product_id)) * 16777619u;
+        dsig = (dsig ^ devs[i].dev_class) * 16777619u;
+    }
+    if (dsig != s_rd_devsig) {
+        s_rd_devsig = dsig;
+        for (int i = 0; i < nd; i++) {
+            if (devs[i].is_controller) continue;
+            th_logf("REMOVDEMO   usb cls=0x%02x %04x:%04x addr=%d",
+                    devs[i].dev_class, devs[i].vendor_id, devs[i].product_id, devs[i].address);
+        }
+    }
+
+    if (!s_rd_primed) {
+        s_rd_nbase = 0;
+        for (int i = 0; i < nv && s_rd_nbase < SC_VOL_MAX; i++)
+            s_rd_base_idx[s_rd_nbase++] = vols[i].index;
+        s_rd_primed = 1;
+        th_logf("REMOVDEMO armed: baseline %d volume(s)", s_rd_nbase);
+        return;
+    }
+
+    if (s_rd_target < 0 && !s_rd_ejected) {
+        for (int i = 0; i < nv; i++) {
+            int isbase = 0;
+            for (int j = 0; j < s_rd_nbase; j++)
+                if (vols[i].index == s_rd_base_idx[j]) { isbase = 1; break; }
+            if (isbase) continue;
+            if (!(vols[i].flags & MOSVOL_REMOVABLE) || !(vols[i].flags & MOSVOL_MOUNTED)) continue;
+            s_rd_target = vols[i].index;
+            s_rd_eject_at = now + 5000;
+            th_logf("REMOVDEMO hot-plug volume idx=%d name='%s' -> eject in 5s",
+                    vols[i].index, vols[i].name);
+            break;
+        }
+    }
+    if (s_rd_target >= 0 && !s_rd_ejected && now >= s_rd_eject_at) {
+        int rc = vol_eject(s_rd_target);
+        th_logf("REMOVDEMO eject idx=%d rc=%d (flush+unmount)", s_rd_target, rc);
+        s_rd_ejected = 1;
+        s_rd_target = -1;
+    }
+}
+
+// #emfield (owner request 2026-09-22): self-driving EMFIELD proof harness.
+// Arms EMFIELD, spawns two windows (Calc, and Files which it oscillates back and
+// forth every frame via wm_set_bounds()), so a headless VM can be screendumped
+// with the swirl/vortex mid-motion without coordinate-accurate mouse drag
+// (#334) - the same wm_set_bounds() path a titlebar drag calls, just a
+// different entry point. After the swirl has built up it opens the Start menu
+// once, so the frosted-glass-over-the-live-field proof (requirement 4) can be
+// captured too. Compile-gated with the rest of this file: never in a golden.
+static int      s_emf_armed = 0;
+static int      s_emf_phase = 0;   // 0 = spawn, 1 = oscillate, 2 = +start menu
+static uint64_t s_emf_t0    = 0;
+
+static int emf_name_eq(const char *a, const char *want) {
+    int j = 0;
+    for (; a[j] && want[j]; j++) {
+        char x = a[j], y = want[j];
+        if (x >= 'a' && x <= 'z') x = (char)(x - 32);
+        if (y >= 'a' && y <= 'z') y = (char)(y - 32);
+        if (x != y) return 0;
+    }
+    return a[j] == '\0' && want[j] == '\0';
+}
+
+static void emfdemo_tick(void) {
+    if (s_emf_phase == 0) {
+        sys_spawn("/APPS/CALC");
+        sys_spawn("/APPS/FILES");
+        s_emf_t0 = uptime_ms();
+        s_emf_phase = 1;
+        return;   // let the windows appear before moving one
+    }
+    if (s_emf_phase >= 2) {
+        // Parked: Start menu is open for the glass proof. Do NOT move a window
+        // now - a wm_set_bounds re-focuses that window and closes the menu.
+        // The ambient swirl + persistent dye keep the field alive underneath.
+        return;
+    }
+
+    // Locate windows. Oscillate CALC (small, central open field) with a
+    // triangle wave (constant speed, smooth turn) so the vortex is steady and
+    // the dye trails it.
+    wm_window_info_t wins[16];
+    int n = wm_get_windows(wins, 16);
+    if (n < 0) n = 0;
+    int id = -1, w = 0, h = 0, files_id = -1, files_w = 0, files_h = 0;
+    for (int i = 0; i < n; i++) {
+        if (!wins[i].app_id[0]) continue;
+        if (emf_name_eq(wins[i].app_id, "CALC")) { id = wins[i].id; w = wins[i].width; h = wins[i].height; }
+        else if (emf_name_eq(wins[i].app_id, "FILES")) { files_id = wins[i].id; files_w = wins[i].width; files_h = wins[i].height; }
+    }
+    if (id < 0) return;   // Calc not up yet
+
+    uint64_t dt = uptime_ms() - s_emf_t0;
+
+    // After ~18s of swirling: shove BOTH windows to opposite top corners so the
+    // Start menu's frosted glass sits over the open swirling field, then open it
+    // once and park (nothing re-focuses and closes it after this).
+    if (dt > 18000) {
+        if (files_id >= 0)
+            wm_set_bounds(files_id, (int)g_fb_width - 220, 40, files_w, files_h, 0);
+        wm_set_bounds(id, 20, 40, w, h, 0);
+        if (!g_start_menu_open) startmenu_toggle();
+        s_emf_phase = 2;
+        g_needs_redraw = true;
+        return;
+    }
+
+    uint64_t period = 3000;
+    uint64_t p = dt % period;
+    int half = (int)(period / 2);
+    int tri_num = ((int)p <= half) ? (int)p : (int)(period - p);   // 0..half..0
+    int range = (int)g_fb_width - w - 80;
+    if (range < 0) range = 0;
+    int nx = 40 + (range * tri_num) / (half > 0 ? half : 1);
+    int ny = (int)g_fb_height / 2 - h / 2;
+    wm_set_bounds(id, nx, ny, w, h, 0);
+    g_needs_redraw = true;
+}
+
 void testhook_poll(void) {
     if (s_th_lock_at_ms != 0 && uptime_ms() >= s_th_lock_at_ms) {
         s_th_lock_at_ms = 0;
@@ -451,6 +721,20 @@ void testhook_poll(void) {
         startmenu_test_power_confirm_click(s_th_pcclick_x, s_th_pcclick_y);
         th_log("OK PCTEST click fired");
     }
+    // #404 (cfhost): while armed, place/hide the hosted windows every frame.
+    // cf_host_apply() reconciles the async window bind and re-issues placement,
+    // so a window that only just appeared snaps to its card rect within a frame.
+    if (th_cf_armed) {
+        // Auto-cycle SINGLE -> GROUP -> COLUMNS -> STOW on a 4s wall clock, so a
+        // headless throwaway VM can be screendumped through every hosting state
+        // without live command delivery. Rebuild only when the mode changes.
+        int m = (int)((uptime_ms() / 4000UL) % 4UL);
+        if (m != th_cf_mode) { th_cf_mode = m; th_cf_build(m); }
+        cf_geom_t g = th_cf_geom(th_cf_deck.nslots);
+        cf_host_apply(&th_cf_deck, &g);
+    }
+    if (s_rd_armed) removdemo_tick();   // #removdev self-driving removable monitor
+    if (s_emf_armed) emfdemo_tick();     // #emfield self-driving EMFIELD swirl proof
     int fd = sys_open(TH_CMD_PATH, 0 /* O_RDONLY */);
     if (fd < 0) return;   // no pending command: fast common-case return
 
@@ -483,6 +767,44 @@ void testhook_poll(void) {
 
     if (verb[0] == '\0') {
         th_log("ERR empty command");
+        return;
+    }
+
+    if (strcmp(verb, "EMFDEMO") == 0) {   // #emfield self-driving EMFIELD swirl proof
+        // Idempotent: a baked /TESTHOOK.CMD on ext2 cannot be consumed
+        // (truncate/unlink no-op for the offline-baked owner), so this verb
+        // re-fires every frame. Ignore re-fires so the phase/t0 timeline
+        // actually advances (otherwise the window never oscillates).
+        if (s_emf_armed) return;
+        set_wallpaper_anim(5 /* WPANIM_EMFIELD */);
+        set_wallpaper_anim_intensity(80);
+        set_wallpaper_anim_repel(1);
+        s_emf_armed = 1;
+        s_emf_phase = 0;
+        g_needs_redraw = true;
+        th_log("OK EMFDEMO armed");
+        return;
+    }
+
+    if (strcmp(verb, "REMOVDEMO") == 0) {   // #removdev throwaway-only removable-device demo
+        s_rd_armed = 1;
+        th_log("OK REMOVDEMO armed");
+        return;
+    }
+
+    if (strcmp(verb, "CFHOST") == 0) {
+        // CFHOST SINGLE|GROUP|COLUMNS|STOW - hand-built deck window hosting.
+        // First invocation switches the shell to the Cardfile layout (so the
+        // rail draws and the classic taskbar stops); every invocation
+        // rebuilds the open state for the named mode. (cfmaxwidth) Files +
+        // Calc are now spawned from inside th_cf_build()'s first call
+        // (th_cf_launched gates it there), once real card ids exist for
+        // cf_host_launch()'s pre-launch snapshot exclusion to record against.
+        taskbar_set_style(DOCK_CARDFILE);
+        th_cf_armed = 1;
+        th_cf_mode = -1;   // force the driver to (re)build on the next frame
+        th_logf("OK CFHOST armed, auto-cycling SINGLE/GROUP/COLUMNS/STOW (fb=%dx%d)",
+                (int)g_fb_width, (int)g_fb_height);
         return;
     }
 
@@ -721,6 +1043,31 @@ void testhook_poll(void) {
         return;
     }
 
+    // #opacityglass verification-only verb: WINOPACITY <0-100> drives the
+    // SAME channel the tray quick-settings slider uses (traymenu.c's
+    // win_opacity setter: set g_win_opacity, call set_win_opacity()), which
+    // is the real global-default window opacity syscall (SYS_SET_WIN_OPACITY)
+    // every open window's win->opacity is seeded/overwritten from - not a
+    // private setter. This exists to let a headless run set window
+    // translucency without a coordinate-accurate mouse click on the tray
+    // menu, so the stable-glass fix (any translucent window forces the full
+    // render_frame() path - see main.c's _any_translucent) can be verified
+    // by screendump alone. Never shipped: gated the same as every other verb
+    // in this file.
+    if (strcmp(verb, "WINOPACITY") == 0) {
+        extern int g_win_opacity;
+        int pct = th_atoi(arg);
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        int o = pct * 255 / 100;
+        if (o < 40) o = 40;
+        if (o > 255) o = 255;
+        g_win_opacity = o;
+        set_win_opacity(o);
+        th_logf("OK WINOPACITY %d", pct);
+        return;
+    }
+
     // Write the CFG, do NOT call taskbar_set_style() directly. MEASURED: a
     // direct call is reverted within ~10 frames, because dock_style_poll()
     // reads /CONFIG/DOCKSTYL.CFG on main.c's poll cadence and re-applies
@@ -913,6 +1260,69 @@ void testhook_poll(void) {
         return;
     }
 
+    // #dosfspacing verification-only verb: DOSRUN <path> - the exact call the
+    // Start menu makes to launch a bundled DOS game (dos_run(), SYS_DOS_RUN,
+    // startmenu.c LAUNCH_DOS case), used here instead of a generic LAUNCH so
+    // the verification exercises a REAL DOS host window (mode-13h/text video,
+    // a real kernel dos_run() proc) rather than depending on any particular
+    // app's own internal wrapping. Non-blocking (kernel spawns a dedicated
+    // proc + host window per its own doc comment), so this cannot stall the
+    // draw thread (#426). Never shipped: gated the same as every other verb.
+    if (strcmp(verb, "DOSRUN") == 0) {
+        if (arg[0] == '\0') { th_log("ERR DOSRUN needs a path"); return; }
+        int r = dos_run(arg);
+        th_log(r == 0 ? "OK DOSRUN" : "ERR DOSRUN failed");
+        return;
+    }
+
+    // #dosfspacing verification-only verbs: drive #158 native fullscreen
+    // enter/exit DIRECTLY, the SAME kernel entry point Alt+Enter uses
+    // (SYS_WM_FULLSCREEN_ENTER/EXIT - kernel/proc/syscall.c), sidestepping
+    // raw scancode injection. sys_wm_fullscreen_enter()'s own permission
+    // check explicitly allows this: "the COMPOSITOR itself... a second entry
+    // point to one Ring-0 already grants unconditionally to itself" - this
+    // process (compositor + testhook) IS the framebuffer owner. Needed
+    // because a testhook-launched DOS window has never been proven to
+    // reliably receive raw scancodes (dosfullscreen commit's own caveat), so
+    // this is the sanctioned way to verify the fast path end-to-end without
+    // that dependency. Never shipped: gated the same as every other verb
+    // here. Acts on window_get_focused() - LAUNCH (or a real click) must put
+    // the target window in focus first.
+    if (strcmp(verb, "FSENTER") == 0) {
+        int r = sys_wm_fullscreen_enter();
+        th_log(r == 0 ? "OK FSENTER" : "ERR FSENTER failed");
+        return;
+    }
+    if (strcmp(verb, "FSEXIT") == 0) {
+        sys_wm_fullscreen_exit();
+        th_log("OK FSEXIT");
+        return;
+    }
+
+    // (#dosfsmax) Verification-only verb: drive the MAXIMIZE gesture on the
+    // focused window through the SAME kernel entry point the taskbar/
+    // context-menu "Maximize/Restore" item uses (SYS_WM_MAXIMIZE_WINDOW ->
+    // wm_toggle_maximize_focused()), rather than a coordinate-accurate click
+    // on the titlebar's maximize button or its double-click detector (#334 -
+    // headless mouse does not land reliably, and while a window holds #158
+    // native fullscreen the kernel suppresses ALL chrome, including any
+    // titlebar to click on, so a real click could not reach a restore either
+    // way). This is a TOGGLE, exactly like FSENTER/FSEXIT's own real button:
+    // called on a focused DOS-hosted window it now enters #158 native
+    // fullscreen (window_maximize()'s DOS routing, kernel/gui/window.c);
+    // called again it exits fullscreen back to the pre-maximize windowed
+    // bounds (wm_toggle_maximize_focused()'s fullscreen-exit check, same
+    // file). Called on a focused NORMAL (non-DOS) window it is the ordinary,
+    // unchanged maximize/restore toggle - proves no-regression for that case
+    // from the same verb. DOSRUN (above) leaves its window focused, so no
+    // separate focus step is needed for the DOS case. Never shipped: gated
+    // the same as every other verb in this file.
+    if (strcmp(verb, "MAXIMIZE") == 0) {
+        int r = sys_wm_maximize_focused();
+        th_log(r == 0 ? "OK MAXIMIZE" : "ERR MAXIMIZE failed");
+        return;
+    }
+
     // #223 ROUND 2 verification-only verb: close a window the SAME way a real
     // titlebar-X click does, by finding it via wm_get_windows() and driving
     // taskbar_close_window() (the existing synthetic-click closer #44 already
@@ -960,6 +1370,67 @@ void testhook_poll(void) {
         if (target < 0) { th_log("ERR WINCLOSE not found"); return; }
         taskbar_close_window(target);
         th_log("OK WINCLOSE");
+        return;
+    }
+
+    // #wpanim verification-only verb: move a window by name to an ABSOLUTE
+    // (x,y), by app_id (falling back to a title substring) - the exact same
+    // matching WINCLOSE above uses, so this needs no new lookup mechanism.
+    // Drives SYS_WM_SET_BOUNDS (#404, compositor-only) directly, keeping the
+    // window's own current width/height so this is a pure move, not a
+    // resize. Exists purely to make the animated-wallpaper "field deforms as
+    // a window moves" proof reproducible without coordinate-accurate mouse
+    // drag (#334) - a real drag would exercise the same wm_set_bounds() path
+    // a titlebar drag already calls, just via a different entry point, so
+    // this does not test anything a real drag would not also exercise.
+    // Format: "WINPOS <name> <x> <y>". Never shipped (TESTHOOK gate).
+    if (strcmp(verb, "WINPOS") == 0) {
+        char name[32]; int ni = 0;
+        const char *sp = arg;
+        while (*sp && *sp != ' ' && ni < (int)sizeof(name) - 1) name[ni++] = *sp++;
+        name[ni] = '\0';
+        while (*sp == ' ') sp++;
+        int32_t nx = th_atoi(sp);
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int32_t ny = th_atoi(sp);
+
+        if (name[0] == '\0') { th_log("ERR WINPOS needs a name"); return; }
+        wm_window_info_t wins[16];
+        int n = wm_get_windows(wins, 16);
+        if (n < 0) n = 0;
+        int target = -1, tw = 0, th_ = 0;
+        for (int i = 0; i < n && target < 0; i++) {
+            if (wins[i].app_id[0] == '\0') continue;
+            int j = 0;
+            for (; name[j] && wins[i].app_id[j]; j++) {
+                char a = name[j], b = wins[i].app_id[j];
+                if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+                if (b >= 'a' && b <= 'z') b = (char)(b - 32);
+                if (a != b) break;
+            }
+            if (name[j] == '\0' && wins[i].app_id[j] == '\0') { target = wins[i].id; tw = wins[i].width; th_ = wins[i].height; }
+        }
+        if (target < 0) {
+            for (int i = 0; i < n && target < 0; i++) {
+                const char *t = wins[i].title, *want = name;
+                for (const char *h = t; *h; h++) {
+                    const char *hh = h, *nn = want;
+                    while (*hh && *nn) {
+                        char a = *hh, b = *nn;
+                        if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                        if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+                        if (a != b) break;
+                        hh++; nn++;
+                    }
+                    if (!*nn) { target = wins[i].id; tw = wins[i].width; th_ = wins[i].height; break; }
+                }
+            }
+        }
+        if (target < 0) { th_log("ERR WINPOS not found"); return; }
+        int r = wm_set_bounds(target, nx, ny, tw, th_, 0);
+        g_needs_redraw = true;
+        th_logf("OK WINPOS %s x=%d y=%d r=%d", name, (int)nx, (int)ny, r);
         return;
     }
 
@@ -1492,6 +1963,360 @@ void testhook_poll(void) {
         if (idx < 0) { th_log("ERR STICKYTXT no note editing"); return; }
         th_logf("OK STICKYTXT idx=%d len=%d text=%s",
                 idx, stickies_edit_len(), stickies_edit_text());
+        return;
+    }
+
+    // (cfrender) Cardfile deck verification verbs. Same shape and same
+    // honesty rule as DOCKCLICK/DOCKMOUSE above (testhook.c's own file-
+    // header note applies): these call cardfile_handle_mouse()/
+    // cardfile_handle_key() directly at caller-given coordinates, which is
+    // the REAL hit-test cardfile.c's process_events() dispatch line runs -
+    // not a private setter, and not the by-name ICON/MENUITEM shortcut that
+    // would skip the very geometry this feature is. Use DOCKSTYLE 5 first
+    // to enter the Cardfile layout (writes /CONFIG/DOCKSTYL.CFG through the
+    // same live channel Settings uses - see the DOCKSTYLE verb above).
+    //
+    // CFCLICK x y   - a full press+release at (x,y) in one shot: for taps
+    //                 that resolve on release with no movement (a tab,
+    //                 a tab button, the "+"/Sort rail tabs, a popup row/
+    //                 swatch, a stowed edge).
+    // CFDOWN x y    - press only (leaves the button "held" via
+    //                 g_mouse_buttons so a drag can be driven step by step
+    //                 from a /DOCK123.SEQ, one verb per line/HOLD).
+    // CFMOVE x y    - move while held (no new press edge); this is what
+    //                 crosses the drag-start threshold and updates a grip/
+    //                 divider drag or the drop-target highlight.
+    // CFUP x y      - release at (x,y), committing whatever CFDOWN/CFMOVE
+    //                 started (group-into, pull-out-to-column, a resize, a
+    //                 divider).
+    // CFKEY n       - cardfile_handle_key(n); n=27 is ESC, the only way a
+    //                 cardfile popup (picker/sort/swatches) closes besides
+    //                 its own explicit button (true-modal, no click-away).
+    if (strcmp(verb, "CFCLICK") == 0 || strcmp(verb, "CFDOWN") == 0 ||
+        strcmp(verb, "CFMOVE") == 0 || strcmp(verb, "CFUP") == 0) {
+        int x = th_atoi(arg);
+        const char *sp = arg;
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int y = th_atoi(sp);
+        g_th_mouse_pinned = 1;
+        g_mouse_x = x; g_mouse_y = y;
+        if (strcmp(verb, "CFCLICK") == 0) {
+            g_mouse_buttons |= 1u;
+            cardfile_handle_mouse(x, y, 1, 0);
+            g_mouse_buttons &= ~1u;
+            cardfile_handle_mouse(x, y, 0, 0);
+        } else if (strcmp(verb, "CFDOWN") == 0) {
+            g_th_buttons_pinned = 1;   // hold across the whole CFDOWN..CFUP script
+            g_mouse_buttons |= 1u;
+            cardfile_handle_mouse(x, y, 1, 0);
+        } else if (strcmp(verb, "CFMOVE") == 0) {
+            cardfile_handle_mouse(x, y, 0, 0);   // buttons unchanged - still held from CFDOWN
+        } else {   // CFUP
+            g_mouse_buttons &= ~1u;
+            cardfile_handle_mouse(x, y, 0, 0);
+            g_th_buttons_pinned = 0;   // release control back to real hardware
+        }
+        g_needs_redraw = true;
+        th_logf("OK %s %d %d", verb, x, y);
+        return;
+    }
+
+    if (strcmp(verb, "CFKEY") == 0) {
+        int consumed = cardfile_handle_key(th_atoi(arg));
+        g_needs_redraw = true;
+        th_logf("OK CFKEY consumed=%d", consumed);
+        return;
+    }
+
+    // (cfmaxwidth) Dumps the CURRENT frame's exact cardfile geometry (rail/
+    // edge/tab metrics, every slot's cf_layout() entry, the first open
+    // slot's grip/maximize-button/plate rects, and the maximize view's
+    // side widget rects) to serial, so a /DOCK123.SEQ script can read real
+    // pixel coordinates instead of hand-computing them - the SAME formulas
+    // cardfile.c's own render/input use (cardfile_debug_dump() lives there,
+    // not duplicated here) rather than a guess that could drift.
+    if (strcmp(verb, "CFDUMP") == 0) {
+        char b[512];
+        cardfile_debug_dump(b, sizeof(b));
+        th_log(b);
+        return;
+    }
+
+    // (cfmaxwidth) every card's app_path/win_id/launch_floor_id - verifies
+    // the pre-launch snapshot exclusion actually bound the RIGHT window.
+    if (strcmp(verb, "CFWINS") == 0) {
+        char b[512];
+        cardfile_debug_wins(b, sizeof(b));
+        th_log(b);
+        return;
+    }
+
+    // (cfmaxwidth) Seeds the deck with `n` real, distinct /APPS cards
+    // (unopened), for width-drag/maximize verification scenarios that need
+    // a specific, known slot count. Real app_paths (not synthetic ones), so
+    // cf_host_launch() below binds a genuine hosted window, same as the "+"
+    // picker's own path.
+    if (strcmp(verb, "CFSEED") == 0) {
+        static const struct { const char *path, *title; int cat, color; } apps[] = {
+            { "/APPS/FILES",    "Files",     CF_CAT_ACCESSORIES, CF_COLOR_SAGE },
+            { "/APPS/TERMINAL", "Terminal",  CF_CAT_ACCESSORIES, CF_COLOR_SLATE },
+            { "/APPS/CALC",     "Calculator",CF_CAT_ACCESSORIES, CF_COLOR_WHEAT },
+            { "/APPS/EDITOR",   "Editor",    CF_CAT_ACCESSORIES, CF_COLOR_ROSE },
+            { "/APPS/BROWSER",  "Browser",   CF_CAT_INTERNET,    CF_COLOR_SPRUCE },
+            { "/APPS/AICHAT",   "Maytera AI",CF_CAT_INTERNET,    CF_COLOR_HEATHER },
+            { "/APPS/NOTES",    "Notes",     CF_CAT_ACCESSORIES, CF_COLOR_SAND },
+        };
+        cf_deck_t *d = cardfile_debug_deck();
+        int n = th_atoi(arg);
+        int made = 0, i;
+        if (n <= 0) n = 5;
+        if (n > (int)(sizeof(apps) / sizeof(apps[0]))) n = (int)(sizeof(apps) / sizeof(apps[0]));
+        for (i = 0; i < n; i++) {
+            uint32_t sid = cf_add_card(d, apps[i].path, apps[i].title, apps[i].cat, apps[i].color, uptime_ms(), 0, 0);
+            if (!sid) continue;
+            {
+                cf_slot_t *s = cf_find_slot(d, sid);
+                cf_card_t *c = s ? cf_slot_focused_card(s) : NULL;
+                if (c) cf_host_launch(d, c->id, apps[i].path);
+            }
+            made++;
+        }
+        g_needs_redraw = true;
+        th_logf("OK CFSEED made=%d", made);
+        return;
+    }
+
+    // (cfmaxwidth) Owner-requested demo layout: TWO open columns, each a
+    // GROUP-SPLIT of two real apps - left = Browser over Terminal, right =
+    // Maytera AI (aichat) over Editor. Built via the SAME model ops the
+    // real UI drag/drop path uses (cf_add_card/cf_group_card_into/
+    // cf_open_second_as_column), then launched via cf_host_launch() exactly
+    // as the "+" picker does, so every pane hosts a REAL running app window
+    // through the normal cf_host_apply() placement path - this is not a
+    // fake screenshot, cardfile_host_tick() (called every frame from
+    // main.c) is what puts each window where it lands.
+    if (strcmp(verb, "CFDEMO") == 0) {
+        cf_deck_t *d = cardfile_debug_deck();
+        uint64_t now = uptime_ms();
+        uint32_t s_browser = cf_add_card(d, "/APPS/BROWSER",  "Browser",    CF_CAT_INTERNET,    CF_COLOR_SLATE, now, 0, 0);
+        uint32_t s_term    = cf_add_card(d, "/APPS/TERMINAL", "Terminal",   CF_CAT_ACCESSORIES, CF_COLOR_SAGE,  now, 0, 0);
+        uint32_t s_aichat  = cf_add_card(d, "/APPS/AICHAT",   "Maytera AI", CF_CAT_INTERNET,    CF_COLOR_ROSE,  now, 0, 0);
+        uint32_t s_editor  = cf_add_card(d, "/APPS/EDITOR",   "Editor",     CF_CAT_ACCESSORIES, CF_COLOR_WHEAT, now, 0, 0);
+        int ok = (s_browser && s_term && s_aichat && s_editor);
+        if (ok) {
+            // Capture both member card ids BY VALUE before EITHER grouping
+            // call: cf_group_card_into()'s cf_remove_card_from_slot() can
+            // cf_remove_slot_at() the source slot, which shifts every LATER
+            // slot down one array position and memsets the vacated tail -
+            // a cf_card_t* held across that call (e.g. into editor's slot,
+            // which sits after term's in deck order) can end up pointing at
+            // the zeroed tail, reading id=0 and silently failing the second
+            // group. Reading ->id into a plain uint32_t up front is immune:
+            // ids are stable across the shift, only array POSITIONS move.
+            uint32_t term_card_id   = cf_slot_focused_card(cf_find_slot(d, s_term))->id;
+            uint32_t editor_card_id = cf_slot_focused_card(cf_find_slot(d, s_editor))->id;
+            ok = ok && cf_group_card_into(d, term_card_id, s_browser, now);
+            ok = ok && cf_group_card_into(d, editor_card_id, s_aichat, now);
+            cf_open_single(d, s_browser, now);
+            cf_open_second_as_column(d, s_aichat, 0, now);
+            {
+                cf_slot_t *g = cf_find_slot(d, s_browser);
+                int k;
+                for (k = 0; g && k < g->ncards; k++) {
+                    cf_host_launch(d, g->cards[k].id, g->cards[k].app_path);
+                }
+            }
+            {
+                cf_slot_t *g = cf_find_slot(d, s_aichat);
+                int k;
+                for (k = 0; g && k < g->ncards; k++) {
+                    cf_host_launch(d, g->cards[k].id, g->cards[k].app_path);
+                }
+            }
+        }
+        g_needs_redraw = true;
+        th_logf("OK CFDEMO ok=%d", ok);
+        return;
+    }
+
+    // (cfmaxwidth) Opens deck-order slot `idx` (pure setup, see
+    // cardfile_debug_open_index()'s own comment - not itself a hit-test).
+    if (strcmp(verb, "CFOPENIDX") == 0) {
+        int ok = cardfile_debug_open_index(th_atoi(arg));
+        g_needs_redraw = true;
+        th_logf("OK CFOPENIDX ok=%d", ok);
+        return;
+    }
+
+    // (cfmaxwidth) Full press-move-release resize-grip drag through the REAL
+    // cardfile_handle_mouse() dispatch, targeting column width `w` on
+    // whichever slot is open - cardfile_debug_grip_drag() computes the
+    // grip's on-screen rect itself.
+    if (strcmp(verb, "CFGRIPDRAG") == 0) {
+        int ok = cardfile_debug_grip_drag(th_atoi(arg));
+        g_needs_redraw = true;
+        th_logf("OK CFGRIPDRAG ok=%d", ok);
+        return;
+    }
+
+    // (cfmaxwidth) A real click on the open slot's MAXIMIZE button.
+    if (strcmp(verb, "CFMAXBTN") == 0) {
+        int ok = cardfile_debug_click_maximize();
+        g_needs_redraw = true;
+        th_logf("OK CFMAXBTN ok=%d", ok);
+        return;
+    }
+
+    // (cfmaxwidth) A real click on side 0(left)/1(right)'s maximize-view
+    // widget - the summary tab if collapsed, the small collapse button if
+    // expanded (whichever is currently showing).
+    if (strcmp(verb, "CFSIDECLICK") == 0) {
+        int ok = cardfile_debug_click_side(th_atoi(arg));
+        g_needs_redraw = true;
+        th_logf("OK CFSIDECLICK ok=%d", ok);
+        return;
+    }
+
+    // (cfdock) Direct dock model manipulation for screenshot setup - see
+    // cardfile.h's own comment on cardfile_debug_dock_add() etc. for why
+    // this is setup, not a hit-test. `kind` is CF_DOCK_POS_EDGE(0)/BETWEEN(1);
+    // `edge_or_slot` is CF_DOCK_EDGE_TOP/BOTTOM/LEFT/RIGHT(0-3) when kind==0,
+    // a slot boundary index when kind==1.
+    //   CFDOCKADD kind edge_or_slot thickness  - adds a dock, logs its id
+    //   CFDOCKPOS id kind edge_or_slot          - moves an existing dock
+    //   CFDOCKTHICK id thickness                - resizes an existing dock
+    //   CFDOCKRM id                              - removes a dock
+    if (strcmp(verb, "CFDOCKADD") == 0) {
+        int kind = th_atoi(arg);
+        const char *sp = arg;
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int eos = th_atoi(sp);
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int thick = th_atoi(sp);
+        uint32_t id = cardfile_debug_dock_add(kind, eos, thick);
+        g_needs_redraw = true;
+        th_logf("OK CFDOCKADD id=%u", id);
+        return;
+    }
+    if (strcmp(verb, "CFDOCKPOS") == 0) {
+        int id = th_atoi(arg);
+        const char *sp = arg;
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int kind = th_atoi(sp);
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int eos = th_atoi(sp);
+        int ok = cardfile_debug_dock_set_pos((uint32_t)id, kind, eos);
+        g_needs_redraw = true;
+        th_logf("OK CFDOCKPOS ok=%d", ok);
+        return;
+    }
+    if (strcmp(verb, "CFDOCKTHICK") == 0) {
+        int id = th_atoi(arg);
+        const char *sp = arg;
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int thick = th_atoi(sp);
+        int ok = cardfile_debug_dock_set_thickness((uint32_t)id, thick);
+        g_needs_redraw = true;
+        th_logf("OK CFDOCKTHICK ok=%d", ok);
+        return;
+    }
+    if (strcmp(verb, "CFDOCKRM") == 0) {
+        int ok = cardfile_debug_dock_remove((uint32_t)th_atoi(arg));
+        g_needs_redraw = true;
+        th_logf("OK CFDOCKRM ok=%d", ok);
+        return;
+    }
+    // (cfdock) Right-click, for a real end-to-end proof of the dock context
+    // menu path (cardfile_handle_right_click()), the same real-dispatch role
+    // CFCLICK plays for left clicks.
+    if (strcmp(verb, "CFRCLICK") == 0) {
+        int x = th_atoi(arg);
+        const char *sp = arg;
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int y = th_atoi(sp);
+        int consumed = cardfile_handle_right_click(x, y);
+        g_needs_redraw = true;
+        th_logf("OK CFRCLICK consumed=%d", consumed);
+        return;
+    }
+
+
+    // (wallpersist, no-ticket) SETWALL <filename> - drive the wallpaper
+    // picker's own selection code path (wallpaper.c's mouse handler:
+    // wallpaper_load() + set_wallpaper() + profile_save()) BY NAME, the same
+    // "by name not by pixel" idiom every other verb in this file uses,
+    // so a headless run can prove the real runtime persistence sequence
+    // without a coordinate-accurate click on the picker grid. Resolves the
+    // name through wp_enumerate(), the SAME enumeration wallpaper.c and
+    // Settings both use, so the index this picks is byte-identical to what
+    // a real click on that thumbnail would pick. Logs the resolved index so
+    // a serial capture can be cross-checked against the on-disk
+    // UIPROFIL.YML "wallpaper: N" line.
+    if (strcmp(verb, "SETWALL") == 0) {
+        wp_entry_t list[WP_MAX_ENTRIES];
+        int count = wp_enumerate(list, WP_MAX_ENTRIES);
+        int found = -1;
+        for (int i = 0; i < count; i++) {
+            if (strcmp(list[i].file, arg) == 0) { found = i; break; }
+        }
+        if (found < 0) {
+            th_logf("ERR SETWALL no such wallpaper '%s'", arg);
+            return;
+        }
+        wallpaper_load(found);
+        set_wallpaper(found);
+        profile_save();
+        g_needs_redraw = true;
+        th_logf("OK SETWALL %s idx=%d", arg, found);
+        return;
+    }
+
+    // #wpanim verification-only verbs: drive the animated-wallpaper state
+    // directly (sidesteps the context-menu hit-test the same way
+    // ICON/MENUITEM sidestep the desktop/start-menu ones - proves the
+    // EFFECT and the window-reactivity, not the "how do I open the picker"
+    // click path, which is a separate, ordinary hit-test already covered by
+    // the same class of bug WINCLOSE's own comment describes).
+    // Format: "WPANIM <mode 0-4> <intensity 0-100> <repel 0|1> [/path/to/app]".
+    // The optional trailing app path is spawned in the SAME call (sys_spawn(),
+    // the exact call LAUNCH above makes) - /TESTHOOK.CMD is a ONE-SHOT,
+    // baked-before-boot command (see testhook_poll()'s own comment on why),
+    // so a live verification session that needs both "pick an effect" and "a
+    // window to react to" needs them in one verb, not two.
+    if (strcmp(verb, "WPANIM") == 0) {
+        int mode = th_atoi(arg);
+        const char *sp = arg;
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int inten = th_atoi(sp);
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int repel = th_atoi(sp);
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        set_wallpaper_anim(mode);
+        set_wallpaper_anim_intensity(inten);
+        set_wallpaper_anim_repel(repel);
+        if (*sp != '\0') sys_spawn(sp);
+        g_needs_redraw = true;
+        th_logf("OK WPANIM mode=%d intensity=%d repel=%d spawn=%s", get_wallpaper_anim(),
+                get_wallpaper_anim_intensity(), get_wallpaper_anim_repel(), sp);
+        return;
+    }
+    // "WPICK OPEN" / "WPICK CLOSE": drive the picker overlay directly, to
+    // screenshot the effect-selector UI itself without a coordinate-exact
+    // right-click on the desktop.
+    if (strcmp(verb, "WPICK") == 0) {
+        if (strcmp(arg, "OPEN") == 0) { wallpaper_picker_open(); g_needs_redraw = true; th_log("OK WPICK OPEN"); return; }
+        if (strcmp(arg, "CLOSE") == 0) { wallpaper_picker_close(); g_needs_redraw = true; th_log("OK WPICK CLOSE"); return; }
+        th_log("ERR WPICK needs OPEN|CLOSE");
         return;
     }
 

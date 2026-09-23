@@ -107,13 +107,18 @@ fn main() {
         check("RED old: right edge of drawn Prio button -> nothing",
               old_proc_foot_hit(dw, hi) == FootAct::None,
               format!("dw={} mx={} -> {:?}", dw, hi, old_proc_foot_hit(dw, hi)));
-        // GREEN: the same strip now resolves, and it resolves to a DIRECTION.
+        // GREEN: the strip the buttons are DRAWN in now resolves, and it
+        // resolves to a DIRECTION. (tmglass) that strip is proc_btns()[2..3],
+        // 6px left of the old one, so the green arm reads it from there.
+        let nb = proc_btns(dw);
+        let nlo = nb[2].x;
+        let nhi = nb[3].x + nb[3].w - 1;
         check("GREEN new: left half of the Prio strip -> PrioDown",
-              proc_foot_hit(dw, lo + 2) == FootAct::PrioDown,
-              format!("dw={} mx={} -> {:?}", dw, lo + 2, proc_foot_hit(dw, lo + 2)));
+              proc_foot_hit(dw, nlo + 2) == FootAct::PrioDown,
+              format!("dw={} mx={} -> {:?}", dw, nlo + 2, proc_foot_hit(dw, nlo + 2)));
         check("GREEN new: right half of the Prio strip -> PrioUp",
-              proc_foot_hit(dw, hi - 2) == FootAct::PrioUp,
-              format!("dw={} mx={} -> {:?}", dw, hi - 2, proc_foot_hit(dw, hi - 2)));
+              proc_foot_hit(dw, nhi - 2) == FootAct::PrioUp,
+              format!("dw={} mx={} -> {:?}", dw, nhi - 2, proc_foot_hit(dw, nhi - 2)));
     }
 
     println!("\n== P0.1  every drawn footer button responds where it is drawn ==");
@@ -128,31 +133,42 @@ fn main() {
                   all, format!("dw={} btn{} x={}..{} -> {:?}", dw, i, b.x, b.x + b.w - 1, want[i]));
         }
         // And nothing outside them fires.
+        // (tmglass) the group is right-aligned PANEL_IN inside the glass
+        // panel's right edge; the gap between Kill and Prio- moved with it.
+        let right = dw - PAD - PANEL_IN;
         check("gap between Kill and Prio- is inert",
-              proc_foot_hit(dw, dw - 95) == FootAct::None,
-              format!("dw={} mx={} -> {:?}", dw, dw - 95, proc_foot_hit(dw, dw - 95)));
-        check("End Task keeps its original x (dw-250)",
-              proc_btns(dw)[0].x == dw - 250, format!("x={}", proc_btns(dw)[0].x));
-        check("Kill keeps its original x (dw-170)",
-              proc_btns(dw)[1].x == dw - 170, format!("x={}", proc_btns(dw)[1].x));
-        check("Prio pair stays inside the old dw-90..dw-16 strip",
-              proc_btns(dw)[2].x == dw - 90 && proc_btns(dw)[3].x + proc_btns(dw)[3].w == dw - 16,
+              proc_foot_hit(dw, right - 78) == FootAct::None,
+              format!("dw={} mx={} -> {:?}", dw, right - 78, proc_foot_hit(dw, right - 78)));
+        check("End Task sits 234px left of the panel's inner right edge",
+              proc_btns(dw)[0].x == right - 234, format!("x={}", proc_btns(dw)[0].x));
+        check("Kill sits 154px left of the panel's inner right edge",
+              proc_btns(dw)[1].x == right - 154, format!("x={}", proc_btns(dw)[1].x));
+        check("Prio pair fills the 74px strip that ends at the panel's inner right edge",
+              proc_btns(dw)[2].x == right - 74 && proc_btns(dw)[3].x + proc_btns(dw)[3].w == right,
               format!("{}..{}", proc_btns(dw)[2].x, proc_btns(dw)[3].x + proc_btns(dw)[3].w));
+        check("the footer group never crosses the panel's right edge (dw - PAD)",
+              proc_btns(dw)[3].x + proc_btns(dw)[3].w < dw - PAD,
+              format!("end={} edge={}", proc_btns(dw)[3].x + proc_btns(dw)[3].w, dw - PAD));
     }
 
     println!("\n== P0.2  column headers are hit-tested at all ==");
     for &dw in widths.iter() {
         let c = proc_cols(dw);
-        // RED: the header band produced no action whatsoever.
-        for my in LIST_HDR_Y..LIST_TOP_Y {
+        // RED: the header band produced no action whatsoever. The red arm is
+        // a transcription of the OLD code, so it is judged against the OLD
+        // band (PAD + TAB_H + 6 .. + 18); (tmglass) moved the live band down
+        // into the glass panel, which is not what this arm is about.
+        const OLD_LIST_HDR_Y: i32 = PAD + TAB_H + 6;
+        const OLD_LIST_TOP_Y: i32 = OLD_LIST_HDR_Y + 18;
+        for my in OLD_LIST_HDR_Y..OLD_LIST_TOP_Y {
             check("RED old: click in the header band -> nothing",
                   old_body_click(my) == "nothing",
                   format!("my={} -> {}", my, old_body_click(my)));
             break; // one representative row is enough to name; loop below covers the band
         }
-        let band_dead = (LIST_HDR_Y..LIST_TOP_Y).all(|my| old_body_click(my) == "nothing");
+        let band_dead = (OLD_LIST_HDR_Y..OLD_LIST_TOP_Y).all(|my| old_body_click(my) == "nothing");
         check("RED old: the WHOLE header band was dead",
-              band_dead, format!("my {}..{}", LIST_HDR_Y, LIST_TOP_Y - 1));
+              band_dead, format!("my {}..{}", OLD_LIST_HDR_Y, OLD_LIST_TOP_Y - 1));
         // GREEN: each header's own X resolves to its own column.
         let cases = [(c.name, SortCol::Name), (c.pid, SortCol::Pid), (c.state, SortCol::State),
                      (c.core, SortCol::Core), (c.cpu, SortCol::Cpu), (c.mem, SortCol::Mem)];
@@ -254,11 +270,52 @@ fn main() {
     check("GREEN new: Disable button responds across its whole width",
           (sched_btns()[1].x..(sched_btns()[1].x + sched_btns()[1].w)).all(|mx| sched_foot_hit(mx) == SchedAct::Disable),
           format!("x={}..{}", sched_btns()[1].x, sched_btns()[1].x + sched_btns()[1].w - 1));
-    check("Scheduled footer geometry MATCHES the Services footer (PAD, PAD+80, w=74)",
-          sched_btns()[0] == Btn { x: PAD, w: 74 } && sched_btns()[1] == Btn { x: PAD + 80, w: 74 },
-          format!("{:?}", sched_btns()));
+    // (tmglass) both pairs start at CX, the glass panel's inner left edge,
+    // and the Services pair is svc_btns(), the same function, not a copy.
+    check("Scheduled footer geometry MATCHES the Services footer (CX, CX+80, w=74)",
+          sched_btns()[0] == Btn { x: CX, w: 74 } && sched_btns()[1] == Btn { x: CX + 80, w: 74 }
+          && svc_btns() == sched_btns(),
+          format!("{:?} / {:?}", sched_btns(), svc_btns()));
     check("the gap between Enable and Disable is inert",
-          sched_foot_hit(PAD + 76) == SchedAct::None, format!("mx={}", PAD + 76));
+          sched_foot_hit(CX + 76) == SchedAct::None, format!("mx={}", CX + 76));
+    check("the left footer pair starts inside the glass panel (right of its border at PAD)",
+          sched_btns()[0].x > PAD, format!("x={} PAD={}", sched_btns()[0].x, PAD));
+
+    println!("\n== tmglass  tab pills: one rectangle for draw and hit-test ==");
+    for i in 0..5usize {
+        let r = tab_rect(i);
+        check("every pixel of a drawn pill selects that tab",
+              (r.x..(r.x + r.w)).all(|mx| tab_at(5, mx) == Some(i)),
+              format!("tab{} x={}..{}", i, r.x, r.x + r.w - 1));
+    }
+    check("the gap between two pills selects nothing",
+          tab_at(5, tab_rect(0).x + tab_rect(0).w + TAB_GAP / 2).is_none(), "".into());
+    check("left of the first pill selects nothing", tab_at(5, PAD - 1).is_none(), "".into());
+    check("the strip of five fits a 640-wide content area",
+          tab_rect(4).x + tab_rect(4).w <= 640 - PAD, format!("end={}", tab_rect(4).x + tab_rect(4).w));
+    // RED arm: the OLD hit-test divided by a literal 87 while the draw loop
+    // stepped 84 + 3 = 87 too, so they agreed by coincidence, not construction;
+    // it also treated the 3px gaps as part of the pill to their left.
+    fn old_tab_at(mx: i32) -> Option<usize> { let i = ((mx - PAD) / 87) as usize; if i < 5 { Some(i) } else { None } }
+    check("RED old: the gap after a pill was silently attributed to that pill",
+          old_tab_at(PAD + 85).is_some(), "".into());
+
+    println!("\n== tmglass  glass panel contains every list-tab control ==");
+    for &dw in widths.iter() {
+        for &dh in [400, 536, 700].iter() {
+            let (px, py, pw, ph) = panel_rect(dw, dh);
+            check("footer buttons lie inside the panel, vertically",
+                  foot_y(dh) > py && foot_y(dh) + FOOT_H < py + ph,
+                  format!("dw={} dh={} foot_y={} panel {}..{}", dw, dh, foot_y(dh), py, py + ph));
+            check("list rows stop above the footer hairline",
+                  list_bottom(dh) < foot_y(dh) - 8, format!("dh={}", dh));
+            check("first column and last button lie inside the panel, horizontally",
+                  proc_cols(dw).name > px && proc_btns(dw)[3].x + proc_btns(dw)[3].w < px + pw,
+                  format!("dw={}", dw));
+            check("column header band starts below the panel's top edge",
+                  LIST_HDR_Y > py + 1, format!("hdr={} panel_y={}", LIST_HDR_Y, py));
+        }
+    }
 
     println!("\n== P2.6  update speed ==");
     check("Normal is the 1000 ms the app has always used",
@@ -279,8 +336,9 @@ fn main() {
               (b.x..(b.x + b.w)).all(|mx| speed_at(mx) == Some(want)),
               format!("{:?} x={}..{}", want, b.x, b.x + b.w - 1));
     }
-    check("speed buttons never overlap the Overall/Per-core pair (which end at PAD+166)",
-          speed_btns()[0].x > PAD + 166, format!("first speed x={}", speed_btns()[0].x));
+    let pm = perf_mode_btns();
+    check("speed buttons never overlap the Overall/Per-core pair (perf_mode_btns)",
+          speed_btns()[0].x > pm[1].x + pm[1].w, format!("first speed x={} pair ends {}", speed_btns()[0].x, pm[1].x + pm[1].w));
 
     let p = PASS.load(Ordering::Relaxed);
     let f = FAIL.load(Ordering::Relaxed);

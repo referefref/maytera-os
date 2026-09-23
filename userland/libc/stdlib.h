@@ -63,6 +63,16 @@ int abs(int n);
 long labs(long n);
 long long llabs(long long n);
 
+// Integer division with quotient and remainder (C89/C99). Added for the
+// libarchive mports port (#745): archive_time.c uses lldiv() to split a 64-bit
+// NTFS tick count. Purely additive; no existing caller is affected.
+typedef struct { int quot; int rem; } div_t;
+typedef struct { long quot; long rem; } ldiv_t;
+typedef struct { long long quot; long long rem; } lldiv_t;
+div_t   div(int numer, int denom);
+ldiv_t  ldiv(long numer, long denom);
+lldiv_t lldiv(long long numer, long long denom);
+
 // File I/O functions (POSIX-style)
 int open(const char *path, int flags, ...);
 int close(int fd);
@@ -100,8 +110,13 @@ long clock(void);
 extern char **environ;
 void  __libc_init_env(char **envp);   // #112: crt0 hands over the inherited block
 char *getenv(const char *name);
+char *realpath(const char *path, char *resolved_path);
 int   setenv(const char *name, const char *value, int overwrite);
 int   unsetenv(const char *name);
 int   putenv(char *string);
+
+// Create and open a unique temporary file, added for the libedit port
+// (#745). The last six chars of the template must be XXXXXX.
+int   mkstemp(char *tmpl);
 
 #endif // LIBC_STDLIB_H

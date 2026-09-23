@@ -20,6 +20,8 @@
 #define GLDEMO_HYPERCUBE   9   // rotating tesseract (4D->3D->2D projection)
 #define GLDEMO_VORTEX      10  // swirling particle vortex, point sprites
 #define GLDEMO_LAVA        11  // drifting alpha-blended low-poly lava blobs
+#define GLDEMO_LAVALAMP    12  // proper 3D lava lamp: metaball wax, glass vessel (lavalamp)
+#define GLDEMO_AQUARIUM    13  // 3D reef aquarium: fish species, boids school, kelp (aquarium)
 
 // (Re)initialize the GL context and the chosen demo at size w x h.
 // Returns 1 on success, 0 on failure. Safe to call repeatedly (it tears down
@@ -39,5 +41,22 @@ void gldemo_shutdown(void);
 // Current render size (for callers that need it).
 int  gldemo_width(void);
 int  gldemo_height(void);
+
+// (aquarium) GLDEMO_AQUARIUM runtime options. Set with
+// gldemo_aquarium_option(opt, val); the value is clamped and applied (a
+// structural change, e.g. population, reseeds the scene on the next frame)
+// and the applied value is returned, or -1 for an unknown opt. Safe to call
+// before or after gldemo_init(). The screensaver path uses the defaults;
+// the aquarium app maps keyboard keys onto these.
+#define AQOPT_POPULATION 0   // 0 sparse / 1 normal / 2 busy
+#define AQOPT_SPECIES    1   // bitmask: 1 clown, 2 tang, 4 angel, 8 goby, 16 school
+#define AQOPT_TINT       2   // 0 clear blue / 1 lagoon green / 2 deep ocean / 3 sunset
+#define AQOPT_LIGHT      3   // 0 dim / 1 normal / 2 bright
+#define AQOPT_CAUSTICS   4   // 0/1: sand caustic shimmer + god rays
+#define AQOPT_BUBBLES    5   // 0 off / 1 normal / 2 dense
+#define AQOPT_CAMERA     6   // 0 slow orbit / 1 fixed / 2 drifting glide
+#define AQOPT_PLANTS     7   // 0 few / 1 normal / 2 lush
+#define AQOPT_QUALITY    8   // 0 performance / 1 quality
+int gldemo_aquarium_option(int opt, int val);
 
 #endif

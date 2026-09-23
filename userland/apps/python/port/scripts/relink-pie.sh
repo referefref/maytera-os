@@ -15,9 +15,9 @@
 # The kernel loader applies the resulting R_X86_64_RELATIVE entries at load, so
 # the image still relocates correctly; it just carries more of them.
 set -e
-U=${U:-<repo>/userland}
+U=${U:-<repo>-build/userland}
 L=$U/libc
-CP=<workspace>
+CP=/root/cpython-port
 S=$CP/Python-3.11.9
 SH=$CP/shim
 GI=/usr/lib/gcc/x86_64-linux-gnu/12/include

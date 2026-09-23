@@ -64,9 +64,56 @@ typedef struct {
                                   // device (0 for a whole-disk ext2 volume). Added
                                   // to every absolute block access so ext2 can live
                                   // in partition 2 of a GPT disk behind a FAT ESP.
+    // #404 Stage 4b: AUX (Disk Manager) mount device routing. The boot root
+    // (g_ext2) leaves via_blkmgr = 0 and reaches its device through
+    // blk_read/blk_write(channel, drive, ...) exactly as before. An AUX mount
+    // built by ext2_mount_into() sets via_blkmgr = 1 and routes every sector
+    // through the unified blkmgr device layer (blkmgr_dev_rw_c) by (dev_kind,
+    // dev_index) instead, which is the ONLY path that reaches an AHCI/USB/RAM
+    // scratch second volume. via_blkmgr fs instances also BYPASS the block
+    // cache (g_e2c is keyed by block number only, so it cannot hold two
+    // devices), which is why an aux read/write never collides with the root.
+    uint8_t  via_blkmgr;          // 0 = legacy blk_read/blk_write; 1 = blkmgr_dev_rw_c
+    uint8_t  dev_kind;            // blkmgr KIND_* (only meaningful when via_blkmgr)
+    uint8_t  dev_index;           // blkmgr device index (only meaningful when via_blkmgr)
+    uint8_t  aux_pad;
 } ext2_fs_t;
 
 int     ext2_mount(uint8_t channel, uint8_t drive, uint32_t part_start_lba);
+
+// ---------------------------------------------------------------------------
+// #404 Stage 4b: AUX ext2 mount API (Disk Manager mounts under /MNT/<name>).
+//
+// These reuse the SAME driver as the boot root, parameterised by an explicit
+// `ext2_fs_t *fs` instead of the g_ext2 singleton, so there is exactly ONE
+// ext2 implementation in the tree (no fork). They are SMP-safe against the
+// lock-free root read fast path because the caller passes the fs by pointer
+// (never a g_ext2 swap) and an aux fs bypasses the shared block cache.
+//
+// ext2_mount_into() fills a caller-owned ext2_fs_t from an aux partition on
+// (dev_kind, dev_index) at part_start_lba, routing all its I/O through the
+// unified blkmgr device layer. It does NOT do the #610 dirty-mark superblock
+// write the boot mount does: an aux mount is transient and re-parsed on demand.
+int      ext2_mount_into(ext2_fs_t *fs, uint8_t dev_kind, uint8_t dev_index,
+                         uint32_t part_start_lba);
+// The "_on" family: the mid-level operations against an explicit fs. The
+// public g_ext2 entry points above are thin wrappers over these.
+int      ext2_read_inode_on(const ext2_fs_t *fs, uint32_t ino, ext2_inode_t *out);
+uint32_t ext2_resolve_path_on(const ext2_fs_t *fs, const char *path);
+int64_t  ext2_read_file_range_on(const ext2_fs_t *fs, uint32_t ino,
+                                 uint64_t off, uint64_t len, void *dst);
+// Iterate one directory entry. *pos is the caller's byte cursor (start at 0).
+// Returns 0 (entry written), -1 (end / error). Skips "." and "..".
+int      ext2_readdir_on(const ext2_fs_t *fs, uint32_t dir_ino, uint32_t *pos,
+                         char *name_out, int name_max,
+                         uint32_t *ino_out, uint8_t *type_out);
+// Create-or-replace a regular file. Takes the shared ext2_lock (serialised with
+// root writes) and routes I/O to the aux device. Returns 0 on success.
+int      ext2_write_file_on(ext2_fs_t *fs, const char *path,
+                            const void *data, uint32_t len);
+// 1 if the PARENT dir of `path` exists on `fs`, else 0.
+int      ext2_parent_dir_exists_on(const ext2_fs_t *fs, const char *path);
+
 // #365: locate an ext2/Linux partition on a disk and return its starting LBA.
 // Parses GPT (preferred) then MBR. Returns 0 and sets *out_base_lba on success.
 int     ext2_find_partition(uint8_t channel, uint8_t drive, uint32_t *out_base_lba);
@@ -83,6 +130,10 @@ int64_t ext2_read_file_ino(uint32_t ino, void *buf, uint64_t max);
 int     ext2_lookup(uint32_t dir_ino, const char *name,
                     uint32_t *out_ino, uint8_t *out_type);
 uint32_t ext2_resolve_path(const char *path);
+// (opencreatenoent): 1 if the PARENT dir of `path` exists and is a directory,
+// else 0. Used by the O_CREAT open paths to refuse a create under a missing
+// parent BEFORE allocating an fd (see the definition in ext2.c).
+int ext2_parent_dir_exists(const char *path);
 void    ext2_selftest(void);
 
 // #404 / #485 Phase C: directory-block entry scan strangler seam. ext2_lookup()

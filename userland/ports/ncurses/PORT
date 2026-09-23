@@ -1,0 +1,110 @@
+# mports recipe: ncurses. Tier 1 item #2 of
+# docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md section 9, described there as
+# "the highest leverage single port": it makes the class-C pool (202 licence-clean
+# native TUI programs) reachable and is the prerequisite for the roguelikes
+# (NetHack, Angband) and the small terminal games. Licence is X11-style
+# permissive; dependency closure 0.
+#
+# WHY LUA (recipe 3) DELIBERATELY WAS NOT ncurses, and why it is now unblocked.
+# userland/ports/lua/PORT records that ncurses "needs a terminfo database on the
+# image AND a real interactive tty, and MayteraOS still has no interactive tty".
+# Both preconditions now hold: #586 gave the Terminal a real pty
+# (userland/apps/terminal/term_pty.c) and its ANSI parser (term_parse.c) is a
+# VT220/xterm-class emulator. This recipe supplies the missing terminfo database
+# and the library. The one remaining honesty gap - the DEC line-drawing charset
+# the emulator swallowed but never switched - was CLOSED as part of this work
+# (term_parse.c now maps the DEC special-graphics set to Unicode), so box() and
+# every TUI frame render as real lines rather than literal q/x/l characters.
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA. Unlike the
+# four `build=objects` recipes before it, ncurses is `build=script`: it is NOT a
+# fixed list of .c files. Its library sources are GENERATED at build time by a
+# tree of awk/sed/sh generators driven by ./configure (curses.h from curses.h.in,
+# term.h, comp_captab.c, names.c, fallback.c, init_keytry.h, ...). Freezing that
+# generated output into the recipe would rot at the first version bump, which is
+# the exact failure this whole system exists to avoid. So the generation is done
+# by upstream's own build system in ports/ncurses/build.sh, and mports still
+# enforces the same guarantees around it: the produced lib=libncurses.a must
+# exist and every symbol in `symbols` must be DEFINED in it (the anti-no-op
+# check), and every header in `headers` must be installed.
+
+name=ncurses
+version=6.5
+class=C
+homepage=https://invisible-island.net/ncurses/
+
+# The GNU release tarball. The sha256 below is of THIS file and was MEASURED on
+# the build container with sha256sum, not copied from a web page:
+#   wget -O ncurses-6.5.tar.gz https://ftp.gnu.org/gnu/ncurses/ncurses-6.5.tar.gz
+#   sha256sum ncurses-6.5.tar.gz
+#   -> 136d91bc269a9a5785e5f9e980bc76ab57428f604ce3e5a5a90cebc767971cc6  (3,688,489 bytes)
+# 6.5 (27 April 2024) is the current stable release; the GNU listing was read at
+# port time rather than assumed.
+source_url=https://ftp.gnu.org/gnu/ncurses/ncurses-6.5.tar.gz
+tarball=ncurses-6.5.tar.gz
+sha256=136d91bc269a9a5785e5f9e980bc76ab57428f604ce3e5a5a90cebc767971cc6
+srcdir=ncurses-6.5
+
+# ncurses is under the X11-style (MIT-derived, "MIT-open-group") permissive
+# licence: the verbatim grant is in COPYING and is reproduced in ATTRIBUTION.md,
+# copied out of THIS tarball, not written from memory. It is compatible with the
+# GPLv2 base (permissive, non-copyleft). This string must equal the
+# components.tsv row exactly or the attribution gate fails.
+licence=X11
+licence_files=COPYING
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): does this library want to USE a platform
+# layer, or to BE one? CONFIRMED BY MEASUREMENT, not assumed. A test program
+# (initscr/box/mvwprintw/wgetch/colours) linked against the built libncurses.a
+# plus userland/libc/libc.a with crt0.o and user-pie.ld, and the link resolved
+# with ZERO undefined symbols. The only platform surface libncurses.a leaves to
+# the caller is the ordinary libc set (malloc/free, str/mem, snprintf/vsscanf,
+# open/read/write/close/lseek/stat/fstat, getenv/setenv, tcgetattr/tcsetattr,
+# ioctl TIOCGWINSZ, gettimeofday/nanosleep, sigaction, isatty, poll), every one
+# already in userland/libc. ncurses does NOT own main(), the process, or the
+# event loop: the HOST app owns them and calls getch() itself. It USES.
+adoption=USES. Measured: a test program linked against the built libncurses.a + userland/libc/libc.a resolved with zero undefined symbols; the library's only platform demands are the ordinary libc string/mem/stdio/file/termios/poll surface, all already in userland/libc. The host owns main(), the process and the input loop and calls into ncurses; ncurses owns the screen model but never the process.
+
+needs=libc
+
+# No pre-configure copies: ncurses uses a real ./configure, run inside build.sh.
+prepare=none
+
+# THE ONE PATCH. A child spawned by the Terminal on its pty (term_pty.c calls
+# sys_spawn_args, which does NOT pass an environment) has NO environ, so
+# getenv("TERM") is NULL and setupterm() would ret_error "TERM environment
+# variable not set". The patch defaults the terminal name to "maytera" when TERM
+# is unset, so an UNMODIFIED ncurses program (nethack, mc, ...) works with no
+# env plumbing. Combined with --with-default-terminfo-dir=/TERMINFO in build.sh,
+# ncurses is fully self-sufficient on MayteraOS with no environment at all.
+# It is load-bearing: setupterm/tigetstr are in the `symbols` list, so a patch
+# that stopped applying (and left the library unbuildable in the way it would)
+# fails the build rather than shipping silently.
+patches=0001-default-term-maytera.patch
+
+# build=script: ports/ncurses/build.sh does a HOST pass (to build tic, which
+# compiles the terminfo source) and a CROSS pass (to build the MayteraOS target
+# libraries), then compiles the terminfo database into ports/out/terminfo. See
+# that file's header for the full rationale.
+build=script
+
+# The generated public headers, installed into out/include for consumers. They
+# are produced by build.sh (curses.h from curses.h.in etc.) into the source
+# tree's include/ so mports can install them by the paths below.
+headers=include/curses.h include/term.h include/unctrl.h include/ncurses_dll.h include/termcap.h include/panel.h include/menu.h include/form.h include/eti.h
+
+# THE PRIMARY LIBRARY. build.sh also installs libpanel.a, libmenu.a and
+# libform.a into out/lib directly (they are separate archives even in this
+# single-libtinfo build); libncurses.a is the one mports symbol-checks.
+lib=libncurses.a
+
+# THE ANTI-NO-OP CHECK. mports proves with nm that every one of these is a
+# DEFINED symbol in libncurses.a. Read out of the built archive with nm, not
+# from memory. The spread is deliberate: the high-level curses API (initscr,
+# newwin, box, wgetch, mvwprintw), the colour API (start_color, init_pair,
+# has_colors), the terminfo low level (setupterm, tigetstr, tigetnum, tparm)
+# and the input plumbing (keypad, wtimeout) each come from a different group of
+# translation units, so a `configure`/generator step that produced the wrong
+# source set cannot pass this line.
+symbols=initscr endwin newwin delwin box wborder wmove waddstr waddnstr mvprintw mvwprintw wprintw refresh wrefresh doupdate wnoutrefresh getch wgetch keypad cbreak noecho curs_set clear werase wclear wclrtoeol start_color init_pair has_colors wattron wattroff wattr_on wbkgd wtimeout napms setupterm tigetstr tigetnum tigetflag tparm newterm

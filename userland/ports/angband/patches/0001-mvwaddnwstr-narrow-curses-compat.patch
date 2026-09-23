@@ -1,0 +1,97 @@
+diff -Nur a/src/main-gcu.c b/src/main-gcu.c
+--- a/src/main-gcu.c	2025-12-16 05:27:20.000000000 +0000
++++ b/src/main-gcu.c	2026-09-07 10:12:56.141828781 +0000
+@@ -51,6 +51,8 @@
+ 
+ #undef term
+ 
++#include "mayteraos-curses-compat.h"
++
+ /**
+  * Use POSIX terminal I/O
+  */
+diff -Nur a/src/mayteraos-curses-compat.c b/src/mayteraos-curses-compat.c
+--- a/src/mayteraos-curses-compat.c	1970-01-01 00:00:00.000000000 +0000
++++ b/src/mayteraos-curses-compat.c	2026-09-07 10:12:56.133282631 +0000
+@@ -0,0 +1,37 @@
++/* mayteraos-curses-compat.c - see mayteraos-curses-compat.h for why this
++ * exists. MayteraOS #745 Tier 3 #15 (userland/ports/angband).
++ * SPDX-License-Identifier: MIT
++ * Copyright (c) MayteraOS contributors.
++ *
++ * mvwaddnwstr() writes at most n wide characters (or up to the first L'\0' if
++ * n < 0) starting at (y, x) in win, exactly like real ncursesw's version, but
++ * implemented on top of the NARROW waddch() our libncurses.a actually has.
++ *
++ * Every code point 0x20-0xFF is passed straight through as a single-byte
++ * chtype: the terminal side (userland/apps/terminal/term_pty.c +
++ * term_parse.c) is what turns bytes into glyphs, and Angband's GCU frontend
++ * with no tile graphics only ever asks for plain ASCII/Latin-1 dungeon
++ * symbols this way, never a multi-byte code point that needs UTF-8 encoding
++ * on the wire. A code point above 0xFF (only reachable if a user hand-edits
++ * a .prf file to reference one) is drawn as '?' rather than silently
++ * corrupting the display or mis-encoding: an honest lossy fallback, not a
++ * crash and not a lie about what got drawn.
++ */
++#include "mayteraos-curses-compat.h"
++#include <curses.h>
++
++int mvwaddnwstr(WINDOW *win, int y, int x, const wchar_t *wstr, int n)
++{
++	int count;
++
++	if (wmove(win, y, x) == ERR) return ERR;
++
++	for (count = 0; wstr[count] != L'\0' && (n < 0 || count < n); count++) {
++		wchar_t wc = wstr[count];
++		chtype ch = (wc <= 0xFF) ? (chtype)wc : (chtype)'?';
++
++		if (waddch(win, ch) == ERR) return ERR;
++	}
++
++	return OK;
++}
+diff -Nur a/src/mayteraos-curses-compat.h b/src/mayteraos-curses-compat.h
+--- a/src/mayteraos-curses-compat.h	1970-01-01 00:00:00.000000000 +0000
++++ b/src/mayteraos-curses-compat.h	2026-09-07 10:12:56.132367750 +0000
+@@ -0,0 +1,40 @@
++/* mayteraos-curses-compat.h - narrow-curses stand-in for the ncursesw entry
++ * point Angband's GCU frontend hard-requires.  MayteraOS #745 Tier 3 #15
++ * (userland/ports/angband).
++ * SPDX-License-Identifier: MIT
++ * Copyright (c) MayteraOS contributors.
++ *
++ * WHY THIS FILE EXISTS.  main-gcu.c's Term_text_gcu(), the ONLY glyph-drawing
++ * path in the GCU frontend, calls mvwaddnwstr() unconditionally (there is no
++ * narrow-curses fallback left in this Angband version; the "-lcurses
++ * -ltermcap" line in Makefile.std is vestigial). mvwaddnwstr() is an ncursesw
++ * (wide-character) API function and does not exist in a narrow build.
++ * userland/ports/ncurses is deliberately built --disable-widec (see that
++ * port's build.sh: "the emulator and this milestone are 8-bit/UTF-8-
++ * passthrough"), and rebuilding a second, wide copy of ncurses for one
++ * caller is a disproportionate answer to what Angband actually needs here:
++ * every glyph the GCU frontend draws in the shipped configuration (no tile
++ * graphics, no USE_GRAPHICS) is a plain code point under 256.
++ *
++ * ONE COPY, ON PURPOSE, per docs/MPORTS.md's "added files" precedent
++ * (userland/ports/musl-regex/patches/0004, gnuregex.h/gnu_compat.c): this is
++ * FIRST-PARTY MayteraOS glue living inside somebody else's fetched source
++ * tree because that is where the one copy belongs. Angband's own build
++ * lists it as an ordinary translation unit (see angband/PORT `sources=`),
++ * and mvwaddnwstr is in that PORT's `symbols=` list so a patch that stops
++ * applying fails the build loudly instead of shipping a binary that cannot
++ * link.
++ */
++#ifndef MAYTERAOS_CURSES_COMPAT_H
++#define MAYTERAOS_CURSES_COMPAT_H
++
++#include <wchar.h>
++#include <curses.h>   /* for WINDOW; ncurses.h's own guards make this safe to
++                       * include again even if the consumer already pulled in
++                       * <ncurses.h> under a different name (main-gcu.c does). */
++
++/* WINDOW is already declared by <curses.h>/<ncurses.h>, included before this
++ * header in main-gcu.c. */
++int mvwaddnwstr(WINDOW *win, int y, int x, const wchar_t *wstr, int n);
++
++#endif /* MAYTERAOS_CURSES_COMPAT_H */

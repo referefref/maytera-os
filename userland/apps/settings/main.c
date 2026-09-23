@@ -14,8 +14,11 @@
 #include "../../libc/assoc.h"
 #include "../../libc/devinfo.h"      // (#382) real CPU/RAM (SYS_SYSINFO) + PCI (SYS_DEV_PCI_LIST)
 #include "../../libhelp/help_ui.h"   // (#267) help subsystem: tooltips, "?" icon, F1
-#define BT_STUB_IMPL                 // (#237, was BT_MOCK_IMPL/#372) this TU owns the stub state
-#include "../../libc/bt_client.h"    // (#237) Bluetooth client API + honest stub (no driver)
+// (btui) The Bluetooth panel is now REAL: this TU no longer defines the honest
+// stub. bt_client.c (linked into this binary via the settings Makefile) provides
+// the real implementation that drives the SYS_BT syscall. The stub block in the
+// header is left in place only for the compositor's own bt_impl.c consumer.
+#include "../../libc/bt_client.h"    // (btui) Bluetooth client API (real, via SYS_BT)
 #define WIFI_STUB_IMPL               // (#237, was WIFI_MOCK_IMPL/#384) this TU owns the stub state
 #include "../../libc/wifi_client.h"  // (#237) Wi-Fi client API + honest stub (no driver)
 #include "userconf.h"   // #683: per-user preference paths
@@ -346,6 +349,8 @@ static int dock_zoom   = DOCK_ZOOM_DEFAULT;
 static int cursor_theme = 0;
 static int dock_style = 0;          // #387 0=Default 1=Lumina 2=Classic UNIX 3=Retro Bench 4=Marble
                                     // (#26 internal enum stays DOCK_XFCE; #745 relabel only)
+                                    // (cfsettings) 5=Cardfile (GUI_DOCK_CARDFILE): the
+                                    // Rolodex card-deck shell, no taskbar or dock
 static int appearance_needs_restart = 0; // 1 if font/icon size changed
 
 // Wallpaper selector (#517). Previously two hardcoded arrays (names + files) that
@@ -447,7 +452,19 @@ static char dns_primary[16] = "8.8.8.8";
 // lease OFFERED (net_status_t.dns_dhcp), which is exactly the number that
 // makes "why is my DNS not what the panel says" answerable at a glance.
 static char dns_offered[16] = "";
-static char mac_address[18] = "00:00:5E:00:53:00";
+// #netfix2: WHICH of the two resolver states is in force. 0 = automatic (the
+// stack takes whatever the network offers), 1 = pinned by an explicit choice
+// that overrides DHCP on every network and survives reboot. The panel could
+// not show a difference it could not see, so a user pinned to a resolver he
+// never knowingly chose had nothing on screen telling him there was anything
+// to undo. Filled from net_status_t.dns_pinned in net_pull_live().
+static unsigned int dns_pinned = 0;
+// #netfix2: the DNS text a DNS dialog was SEEDED with. Both dialogs prefill
+// from the LIVE resolver, so "the field is non-empty" was never evidence that
+// the user chose anything; it was only ever evidence that the prefill worked.
+// Submit compares against this so an untouched field applies nothing.
+static char dns_prefill[16] = "";
+static char mac_address[18] = "BC:24:11:80:C9:5B";
 
 // (#382 pass2) Removed vpn_enabled / vpn_protocol: there is no VPN client stack,
 // so the Network panel marks VPN honestly as unavailable instead of a fake toggle.
@@ -1241,9 +1258,9 @@ static const char *const ICON_SIZE_OPTS[] = {"Small", "Medium", "Large"};
 // is persisted directly into SETTINGS.CFG and inserting mid-list renumbers
 // every entry after it - which is exactly what #ssredesign did when it pushed
 // the ten GL effects from idx 9-18 to 11-20.
-static const char *const SS_OPTS[]        = {"Off", "Starfield", "Flux", "Lines", "Bubbles", "Matrix", "Psychedelic: Plasma", "GL Cube", "GL Matrix", "Psychedelic: Bloom Garden", "Psychedelic: Stained Glass", "Rainbow: Tunnel", "Psychedelic: Kaleidoscope", "Geometric: Platonic Solids", "Geometric: Lorenz Attractor", "Geometric: Mobius Strip", "Geometric: Wave Mesh", "Geometric: Spirograph", "Geometric: Hypercube", "Geometric: Vortex", "Psychedelic: Lava Blobs", "Plasma (Classic)"};
+static const char *const SS_OPTS[]        = {"Off", "Starfield", "Flux", "Lines", "Bubbles", "Matrix", "Psychedelic: Plasma", "GL Cube", "GL Matrix", "Psychedelic: Bloom Garden", "Psychedelic: Stained Glass", "Rainbow: Tunnel", "Psychedelic: Kaleidoscope", "Geometric: Platonic Solids", "Geometric: Lorenz Attractor", "Geometric: Mobius Strip", "Geometric: Wave Mesh", "Geometric: Spirograph", "Geometric: Hypercube", "Geometric: Vortex", "Psychedelic: Lava Blobs", "Plasma (Classic)", "Lava Lamp (3D)", "Aquarium (3D)"};
 static const char *const CURSOR_OPTS[]    = {"Light", "Dark", "Glow"};  // (#116) maps to compositor curstyle 0/1/2
-static const int SS_KERNEL_MAP[]          = {0, 2, 6, 3, 4, 5, 7, 8, 9, 20, 21, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 22};
+static const int SS_KERNEL_MAP[]          = {0, 2, 6, 3, 4, 5, 7, 8, 9, 20, 21, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 22, 23, 24};
                                           // idx -> kernel screensaver id (#319 8=GL Cube 9=GL Matrix; 20/21 are the
                                           // psychedelic-redesign direct-pixel effects, see #ssredesign above; 10-19
                                           // are the #560/#571 GL effects, un-gated and appended - see comment above)
@@ -1610,6 +1627,10 @@ static void net_pull_live(void) {
     if (sys_net_status(&nst) == 0) {
         // #144: the DHCP toggle reflects REALITY, not the initializer.
         dhcp_enabled = !nst.config_static;
+        // #netfix2: automatic or pinned. This is a different fact from "is the
+        // address static": a machine on a DHCP lease can still have a pinned
+        // resolver, and that combination is exactly the one that fails.
+        dns_pinned = nst.dns_pinned;
         // #786: what the lease offered, rendered as a fact and not as a
         // second resolver. 0 is a REAL state ("your DHCP server gave you
         // none") and is said out loud rather than left blank.
@@ -4011,10 +4032,16 @@ static void draw_sound_panel(void) {
     // (#382 pass2) Only master volume/mute and the WAV test are real (kernel
     // mixer + SYS_PLAY_WAV). The output DEVICE is the real PCI-enumerated audio
     // controller (read-only, no device switching support). There is no audio
-    // capture path and no equalizer DSP, so the Input + Equalizer sections show
-    // an honest "not available" state instead of the old fake dropdowns / VU
-    // meter / 10-band sliders.
+    // capture path, so the Input section shows an honest "not available" state
+    // instead of a fake VU meter. #247: sound_muted used to be a static that
+    // only this app's own click handler ever wrote, defaulting to false on
+    // every relaunch - so the Mute button could read "Mute" while the output
+    // was actually muted from a previous session (docs/SETTINGS_CONTROL_
+    // AUDIT.md #224, ranked item 6). Re-read the REAL kernel mute bit
+    // (SYS_VOL_STATE) every draw, the same way master_volume already re-reads
+    // get_volume() below - one is not more "live" than the other.
     hwinfo_load();
+    sound_muted = vol_state_muted(vol_state()) ? true : false;
     int x = CONTENT_X + PADDING;
     int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
     char buf[32];
@@ -4051,22 +4078,33 @@ static void draw_sound_panel(void) {
                  "Audio input (microphone capture) is not supported by this build.");
     y += 40;                                  // 240
 
-    // ---- Equalizer (no DSP) ----
+    // ---- Equalizer ----
+    // #247: this used to claim "No hardware equalizer or audio DSP is
+    // available", which stopped being true at #231r - a real 5-band
+    // biquad EQ (SYS_AUDIO_EQ -> rustkern/pcmeq.rs) shipped, wired into the
+    // taskbar tray's Sound menu (compositor/traymenu.c). Settings itself has
+    // no EQ widget, so point at the one that exists instead of denying it.
     draw_subsection(x, y, "Equalizer");
     y += 25;                                  // 265
     draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED) /* (#704) was hardcoded 0x00A0A0A8 */,
-                 "No hardware equalizer or audio DSP is available.");
+                 "Not in Settings: use the taskbar tray Sound menu for the real 5-band equalizer.");
     y += 40;                                  // 305
 
-    // ---- System sounds (real preference) ----
+    // ---- System sounds ----
     draw_subsection(x, y, "System Sounds");
     y += 25;                                  // 330
     draw_toggle_labeled(x, y, 300, "System Sound Effects", sound_effects);
-    y += 40;                                  // 370
+    // #247: no event in the OS ever plays a sound because of this toggle
+    // (docs/SETTINGS_CONTROL_AUDIT.md #224) - it is a preference with no
+    // consumer, same class as Location Services/Send Diagnostics below in
+    // Privacy. Kept as a persisted preference, labeled honestly, rather than
+    // ripped out, in case UI/system sounds are wired to it later.
+    draw_hint(x, y + 28, "Preference only: no UI sound events are wired to this build.");
+    y += 58;                                  // 388
 
     // Test Speakers plays a real WAV via SYS_PLAY_WAV (needs a real device).
     draw_button(x, y, 130, "Test Speakers", false, false);
-    y += 38;                                  // 408
+    y += 38;                                  // 426
     if (!g_audio_present)
         draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED) /* (#704) was hardcoded 0x00A0A0A8 */, "No audio output device present.");
     else if (sound_test_status == 3)
@@ -4151,7 +4189,15 @@ static void draw_network_panel(void) {
     // static config or a Settings change pins the first and ignores the
     // second - and when they do, showing only one of them is how a user ends
     // up debugging a machine that is not doing what the screen says.
-    draw_label_value(x + 280, y + 60, "DNS (live):", dns_primary, 80);
+    // #netfix2: the number alone cannot say whether it survives a reboot onto
+    // a different network, and that is the only part of it anyone ever has to
+    // debug. "(pinned)" means an explicit choice is overriding DHCP.
+    {
+        char dnsv[32];
+        snprintf(dnsv, sizeof(dnsv), "%s %s", dns_primary,
+                 dns_pinned ? "(pinned)" : "(auto)");
+        draw_label_value(x + 280, y + 60, "DNS (live):", dnsv, 80);
+    }
     draw_label_value(x + 280, y + 80, "DHCP offered:", dns_offered, 80);
 
     y += 125;
@@ -4166,6 +4212,12 @@ static void draw_network_panel(void) {
     } else {
         // (#786) On DHCP the address is not yours to set, but the RESOLVER is.
         draw_button_small(x + 20, g.dnsbtn, 160, "Set DNS...", false);
+        // #netfix2: the way BACK. Pinning a resolver had a control and
+        // un-pinning had none, so a pin made once applied to every network
+        // afterwards with nothing in the GUI able to lift it. Shares the DNS
+        // row rather than adding one, so network_geom() is unchanged and both
+        // the draw pass and the hit test still read the same g.dnsbtn.
+        draw_toggle_labeled(x + 190, g.dnsbtn, 110, "DNS automatic", !dns_pinned);
         y = g.dnsbtn + 36;
     }
 
@@ -4398,7 +4450,7 @@ static void datetime_geom(datetime_geom_t *g) {
     g->use24 = y; y += 45;
     y += 25;                 /* "Time Zone" subsection heading */
     g->tz = y; y += 50;
-    g->weekstart = y; y += 50;
+    g->weekstart = y; y += 68;   // #247: +18 vs #227's 50 for the honesty hint
     g->setbtn = y;
 }
 
@@ -4478,7 +4530,13 @@ static void draw_datetime_panel(void) {
     // Auto time toggle
     draw_toggle_labeled(x, g.auto_time, 300, "Set time automatically", auto_time);
     y = g.auto_time + 10;
-    draw_hint(x, y + 20, "Synchronize with network time servers");
+    // #247: sntp_sync() (kernel/net/sntp.c) has no periodic caller anywhere in
+    // the tree (docs/SETTINGS_CONTROL_AUDIT.md #224) - enabling this fires
+    // ONE sync and nothing re-syncs afterwards, so the old label promised
+    // continuous behaviour the build does not perform. Said plainly rather
+    // than implemented, since a real periodic re-sync is a bounded but
+    // separate kernel change (a repeating timer caller), not a Settings fix.
+    draw_hint(x, y + 20, "Synchronizes once when enabled; does not re-sync periodically in this build.");
     y += 30;
     // NTP status feedback
     if (ntp_status == 1)
@@ -4499,6 +4557,12 @@ static void draw_datetime_panel(void) {
     draw_label(x, g.weekstart, "Week starts on");
     const char* week_days[] = {"Sunday", "Monday"};
     draw_option_buttons(x + 140, g.weekstart - 3, week_days, ARRAY_COUNT(week_days), first_day_of_week);
+    // #247: nothing in the tree lays out a calendar or week view that this
+    // could affect (docs/SETTINGS_CONTROL_AUDIT.md #224) - it is a plain
+    // in-RAM preference (not even saved across relaunch). Same honest
+    // treatment as the rest of this pass rather than removal, since it is a
+    // single isolated control, not a cluster like Mouse/Keyboard's #230 cut.
+    draw_hint(x, g.weekstart + 30, "Preference only: no calendar/week view reads this in this build.");
 
     // Manual time setting button
     if (!auto_time) {
@@ -4663,7 +4727,13 @@ static void draw_users_panel(void) {
 
     draw_button(x, g.adduser, 120, "Add User", true, false);
     draw_toggle_labeled(x, g.guest, 300, "Enable Guest Account", guest_enabled);
-    g_content_bottom_y = g.guest + 40;   // (#227) toggle height + margin
+    // #247: there is no guest-account handling anywhere in kernel/proc/users.c
+    // or kernel/gui/login.c (docs/SETTINGS_CONTROL_AUDIT.md #224) - this
+    // toggle changes an in-RAM bool that resets to on every relaunch and is
+    // never read by anything, including this app's own settings_save(). Same
+    // honest treatment as Privacy's Location Services / Send Diagnostics.
+    draw_hint(x, g.guest + 30, "Preference only: no guest account exists in this build.");
+    g_content_bottom_y = g.guest + 55;   // (#227) toggle + hint line + margin
 }
 
 // =============================================================================
@@ -4750,6 +4820,13 @@ static void draw_privacy_panel(void) {
     draw_hint(x, g.diagnostics + 30, "Preference only: no diagnostics are collected or transmitted.");
 
     draw_toggle_labeled(x, g.crash, 300, "Send Crash Reports", crash_reports);
+    // #247: unlike Location Services/Send Diagnostics right above, this one
+    // shipped with no caveat at all - it read as a working privacy control
+    // (docs/SETTINGS_CONTROL_AUDIT.md #224, ranked item 2: "the worst of
+    // the write-nothing-reads set, because it looks the most trustworthy").
+    // No code anywhere reads `crash_reports`. Same honest treatment as its
+    // neighbours.
+    draw_hint(x, g.crash + 30, "Preference only: no crash reporting exists in this build.");
     y = g.crash + 45;
 
     // App permissions: there is no per-app capability enforcement in this build,
@@ -5679,6 +5756,17 @@ static void draw_dock_panel(void) {
     draw_label(x, L.style_y + 4, "Style");
     draw_dropdown_n(x + 120, L.style_y - 3, 220, DOCK_OPTS[DOCK_CLAMP(dock_style)],
                      g_dd_open && g_dd_sel == &dock_style, DOCK_OPTS_COUNT);
+    // (cfsettings) The Cardfile shell (docs/CARDFILE_ARCHITECTURE.md) has no
+    // taskbar and no dock at all, so every control below this row is inert
+    // under it. Say so in the same place and idiom as the Opacity row's own
+    // hint (x+120, row+22, secondary ink) rather than hiding the rows: the
+    // values they hold still persist and come back with any other style.
+    // Not drawn while the dropdown popup is open: the popup paints over this
+    // row and the list would otherwise show through a stale hint.
+    if (DOCK_CLAMP(dock_style) == GUI_DOCK_CARDFILE && !(g_dd_open && g_dd_sel == &dock_style))
+        win_draw_text(window_handle, x + 120, L.style_y + 22,
+                      "A Rolodex-style deck of cards; no taskbar or dock. The controls below do not apply.",
+                      COL_TEXT_SECONDARY);
 
     draw_label(x, L.opacity_y + 4, "Opacity");
     {
@@ -5875,10 +5963,12 @@ static void draw_about_panel(void) {
     // Logical core count, and HOW MANY OF THEM ARE ACTUALLY EXECUTING.
     //
     // cpu_count is the MADT count (proc/devinfo.c: smp_get_cpu_count()). It is
-    // what the firmware says the machine has, NOT what this kernel runs on:
-    // g_smp_user_sched ships at 0 and main.c only calls smp_start_aps() when it
-    // is set, so on every shipping build one core runs threads and the rest are
-    // never started. Printing cpu_count alone told the owner his laptop had 8
+    // what the firmware says the machine has, NOT necessarily what this kernel
+    // runs on. #SMPDEFAULT (2026-09-02): g_smp_user_sched now ships at 1, so
+    // application processors ARE started and cpu_online should normally equal
+    // cpu_count; a divergence now means an AP genuinely failed to come up, or
+    // /NOSMPSCHED.TXT is on the ESP. Both halves are still printed, because the
+    // point stands either way. Printing cpu_count alone told the owner his 8
     // cores while 1 executed, which is the kind of number someone reasonably
     // uses to decide a machine is fine and the software is slow. cpu_online is
     // published beside it and is the honest half; devmgr has always shown both.
@@ -6136,12 +6226,13 @@ static void draw_devices_panel(void) {
 }
 
 // =============================================================================
-// Panel: Bluetooth (#372, honesty pass #237)
+// Panel: Bluetooth (#372, honesty pass #237, REAL since the btui pass)
 // UI codes against the bt_client.h contract, which mirrors the architect's
-// kernel bt_ctrl.h one-to-one. The backend is an honest stub (no invented
-// devices, no simulated pairing) until the SYS_BT_* stack lands; swapping it
-// in is a one-line change per function inside bt_client.h and nothing in
-// this panel changes.
+// kernel bt_ctrl.h one-to-one. CORRECTED (bt-settings-ux, 2026-09-16): this
+// comment used to say the backend was still an honest stub "until the
+// SYS_BT_* stack lands" - that stack landed with the btui pass and
+// bt_client.c (linked into this binary) drives it for real over SYS_BT; see
+// draw_bluetooth_panel()'s own comment below for the current design.
 // =============================================================================
 
 // Click regions recorded during the draw pass and consumed by the click
@@ -6160,6 +6251,109 @@ static int g_bt_spin = 0;                 // spinner frame, advanced from idle t
 static bt_addr_t g_bt_pend_addr;
 static int g_bt_pend_active = 0;
 static bt_link_state_t g_bt_pend_target = BT_LINK_NONE;
+
+// =============================================================================
+// bt-settings-ux (2026-09-16): scan-cadence + incremental device-list model.
+// Owner feedback from real-iMac testing: the panel was continually scanning
+// and rebuilding its whole device list from scratch on every redraw, and the
+// "Stop scanning" button did not actually stop anything (see bt_scan_stop()
+// in kernel/bt/bt.c and the bt worker fix in kernel/bt/hci_usb.c for the root
+// cause: the background worker silently restarted scanning ~5s after a Stop,
+// and the classic BR/EDR inquiry Stop never cancelled kept running to its own
+// ~10.24s Inquiry_Length regardless).
+//
+// The requested cadence: on enable/start, scan ONCE for 10 seconds, then take
+// one full census of every device found (name/class/etc captured once).
+// After that, every 15 seconds, run one more short discovery burst whose ONLY
+// job is to add newly-found devices and drop ones no longer seen - it must
+// NOT rebuild the visible list or re-fetch metadata for devices already
+// known.
+//
+// This is implemented as a small persistent model (g_bt_ui[], keyed by MAC)
+// plus a 4-state cadence machine (bt_ui_scan_tick(), ticked once per Settings
+// idle-loop pass - the same uptime_ms()-deadline idiom the theme/dockfav
+// pollers a few hundred lines below already use, NEVER a busy/proc_sleep
+// loop) that starts/stops the actual kernel scan and decides when the model
+// is allowed to grow or shrink. The model type + macros + the MAC-keyed diff
+// (bt_ui_merge()) live in bt_scancad.h: it is a pure function (no dependency
+// beyond bt_client.h's bt_addr_eq()), so the SAME compiled header also builds
+// into bt_scancad_hosttest.c, a host-side unit test that cannot silently
+// drift from what ships (see that file for the cases it proves).
+//
+// Separate from that cadence, LIVE fields (rssi/paired/connected/link) are
+// still refreshed every draw via the same merge function in "no add/remove"
+// mode, so Pair/Connect/Forget and the pending-operation spinner stay
+// immediately responsive - only the add/remove-from-the-list decision is
+// slowed down to the 10s/15s cadence, which is what the owner actually asked
+// for ("do not redraw/rebuild the entire list", not "make Pair feel slower").
+// =============================================================================
+#include "bt_scancad.h"
+
+static bt_ui_dev_t g_bt_ui[BT_UI_MAX_DEVICES];
+static int         g_bt_ui_n = 0;
+
+static bt_scancad_state_t g_bt_scancad = BT_SCANCAD_OFF;
+static uint64_t           g_bt_scancad_deadline = 0;   // uptime_ms() phase end
+// Set when the user clicks "Stop scanning" explicitly: freezes the cadence
+// machine exactly where it was (radio already stopped via bt_scan_stop())
+// until the user clicks "Scan for devices" again or Bluetooth is power-
+// cycled. This is the UI-side half of "stay stopped until the user starts
+// again"; the kernel-side half is bt_scan_user_stopped() in kernel/bt/bt.c.
+static int g_bt_scancad_paused = 0;
+
+// Advances the cadence state machine. Called once per draw of the Bluetooth
+// panel, which itself redraws on the Settings idle tick roughly every 90ms
+// while the panel is enabled+present (bt_panel_animating(), below) - so this
+// is a deadline check against uptime_ms(), exactly the theme/dockfav poller
+// idiom used later in this file, and never a busy-wait or proc_sleep loop.
+static void bt_ui_scan_tick(const bt_state_info_t *st) {
+    if (!st->enabled || !(st->present || g_bt_present)) {
+        // A later enable/start is a fresh session (owner spec: "on
+        // enable/start"), so drop any stale model/pause state now.
+        g_bt_scancad = BT_SCANCAD_OFF;
+        g_bt_scancad_paused = 0;
+        g_bt_ui_n = 0;
+        return;
+    }
+    if (g_bt_scancad_paused) return;   // explicit Stop; hold until Scan/enable
+
+    uint64_t now = uptime_ms();
+    bt_device_t raw[BT_MAX_DEVICES];
+    switch (g_bt_scancad) {
+        case BT_SCANCAD_OFF:
+            bt_scan_start();
+            g_bt_scancad = BT_SCANCAD_INITIAL;
+            g_bt_scancad_deadline = now + BT_SCANCAD_INITIAL_MS;
+            break;
+        case BT_SCANCAD_INITIAL:
+            if (now >= g_bt_scancad_deadline) {
+                bt_scan_stop();
+                int n = bt_get_devices(raw, BT_MAX_DEVICES);
+                if (n < 0) n = 0;
+                bt_ui_merge(g_bt_ui, &g_bt_ui_n, BT_UI_MAX_DEVICES, raw, n, 1);
+                g_bt_scancad = BT_SCANCAD_SETTLED;
+                g_bt_scancad_deadline = now + BT_SCANCAD_INTERVAL_MS;
+            }
+            break;
+        case BT_SCANCAD_SETTLED:
+            if (now >= g_bt_scancad_deadline) {
+                bt_scan_start();
+                g_bt_scancad = BT_SCANCAD_INCREMENTAL;
+                g_bt_scancad_deadline = now + BT_SCANCAD_BURST_MS;
+            }
+            break;
+        case BT_SCANCAD_INCREMENTAL:
+            if (now >= g_bt_scancad_deadline) {
+                bt_scan_stop();
+                int n = bt_get_devices(raw, BT_MAX_DEVICES);
+                if (n < 0) n = 0;
+                bt_ui_merge(g_bt_ui, &g_bt_ui_n, BT_UI_MAX_DEVICES, raw, n, 1);
+                g_bt_scancad = BT_SCANCAD_SETTLED;
+                g_bt_scancad_deadline = now + BT_SCANCAD_INTERVAL_MS;
+            }
+            break;
+    }
+}
 
 static void bt_hit_reset(void) { g_bt_nhits = 0; }
 static void bt_hit_add(int x, int y, int w, int h, int action, int dev) {
@@ -6267,12 +6461,10 @@ static void bt_draw_signal(int x, int y, int rssi) {
 #define BT_CARD_H   54
 #define BT_ROW_STEP 62
 
-// (#237) Kept for #383 (the real Bluetooth driver): renders one paired/
-// available device row from REAL data once a driver exists to supply it.
-// Unreachable today - no driver means no devices are ever listed - which is
-// why this is marked unused rather than deleted: it is scaffolding, not
-// dead code left behind by accident.
-__attribute__((unused)) static void bt_draw_device_card(int x, int y, int cw, int dev, int paired_section) {
+// (btui) Renders one paired/available device row from REAL data supplied by
+// the kernel BT stack over SYS_BT (bt_get_devices). Registers the per-row
+// Pair / Connect / Disconnect / Forget hit rectangles.
+static void bt_draw_device_card(int x, int y, int cw, int dev, int paired_section) {
     bt_device_t *d = &g_bt_dev[dev];
     draw_card(x, y, cw, BT_CARD_H);
     bt_draw_dev_icon(x + 14, y + 16, d->cls, COL_TEXT_PRIMARY);
@@ -6314,100 +6506,181 @@ __attribute__((unused)) static void bt_draw_device_card(int x, int y, int cw, in
     }
 }
 
+// (btui) REAL Bluetooth panel. Drives the kernel BT stack over SYS_BT
+// (bt_client.c): a live master-enable toggle (bt_power), controller/BD_ADDR
+// state (bt_get_state_info), a scan control, and a live device list with
+// per-device Pair / Connect / Disconnect / Forget.
+//
+// (bt-settings-ux, 2026-09-16) The enable toggle sets g_bt_enable in the
+// kernel, which the bt worker turns into an LE scan + gatt HOGP auto-connect
+// (kept alive by the worker's own idle-rescan safety net so a keyboard put
+// into sync mode after enabling is still found), but the PANEL's own visible
+// device list no longer mirrors that continuous scan 1:1: it now follows the
+// bt_ui_scan_tick()/g_bt_ui[] cadence machine defined above (10s initial
+// scan + full census, then a short add/remove-only burst every 15s), and the
+// enable toggle + scan button now live inside the status card's right-hand
+// side instead of as separate rows above/below it. See the block comment
+// above g_bt_ui[] for the full design and the real root cause of the
+// previous "Stop scanning does nothing" bug.
 static void draw_bluetooth_panel(void) {
     bt_hit_reset();
     hwinfo_load();
     int x  = CONTENT_X + PADDING;
-    int y  = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
+    int y  = PADDING - g_content_scroll.offset;   // (#227) content area scrolls
     int cw = CONTENT_WIDTH - 2 * PADDING;
-    int on = bt_is_powered();
+
+    // Real adapter/stack state over SYS_BT.
+    bt_state_info_t st;
+    if (bt_get_state_info(&st) != 0) memset(&st, 0, sizeof(st));
+    int enabled = st.enabled;
+    // A dongle is known either to the kernel transport (st.present) or to the
+    // Settings USB probe (g_bt_present); on real HW they agree.
+    int adapter = st.present || g_bt_present;
+
+    // Advance the 10s/15s scan-cadence state machine before anything below
+    // reads the device list. See the design comment above g_bt_ui[].
+    bt_ui_scan_tick(&st);
 
     draw_section_header(x, y, "Bluetooth");
+    y += 44;
 
-    // (#382 pass2) MayteraOS has no Bluetooth driver/stack. Rather than a mock
-    // power switch + fake device list, reflect the real radio presence. No BT
-    // adapter is present on any current target (QEMU VMs, the iMac), so this
-    // honestly reports "no adapter" instead of scanning fake devices.
-    if (!g_bt_present) {
-        y += 44;
-        int ch = 130;
+    // Status card: presence, controller bring-up, BD_ADDR, USB id - and now
+    // (layout item #3) the enable toggle and scan control on its right-hand
+    // side, so the panel's two live controls live inside the one box instead
+    // of scattered as separate rows. Status text bumped from Caption (11px)
+    // to Body (14px, win_draw_text) per UI_STYLE_GUIDE.md's type ladder: it
+    // was reported too small to read comfortably on real hardware.
+    {
+        int ch = (enabled && adapter) ? 128 : 96;
         draw_card(x, y, cw, ch);
-        bt_draw_rune(x + cw / 2 - 14, y + 20, 28, COL_TEXT_DISABLED);
-        gui_text_ttf_centered(window_handle, x, y + 58, cw, 20,
-                              "No Bluetooth adapter detected", COL_TEXT_PRIMARY, 15);
-        gui_text_ttf_centered(window_handle, x, y + 84, cw, 16,
-                              "This system has no Bluetooth radio, and MayteraOS has no Bluetooth stack.",
-                              COL_TEXT_SECONDARY, 12);
+        bt_draw_rune(x + 14, y + 12, 24, enabled ? COL_ACCENT : COL_TEXT_DISABLED);
+        const char *title =
+            !adapter      ? "No Bluetooth adapter" :
+            st.driver_up  ? "Bluetooth ready" :
+            enabled       ? "Bringing up controller..." :
+                            "Bluetooth adapter detected";
+        win_draw_text(window_handle, x + 48, y + 8, title, COL_TEXT_PRIMARY);
+
+        char sline[64] = "";
+        hw_append(sline, sizeof(sline), enabled ? "Enabled" : "Disabled");
+        hw_append(sline, sizeof(sline), " - ");
+        hw_append(sline, sizeof(sline),
+                  !adapter     ? "no radio present" :
+                  st.driver_up ? "controller up"    : "controller starting");
+        win_draw_text(window_handle, x + 48, y + 32, sline, COL_TEXT_SECONDARY);
+
+        char l2[72] = "";
+        int zero = 1;
+        for (int k = 0; k < 6; k++) if (st.local_addr.b[k]) { zero = 0; break; }
+        if (st.driver_up && !zero) {
+            char abuf[20]; bt_addr_fmt(&st.local_addr, abuf);
+            hw_append(l2, sizeof(l2), abuf);
+        }
+        if (g_bt_present) {
+            char idbuf[10]; hw_fmt_id(g_bt_vid, g_bt_pid, idbuf);
+            if (l2[0]) hw_append(l2, sizeof(l2), "   ");
+            hw_append(l2, sizeof(l2), "USB ");
+            hw_append(l2, sizeof(l2), idbuf);
+        }
+        if (l2[0]) win_draw_text(window_handle, x + 48, y + 56, l2, COL_TEXT_DISABLED);
+
+        // Right-hand side: enable toggle always shown; scan control only
+        // once there is something to scan for (enabled + adapter present).
+        int tgx = x + cw - 96, tgy = y + 14;
+        win_draw_text_small(window_handle, tgx - 34, tgy + 4, enabled ? "On" : "Off",
+                            COL_TEXT_SECONDARY);
+        bt_hit_add(tgx, tgy, 48, 24, BTA_POWER, -1);
+        draw_toggle(tgx, tgy, enabled);
+
+        if (enabled && adapter) {
+            int sw = 150, sy = tgy + 40;
+            int sx = x + cw - 12 - sw;
+            bt_hit_add(sx, sy, sw, 30, BTA_SCAN, -1);
+            draw_button(sx, sy, sw, st.scanning ? "Stop scanning" : "Scan for devices",
+                        st.scanning ? false : true, false);
+            if (st.scanning) bt_draw_spinner(sx - 22, sy + 15);
+        }
+        y += ch + 16;
+    }
+
+    if (!enabled) {
+        draw_hint(x, y, "Turn on Bluetooth to search for and pair devices.");
+        y += 34;
         g_bt_ndev = 0;
-        g_content_bottom_y = y + ch;   // (#227)
+        g_content_bottom_y = y + 20;
         return;
     }
 
-    // (#237) A real adapter WAS found (g_bt_present, above), but MayteraOS has
-    // no Bluetooth driver/stack to run it - a genuinely different condition
-    // from "no adapter" (nothing to build on) and from a hypothetical "driver
-    // present, scanning" or "driver present, no devices found" (neither of
-    // which can occur: nothing here ever scans). `on` is always false in this
-    // build (bt_is_powered() is a stub), so every control below is drawn with
-    // the shared GUI_ST_DISABLED treatment via draw_toggle_inert()/
-    // draw_button_inert() and NO click hit is registered for any of them -
-    // inert by construction, not merely painted grey. This is the scaffolding
-    // #383's real driver fills in: same sections, same layout, zero invented
-    // data.
-    y += 44;
-    int tgx = x + cw - 52, tgy = y - 2;
-    win_draw_text(window_handle, tgx - 34, y + 2, on ? "On" : "Off", COL_TEXT_SECONDARY);
-    draw_toggle_inert(tgx, tgy, on);
-    y += 44;
-
-    {
-        int ch = 96;
-        draw_card(x, y, cw, ch);
-        bt_draw_rune(x + 14, y + 12, 24, COL_TEXT_DISABLED);
-        win_draw_text(window_handle, x + 48, y + 8, "Bluetooth adapter detected", COL_TEXT_PRIMARY);
-        win_draw_text_small(window_handle, x + 48, y + 28,
-                            "MayteraOS has no Bluetooth driver yet. Pairing and connecting",
-                            COL_TEXT_SECONDARY);
-        win_draw_text_small(window_handle, x + 48, y + 44,
-                            "are not available in this build.", COL_TEXT_SECONDARY);
-        // Real USB vendor:product id of the radio that tripped the presence
-        // probe (hwinfo_load(), captured once, never invented) - concrete
-        // scaffolding for whoever builds the real driver.
-        char idbuf[10]; hw_fmt_id(g_bt_vid, g_bt_pid, idbuf);
-        char idline[32] = "USB "; hw_append(idline, sizeof(idline), idbuf);
-        win_draw_text_small(window_handle, x + 48, y + 64, idline, COL_TEXT_DISABLED);
-        y += ch + 20;
+    if (!adapter) {
+        draw_hint(x, y, "Bluetooth is on, but no adapter is present on this machine.");
+        y += 34;
+        g_bt_ndev = 0;
+        g_content_bottom_y = y + 20;
+        return;
     }
 
-    draw_button_inert(x, y, 160, "Scan for devices");
-    y += 44;
+    // Live field refresh only (never adds/removes a row - see the design
+    // comment above g_bt_ui[]): keeps Pair/Connect/Forget and the pending
+    // spinner responsive every draw without violating "do not rebuild the
+    // whole list" / "do not re-enumerate metadata for known devices". The
+    // list itself only grows or shrinks at the bt_ui_scan_tick() cadence
+    // boundary above.
+    {
+        bt_device_t raw[BT_MAX_DEVICES];
+        int nraw = bt_get_devices(raw, BT_MAX_DEVICES);
+        if (nraw < 0) nraw = 0;
+        bt_ui_merge(g_bt_ui, &g_bt_ui_n, BT_UI_MAX_DEVICES, raw, nraw, 0);
+    }
+    g_bt_ndev = g_bt_ui_n;
+    if (g_bt_ndev > BT_MAX_DEVICES) g_bt_ndev = BT_MAX_DEVICES;
+    for (int i = 0; i < g_bt_ndev; i++) g_bt_dev[i] = g_bt_ui[i].dev;
 
+    // Paired / connected devices.
     draw_subsection(x, y, "Paired Devices");
     y += 26;
-    draw_hint(x, y, "Not available: no Bluetooth driver is installed.");
-    y += 26 + 8;
+    int npaired = 0;
+    for (int i = 0; i < g_bt_ndev; i++) {
+        if (g_bt_dev[i].paired || g_bt_dev[i].connected) {
+            bt_draw_device_card(x, y, cw, i, 1);
+            y += BT_ROW_STEP; npaired++;
+        }
+    }
+    if (!npaired) { draw_hint(x, y, "No paired devices yet."); y += 26; }
+    y += 8;
 
+    // Available (discovered, unpaired) devices.
     draw_subsection(x, y, "Available Devices");
     y += 26;
-    draw_hint(x, y, "Not available: no Bluetooth driver is installed.");
-    y += 26;
+    int navail = 0;
+    for (int i = 0; i < g_bt_ndev; i++) {
+        if (!g_bt_dev[i].paired && !g_bt_dev[i].connected) {
+            bt_draw_device_card(x, y, cw, i, 0);
+            y += BT_ROW_STEP; navail++;
+        }
+    }
+    if (!navail) {
+        draw_hint(x, y, st.scanning ? "Scanning for nearby devices..."
+                                    : "No devices found. Tap Scan to search.");
+        y += 26;
+    }
 
-    g_bt_ndev = 0;
-    g_content_bottom_y = y + 20;   // (#227)
+    g_content_bottom_y = y + 20;
 }
 
-// Does the Bluetooth panel have a live animation (scan or pending op) worth a
-// redraw on the idle tick?
+// Does the Bluetooth panel have live state (scan / pending op / device arrival)
+// worth a redraw on the idle tick? While enabled with an adapter we keep
+// refreshing so controller bring-up and device arrival/departure show live.
 static int bt_panel_animating(void) {
-    if (!bt_is_powered()) return 0;
-    if (bt_scan_active()) return 1;
+    bt_state_info_t st;
+    if (bt_get_state_info(&st) != 0) return 0;
+    if (!st.enabled) return 0;
+    if (st.scanning) return 1;
     if (g_bt_pend_active) {
-        // Clear the pending flag once the device reached its target link state.
         for (int i = 0; i < g_bt_ndev; i++)
             if (bt_dev_pending(&g_bt_dev[i])) return 1;
         g_bt_pend_active = 0;
     }
-    return 0;
+    return st.present ? 1 : 0;
 }
 
 // =============================================================================
@@ -6865,7 +7138,10 @@ static void draw_modal(void) {
         labels[2] = "Gateway:";
         labels[3] = "DNS Server:";
     } else if (modal_mode == MODAL_SET_DNS) {
-        labels[0] = "DNS Server:";
+        // #netfix2: the label is the only place this dialog can say that an
+        // empty field is a real answer, and the way back from a pinned
+        // resolver has to be discoverable from the dialog that pins it.
+        labels[0] = "DNS Server (leave empty for automatic):";
     } else if (modal_mode == MODAL_ADD_PRINTER) {
         labels[0] = "Name:";
         labels[1] = "Host / IP:";
@@ -6961,7 +7237,7 @@ static void draw_modal(void) {
 // write was REFUSED for every non-root user - /CONFIG is root-owned mode 0711
 // in /CONFIG/PERMS.DB, so sys_open(O_CREAT) under it fails for uid != 0 - and
 // the save_failed() breadcrumb could not be written either, because
-// /SETLOG.TXT is under "/" (root, 0755). Measured on VM <vmid>: click OK, panel
+// /SETLOG.TXT is under "/" (root, 0755). Measured on VM 2333: click OK, panel
 // updates, no file, no log, no clue.
 //
 // The kernel now writes that file itself (kernel/net/net.c net_persist_netcfg),
@@ -7170,7 +7446,22 @@ static void do_modal_submit(void) {
         // (#786) Resolver only. Deliberately does NOT call net_set_static():
         // the machine keeps its DHCP lease, and net_persist_netcfg() writes a
         // dns-only /CONFIG/NETIP.CFG so the next boot still runs DHCP.
-        int rc = net_set_dns(modal_field[0]);
+        //
+        // #netfix2: THREE outcomes, not one. An EMPTY field means "automatic":
+        // drop the pin and take what the network offers. An UNCHANGED field
+        // means the user opened the dialog and pressed OK without choosing
+        // anything, and must therefore pin NOTHING - the field is prefilled
+        // from the live resolver, so the old unconditional call pinned whatever
+        // DHCP happened to hand out, on every network, forever. Only text the
+        // user actually altered pins a resolver.
+        int rc = NET_SET_DNS_OK;
+        int went_auto = 0;
+        if (modal_field[0][0] == '\0') {
+            rc = net_set_dns_auto();
+            went_auto = 1;
+        } else if (strcmp(modal_field[0], dns_prefill) != 0) {
+            rc = net_set_dns(modal_field[0]);
+        }
         if (rc == NET_SET_DNS_EINVAL) {
             const char *msg = "DNS server is not a valid IPv4 address.";
             int i = 0; while (msg[i] && i < 63) { modal_error[i] = msg[i]; i++; }
@@ -7182,7 +7473,11 @@ static void do_modal_submit(void) {
         // different value than was typed, the panel shows the kernel's.
         net_pull_live();
         if (rc == NET_SET_DNS_EPERSIST)
-            save_failed("NETIP.CFG (DNS applied live, will revert on reboot)");
+            // #netfix2: an un-pin that could not be written back is the more
+            // dangerous of the two, because the pin comes BACK on reboot.
+            save_failed(went_auto
+                        ? "NETIP.CFG (DNS set to automatic live, pin returns on reboot)"
+                        : "NETIP.CFG (DNS applied live, will revert on reboot)");
         modal_mode = MODAL_NONE;
         draw_all();
         return;
@@ -7202,7 +7497,7 @@ static void do_modal_submit(void) {
         // the form no matter what the machine did, and the DNS field had no
         // apply path AT ALL (net_set_static takes three arguments). Step 3 was
         // REFUSED for every non-root user, because /CONFIG is root-owned 0711 -
-        // measured on VM <vmid>: after a successful-looking OK the file did not
+        // measured on VM 2333: after a successful-looking OK the file did not
         // exist, and the app's own /SETLOG.TXT breadcrumb could not be written
         // either (it lives under "/", also root-owned), so the failure left no
         // trace anywhere at all.
@@ -7214,7 +7509,15 @@ static void do_modal_submit(void) {
         net_set_static(modal_field[0], modal_field[1], modal_field[2]);
 
         int dns_rc = NET_SET_DNS_OK;
-        if (modal_field[3][0]) dns_rc = net_set_dns(modal_field[3]);
+        // #netfix2: was `if (modal_field[3][0])`, a non-empty test that could
+        // never be false, because the field is seeded from the live resolver
+        // a few lines before the dialog opens. So every OK through this dialog
+        // pinned the resolver whether or not DNS was what the user came here
+        // to change. Compare against the prefill instead: an untouched field
+        // applies nothing. An emptied field is still a no-op here (asking for
+        // automatic has its own control and its own dialog).
+        if (modal_field[3][0] && strcmp(modal_field[3], dns_prefill) != 0)
+            dns_rc = net_set_dns(modal_field[3]);
 
         // RE-READ, never echo. This is the whole fix in one line.
         net_pull_live();
@@ -7833,13 +8136,35 @@ static void handle_content_click(int local_x, int local_y) {
                 if (local_x < h->x || local_x >= h->x + h->w ||
                     local_y < h->y || local_y >= h->y + h->h) continue;
                 switch (h->action) {
-                    case BTA_POWER:
-                        bt_power(bt_is_powered() ? 0 : 1);
-                        if (!bt_is_powered()) g_bt_pend_active = 0;
+                    case BTA_POWER: {
+                        // (btui) Toggle on the DISPLAYED master-enable state
+                        // (g_bt_enable), which is what the toggle shows. Keying
+                        // off bt_is_powered() would be wrong with no adapter
+                        // present (powered stays false though enabled is true),
+                        // so the toggle could never be turned back off.
+                        bt_state_info_t st;
+                        int en = (bt_get_state_info(&st) == 0) ? st.enabled
+                                                               : bt_is_powered();
+                        bt_power(en ? 0 : 1);
+                        if (en) g_bt_pend_active = 0;   // turning off
                         break;
+                    }
                     case BTA_SCAN:
-                        if (bt_scan_active()) bt_scan_stop();
-                        else                  bt_scan_start();
+                        // bt-settings-ux: route through the cadence machine
+                        // rather than bt_scan_start()/stop() directly, so an
+                        // explicit Stop actually latches (g_bt_scancad_paused)
+                        // instead of being silently restarted a few ticks
+                        // later by either the cadence's own 15s timer or the
+                        // kernel worker's idle-rescan safety net.
+                        if (bt_scan_active()) {
+                            bt_scan_stop();
+                            g_bt_scancad_paused = 1;
+                        } else {
+                            bt_scan_start();
+                            g_bt_scancad_paused = 0;
+                            g_bt_scancad = BT_SCANCAD_INCREMENTAL;
+                            g_bt_scancad_deadline = uptime_ms() + BT_SCANCAD_BURST_MS;
+                        }
                         break;
                     case BTA_PAIR:
                         if (h->dev >= 0 && h->dev < g_bt_ndev) {
@@ -8312,8 +8637,10 @@ static void handle_content_click(int local_x, int local_y) {
                 return;
             }
 
-            // Test Speakers button @ y=370 (real WAV, only if a device exists).
-            int test_spk_y = base_y + 350;           // 370
+            // Test Speakers button @ y=388 (real WAV, only if a device exists).
+            // #247: shifted +18px down from 370 to make room for the "System
+            // Sound Effects" honesty hint draw_sound_panel() now draws.
+            int test_spk_y = base_y + 368;           // 388
             if (local_y >= test_spk_y && local_y < test_spk_y + 30 &&
                 local_x >= x && local_x < x + 130) {
                 if (g_audio_present) {
@@ -8356,8 +8683,37 @@ static void handle_content_click(int local_x, int local_y) {
                 modal_mode = MODAL_SET_DNS;
                 modal_num_fields = 1;
                 copy_to_modal_field(0, dns_primary);
+                // #netfix2: remember the seed so submit can tell a real choice
+                // from an untouched prefill.
+                copy_str(dns_prefill, dns_primary, sizeof(dns_prefill));
                 modal_active_field = 0;
                 modal_error[0] = '\0';
+                draw_all();
+                return;
+            }
+
+            // #netfix2: "DNS automatic" - the un-pin control, sharing the DNS
+            // row with the button above it (x+20..x+180 there, x+300..x+348
+            // here, so the two cannot overlap) and reading the same g.dnsbtn,
+            // which is what keeps it inside hitbox-lint's reach.
+            //
+            // ON means automatic, so switching it ON is the only way to lift a
+            // pin from the GUI. Switching it OFF is deliberately a no-op
+            // refresh: pinning already has a field that says WHICH server, and
+            // a toggle that pinned some previous value would be guessing.
+            if (g.dnsbtn >= 0 &&
+                local_y >= g.dnsbtn && local_y < g.dnsbtn + 24 &&
+                local_x >= x + 300 && local_x < x + 348) {
+                if (dns_pinned) {
+                    int rc = net_set_dns_auto();
+                    // RE-READ the stack, never assume the call took: same rule
+                    // as every other control in this panel.
+                    net_pull_live();
+                    if (rc == NET_SET_DNS_EPERSIST)
+                        save_failed("NETIP.CFG (DNS set to automatic live, pin returns on reboot)");
+                } else {
+                    net_pull_live();
+                }
                 draw_all();
                 return;
             }
@@ -8373,6 +8729,8 @@ static void handle_content_click(int local_x, int local_y) {
                 copy_to_modal_field(1, subnet_mask);
                 copy_to_modal_field(2, gateway);
                 copy_to_modal_field(3, dns_primary);
+                // #netfix2: same seed, same reason, as the DNS-only dialog.
+                copy_str(dns_prefill, dns_primary, sizeof(dns_prefill));
                 modal_active_field = 0;
                 modal_error[0] = '\0';
                 draw_all();
@@ -9366,12 +9724,16 @@ int main(int argc, char **argv) {
             }
         }
 
-        // (#372/#384, honesty pass #237) bt_tick()/wifi_tick() are now no-ops
-        // and bt_panel_animating()/wifi_panel_animating() always return 0 (no
-        // driver -> nothing ever scans, pairs or connects, so nothing ever
-        // animates). Left in place rather than deleted: it is the real
-        // per-panel poll seam a future driver's animation would tick through,
-        // and removing it would be one more thing to re-add for #383.
+        // (#372/#384) CORRECTED (bt-settings-ux, 2026-09-16): this comment used
+        // to say bt_tick()/bt_panel_animating() are dead code because there was
+        // no driver. Bluetooth is real now (see bt_client.c): this ~90ms tick is
+        // what redraws the BT panel while it is open so the scan-cadence state
+        // machine (bt_ui_scan_tick(), driven from inside draw_bluetooth_panel())
+        // actually gets ticked, and so the spinner/pending-op UI stays live. The
+        // Wi-Fi half is still accurate as originally written: wifi_client.h has
+        // no driver (#383 not built), so wifi_tick()/wifi_panel_animating() are
+        // still honest no-ops. Left in place either way: it is the real
+        // per-panel poll seam, not dead code to delete.
         {
             static unsigned long last_conn_tick = 0;
             unsigned long nowc = uptime_ms();

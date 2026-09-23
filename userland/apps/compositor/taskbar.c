@@ -12,6 +12,11 @@
 #include "../../libc/dock_opacity.h" // #132: shared DOCK_OPACITY_MIN/MAX/WARN
 #include "../../libc/settingscfg.h"  // #230: settingscfg_use24h() for tb_clock_str()
 #include "../../libc/battery.h"     // #battmeter: tray battery meter
+#include "../../libc/notify.h"      // #removtray: eject success/failure toast
+#include "cardfile.h"               // (cfsettings) cardfile_rail_width(): the LEFT inset under DOCK_CARDFILE
+#include "cardtext.h"               // (cfdock, rot) cardtext_vertical() - REUSE the deck's own sideways-label
+                                     // primitive for vertical-dock text, rather than hand-rolling a second
+                                     // rotation (see draw_gauge_vband()'s own comment below)
 // #41: NOT #include "../../libc/unistd.h" - it drags in libc/types.h, whose
 // own `bool` typedef conflicts with compositor.h's (the documented
 // gui_scroll.h/types.h landmine, blame.md 2026-07-29). A local extern for
@@ -983,6 +988,22 @@ static void draw_perf_popup(void) {
     const int pcts[4]             = { g_cpu_percent, g_ram_percent,
                                       g_disk_percent, g_net_percent };
 
+    // (#glassmodal / tray restyle 2026-09-06) This floating card carries the
+    // SAME dark-teal 'glass' palette as the first-run wizard, Task Manager and
+    // the App Repo, so the surfaces the user explicitly asked to unify all read
+    // as one material. Scoped LOCAL on purpose: the taskbar/dock/start-menu
+    // chrome keeps its own themed CLR_* tokens, this popup does not disturb them.
+    const uint32_t PP_TINT   = 0xFF0E1D1B; // frosted-glass tint (== wizard surface)
+    const uint32_t PP_SURF   = 0xFF0E1D1B; // opaque fallback when glass is off
+    const uint32_t PP_PANEL  = 0xFF16302A; // title strip
+    const uint32_t PP_BTN    = 0xFF122420; // action-button fill
+    const uint32_t PP_BORDER = 0xFF2C4A44; // hairline borders
+    const uint32_t PP_INK    = 0xFFF3FBF9; // primary text
+    const uint32_t PP_DIM    = 0xFFA9D9CC; // secondary/detail text
+    const uint32_t PP_ROWSEL = 0xFF1D3A33; // selected-gauge row wash
+    const uint32_t PP_TRACK  = 0xFF0A1614; // progress-bar background
+    const uint32_t PP_ACCENT = 0xFF6AE2CF; // mint accent (button label)
+
     const int32_t PAD   = 10;
     const int32_t TITLE = 24;
     const int32_t ROW_H = 44;
@@ -1034,17 +1055,18 @@ static void draw_perf_popup(void) {
     corner_capture_t pp_cc;
     draw_round_corners_capture(&pp_cc, g_pp_x, g_pp_y, g_pp_w, g_pp_h, PP_RADIUS, CORNER_ALL);
 
-    // Panel body: glass when enabled (same CLR_GLASS_TINT/GLASS_SURF_MODAL
-    // recipe the taskbar/dock/start menu already use), flat CLR_MENU_BG
-    // otherwise - preserves the exact old look when glass is off.
-    if (g_glass_enable) glass_render(g_pp_x, g_pp_y, g_pp_w, g_pp_h, CLR_GLASS_TINT, GLASS_SURF_MODAL);
-    else                 draw_fill_rect(g_pp_x, g_pp_y, g_pp_w, g_pp_h, CLR_MENU_BG);
-    draw_rect_outline(g_pp_x, g_pp_y, g_pp_w, g_pp_h, CLR_MENU_BORDER);
+    // Panel body: frosted glass when enabled, using the LOCAL dark-teal PP_TINT
+    // (the wizard/Task Manager material, GLASS_SURF_MODAL recipe) rather than the
+    // chrome-wide CLR_GLASS_TINT, so this card matches the other glass surfaces
+    // the user unified. Opaque PP_SURF fallback when glass is off.
+    if (g_glass_enable) glass_render(g_pp_x, g_pp_y, g_pp_w, g_pp_h, PP_TINT, GLASS_SURF_MODAL);
+    else                 draw_fill_rect(g_pp_x, g_pp_y, g_pp_w, g_pp_h, PP_SURF);
+    draw_rect_outline(g_pp_x, g_pp_y, g_pp_w, g_pp_h, PP_BORDER);
     glass_highlight_h(g_pp_x + PP_RADIUS, g_pp_y + 1, g_pp_w - 2 * PP_RADIUS);
 
     // Title bar.
-    draw_fill_rect(g_pp_x + 1, g_pp_y + 1, g_pp_w - 2, TITLE - 1, CLR_MENU_CAT_BG);
-    draw_text(g_pp_x + PAD, g_pp_y + 7, "System Performance", CLR_MENU_TEXT);
+    draw_fill_rect(g_pp_x + 1, g_pp_y + 1, g_pp_w - 2, TITLE - 1, PP_PANEL);
+    draw_text(g_pp_x + PAD, g_pp_y + 7, "System Performance", PP_INK);
 
     int32_t ry = g_pp_y + TITLE + 2;
     for (int i = 0; i < 4; i++) {
@@ -1053,12 +1075,12 @@ static void draw_perf_popup(void) {
 
         // Highlight the gauge that opened the popup.
         if (i == g_perf_sel)
-            draw_fill_rect(rx, ry, rw, ROW_H - 4, CLR_MENU_ITEM_HOVER);
+            draw_fill_rect(rx, ry, rw, ROW_H - 4, PP_ROWSEL);
 
         // Accent swatch + label + value.
         draw_fill_rect(rx + 4, ry + 6, 10, 10, accents[i]);
-        draw_rect_outline(rx + 4, ry + 6, 10, 10, CLR_MENU_BORDER);
-        draw_text(rx + 22, ry + 5, names[i], CLR_MENU_TEXT);
+        draw_rect_outline(rx + 4, ry + 6, 10, 10, PP_BORDER);
+        draw_text(rx + 22, ry + 5, names[i], PP_INK);
 
         // #76: NET's top-right value is a throughput rate, not a percent -
         // pcts[3] (the bar's log-scale fill, see net_log_percent()) is not a
@@ -1068,17 +1090,17 @@ static void draw_perf_popup(void) {
         char pv[16];
         if (i == 3) net_fmt_rate(pv, g_net_bps, net_hist_avg());
         else        fmt_percent(pv, pcts[i]);
-        draw_text(rx + rw - text_width(pv) - 6, ry + 5, pv, CLR_MENU_TEXT);
+        draw_text(rx + rw - text_width(pv) - 6, ry + 5, pv, PP_INK);
 
         // Progress bar.
         int32_t bx = rx + 22, by = ry + 19, bw = rw - 28, bh = 8;
         int p = pcts[i]; if (p < 0) p = 0; if (p > 100) p = 100;
-        draw_fill_rect(bx, by, bw, bh, CLR_GAUGE_BG);
+        draw_fill_rect(bx, by, bw, bh, PP_TRACK);
         if (p > 0) {
             int32_t fw = bw * p / 100; if (fw < 1) fw = 1;
             draw_fill_rect(bx, by, fw, bh, accents[i]);
         }
-        draw_rect_outline(bx, by, bw, bh, CLR_GAUGE_BORDER);
+        draw_rect_outline(bx, by, bw, bh, PP_BORDER);
 
         // Detail line.
         char det[64];
@@ -1112,7 +1134,7 @@ static void draw_perf_popup(void) {
                 break;
             }
         }
-        draw_text(rx + 22, ry + 30, det, readable_ink_dim(CLR_MENU_BG));
+        draw_text(rx + 22, ry + 30, det, PP_DIM);
 
         ry += ROW_H;
     }
@@ -1122,12 +1144,12 @@ static void draw_perf_popup(void) {
     g_pp_tm_h = BTN_H;
     g_pp_tm_x = g_pp_x + PAD;
     g_pp_tm_y = ry + 4;
-    draw_fill_rect(g_pp_tm_x, g_pp_tm_y, g_pp_tm_w, g_pp_tm_h, CLR_MENU_CAT_BG);
-    draw_rect_outline(g_pp_tm_x, g_pp_tm_y, g_pp_tm_w, g_pp_tm_h, CLR_MENU_BORDER);
+    draw_fill_rect(g_pp_tm_x, g_pp_tm_y, g_pp_tm_w, g_pp_tm_h, PP_BTN);
+    draw_rect_outline(g_pp_tm_x, g_pp_tm_y, g_pp_tm_w, g_pp_tm_h, PP_BORDER);
     {
         const char *lbl = "Open Task Manager";
         int32_t lx = g_pp_tm_x + (g_pp_tm_w - text_width(lbl)) / 2;
-        draw_text(lx, g_pp_tm_y + 9, lbl, CLR_MENU_TEXT);
+        draw_text(lx, g_pp_tm_y + 9, lbl, PP_ACCENT);
     }
 
     // Restore LAST, after every band above (including the Task Manager
@@ -1321,6 +1343,11 @@ int g_tray_muted = 0;   // #336: global so the analog EQ popup (traymenu.c) can 
 #define TRAY_BT       3
 #define TRAY_SHEEP    4
 #define TRAY_BELL     5
+// #removtray: MUST stay before TRAY_BATTERY (owner req #5). Same conditional-
+// slot convention TRAY_BATTERY established below: hidden (no removable
+// device attached, the default state) means icons 0..5 keep the exact slots
+// they had before this feature existed.
+#define TRAY_REMOV    6
 // #battmeter: MUST stay last. Unlike every icon above, this one is not
 // always shown - see tray_visible_n()/tray_total_w() and the x-assignment
 // loop in tray_render_core(). Putting it last means that when it is hidden
@@ -1328,8 +1355,8 @@ int g_tray_muted = 0;   // #336: global so the analog EQ popup (traymenu.c) can 
 // on), icons 0..5 are assigned the exact same slots as before this feature
 // existed - a no-battery machine's tray is pixel-identical to today, not
 // merely visually similar.
-#define TRAY_BATTERY  6
-#define TRAY_N        7
+#define TRAY_BATTERY  7
+#define TRAY_N        8
 #define TRAY_ICON_W   ui_px(26)
 #define TRAY_ICON_GAP ui_px(2)
 static int32_t g_tray_x[TRAY_N];
@@ -1755,13 +1782,150 @@ static void draw_battery_card(void) {
     draw_text(x + PAD, y + PAD + LINE_H, line2, CLR_MENU_TEXT);
 }
 
+// ---------------------------------------------------------------------------
+// #removtray (owner req #5): removable-devices tray widget - the DRAW/CLICK
+// half. The MODEL (which devices exist, dedup, the per-class eject decision)
+// lives entirely in traydev.c; this section never calls vol_list()/
+// sys_dev_usb_list() directly, only traydev_poll()/traydev_present()/
+// traydev_rows()/traydev_eject() - see docs/REMOVABLE_DEVICES_TRAY_PLAN.md.
+//
+// Same shape as the battery meter just above: a conditionally-visible tray
+// slot (TRAY_REMOV, hidden when traydev_present() is false), a procedural
+// glyph (no raster mask exists for "USB drive" in tray_glyphs.h, so this
+// draws one the same way tray_draw_battery() draws its body+nub rather than
+// adding a new mask table for a single caller), and a click-to-toggle,
+// click-elsewhere-to-dismiss popup card (the notif.c history-list grammar:
+// one row per device, an Eject button ONLY on rows the matrix marks
+// can_eject, geometry shared between draw and hit-test via
+// traydev_row_eject_rect() so the two can never drift - the exact
+// notif_clearall_rect()/battery-card discipline this file's own comments
+// elsewhere call out by name).
+// ---------------------------------------------------------------------------
+
+// Procedural "USB stick" glyph: a body rectangle with a narrower connector
+// nub on top, the same two-shape construction tray_draw_battery() uses
+// (body + terminal nub) so it reads as one family of glyphs at a glance.
+static void tray_draw_traydev(int x, int y) {
+    const int BW = 12, BH = 14, NUBW = 6, NUBH = 4;
+    uint32_t ink = readable_ink(CLR_TASKBAR_BG);
+    int gx = x + (TRAY_ICON_W - BW) / 2;
+    int gy = TRAY_GLYPH_Y(y, BH + NUBH);
+    draw_fill_rect(gx + (BW - NUBW) / 2, gy, NUBW, NUBH, ink);        // connector nub, top
+    draw_rect_outline(gx, gy + NUBH, BW, BH, ink);                     // body
+    draw_fill_rect(gx + 2, gy + NUBH + BH - 5, BW - 4, 3, ink);        // activity stripe
+}
+
+// Truncate a single line to fit max_w, appending a real-measured ellipsis.
+// Same small, self-contained algorithm as notif.c's ellipsize_ttf() (and
+// desktop.c's own copy) - not shared via a header because each caller is a
+// few lines against text_width_ttf(), already declared here, and a mismatch
+// would only ever be cosmetic. See desktop.c's identical comment.
+static void traydev_ellipsize(const char *src, int size, int max_w, char *out, int outcap) {
+    int n = 0; while (src[n] && n < outcap - 1) { out[n] = src[n]; n++; } out[n] = 0;
+    if (text_width_ttf(out, size) <= max_w) return;
+    int ellw = text_width_ttf("...", size);
+    while (n > 0 && text_width_ttf(out, size) + ellw > max_w) out[--n] = 0;
+    if (n + 3 < outcap) { out[n]='.'; out[n+1]='.'; out[n+2]='.'; out[n+3]=0; }
+}
+
+#define TRAYDEV_CARD_W    ui_px(260)
+#define TRAYDEV_HEADER_H  ui_px(30)
+#define TRAYDEV_ROW_H     ui_px(40)
+#define TRAYDEV_EJECT_W   ui_px(56)
+#define TRAYDEV_EJECT_H   ui_px(20)
+#define TRAYDEV_MAX_SHOWN 6   // #removtray: clipped like notif.c's history list; no scroll in this bounded pass
+
+static int     g_traydev_card_open = 0;
+static int32_t g_td_anchor_x = 0;                       // fixed anchor, set once by the toggle - see #battpop
+static int32_t g_td_x = 0, g_td_y = 0, g_td_w = 0, g_td_h = 0;   // finalized rect, output of the draw fn
+
+static void traydev_card_toggle(int anchor_x) {
+    if (g_traydev_card_open) { g_traydev_card_open = 0; g_needs_redraw = true; return; }
+    if (!traydev_present()) return;   // nothing to show; should not be reachable (icon is hidden)
+    g_traydev_card_open = 1;
+    g_td_anchor_x = anchor_x;
+    g_needs_redraw = true;
+}
+
+// Row `i`'s Eject-button rect. Shared between draw_traydev_card() and
+// taskbar_popup_handle_mouse() so the clickable area can never drift from
+// what is actually on screen (the same discipline notif_clearall_rect() and
+// bar_clock_set_rect() already document by name in this file).
+static void traydev_row_eject_rect(int32_t card_x, int32_t row_y, int32_t card_w,
+                                    int32_t *bx, int32_t *by, int32_t *bw, int32_t *bh) {
+    *bw = TRAYDEV_EJECT_W; *bh = TRAYDEV_EJECT_H;
+    *bx = card_x + card_w - *bw - ui_px(8);
+    *by = row_y + (TRAYDEV_ROW_H - *bh) / 2;
+}
+
+static void draw_traydev_card(void) {
+    if (!g_traydev_card_open) return;
+    if (!traydev_present()) { g_traydev_card_open = 0; return; }   // last device just vanished
+
+    const traydev_row_t *rows;
+    int n = traydev_rows(&rows);
+    int shown = (n < TRAYDEV_MAX_SHOWN) ? n : TRAYDEV_MAX_SHOWN;
+
+    int rr = theme_metric_or(THEME_METRIC_RADIUS_CARD, 10);
+    int rb = theme_metric_or(THEME_METRIC_RADIUS_BTN, 5);
+    uint32_t ink = readable_ink(CLR_MENU_BG), dim = readable_ink_dim(CLR_MENU_BG);
+    uint32_t row_fill = readable_ink_dim_mix(CLR_MENU_BG, 88);   // same bg-dominant wash as notif.c's rows
+
+    int32_t w = TRAYDEV_CARD_W;
+    int32_t h = TRAYDEV_HEADER_H + (shown > 0 ? shown * TRAYDEV_ROW_H : ui_px(30)) + ui_px(6);
+
+    // #battpop: derive from the fixed anchor set once by the toggle, never
+    // from g_td_x itself - see g_bc_anchor_x's comment for the drift bug this
+    // avoids by construction.
+    int32_t x = g_td_anchor_x - w / 2;
+    if (x < ui_px(4)) x = ui_px(4);
+    if (x + w > g_fb_width - ui_px(4)) x = g_fb_width - ui_px(4) - w;
+    int32_t y = g_tray_bar_top ? (g_tray_bar_y + g_tray_bar_h + ui_px(4))
+                                : (g_tray_bar_y - h - ui_px(4));
+    if (y < ui_px(2)) y = ui_px(2);
+    g_td_x = x; g_td_y = y; g_td_w = w; g_td_h = h;   // finalized rect for this frame; hit-test reads these
+
+    draw_popup_panel(x, y, w, h, rr);
+    draw_text_ttf(x + ui_px(12), y + ui_px(8), "Removable Devices", 14, ink);
+
+    int32_t ry = y + TRAYDEV_HEADER_H;
+    if (n == 0) {
+        draw_text_ttf(x + ui_px(12), ry + ui_px(10), "No removable devices", 12, dim);
+        return;
+    }
+    for (int i = 0; i < shown; i++) {
+        const traydev_row_t *r = &rows[i];
+        draw_fill_rect(x + ui_px(8), ry + ui_px(2), w - ui_px(16), TRAYDEV_ROW_H - ui_px(4), row_fill);
+        int32_t name_w_avail = w - ui_px(24) - (r->can_eject ? TRAYDEV_EJECT_W + ui_px(8) : 0);
+        char name_e[64], sub_e[64];
+        traydev_ellipsize(r->name, 13, name_w_avail, name_e, sizeof(name_e));
+        traydev_ellipsize(r->subtitle, 11, name_w_avail, sub_e, sizeof(sub_e));
+        draw_text_ttf(x + ui_px(16), ry + ui_px(6), name_e, 13, ink);
+        draw_text_ttf(x + ui_px(16), ry + ui_px(22), sub_e, 11, dim);
+        if (r->can_eject) {
+            int32_t bx, by, bw, bh;
+            traydev_row_eject_rect(x + ui_px(8), ry, w - ui_px(16), &bx, &by, &bw, &bh);
+            draw_popup_button_centered(bx, by, bw, bh, rb, "Eject", 11);
+        }
+        ry += TRAYDEV_ROW_H;
+    }
+}
+
 // #387: tray metrics + top/bottom anchor state, shared by every dock layout.
 int      g_tray_bar_top = 0;   // 1 = tray sits on a TOP bar (menus drop DOWN)
 int32_t  g_tray_bar_y   = 0;   // current tray-row top (traymenu anchors to it)
 int32_t  g_tray_bar_h   = 26;
 // #battmeter: dynamic - the battery slot (always last) counts only while
 // present. See TRAY_BATTERY's own comment for why it must stay last.
-static int tray_visible_n(void) { return TRAY_N - (g_batt_present == 1 ? 0 : 1); }
+// #removtray: two independently-conditional slots now (TRAY_REMOV and
+// TRAY_BATTERY), so this counts down from TRAY_N by however many of the two
+// are actually hidden rather than assuming exactly one.
+static int tray_visible_n(void) {
+    int n = TRAY_N;
+    if (g_batt_present != 1)   n--;
+    if (!traydev_present())    n--;
+    return n;
+}
 static int tray_total_w(void) { int n = tray_visible_n(); return n * TRAY_ICON_W + (n - 1) * TRAY_ICON_GAP; }
 
 // #129: the bar-clock text hitbox, one shared set of globals rather than one
@@ -1798,16 +1962,22 @@ static void tray_render_core(int x0, int y, uint32_t bar_bg, int is_top) {
     // #372/#384: re-sync shared BT/Wi-Fi state every frame (self-throttled).
     bt_tick(); wifi_tick();
     battery_tray_poll();   // #battmeter: also self-throttled, see its own header
+    traydev_poll();        // #removtray: also self-throttled, see traydev.c's own header
     g_tray_y = y; g_tray_h = 26;
     g_tray_bar_y = y; g_tray_bar_h = 26; g_tray_bar_top = is_top;
-    // #battmeter: TRAY_BATTERY (always last) only occupies a slot while
-    // present, so a no-battery machine assigns icons 0..5 to the exact same
-    // slots this loop always has - see TRAY_BATTERY's own comment.
+    // #battmeter/#removtray: TRAY_BATTERY (always last) and TRAY_REMOV only
+    // occupy a slot while present, so a machine with neither assigns icons
+    // 0..5 to the exact same slots this loop always has - see each define's
+    // own comment.
     {
         int slot = 0;
         for (int i = 0; i < TRAY_N; i++) {
             if (i == TRAY_BATTERY && g_batt_present != 1) {
                 g_tray_x[i] = -1000000;   // parked off-screen: never hit-tests true
+                continue;
+            }
+            if (i == TRAY_REMOV && !traydev_present()) {
+                g_tray_x[i] = -1000000;
                 continue;
             }
             g_tray_x[i] = x0 + slot * (TRAY_ICON_W + TRAY_ICON_GAP);
@@ -1832,10 +2002,13 @@ static void tray_render_core(int x0, int y, uint32_t bar_bg, int is_top) {
     tray_draw_bt     (g_tray_x[TRAY_BT],      g_tray_y, bt_tray_state());
     tray_draw_sheep  (g_tray_x[TRAY_SHEEP],   g_tray_y, g_sheep_enabled);
     tray_draw_bell   (g_tray_x[TRAY_BELL],    g_tray_y, notif_unread());
+    if (traydev_present())
+        tray_draw_traydev(g_tray_x[TRAY_REMOV], g_tray_y);
     if (g_batt_present == 1)
         tray_draw_battery(g_tray_x[TRAY_BATTERY], g_tray_y, g_batt_pct, g_batt_state);
     CLR_TASKBAR_BG = saved;
     draw_battery_card();   // #battmeter: click-through info card, drawn last (on top)
+    draw_traydev_card();   // #removtray: same "drawn last" rule (on top)
 }
 
 static void tray_render(int right_edge) {
@@ -1873,6 +2046,7 @@ static bool tray_click(int32_t x, int32_t y) {
             else if (i == TRAY_NET)  settings_open_panel(SETTINGS_PANEL_NETWORK);
             else if (i == TRAY_BT)   settings_open_panel(SETTINGS_PANEL_BLUETOOTH);
             else if (i == TRAY_BATTERY) battery_card_toggle(g_tray_x[i] + TRAY_ICON_W / 2);  // #battmeter
+            else if (i == TRAY_REMOV)   traydev_card_toggle(g_tray_x[i] + TRAY_ICON_W / 2);  // #removtray
             else                     traymenu_open_for_icon(i, g_tray_x[i] + TRAY_ICON_W / 2);
             g_needs_redraw = true;
             return true;
@@ -3417,7 +3591,7 @@ static void taskbar_render_xfce_dock(void) {
                 if (now - s_fav_fallback_logged_ms[i] > 5000) {
                     s_fav_fallback_logged_ms[i] = now;
                     // #41: ONE write(1,...) syscall, not printf()/putchar().
-                    // MEASURED live (VM <vmid>, FreeCell): printf() calls
+                    // MEASURED live (VM 2942, FreeCell): printf() calls
                     // putchar() per character, each of which is its own
                     // SYS_PUTCHAR -> console_write() -> kputc() PLUS a
                     // syslog_log() call for that single byte, so this line
@@ -3691,21 +3865,30 @@ static bool taskbar_handle_xfce(int32_t x, int32_t y, bool clicked) {
 //     follow-up that also threads a maximized bit through
 //     sys_wm_get_windows().
 //
-// "Close" itself is implemented as a synthetic left-click on the target
-// window's own titlebar close (X) button, not a new close primitive. This
-// matters because the close-button rect is themeable (#711 mtheme v2): the
-// kernel's is_on_close_button() reads TM_TITLEBAR_H/TM_BORDER_W/
-// TM_TITLEBAR_BTN live from the active .mtheme file, so a compile-time guess
-// at the button's pixel offset here would silently drift out of sync the
-// first time a user picks a different theme - exactly the "second
-// implementation of the same geometry" trap this tree has hit before.
-// Reading the SAME metric ids through the already-wired SYS_THEME_METRIC
-// (theme_metric_or(), userland/libc/theme.h) keeps this to one source of
-// truth and needs no kernel/proc/syscall.c change (that file is out of
-// scope for this pass): the click lands exactly where the kernel's own
-// close-button hit test expects it, so behaviour is byte-for-byte what a
-// real click on the X produces - no special-casing, no new server-side
-// close path.
+// "Close" itself is implemented via SYS_WM_CLOSE_WINDOW (wm_close_window(),
+// userland/libc/syscall.h), an id-based close that runs the kernel's own
+// window_request_close() - the EXACT code a real click on the target
+// window's titlebar close (X) button runs (kernel/gui/window.c). This used
+// to be a synthetic left-click at the close button's computed SCREEN
+// COORDINATES (theme_metric_or() geometry, mirroring the kernel's
+// is_on_close_button() formula), which worked for a normal chromed window
+// but was a silent no-op on any WINDOW_FLAG_NOCHROME (win_set_nochrome())
+// window: the kernel's wm_handle_mouse_down() skips its entire titlebar-
+// button block for a NOCHROME window - it has no titlebar - so no click
+// coordinate could ever land on a close button that does not exist. Proven
+// live on Maytera Squadron (appqa census, no-ticket): `OK WINCLOSE` printed
+// and the click WAS injected, but Squadron kept running because the click
+// landed as an ordinary mouse click inside its own content, never as
+// EVENT_WINDOW_CLOSE. 9 apps ship WINDOW_FLAG_NOCHROME (aichat, arena,
+// classicube, install, launcher, musicplayer, squadron, winswitch, setup)
+// and all 9 already handle EVENT_WINDOW_CLOSE in their own event loop - they
+// were simply never able to receive it from the taskbar. wm_close_window()
+// is used for EVERY window now, chromed or not: for a chromed window it
+// reaches the identical on_close code path a real click reaches (same
+// window_request_close(), one implementation, so a normal window's Close
+// behaves exactly as before), and it needs no theme-metric geometry at all,
+// so it cannot drift out of sync with a theme change the way the coordinate
+// click could.
 #define TBMENU_W  ui_px(108)
 #define TBMENU_IH ui_px(22)
 // #44: this single-item "Close" popup now serves ONLY the non-XFCE dock
@@ -3758,42 +3941,27 @@ void taskbar_menu_render(void) {
     draw_text(x + 12, y + 4 + 5, "Close", CLR_MENU_TEXT);
 }
 
-// Send the same DOWN+UP left-click pair sys_inject_mouse() already relays
-// into the kernel WM for a real mouse click, aimed at the target window's
-// close button (see the file-comment above for why the coordinates are
-// computed from live theme metrics rather than hardcoded). #44: no longer
-// static - contextmenu.c's CTX_MODE_DOCK "Close" action calls this directly
-// (declared in compositor.h) so the XFCE dock's Close does exactly the same
-// synthetic-click thing the non-XFCE taskbar-tile Close above always has,
-// one implementation either way.
+// #tbclose (appqa Finding 1): id-based close, via SYS_WM_CLOSE_WINDOW
+// (wm_close_window(), userland/libc/syscall.h). This used to compute the
+// target window's titlebar close-button SCREEN COORDINATES from live theme
+// metrics and inject a synthetic DOWN+UP click there (see the git history of
+// this function for that geometry - it mirrored the kernel's
+// is_on_close_button()/titlebar_btn_x() formula exactly, "byte-for-byte what
+// a real click on the X produces"). That was correct for a normal chromed
+// window but a silent no-op for a WINDOW_FLAG_NOCHROME window: it has no
+// titlebar, so the kernel's wm_handle_mouse_down() never even attempts the
+// close-button hit test at any coordinate for it (see the file-comment
+// above). wm_close_window() sidesteps coordinates entirely - it runs the
+// kernel's window_request_close() directly on the window found by id, the
+// exact code its own titlebar X button would have run - so it works
+// identically whether or not the window has chrome, and no longer needs any
+// theme-metric geometry to do it. #44: no longer static - contextmenu.c's
+// CTX_MODE_DOCK "Close" action calls this directly (declared in
+// compositor.h) so the XFCE dock's Close does exactly the same thing the
+// non-XFCE taskbar-tile Close above always has, one implementation either
+// way.
 void taskbar_close_window(int32_t win_id) {
-    wm_window_info_t wins[TB_MAX_WINS];
-    int n = wm_get_windows(wins, TB_MAX_WINS);
-    if (n < 0) n = 0;
-    for (int i = 0; i < n; i++) {
-        if (wins[i].id != win_id) continue;
-        int titlebar_h = theme_metric_or(THEME_METRIC_TITLEBAR_H, 20);
-        int border_w   = theme_metric_or(THEME_METRIC_BORDER_W,   2);
-        int btn_size   = theme_metric_or(THEME_METRIC_TITLEBAR_BTN, 16);
-        // #uiscale: this was the ELEVENTH copy of the kernel's close-button
-        // geometry, including a bare "- 2" inset - the exact same pattern
-        // kernel/gui/window.h's own titlebar_btn_x() comment describes
-        // fixing at its ten in-kernel copies ("It was the bare literal 2 at
-        // all eleven sites"). titlebar_btn_x() itself is a kernel-only
-        // static inline (kernel/gui/window.h) and not reachable from
-        // userland, so this mirrors its EXACT formula instead: slot 0 (the
-        // close button, TITLEBAR_SLOT_CLOSE), bs=btn_size, using the SAME
-        // already-scaled theme metric (THEME_METRIC_TITLEBAR_BTN_GAP) the
-        // kernel reads for the inset, with the kernel's own fallback (2) so
-        // an unset theme key produces byte-identical geometry on both sides.
-        int btn_inset  = theme_metric_or(THEME_METRIC_TITLEBAR_BTN_GAP, 2);
-        int btn_y_off  = border_w + (titlebar_h - btn_size) / 2;
-        int cx = wins[i].x + wins[i].width - btn_size - btn_inset + btn_size / 2;
-        int cy = wins[i].y + btn_y_off + btn_size / 2;
-        sys_inject_mouse(cx, cy, MOUSE_EVENT_DOWN, 1);
-        sys_inject_mouse(cx, cy, MOUSE_EVENT_UP,   1);
-        break;
-    }
+    wm_close_window(win_id);
 }
 
 // #44: force-quit the process matching app_id by NAME via SYS_PROC_LIST (the
@@ -4046,6 +4214,13 @@ int taskbar_bottom_inset(void) {
 // would reserve the wrong edge for the classic bottom-panel styles.
 int taskbar_left_inset(void) {
     switch (g_dock_style) {
+        // (cfsettings) The Cardfile deck is the first LEFT-edge shell: its rail
+        // owns the left strip, and cardfile.c is the single source of truth for
+        // how wide (theme-scaled, so not a literal here). Routing it through
+        // this inset is what makes the kernel WM's placement / maximize /
+        // restore clear the rail, and taskbar_set_style() republishes the work
+        // area the moment the style flips, so the switch is live both ways.
+        case DOCK_CARDFILE: return cardfile_rail_width();
         default: return 0;
     }
 }
@@ -4212,18 +4387,19 @@ void taskbar_set_style(int s) {
     g_start_menu_open = false;
     g_tray_menu_open = 0;
     g_batt_card_open = 0;   // #battmeter: anchored off the old bar position
+    g_traydev_card_open = 0; // #removtray: same reason
     g_needs_redraw = true;
 }
 
-// #241/#battmeter: is a taskbar-owned popup currently showing? (performance
-// popup, or the battery info card)
+// #241/#battmeter/#removtray: is a taskbar-owned popup currently showing?
+// (performance popup, the battery info card, or the removable-devices card)
 bool taskbar_popup_active(void) {
-    return g_perf_open != 0 || g_batt_card_open != 0;
+    return g_perf_open != 0 || g_batt_card_open != 0 || g_traydev_card_open != 0;
 }
 
-// #241/#battmeter: handle mouse while a taskbar-owned popup is open. Runs in
-// main.c BEFORE taskbar_handle_mouse so it can intercept clicks anywhere on
-// screen.
+// #241/#battmeter/#removtray: handle mouse while a taskbar-owned popup is
+// open. Runs in main.c BEFORE taskbar_handle_mouse so it can intercept
+// clicks anywhere on screen.
 bool taskbar_popup_handle_mouse(int32_t x, int32_t y, bool clicked) {
     // #battmeter: the info card is a plain click-through readout, not a
     // control surface, so EVERY click while it is open dismisses it (whether
@@ -4235,6 +4411,52 @@ bool taskbar_popup_handle_mouse(int32_t x, int32_t y, bool clicked) {
                            y >= g_bc_y && y < g_bc_y + g_bc_h);
         if (!clicked) return inside_card != 0;
         g_batt_card_open = 0;
+        g_needs_redraw = true;
+        return true;
+    }
+
+    // #removtray: a REAL control surface (the Eject buttons), so unlike the
+    // battery card above, a click INSIDE the card is swallowed rather than
+    // closing it - the notif.c notification-center convention ("swallow
+    // inside", "click outside closes") rather than the battery card's
+    // "any click anywhere closes" one, because this card has actions worth
+    // taking more than once per open.
+    if (g_traydev_card_open) {
+        int inside_card = (x >= g_td_x && x < g_td_x + g_td_w &&
+                           y >= g_td_y && y < g_td_y + g_td_h);
+        if (!clicked) return inside_card != 0;
+        if (inside_card) {
+            const traydev_row_t *rows;
+            int n = traydev_rows(&rows);
+            int shown = (n < TRAYDEV_MAX_SHOWN) ? n : TRAYDEV_MAX_SHOWN;
+            int32_t ry = g_td_y + TRAYDEV_HEADER_H;
+            for (int i = 0; i < shown; i++) {
+                const traydev_row_t *r = &rows[i];
+                if (r->can_eject) {
+                    int32_t bx, by, bw, bh;
+                    traydev_row_eject_rect(g_td_x + ui_px(8), ry, g_td_w - ui_px(16), &bx, &by, &bw, &bh);
+                    if (x >= bx && x < bx + bw && y >= by && y < by + bh) {
+                        char label[64];
+                        strncpy(label, r->name, sizeof(label) - 1);
+                        label[sizeof(label) - 1] = '\0';
+                        if (traydev_eject(r->vol_index) == 0)
+                            notify_post("Safe to remove", label, NOTIFY_SUCCESS);
+                        else
+                            notify_post("Eject failed", label, NOTIFY_ERROR);
+                        // #removtray: the eject just changed the row set (or
+                        // emptied it) - close the card if nothing is left,
+                        // same as desktop_icon_eject()'s own refresh rule.
+                        if (!traydev_present()) g_traydev_card_open = 0;
+                        g_needs_redraw = true;
+                        return true;
+                    }
+                }
+                ry += TRAYDEV_ROW_H;
+            }
+            g_needs_redraw = true;
+            return true;   // swallow: inside the card, no button hit
+        }
+        g_traydev_card_open = 0;   // click outside closes
         g_needs_redraw = true;
         return true;
     }
@@ -4273,6 +4495,292 @@ bool taskbar_popup_handle_mouse(int32_t x, int32_t y, bool clicked) {
     g_perf_open = 0;
     g_needs_redraw = true;
     return true;
+}
+
+// ============================================================================
+// (cfdock) Cardfile dock-bar hosting (docs/CARDFILE_ARCHITECTURE.md sec 10).
+// Reuses the SAME sampled tray/gauge state - taskbar_update() already runs
+// every main-loop iteration regardless of dock_style (see main.c) - and the
+// SAME icon/gauge/clock draw primitives every other dock style already
+// calls; only the PLACEMENT differs (an arbitrary caller rect from
+// cardfile.c instead of the fixed classic bar). taskbar_render()/
+// taskbar_handle_mouse() themselves stay gated off in cardfile mode
+// (render_frame_body()'s `!cf`) - every symbol below is NEW and called only
+// from cardfile.c.
+//
+// The gauge cluster (CPU+RAM+DSK+NET, one CF_DOCKITEM_GAUGES item - see
+// cardfile_model.h's own note on why it is not three separate items) does
+// NOT reuse gauge_hit()/draw_perf_popup(): that popup anchors off
+// g_taskbar_y/g_tray_bar_top, classic-bar position state a cardfile dock has
+// none of. A click on a dock's gauge cluster instead launches Task Manager
+// directly - sys_spawn("/APPS/taskmgr"), the exact action the popup's own
+// button already performs - which is a real, useful action with no
+// popup-anchoring problem to solve. The tray and clock DO reuse their real
+// classic primitives (tray_draw_*()/tb_clock_str()); only the ORCHESTRATION
+// (which icon goes where) is new, because tray_click()/tray_right_click()
+// assume ONE shared horizontal row (g_tray_x[]/g_tray_y), which a second,
+// differently-oriented dock in the SAME frame would violate - see
+// cfdi_tray_compose()'s own comment.
+// ============================================================================
+
+#define CFDI_MAX_TRAY 8
+static int32_t g_cfdi_tray_x[CFDI_MAX_TRAY], g_cfdi_tray_y[CFDI_MAX_TRAY];
+static int     g_cfdi_tray_kind[CFDI_MAX_TRAY];
+static int     g_cfdi_tray_n;
+static int32_t g_cfdi_gauge_x, g_cfdi_gauge_y, g_cfdi_gauge_w, g_cfdi_gauge_h;
+static int32_t g_cfdi_clock_x, g_cfdi_clock_y, g_cfdi_clock_w, g_cfdi_clock_h;
+
+// Composes the tray cluster into (x,y,w,h): left-to-right (!vertical, the
+// icons' own natural size, y-centred in h) or top-to-bottom (vertical, one
+// icon per row, x-centred in w) - the SAME tray_draw_*() icon primitives
+// tray_render_core() uses, just laid out along whichever axis this dock's
+// orientation needs (tray_render_core() itself is always horizontal, so is
+// not reused directly here - see this section's own header comment on why
+// its g_tray_x[]/g_tray_y hit-test state is not, either). Records each
+// icon's own hit rect into g_cfdi_tray_* for taskbar_dock_items_handle_
+// mouse() below. Returns the total length used along the layout axis.
+static int32_t cfdi_tray_compose(int32_t x, int32_t y, int32_t w, int32_t h,
+                                  uint32_t bar_bg, int vertical) {
+    bt_tick(); wifi_tick(); battery_tray_poll(); traydev_poll();   // #removtray: also self-throttled
+    int net_state, net_bars = 0;
+    if (sys_net_is_up()) net_state = 1;
+    else if (wifi_tray_state() == 2) {
+        net_state = 2; int sig = wifi_tray_signal();
+        net_bars = sig >= 75 ? 3 : sig >= 45 ? 2 : sig > 0 ? 1 : 0;
+    } else net_state = 0;
+    uint32_t saved = CLR_TASKBAR_BG; CLR_TASKBAR_BG = bar_bg;
+    static const int order[8] = { TRAY_WIDGETS, TRAY_SOUND, TRAY_NET, TRAY_BT,
+                                   TRAY_SHEEP, TRAY_BELL, TRAY_REMOV, TRAY_BATTERY };
+    g_cfdi_tray_n = 0;
+    int32_t pos = vertical ? y : x;
+    for (int k = 0; k < TRAY_N; k++) {
+        int i = order[k];
+        if (i == TRAY_BATTERY && g_batt_present != 1) continue;
+        if (i == TRAY_REMOV && !traydev_present()) continue;   // #removtray
+        int32_t ix, iy;
+        if (vertical) { ix = x + (w - TRAY_ICON_W) / 2; if (ix < x) ix = x; iy = pos; }
+        else          { ix = pos; iy = y + (h - TRAY_ICON_W) / 2; }
+        if (g_cfdi_tray_n < CFDI_MAX_TRAY) {
+            g_cfdi_tray_x[g_cfdi_tray_n] = ix; g_cfdi_tray_y[g_cfdi_tray_n] = iy;
+            g_cfdi_tray_kind[g_cfdi_tray_n] = i; g_cfdi_tray_n++;
+        }
+        switch (i) {
+            case TRAY_WIDGETS: tray_draw_widgets(ix, iy, g_widgets_enabled); break;
+            case TRAY_SOUND:   tray_draw_sound(ix, iy, g_tray_muted); break;
+            case TRAY_NET:     tray_draw_net(ix, iy, net_state, net_bars); break;
+            case TRAY_BT:      tray_draw_bt(ix, iy, bt_tray_state()); break;
+            case TRAY_SHEEP:   tray_draw_sheep(ix, iy, g_sheep_enabled); break;
+            case TRAY_BELL:    tray_draw_bell(ix, iy, notif_unread()); break;
+            case TRAY_REMOV:   tray_draw_traydev(ix, iy); break;   // #removtray
+            case TRAY_BATTERY: tray_draw_battery(ix, iy, g_batt_pct, g_batt_state); break;
+        }
+        pos += TRAY_ICON_W + (vertical ? ui_px(5) : TRAY_ICON_GAP);
+    }
+    CLR_TASKBAR_BG = saved;
+    return pos - (vertical ? y : x);
+}
+
+// (cfdock, vfix) A vertical gauge "band": full dock-width, THREE SEPARATE
+// rows - label, then value, then a proportional fill bar - so nothing ever
+// shares a row with anything else. The classic horizontal draw_gauge()/
+// draw_cpu_gauge()/draw_net_gauge() put the label at the LEFT and the value
+// at the RIGHT of ONE row, which is fine at their native GAUGE_WIDTH=80px but
+// NOT at a cardfile dock's default 32px thickness - the two strings print on
+// top of each other ("RAM52%", per the bug report). This is the fix for the
+// VERTICAL orientation only: same sampled percent/value, stacked down the
+// page instead of packed across it, legible from CF_DOCK_THICKNESS_MIN
+// (cardfile_model.h) up. A NEW, ADDITIONAL primitive - the classic taskbar's
+// own draw_gauge()/draw_cpu_gauge()/draw_net_gauge() calls (horizontal dock
+// style, and the DOCK_DEFAULT/DOCK_XFCE bars) are completely untouched.
+// Returns the total height used, so callers can stack several bands.
+// (cfdock, rot) Owner: "we need to properly rotate the text on the dock
+// elements" - upright text stacked in horizontal bands read wrong on a
+// vertical dock (a tall narrow strip); it must run SIDEWAYS, matching the
+// deck's own sideways card-tab labels. REUSES cardtext_vertical()/
+// cardtext_vertical_len() (cardtext.c/.h) - the SAME rotate-via-font_glyph()
+// primitive the tab labels already use - rather than hand-rolling a second
+// rotation or reaching for a kernel change; cardtext_vertical() already
+// rotates CLOCKWISE so the first glyph lands at the TOP and the label reads
+// top-to-bottom, which is exactly the tab labels' own reading direction, so
+// passing it the same `y_top`-grows-downward convention this function
+// already uses keeps a dock's text and its neighbouring card tab reading the
+// SAME way, not one up one down.
+//
+// LAYOUT (this is the "pick what looks clean and say which" call): a thin
+// proportional fill bar on the dock's near (x) side, filling from the
+// BOTTOM up like a thermometer along the dock's own long axis, with the
+// rotated LABEL then the rotated VALUE stacked top-to-bottom beside it (own
+// column, own y-ranges - never sharing a row/column with each other or the
+// bar), so bar and text read together as one vertical unit per gauge. The
+// bar's thickness scales with dock width (wider dock = more prominent bar);
+// the text's font SIZE is fixed (CFDOCK_VTXT_SIZE) - matching the size the
+// deck already uses for its OWN small sideways labels (the rail's "Sort"
+// tab) - so widening a dock buys the bar and the margins room, not bigger
+// glyphs. Returns the total height (band) used, so callers stack several.
+#define CFDOCK_VTXT_SIZE 11
+#define VGAUGE_GAP    ui_px(3)
+static int32_t draw_gauge_vband(int32_t x, int32_t y, int32_t w,
+                                 int percent, uint32_t color,
+                                 const char *label, const char *value) {
+    uint32_t ink = readable_ink(CLR_GAUGE_BG);
+
+    int32_t bar_w = w / 4; if (bar_w < ui_px(3)) bar_w = ui_px(3); if (bar_w > ui_px(14)) bar_w = ui_px(14);
+    if (bar_w > w - 4) bar_w = (w > 6) ? w - 4 : 2;
+    int32_t text_x0 = x + bar_w + VGAUGE_GAP;
+    int32_t text_w  = w - bar_w - VGAUGE_GAP; if (text_w < ui_px(8)) text_w = ui_px(8);
+    int32_t text_cx = text_x0 + text_w / 2;
+
+    int lbl_len = cardtext_vertical_len(label, CFDOCK_VTXT_SIZE);
+    int val_len = (value && value[0]) ? cardtext_vertical_len(value, CFDOCK_VTXT_SIZE) : 0;
+    int32_t content_h = lbl_len + (val_len > 0 ? (VGAUGE_GAP + val_len) : 0);
+    int32_t band_h = content_h;
+    if (band_h < ui_px(12)) band_h = ui_px(12);
+
+    draw_fill_rect(x, y, w, band_h, CLR_GAUGE_BG);
+
+    // Rotated label, then (own y-range, never overlapping) the rotated
+    // value - both centred in the text column, top-to-bottom like a tab.
+    // Centred in the BAND (not just flush to its top): band_h can be taller
+    // than content_h at the ui_px(12) floor (e.g. a very short single-glyph
+    // label at a small ui scale), and a flush-top label there would leave
+    // dead space below it instead of reading as centred like a tab label.
+    int32_t ty = y + (band_h - content_h) / 2;
+    cardtext_vertical(text_cx, ty, lbl_len, label, CFDOCK_VTXT_SIZE, ink);
+    ty += lbl_len + VGAUGE_GAP;
+    if (val_len > 0) cardtext_vertical(text_cx, ty, val_len, value, CFDOCK_VTXT_SIZE, ink);
+
+    // Bar strip beside the text, bottom-up fill along the SAME long axis.
+    draw_fill_rect(x, y, bar_w, band_h, CLR_GAUGE_BORDER);
+    if (percent > 0) {
+        int32_t fill_h = band_h * percent / 100;
+        if (fill_h < 1) fill_h = 1;
+        if (fill_h > band_h) fill_h = band_h;
+        draw_fill_rect(x, y + (band_h - fill_h), bar_w, fill_h, color);
+    }
+    return band_h;
+}
+
+// Renders `items[0..nitems)` (CF_DOCKITEM_* - cardfile_model.h) packed along
+// the dock's long axis into (x,y,w,h): left-to-right when !vertical (a top/
+// bottom edge dock), top-to-bottom when vertical (a left/right edge or
+// between-cards dock). `bar_bg` tints tray/text contrast exactly as every
+// other tray_render_core() caller already passes its own bar colour. Items
+// that do not fit are silently dropped (never overflow-clipped mid-icon).
+void taskbar_render_dock_items(int32_t x, int32_t y, int32_t w, int32_t h,
+                                const int *items, int nitems, uint32_t bar_bg,
+                                int vertical) {
+    g_cfdi_tray_n = 0; g_cfdi_gauge_w = 0; g_cfdi_clock_w = 0;
+    int32_t pos = vertical ? y + 4 : x + 6;
+    int32_t lim = vertical ? y + h : x + w;
+    for (int k = 0; k < nitems && pos < lim; k++) {
+        switch (items[k]) {
+        case CF_DOCKITEM_TRAY: {
+            int32_t used = vertical ? cfdi_tray_compose(x, pos, w, h, bar_bg, 1)
+                                     : cfdi_tray_compose(pos, y, w, h, bar_bg, 0);
+            pos += used + (vertical ? 6 : 10);
+            break;
+        }
+        case CF_DOCKITEM_CLOCK: {
+            char clk[10]; tb_clock_str(clk);
+            int32_t cw = text_width(clk);
+            if (!vertical) {
+                draw_text(pos + 4, y + (h - FONT_CHAR_H) / 2, clk, readable_ink(bar_bg));
+                g_cfdi_clock_x = pos; g_cfdi_clock_y = y; g_cfdi_clock_w = cw + 8; g_cfdi_clock_h = h;
+                pos += cw + 16;
+            } else {
+                // (cfdock, rot) Rotated, same as the gauge labels below and
+                // the deck's own sideways card-tab labels - see
+                // draw_gauge_vband()'s own comment for the reading-direction
+                // rationale. `cw` (the horizontal text_width()) is unused in
+                // this branch; the rotated run length is cardtext_vertical_len().
+                int32_t clen = cardtext_vertical_len(clk, CFDOCK_VTXT_SIZE);
+                int32_t cx = x + w / 2;
+                cardtext_vertical(cx, pos, clen, clk, CFDOCK_VTXT_SIZE, readable_ink(bar_bg));
+                g_cfdi_clock_x = x; g_cfdi_clock_y = pos; g_cfdi_clock_w = w; g_cfdi_clock_h = clen;
+                pos += clen + VGAUGE_GAP + ui_px(2);
+            }
+            break;
+        }
+        case CF_DOCKITEM_GAUGES: {
+            if (!vertical) {
+                int32_t gy = y + (h - GAUGE_HEIGHT) / 2;
+                draw_cpu_gauge(pos, gy, GAUGE_WIDTH, GAUGE_HEIGHT, g_cpu_ncores, g_cpu_cores);
+                draw_gauge(pos + (GAUGE_WIDTH + GAUGE_SPACING), gy, GAUGE_WIDTH, GAUGE_HEIGHT,
+                           g_ram_percent, CLR_GAUGE_RAM, "RAM", g_ram_str);
+                draw_gauge(pos + 2 * (GAUGE_WIDTH + GAUGE_SPACING), gy, GAUGE_WIDTH, GAUGE_HEIGHT,
+                           g_disk_percent, CLR_GAUGE_DSK, "DSK", g_disk_str);
+                draw_net_gauge(pos + 3 * (GAUGE_WIDTH + GAUGE_SPACING), gy, GAUGE_WIDTH, GAUGE_HEIGHT,
+                               g_net_percent, CLR_GAUGE_NET, g_net_str);
+                g_cfdi_gauge_x = pos; g_cfdi_gauge_y = gy;
+                g_cfdi_gauge_w = 4 * GAUGE_WIDTH + 3 * GAUGE_SPACING; g_cfdi_gauge_h = GAUGE_HEIGHT;
+                pos += g_cfdi_gauge_w + 10;
+            } else {
+                // (cfdock, vfix) draw_gauge_vband(), NOT the horizontal
+                // draw_cpu_gauge()/draw_gauge()/draw_net_gauge() calls the
+                // !vertical branch above uses - see that function's own
+                // comment for why the horizontal label-left/value-right
+                // layout cannot be reused at a vertical dock's width. CPU is
+                // the AGGREGATE g_cpu_percent here, not per-core: per-core
+                // mini-bars need real horizontal width to read as anything,
+                // which a vertical dock's thickness does not give them - a
+                // documented simplification for this orientation only (the
+                // horizontal dock path keeps full per-core detail).
+                int32_t gw = w - 2; if (gw < 1) gw = 1;
+                int32_t gx = x + 1;
+                int32_t start = pos;
+                pos += draw_gauge_vband(gx, pos, gw, g_cpu_percent,  CLR_GAUGE_CPU, "CPU", g_cpu_str)  + VGAUGE_GAP;
+                pos += draw_gauge_vband(gx, pos, gw, g_ram_percent,  CLR_GAUGE_RAM, "RAM", g_ram_str)  + VGAUGE_GAP;
+                pos += draw_gauge_vband(gx, pos, gw, g_disk_percent, CLR_GAUGE_DSK, "DSK", g_disk_str) + VGAUGE_GAP;
+                pos += draw_gauge_vband(gx, pos, gw, g_net_percent,  CLR_GAUGE_NET, "NET", g_net_str)  + VGAUGE_GAP;
+                g_cfdi_gauge_x = gx; g_cfdi_gauge_y = start;
+                g_cfdi_gauge_w = gw; g_cfdi_gauge_h = pos - start;
+                pos += 4;
+            }
+            break;
+        }
+        }
+    }
+}
+
+// Hit-test + dispatch for whatever taskbar_render_dock_items() drew THIS
+// frame (one-frame-stale, same convention gauge_hit() etc. already rely on).
+// The gauge cluster launches Task Manager on click (see this section's own
+// header comment); the clock opens the same Date/Time settings panel
+// bar_clock_click() does; tray icons dispatch the SAME actions tray_click()/
+// tray_right_click() do, from this dock's own g_cfdi_tray_* hit rects.
+// Returns 1 if the click/hover was claimed.
+int taskbar_dock_items_handle_mouse(int32_t x, int32_t y, int clicked, int right_clicked,
+                                     int vertical) {
+    (void)vertical;
+    for (int i = 0; i < g_cfdi_tray_n; i++) {
+        if (x < g_cfdi_tray_x[i] || x >= g_cfdi_tray_x[i] + TRAY_ICON_W) continue;
+        if (y < g_cfdi_tray_y[i] || y >= g_cfdi_tray_y[i] + TRAY_ICON_W) continue;
+        if (!clicked && !right_clicked) return 1;   // hover inside an icon: still claimed
+        int k = g_cfdi_tray_kind[i];
+        if (right_clicked) {
+            if (k == TRAY_NET || k == TRAY_BT) traymenu_open_for_icon(k, g_cfdi_tray_x[i] + TRAY_ICON_W / 2);
+            return 1;
+        }
+        if      (k == TRAY_BELL)    notif_toggle_center();
+        else if (k == TRAY_NET)     settings_open_panel(SETTINGS_PANEL_NETWORK);
+        else if (k == TRAY_BT)      settings_open_panel(SETTINGS_PANEL_BLUETOOTH);
+        else if (k == TRAY_BATTERY) battery_card_toggle(g_cfdi_tray_x[i] + TRAY_ICON_W / 2);
+        else if (k == TRAY_REMOV)   traydev_card_toggle(g_cfdi_tray_x[i] + TRAY_ICON_W / 2);  // #removtray
+        else                        traymenu_open_for_icon(k, g_cfdi_tray_x[i] + TRAY_ICON_W / 2);
+        g_needs_redraw = true;
+        return 1;
+    }
+    if (g_cfdi_gauge_w > 0 && x >= g_cfdi_gauge_x && x < g_cfdi_gauge_x + g_cfdi_gauge_w &&
+        y >= g_cfdi_gauge_y && y < g_cfdi_gauge_y + g_cfdi_gauge_h) {
+        if (clicked) sys_spawn("/APPS/taskmgr");
+        return 1;
+    }
+    if (g_cfdi_clock_w > 0 && x >= g_cfdi_clock_x && x < g_cfdi_clock_x + g_cfdi_clock_w &&
+        y >= g_cfdi_clock_y && y < g_cfdi_clock_y + g_cfdi_clock_h) {
+        if (clicked) { settings_open_panel(SETTINGS_PANEL_DATETIME); g_needs_redraw = true; }
+        return 1;
+    }
+    return 0;
 }
 
 int32_t taskbar_get_y(void) {

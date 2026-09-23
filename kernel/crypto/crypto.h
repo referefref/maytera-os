@@ -144,6 +144,11 @@ void aes_encrypt_block(const aes_ctx_t *ctx, const uint8_t in[16], uint8_t out[1
 // Decrypt single block (16 bytes)
 void aes_decrypt_block(const aes_ctx_t *ctx, const uint8_t in[16], uint8_t out[16]);
 
+// AES-CMAC (RFC 4493) over AES-128. key/msg/mac are standard MSB-first octet
+// strings. See aes.c. Used by bt/pair.c for the SMP LESC f4/f5/f6/g2 functions.
+void aes_cmac(const uint8_t key[16], const uint8_t *msg, size_t msg_len,
+              uint8_t mac[16]);
+
 // =============================================================================
 // AES-CBC Mode
 // =============================================================================

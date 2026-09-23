@@ -45,6 +45,7 @@
 #include "../drivers/acpi.h"
 #include "../drivers/usb_msc.h"
 #include "blockdev.h"
+#include "bootlog.h"
 #include "ext2.h"
 #include <stdarg.h>
 
@@ -979,7 +980,11 @@ static void dl_dump_pci(void) {
         dl_puts("  !! Absence from the list below is NOT evidence of absence from the machine.\n"
                 "  !! Raise MAX_PCI_DEVICES and rebuild.\n");
     }
-    dl_line("  B:D.F  vendor:device  class:sub:progif  IRQ  BAR0        claimed-by       description\n");
+    // #imacnic: the subsystem pair is now a column of its own. vendor:device
+    // names the silicon, sub= names the BOARD (0x106B = Apple), and on a
+    // vendor-integrated machine that is the difference between "a Broadcom NIC"
+    // and "the Broadcom NIC Apple put in this exact model".
+    dl_line("  B:D.F  vendor:device  sub=vendor:device  class:sub:progif  IRQ  BAR0        claimed-by       description\n");
     for (int i = 0; i < n; i++) {
         pci_device_t *d = pci_get_device(i);
         if (!d) continue;
@@ -988,8 +993,13 @@ static void dl_dump_pci(void) {
         // /DEVLOG.TXT answers "does this device even have a driver" with
         // certainty instead of an absence-of-evidence argument built from
         // grepping source for vendor strings.
-        dl_line("  %02x:%02x.%x %04x:%04x    %02x:%02x:%02x        %3d  0x%08llx  %-16s %s\n",
-                d->bus, d->slot, d->func, d->vendor_id, d->device_id,
+        char sub[16];
+        if ((d->header_type & 0x7F) == 0)
+            snprintf(sub, sizeof(sub), "%04x:%04x", d->subsys_vendor, d->subsys_id);
+        else
+            snprintf(sub, sizeof(sub), "n/a-hdr%02x", d->header_type & 0x7F);
+        dl_line("  %02x:%02x.%x %04x:%04x    %-11s    %02x:%02x:%02x        %3d  0x%08llx  %-16s %s\n",
+                d->bus, d->slot, d->func, d->vendor_id, d->device_id, sub,
                 d->class_code, d->subclass, d->prog_if, d->interrupt_line,
                 (unsigned long long)bar0,
                 d->claimed ? d->claimed_by : "(none)",
@@ -1210,9 +1220,18 @@ void devlog_dump(fat_fs_t *fs) {
     // file is one of two ways to read it, and on a machine where nothing
     // mounted the caller still wants the buffer to paint on screen.
     if (!fs || !fs->mounted) {
+        // #imacnic: MIRRORED TO /BOOTLOG.TXT, not serial-only. This branch says
+        // the machine's own hardware inventory was NOT written; on a machine
+        // with no serial port that verdict used to vanish with the kprintf that
+        // carried it, leaving an absent /DEVLOG.TXT indistinguishable from a
+        // /DEVLOG.TXT nobody had thought to copy off the disk.
         kprintf("[DEVLOG] filesystem not mounted; %s not written"
                 " (%u bytes built, render it instead)\n",
                 DEVLOG_PATH, (unsigned)len);
+        bootlog_write("[DEVLOG] NOT WRITTEN: no mounted filesystem to write %s to "
+                      "(%u bytes of inventory were built and rendered to the screen "
+                      "instead). The PCI table is also in the [PCI] lines above.",
+                      DEVLOG_PATH, (unsigned)len);
         return;
     }
 
@@ -1223,4 +1242,16 @@ void devlog_dump(fat_fs_t *fs) {
             usb_msc_get_device_count(),
             g_devlog_include_hda ? "included" : "skipped",
             g_devlog_full ? " TRUNCATED" : "");
+    // #imacnic: and durably. Whether the inventory file landed is itself
+    // evidence: without this line, an operator holding only /BOOTLOG.TXT cannot
+    // tell a failed write from a file they forgot to fetch, and would go looking
+    // for a file that was never there.
+    bootlog_write("[DEVLOG] %s %s (%u bytes, fat_write_file rc=%d): PCI=%d USB=%d "
+                  "HUBS=%d MSC=%d HDA=%s%s",
+                  (r < 0) ? "WRITE FAILED for" : "wrote", DEVLOG_PATH,
+                  (unsigned)len, r,
+                  pci_get_device_count(), xhci_get_enum_count(), xhci_get_hub_count(),
+                  usb_msc_get_device_count(),
+                  g_devlog_include_hda ? "included" : "skipped",
+                  g_devlog_full ? " TRUNCATED" : "");
 }

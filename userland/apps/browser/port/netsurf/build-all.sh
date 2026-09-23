@@ -62,4 +62,7 @@ NSI="-I$ROOT -I$ROOT/libdom/include -I$ROOT/libcss/include -I$ROOT/libhubbub/inc
 $CC $NSI -c dom_hubbub_bind.c -o dom_hubbub_bind.o && echo '  dom_hubbub_bind.o OK'
 $CC $NSI -c css_select_bind.c -o css_select_bind.o && echo '  css_select_bind.o OK'
 $CC $NSI -c layout.c -o layout.o && echo '  layout.o OK'
+$CC $NSI -c cssvar.c -o cssvar.o && echo '  cssvar.o OK'
+$CC $NSI -c fontmap.c -o fontmap.o && echo '  fontmap.o OK'
+$CC $NSI -c rrect.c -o rrect.o && echo '  rrect.o OK'
 echo "### done ###"

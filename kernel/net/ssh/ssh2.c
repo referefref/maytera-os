@@ -910,6 +910,16 @@ int ssh2_run_on_fds(uint32_t ip, uint16_t port, const char *user, const char *pa
     uint8_t ibuf[256];
     while (!cli->closed) {
         int did = ssh2_pump(cli);                  // net + remote->stdout
+        // Dead-peer exit, mirroring the server-side break at ssh2_server.c:765.
+        // Without it an RST, half-open or silently-dropped peer never sets
+        // cli->closed (ssh2_pump discards ssh2_ingest()'s negative return), so this
+        // loop spins at ~200 wakeups/sec forever inside SYS_SSH_CLIENT and the
+        // terminal app never returns. tcp_get_state() reflects a peer FIN
+        // (CLOSE_WAIT) or RST (CLOSED), so break exactly as the server does. The
+        // clean MSG_CHANNEL_CLOSE/MSG_DISCONNECT path (which sets cli->closed via
+        // ssh2_pump) is unchanged; this only adds exits for a dead peer.
+        tcp_state_t st = tcp_get_state(cli->sock);
+        if (st == TCP_STATE_CLOSED || st == TCP_STATE_CLOSE_WAIT || st == TCP_STATE_LAST_ACK) break;
         if (fin && file_poll(fin, 0x01 /*POLL_IN*/)) {
             long n = file_read(fin, ibuf, sizeof(ibuf));   // stdin->remote
             if (n > 0) ssh2_send_input(cli, ibuf, (int)n);

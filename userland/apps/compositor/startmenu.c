@@ -1134,13 +1134,13 @@ static void sm_launch_item(int idx) {
     const char *path = it->exec_path;
     switch (it->launch_type) {
         case LAUNCH_WIN16: win16_run_mode(path, it->win16_mode); break;   // (#845)
-        case LAUNCH_DOS:   dos_run(path);   break;
+        case LAUNCH_DOS:   dos_run_titled(path, it->name);   break;
         default:
             if (path[0] == '@' && path[1] == 'R') {
                 int fd = sys_open("/RECYVIEW.FLG", 0x41);
                 if (fd >= 0) { sys_write(fd, "1", 1); sys_close(fd); }
                 sys_spawn("/APPS/FILES");
-            } else sys_spawn(path);
+            } else compositor_spawn_app(path);   // (ncursespty) routes MyMan/Rogue/Angband via Terminal's pty
             break;
     }
     sm_record_recent(path);
@@ -1365,13 +1365,19 @@ void startmenu_launch_path(const char *path, int launch_type) {
             win16_run_mode(path, wmi >= 0 ? g_menu_items[wmi].win16_mode : -1);
             break;
         }
-        case LAUNCH_DOS:   dos_run(path);   break;
+        case LAUNCH_DOS: {
+            // (#dostitle) No menu_item_t here either (favorites/dock carry only
+            // path+type); look the name up by path like the WIN16 case does.
+            int dmi = sm_find_item_by_path(path);
+            dos_run_titled(path, dmi >= 0 ? g_menu_items[dmi].name : (const char *)0);
+            break;
+        }
         default:
             if (path[0] == '@' && path[1] == 'R') {
                 int fd = sys_open("/RECYVIEW.FLG", 0x41);
                 if (fd >= 0) { sys_write(fd, "1", 1); sys_close(fd); }
                 sys_spawn("/APPS/FILES");
-            } else sys_spawn(path);
+            } else compositor_spawn_app(path);   // (ncursespty) same routing as sm_launch_item() - dock/pinned icons
             break;
     }
     sm_record_recent(path);
@@ -1928,8 +1934,13 @@ static icon_id_t sm_icon_by_name(const char *n)
     if (strcmp(n, "taskswitch")   == 0)  return ICON_TASKSWITCH;
     if (strcmp(n, "appstore")     == 0)  return ICON_APPSTORE;
     if (strcmp(n, "sysmon")       == 0)  return ICON_SYSMON;
+    if (strcmp(n, "planetarium")  == 0)  return ICON_PLANETARIUM;
     if (strcmp(n, "services")     == 0)  return ICON_SERVICES;
     if (strcmp(n, "print3d")      == 0)  return ICON_3DPRINT;
+    if (strcmp(n, "writer")       == 0)  return ICON_WRITER;
+    if (strcmp(n, "sheets")       == 0)  return ICON_SHEETS;
+    if (strcmp(n, "slides")       == 0)  return ICON_SLIDES;
+    if (strcmp(n, "office")       == 0)  return ICON_OFFICE;
     return ICON_WINDOW;
 }
 

@@ -324,7 +324,7 @@ int main(int argc,char**argv){
     // browsenet 2026-09-01: SLEEP IN SLICES, so a trip that happens mid-cycle is
     // noticed within one slice instead of up to thirty minutes later.
     //
-    // MEASURED on VM <vmid>, golden 2321, with haservice pointed at an
+    // MEASURED on VM 2601, golden 2321, with haservice pointed at an
     // unreachable LAN address: the breaker tripped 40s into the boot and the
     // machine then sat at `nprobe=0/6` -- SIX refusals, ZERO grants -- for the
     // whole observation window. Nobody ever took the re-probe the kernel was

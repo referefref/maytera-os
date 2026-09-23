@@ -317,18 +317,26 @@ void poly1305_final(poly1305_ctx_t *ctx, uint8_t tag[16]) {
     h3 = (h3 & mask) | g3;
     h4 = (h4 & mask) | g4;
     
-    // h = h + pad
+    // aeadkat FIX: convert the 26-bit limbs to the four little-endian 32-bit
+    // words of the 128-bit result FIRST, THEN add the pad with carry. The pad
+    // is a full 128-bit little-endian integer (key bytes 16..31), so it can
+    // only be added once h is in 32-bit-word form. The previous order added
+    // pad to the still-packed 26-bit limbs (h0 holds only bits 0..25) and
+    // combined the limbs afterwards, corrupting the tag past the low bytes and
+    // producing a non-RFC-8439 authenticator. Proven by chacha20_poly1305_kat.sh
+    // (RFC 8439 2.5.2 MAC + 2.8.2 AEAD vectors).
+    // Convert 26-bit limbs -> 32-bit words (implicit uint32_t truncation)
+    h0 = (h0      ) | (h1 << 26);
+    h1 = (h1 >>  6) | (h2 << 20);
+    h2 = (h2 >> 12) | (h3 << 14);
+    h3 = (h3 >> 18) | (h4 <<  8);
+    
+    // h = h + pad  (mod 2^128)
     uint64_t f;
-    f = (uint64_t)h0 + ctx->pad[0]; h0 = (uint32_t)f;
+    f = (uint64_t)h0 + ctx->pad[0]            ; h0 = (uint32_t)f;
     f = (uint64_t)h1 + ctx->pad[1] + (f >> 32); h1 = (uint32_t)f;
     f = (uint64_t)h2 + ctx->pad[2] + (f >> 32); h2 = (uint32_t)f;
     f = (uint64_t)h3 + ctx->pad[3] + (f >> 32); h3 = (uint32_t)f;
-    
-    // Convert to bytes
-    h0 = h0 | (h1 << 26);
-    h1 = (h1 >> 6) | (h2 << 20);
-    h2 = (h2 >> 12) | (h3 << 14);
-    h3 = (h3 >> 18) | (h4 << 8);
     
     store32_le(tag, h0);
     store32_le(tag + 4, h1);
@@ -427,13 +435,23 @@ void chacha20_poly1305_final(chacha20_poly1305_ctx_t *ctx, uint8_t tag[16]) {
 }
 
 int chacha20_poly1305_verify(chacha20_poly1305_ctx_t *ctx, const uint8_t tag[16]) {
+#ifdef AEADKAT_FAULT
+    /* HOST KAT RED-TEAM ONLY. The kernel build NEVER defines this flag (grep
+       the Makefiles: it appears nowhere). chacha20_poly1305_kat.sh compiles a
+       second copy WITH it - an unconditional-accept tag check, the single most
+       dangerous AEAD bug - to prove chacha20_poly1305_selftest()'s tamper-reject
+       checks actually FIRE and are not a no-op. See aeadkat / blame.md. */
+    (void)ctx; (void)tag;
+    return 0;
+#else
     uint8_t computed[16];
     chacha20_poly1305_final(ctx, computed);
-    
+
     int result = crypto_memcmp(computed, tag, 16);
     crypto_zero(computed, 16);
-    
+
     return result;
+#endif
 }
 
 // One-shot seal
@@ -520,6 +538,131 @@ static inline uint64_t cc20_tsc_serialized(void) {
     __asm__ volatile("xor %%eax,%%eax\n\tcpuid" ::: "eax", "ebx", "ecx", "edx");
     __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+
+// =============================================================================
+// aeadkat: ChaCha20-Poly1305 AEAD record-plane known-answer + tamper-reject
+// self-test.
+//
+// The pre-existing chacha20_rust_selftest() proves ONLY the ChaCha20 keystream
+// BLOCK (RFC 8439 section 2.3.2). It is BLIND to the AEAD: it says nothing about
+// whether Poly1305, the length-block, the AAD/ciphertext padding, or the tag
+// COMPARISON are correct - and above all nothing about whether
+// chacha20_poly1305_open() REJECTS a forged record. That AEAD is the live TLS
+// 1.3 data plane for TLS13_CHACHA20_POLY1305_SHA256 (net/tls/tls13.c): a broken
+// tag check silently accepts attacker-modified TLS records. AES-GCM has its
+// tamper-reject KAT (ghash_rust_selftest, NIST TC4 + 3 negatives); this is the
+// matching proof for the ChaCha20-Poly1305 suite.
+//
+// Vectors are the canonical published KATs (no secret material):
+//   - RFC 8439 section 2.5.2  Poly1305 one-shot MAC (the raw authenticator leaf)
+//   - RFC 8439 section 2.8.2  ChaCha20-Poly1305 AEAD (key, nonce, aad, plaintext
+//                             -> ciphertext + tag)
+// A correct verifier plus a correct vector table is the ONLY combination that
+// yields all-green, so a passing run also validates the transcribed vectors.
+//
+// The security-relevant checks are the NEGATIVE ones: a flipped ciphertext byte,
+// a flipped tag byte, a flipped AAD byte, and a truncated tag must each make
+// chacha20_poly1305_open() return non-zero (REJECT). chacha20_poly1305_kat.sh
+// runs this in the build container: GREEN unmodified, RED with -DAEADKAT_FAULT
+// (an always-accept tag check), proving the reject checks are not a no-op.
+//
+// Returns the number of FAILED checks (0 == every vector behaved). Bounded, runs
+// once from main.c at boot (no busy-wait). C, not Rust, deliberately: this is a
+// self-test OF existing C AEAD code, it lives in the same translation unit as
+// the primitives under test (matching chacha20_rust_selftest / ghash_rust_
+// selftest), and the AEADKAT_FAULT guard has to sabotage the real verify in
+// place.
+// =============================================================================
+static void aeadkat_hex(uint8_t *out, const char *hex, int outlen) {
+    for (int i = 0; i < outlen; i++) {
+        int hi = (unsigned char)hex[2 * i];
+        int lo = (unsigned char)hex[2 * i + 1];
+        hi = (hi <= '9') ? hi - '0' : (hi | 0x20) - 'a' + 10;
+        lo = (lo <= '9') ? lo - '0' : (lo | 0x20) - 'a' + 10;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+}
+
+int chacha20_poly1305_selftest(void) {
+    extern int kprintf(const char *fmt, ...);
+    int fail = 0, checks = 0;
+
+    // ---- RFC 8439 section 2.5.2: Poly1305 one-shot MAC over the ASCII string
+    //      "Cryptographic Forum Research Group" (34 bytes). Proves the raw
+    //      authenticator leaf independent of ChaCha20. ----
+    {
+        uint8_t pkey[32], tag[16], exp[16];
+        static const uint8_t msg[34] = {
+            0x43,0x72,0x79,0x70,0x74,0x6f,0x67,0x72,0x61,0x70,0x68,0x69,0x63,0x20,
+            0x46,0x6f,0x72,0x75,0x6d,0x20,0x52,0x65,0x73,0x65,0x61,0x72,0x63,0x68,
+            0x20,0x47,0x72,0x6f,0x75,0x70 };
+        aeadkat_hex(pkey, "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b", 32);
+        aeadkat_hex(exp,  "a8061dc1305136c6c22b8baf0c0127a9", 16);
+        poly1305(pkey, msg, 34, tag);
+        checks++;
+        if (memcmp(tag, exp, 16) != 0) fail++;
+    }
+
+    // ---- RFC 8439 section 2.8.2: ChaCha20-Poly1305 AEAD. ----
+    uint8_t key[32], nonce[12], aad[12], pt[114], ect[114], etag[16];
+    aeadkat_hex(key,   "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f", 32);
+    aeadkat_hex(nonce, "070000004041424344454647", 12);
+    aeadkat_hex(aad,   "50515253c0c1c2c3c4c5c6c7", 12);
+    aeadkat_hex(pt,
+        "4c616469657320616e642047656e746c656d656e206f662074686520636c6173"
+        "73206f66202739393a204966204920636f756c64206f6666657220796f75206f"
+        "6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73"
+        "637265656e20776f756c642062652069742e", 114);
+    aeadkat_hex(ect,
+        "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6"
+        "3dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b36"
+        "92ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc"
+        "3ff4def08e4b7a9de576d26586cec64b6116", 114);
+    aeadkat_hex(etag, "1ae10b594f09e26a7e902ecbd0600691", 16);
+
+    // (1) seal of the known (key,nonce,aad,plaintext) yields the known
+    //     ciphertext AND the known tag.
+    uint8_t sealed[130];
+    chacha20_poly1305_seal(key, nonce, aad, 12, pt, 114, sealed);
+    checks++; if (memcmp(sealed, ect, 114) != 0) fail++;          // ciphertext
+    checks++; if (memcmp(sealed + 114, etag, 16) != 0) fail++;    // tag
+
+    // Canonical ct||tag from the PUBLISHED vector (not from our own seal), so
+    // open is checked against an independent reference.
+    uint8_t rec[130];
+    memcpy(rec, ect, 114);
+    memcpy(rec + 114, etag, 16);
+
+    // (2) open of the valid record ACCEPTS and returns the plaintext.
+    uint8_t out[114];
+    checks++; if (chacha20_poly1305_open(key, nonce, aad, 12, rec, 130, out) != 0) fail++;
+    checks++; if (memcmp(out, pt, 114) != 0) fail++;
+
+    // (3) tamper -> REJECT (each must make open() return non-zero).
+    uint8_t bad[130];
+    // flipped ciphertext byte
+    memcpy(bad, rec, 130); bad[50] ^= 0x01;
+    checks++; if (chacha20_poly1305_open(key, nonce, aad, 12, bad, 130, out) == 0) fail++;
+    // flipped tag byte
+    memcpy(bad, rec, 130); bad[120] ^= 0x01;    // 114 + 6, inside the tag
+    checks++; if (chacha20_poly1305_open(key, nonce, aad, 12, bad, 130, out) == 0) fail++;
+    // flipped AAD byte (record bytes untouched)
+    {
+        uint8_t aad2[12]; memcpy(aad2, aad, 12); aad2[5] ^= 0x01;
+        checks++; if (chacha20_poly1305_open(key, nonce, aad2, 12, rec, 130, out) == 0) fail++;
+    }
+    // truncated tag, under the 16-byte minimum -> open()'s length guard rejects
+    checks++; if (chacha20_poly1305_open(key, nonce, aad, 12, rec, 8, out) == 0) fail++;
+    // truncated tag, one byte short (129) -> tag realignment mismatch rejects
+    checks++; if (chacha20_poly1305_open(key, nonce, aad, 12, rec, 129, out) == 0) fail++;
+
+    const char *verdict = fail ? "FAIL" : "PASS";
+    kprintf("[AEAD-KAT] chacha20_poly1305: %d checks, %d failed -> %s "
+            "(RFC8439 2.5.2/2.8.2 accept + tamper-reject)\n", checks, fail, verdict);
+    bootlog_write("[AEAD-KAT] chacha20_poly1305: %d checks %d failed -> %s",
+                  checks, fail, verdict);
+    return fail;
 }
 
 void chacha20_rust_selftest(void) {

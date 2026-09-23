@@ -1,0 +1,29 @@
+--- a/actions.c
++++ b/actions.c
+@@ -1143,7 +1143,7 @@
+ 	return GO_CLEAROBJ;
+ }
+ 
+-static phase_codes_t read(command_t command)
++static phase_codes_t verb_read(command_t command)
+ /*  Read.  Print stuff based on objtxt.  Oyster (?) is special case. */
+ {
+ 	if (command.obj == INTRANSITIVE) {
+@@ -1541,7 +1541,7 @@
+ 				return brief();
+ 			case READ:
+ 				command.obj = INTRANSITIVE;
+-				return read(command);
++				return verb_read(command);
+ 			case BREAK:
+ 				return GO_UNKNOWN;
+ 			case WAKE:
+@@ -1636,7 +1636,7 @@
+ 			speak(actions[command.verb].message);
+ 			return GO_CLEAROBJ;
+ 		case READ:
+-			return read(command);
++			return verb_read(command);
+ 		case BREAK:
+ 			return vbreak(command.verb, command.obj);
+ 		case WAKE:

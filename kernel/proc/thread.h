@@ -40,7 +40,8 @@
 // ============================================================================
 
 #define MAX_THREADS_PER_PROCESS 64  // Maximum threads per process
-#define THREAD_STACK_SIZE       (64 * 1024)  // 64KB per thread stack
+#include "../mm/kstack.h"   // #stackguard: the guard-band granule
+#define THREAD_STACK_SIZE       ((size_t)KSTACK_USABLE)  // one kstack granule minus its guard band
 #define DEFAULT_TLS_SIZE        4096  // Default TLS area size
 
 // Thread states

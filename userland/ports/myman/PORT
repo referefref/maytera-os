@@ -1,0 +1,148 @@
+# mports recipe: myman 0.7.0. Tier 3 item #17 of
+# docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md ("myman, ninvaders,
+# moon-buggy ... near-zero individual cost once ncurses lands. Useful
+# specifically as VOLUME PROOF that the recipe system works"). MIT licence,
+# dependency closure 1 (ncurses).
+#
+# WHAT THIS PORT SHIPS. MyMan is Benjamin Sittler's ncurses Pac-Man clone
+# (https://sourceforge.net/projects/myman/). Its entire game logic lives in
+# ONE file, src/myman.c, so this is shaped like the darkhttpd/headers=none
+# precedent: `lib=libmyman.a` is a real archive but exists to be linked by
+# exactly one consumer (userland/apps/myman), which pulls main() out of it.
+#
+# WHY build=objects, NOT build=script. Upstream's own build system (the real
+# Makefile + configure) is a large, self-hosting GNU Make machine that can
+# cross-compile a "builtin data" variant by running myman.c TWICE (once
+# natively to self-generate embedded tile/sprite/maze C tables, once for the
+# target with -DBUILTIN_TILE/-DBUILTIN_SPRITE/-DBUILTIN_MAZE). That is real
+# leverage for a packager who wants ONE binary with no runtime data files, but
+# it is also a second build system to keep working across version bumps, for
+# a port whose brief is "near-zero cost, volume proof". This recipe instead
+# compiles src/myman.c directly (TILEFILE/SPRITEFILE/MAZEFILE are ordinary
+# `-D` overridable macros upstream already exposes for exactly this: see
+# simple.mk, upstream's own documented "simple build" path for when the full
+# GNU Make system is not wanted) and ships the three small text data files the
+# "square" variant needs via `install_sources`, landing at /APPS/chr,
+# /APPS/spr, /APPS/lvl (see build/build-golden.sh and
+# userland/apps/myman/Makefile). fopen_datafile() in myman.c already resolves
+# a relative data path against argv[0]'s directory when the plain relative
+# open fails (measured: src/myman.c fopen_datafile(), the `progname`-relative
+# branch), and MayteraOS's Terminal resolves a launched program's argv[0] to
+# its full /APPS path (term_shell.c: "Update argv[0] to the resolved path"),
+# so /APPS/MYMAN finding /APPS/chr/khr1.txt etc. is the SAME mechanism
+# upstream already built for "run myman from anywhere with its data
+# directory alongside it", not a MayteraOS-specific hack.
+#
+# WHY THE "square" VARIANT. MyMan ships four size variants (huge/big/small/
+# square); "square" draws one character cell per maze/sprite unit, so the
+# classic 28x31 default maze needs only a 28-column-wide screen (vs. 5x or
+# 2x that for huge/big/small), the least likely to run into a narrow terminal.
+# It still needs more than the Terminal's default 24 rows (see
+# docs/MPORTS.md-style honesty here: MEASURED, not assumed - the default maze
+# in lvl/maze.txt is 28x31 characters), so playing it means growing the
+# Terminal window past its default size; this is a terminal-size fact about
+# the classic maze, not a MayteraOS bug.
+
+name=myman
+version=0.7.0
+class=C
+homepage=https://sourceforge.net/projects/myman/
+
+# The SourceForge numbered-release source tarball (myman-cvs snapshots exist
+# but 0.7.0 is the latest actual numbered release; read from the SourceForge
+# file listing at port time, not assumed). The sha256 below is of THIS file,
+# MEASURED on the build container with sha256sum, not copied from a web page:
+#   wget -O myman-0.7.0.tar.gz \
+#     https://downloads.sourceforge.net/project/myman/myman/myman-0.7.0/myman-0.7.0.tar.gz
+#   sha256sum myman-0.7.0.tar.gz
+#   -> 31a94b2c8949a35d18eed35e8f685801fbfeb71418a3c01eafbf710ce95a292b (998,959 bytes)
+source_url=https://downloads.sourceforge.net/project/myman/myman/myman-0.7.0/myman-0.7.0.tar.gz
+tarball=myman-0.7.0.tar.gz
+sha256=31a94b2c8949a35d18eed35e8f685801fbfeb71418a3c01eafbf710ce95a292b
+srcdir=myman-0.7.0
+
+# MIT. The verbatim grant is in LICENSE (copyright 1997-2008 Benjamin C. Wiley
+# Sittler) and is reproduced in ATTRIBUTION.md, copied out of THIS tarball.
+# Compatible with the GPLv2 base (permissive, non-copyleft).
+licence=MIT
+licence_files=LICENSE
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): does this want to USE a platform layer, or
+# to BE one? myman USES. It is an ordinary Ring-3 program driven entirely by
+# ncurses' screen model and the host OS's file/time surface; it owns no event
+# loop anyone else must adopt and no framework. Measured: linking src/myman.c
+# (compiled -Iinc -DMYMANSIZE="square" -DTILEFILE=... -DSPRITEFILE=...) against
+# the built libncurses.a + userland/libc/libc.a with crt0.o and user-pie.ld
+# resolves with ZERO undefined symbols. Its platform surface beyond ncurses is
+# the ordinary libc set (malloc/free, str/mem, stdio incl. fopen/fread family,
+# getopt_long, getenv, gettimeofday, usleep, ioctl, isatty), all already in
+# userland/libc.
+adoption=USES. Measured: src/myman.c compiled with the square-variant -D set links against the built libncurses.a + userland/libc/libc.a (crt0.o + user-pie.ld) with zero undefined symbols. myman owns the game/screen model but never the process or an event loop the rest of the system must adopt; it calls getch() itself and reads its own data files via ordinary fopen().
+
+# ncurses supplies the whole screen/input model (initscr, colours, getch,
+# napms-class timing via getch after a curses timeout). libc is the shared
+# platform library, not a port.
+needs=libc ncurses
+
+# No pre-configure copies: this recipe drives src/myman.c directly rather than
+# upstream's configure/Makefile (see the header comment for why).
+prepare=none
+
+# THE ONE PATCH. src/myman.c includes <langinfo.h> unconditionally on
+# non-WIN32/non-macintosh (for nl_langinfo(CODESET), guarded by `#ifdef
+# CODESET` at its one call site). MayteraOS has one locale (C,
+# byte-transparent) and no <langinfo.h> (the exact same gap libedit's port hit
+# and fixed the same way: see userland/ports/libedit/patches/
+# 0001-drop-unused-langinfo-include.patch). Removing the include leaves
+# CODESET undefined, so the guarded nl_langinfo() call compiles out cleanly;
+# nothing else in myman.c references it. Load-bearing: main/pager (the
+# `symbols` list below) are defined later in the same file, so a patch that
+# stopped applying would fail the build rather than shipping silently.
+patches=0001-drop-unused-langinfo-include.patch
+
+# build=objects: one translation unit, src/myman.c, into libmyman.a. See the
+# header comment for why an APP (main() included) is expressed as a one-member
+# archive here, matching the darkhttpd precedent.
+build=objects
+sources=src/myman.c
+
+# WHY EACH FLAG:
+#   -Iinc                    upstream's own include/ dir, needed for the
+#                             curses-backend-selector headers src/myman.c
+#                             #includes by name (mycurses.h and friends); on
+#                             this build MY_CURSES_H resolves to plain
+#                             <curses.h> so only mycurses.h's tiny compat
+#                             shims are pulled in.
+#   -DMYMANSIZE="square"      selects the smallest rendering (one character
+#                             cell per maze/sprite unit); see header comment.
+#   -DTILEFILE="chr/khr1.txt" / -DSPRITEFILE="spr/spr1.txt"
+#                             the square variant's own data file names, taken
+#                             verbatim from upstream's simple.mk (the
+#                             "square" target); MAZEFILE keeps its built-in
+#                             default (\"lvl/maze.txt\"), also upstream's own.
+cflags=-Iinc -DMYMANSIZE="square" -DTILEFILE="chr/khr1.txt" -DSPRITEFILE="spr/spr1.txt"
+
+# A program installs no public header (see darkhttpd's headers=none literal).
+headers=none
+
+# THE THREE DATA FILES the square variant reads at runtime (fopen, not
+# compiled in - see the header comment on why build=objects over the
+# self-hosting builtin-data build). Copied out of the same sha256-pinned,
+# patched tarball, installed by mports to out/src/{khr1.txt,spr1.txt,maze.txt}
+# for build/build-golden.sh to place at /APPS/chr/khr1.txt, /APPS/spr/spr1.txt
+# and /APPS/lvl/maze.txt respectively (see that script's MYMAN block and
+# userland/apps/myman/Makefile). None of the three is a translation unit, so
+# none can collide with `sources`.
+install_sources=chr/khr1.txt spr/spr1.txt lvl/maze.txt
+
+lib=libmyman.a
+
+# THE ANTI-NO-OP CHECK. myman.c is a single translation unit, so (unlike a
+# multi-file port) there is no "one symbol per TU" spread to prove; these are
+# simply the only two non-static globals the file defines (measured with
+# `nm --defined-only --extern-only` on the compiled object). main is the
+# entry point; pager is myman's built-in output pager, used by --help/--keys/
+# --legal, defined far from main() in the same file, so requiring both proves
+# a real, whole compile rather than a truncated one.
+symbols=main pager

@@ -35,6 +35,7 @@
 #include "aicap.h"      // #293 capability tokens + consent gate
 #include "notify.h"     // #168 toast notifications (consent prompt surfacing)
 #include "conv.h"       // local 66: per-user persistent conversations (tabs)
+#include "gui_scroll.h" // shared scrollable-viewport primitive (#291/#261/#438)
 
 #undef win_draw_text
 #define win_draw_text(h, x, y, s, c) win_draw_text_ttf((h), (x), (y), (s), 14, (c))
@@ -68,8 +69,8 @@ static int g_win_w = 380, g_win_h = 600;   // current window content size
 #define TAB_GAP    2
 #define TABBTN_W   22          // "+" new-conversation button at the strip end
 #define TABX_W     14          // per-tab close hot zone at its right edge
-#define HDRBTN_W   58          // header dock/pop-out toggle (a WORD, not a glyph:
-#define HDRBTN_H   20          // it has to be readable in a screendump)
+#define HDRBTN_W   20          // header dock/pop-out toggle, a square glyph button
+#define HDRBTN_H   20          // (was a text word; now an icon, owner request)
 
 // A torn-out child window holds EXACTLY ONE conversation and therefore has no
 // tab strip. MEASURED, not assumed: with a strip it also had a "+" button, and
@@ -113,6 +114,19 @@ static int g_pos = POS_RIGHT;
 // Pop-out: 0 = docked edge panel (borderless, hover-open, collapse sliver),
 // 1 = an ordinary framed window the window manager can move, raise and resize.
 static int g_popped = 0;
+// (cfmaxwidth) 1 once this PROCESS's own command line asked for --popped (or
+// --conv, which implies it) - see main()'s argv loop. load_cfg() must not
+// let a persisted "popped=" value from AICHAT.CFG override an EXPLICIT
+// argv request: the compositor's own aichat_write_cfg() (main.c) rewrites
+// that file at every boot for the auto-launched dock helper (which never
+// passes --popped), so on a fresh image AICHAT.CFG already carries
+// "popped=0" before ANY card ever launches its own --popped instance -
+// load_cfg() (called both at startup and every ~8 idle polls thereafter,
+// see poll_dock()) would otherwise silently pop the window back into the
+// screen-edge dock behaviour moments after it started, which is exactly
+// backwards for a caller that explicitly asked to be an ordinary window.
+// argv always wins over a stored default - not a cardfile-specific rule.
+static int g_popped_from_argv = 0;
 // Detached child: spawned by a tab tear-out with "--conv <slot>". It owns
 // exactly ONE conversation, is always popped out, never rewrites the shared
 // index (enforced inside conv.c, not by remembering here), and must not obey
@@ -245,7 +259,8 @@ static void apply_theme(int kt) {
 static int  g_window;
 static char g_input[MAX_INPUT];
 static int  g_input_len = 0;
-static int  g_scroll = 0;            // pixel scroll offset of transcript
+static gui_scroll_t g_vscroll;       // shared transcript scroll state (offset/thumb/wheel/drag)
+static int  g_stick_bottom = 1;      // 1 = pinned to newest; a deliberate scroll up clears it
 static int  g_thinking = 0;          // 1 while a request is in flight
 static int  g_total_height = 0;      // last computed transcript content height
 static int  g_dock = DOCK_COLLAPSED; // dock state machine (see enum). Boot HIDDEN
@@ -311,7 +326,17 @@ static void load_cfg(void) {
             if (!strcmp(key, "width"))   g_panel_w = clamp_panel_w(val);
             else if (!strcmp(key, "enabled")) g_cfg_enabled = val ? 1 : 0;
             else if (!strcmp(key, "position")) { if (val>=0 && val<=2) g_pos = val; }
-            else if (!strcmp(key, "popped")) g_popped = val ? 1 : 0;   // local 66
+            // (cfmaxwidth) argv --popped/--conv always wins over a persisted
+            // default - see g_popped_from_argv's own comment. Without this
+            // guard, a "popped=0" written by the compositor's own boot-time
+            // aichat_write_cfg() (main.c, for the UNRELATED auto-launched
+            // dock helper, which never passes --popped) silently overrides
+            // an explicit --popped request the moment THIS load_cfg() call
+            // runs - which happens both here at startup and again every
+            // ~8 idle polls (poll_dock()), so the window would pop back
+            // into dock behaviour moments after starting even if this one
+            // check were skipped only at startup.
+            else if (!strcmp(key, "popped")) { if (!g_popped_from_argv) g_popped = val ? 1 : 0; }   // local 66
         }
     }
 }
@@ -337,7 +362,7 @@ static void save_cfg(void) {
 // y is top of the bubble. Returns height consumed (including BUBBLE_GAP).
 static int render_msg(const ai_msg_t *m, int y, int draw) {
     int cont_l  = g_ins_l;
-    int cont_w  = WIN_W - g_ins_l - g_ins_r;
+    int cont_w  = WIN_W - g_ins_l - g_ins_r - GUI_SCROLL_W;  // reserve the scrollbar gutter
     int avail   = cont_w - 2 * PAD;
     int bub_max = avail * 4 / 5;          // bubble max width ~80% of content
     int inner   = bub_max - 2 * BUBBLE_PAD;
@@ -536,15 +561,23 @@ static void draw_headerbar(int cx0, int cw) {
     fit_text(APP_TITLE, 14, cw - 2 * PAD - HDRBTN_W - 8, t, sizeof(t));
     draw_text_sz(g_window, cx0 + PAD, 8, t, 14, COL_TEXT);
 
-    // Pop-out / dock toggle. Labelled, not glyphed: the state has to be legible
-    // in a screendump, which is how this gets verified.
+    // Pop-out / dock toggle, drawn as an icon (owner request). The two states
+    // stay visually distinct so the state is still legible in a screendump:
+    // "pop out" = two separate windows, "dock" = a panel against the edge.
     int by = (HEADER_H - HDRBTN_H) / 2;
-    const char *lbl = g_popped ? "Dock" : "Pop out";
     win_draw_rect(g_window, g_hdrbtn_x, by, HDRBTN_W, HDRBTN_H, COL_FIELD);
     gui_draw_rect_outline(g_window, g_hdrbtn_x, by, HDRBTN_W, HDRBTN_H, COL_FIELD_BORDER);
-    int lw = gui_ttf_width(lbl, 11);
-    draw_text_sz(g_window, g_hdrbtn_x + (HDRBTN_W - lw) / 2, by + (HDRBTN_H - 11) / 2 - 1,
-                 lbl, 11, COL_TEXT);
+    int ox = g_hdrbtn_x + 4, oy = by + 4;      // 12x12 glyph area
+    if (g_popped) {
+        // Dock: a frame with a solid panel docked on its right edge.
+        gui_draw_rect_outline(g_window, ox, oy + 1, 12, 10, COL_TEXT);
+        win_draw_rect(g_window, ox + 8, oy + 2, 3, 8, COL_TEXT);
+    } else {
+        // Pop out: two overlapping windows (open in a separate window).
+        gui_draw_rect_outline(g_window, ox + 3, oy, 9, 9, COL_TEXT);
+        win_draw_rect(g_window, ox, oy + 3, 9, 9, COL_FIELD);
+        gui_draw_rect_outline(g_window, ox, oy + 3, 9, 9, COL_TEXT);
+    }
 
     win_draw_rect(g_window, cx0, HEADER_H, cw, 1, COL_SEP);
 }
@@ -635,16 +668,21 @@ static void draw_all(void) {
     if (g_thinking) total += LINE_H + BUBBLE_GAP + 2 * BUBBLE_PAD;
     g_total_height = total;
 
-    // Clamp scroll
-    int max_scroll = total - trans_h;
-    if (max_scroll < 0) max_scroll = 0;
-    if (g_scroll > max_scroll) g_scroll = max_scroll;
-    if (g_scroll < 0) g_scroll = 0;
+    // Shared scrollable-viewport primitive (#291/#261/#438): one model owns the
+    // offset, the clamp, the wheel, the keys and the draggable scrollbar. The
+    // gutter is the 14px column at the right edge of the transcript; render_msg
+    // reserves GUI_SCROLL_W so no bubble slides under the thumb.
+    gui_scroll_config(&g_vscroll, cx0, trans_top, cw, trans_h, total, LINE_H);
+    // Stick-to-bottom autoscroll: while pinned, every appended message or
+    // streamed token keeps the newest text in view. A deliberate scroll up
+    // clears g_stick_bottom (see handle_scroll and the scrollbar press), so the
+    // user is never yanked back down mid-read.
+    if (g_stick_bottom) gui_scroll_set(&g_vscroll, gui_scroll_max(&g_vscroll));
 
     // bottom-anchored chat layout
     int y;
     if (trans_h > total) y = trans_top + (trans_h - total);
-    else y = trans_top - g_scroll;
+    else y = trans_top - g_vscroll.offset;
 
     for (int i = 0; i < aiclient_count(); i++) {
         const ai_msg_t *m = aiclient_get(i);
@@ -664,15 +702,12 @@ static void draw_all(void) {
     draw_headerbar(cx0, cw);
     draw_tabstrip(cx0, cw);
 
-    // Scrollbar hint
-    if (total > trans_h) {
-        int bar_h = trans_h * trans_h / total;
-        if (bar_h < 20) bar_h = 20;
-        int range = trans_h - bar_h;
-        int max_scroll2 = total - trans_h;
-        int bar_y = trans_top + (max_scroll2 > 0 ? (g_scroll * range / max_scroll2) : 0);
-        win_draw_rect(g_window, cx0 + cw - 4, bar_y, 3, bar_h, COL_SEP);
-    }
+    // Themed, draggable scrollbar in the right gutter. Draws nothing when the
+    // content fits, so the gutter is only spent when a scroll is possible.
+    // gui_scroll_draw_on (not gui_scroll_draw): the transcript is painted on the
+    // app-local COL_BG, not THEME_COLOR_WINDOW_BG, so the trough contrast repair
+    // must be told the surface it actually sits on (same reason as appstore).
+    gui_scroll_draw_on(g_window, &g_vscroll, COL_BG);
 
     // ---- Input row, pinned at the bottom of the content box ----
     int iy = CH - INPUT_H;
@@ -723,7 +758,7 @@ static void do_send(void) {
     if (!aiclient_have_key()) {
         aiclient_add(2, "Set your API key in Settings > AI.");
         g_input[0] = 0; g_input_len = 0;
-        g_scroll = 0;
+        g_stick_bottom = 1;
         draw_all();
         return;
     }
@@ -740,7 +775,7 @@ static void do_send(void) {
 
     // show thinking state and force redraw BEFORE the blocking call
     g_thinking = 1;
-    g_scroll = 0;
+    g_stick_bottom = 1;
     draw_all();
 
     // Run the ReAct tool loop (#292): Kimi may emit ACTION lines that we execute
@@ -764,7 +799,7 @@ static void do_send(void) {
     conv_save_one(conv_active());
     conv_save_index();
 
-    g_scroll = 0;   // anchor to bottom
+    g_stick_bottom = 1;   // anchor to bottom (newest)
     draw_all();
 }
 
@@ -976,7 +1011,7 @@ static void set_dock(int state) {
     g_dock = state;
     layout_insets(state == DOCK_COLLAPSED);
     create_panel(dock_width(state));
-    if (state == DOCK_OPEN) g_scroll = 0;
+    if (state == DOCK_OPEN) g_stick_bottom = 1;
     draw_all();
 }
 
@@ -1086,7 +1121,7 @@ static void park_current(void) {
     if (!c) return;
     conv_snapshot(cur);
     conv_autotitle(cur);
-    c->scroll = g_scroll;
+    c->scroll = g_stick_bottom ? -1 : g_vscroll.offset;   // -1 sentinel = was pinned to bottom
     strlcpy(c->draft, g_input, sizeof(c->draft));
     conv_save_one(cur);
 }
@@ -1095,7 +1130,8 @@ static void adopt(int i) {
     conv_t *c = conv_at(i);
     if (!c) return;
     conv_restore(i);
-    g_scroll = c->scroll;
+    if (c->scroll < 0) { g_stick_bottom = 1; }
+    else { g_vscroll.offset = c->scroll; g_stick_bottom = 0; }
     strlcpy(g_input, c->draft, sizeof(g_input));
     g_input_len = (int)strlen(g_input);
 }
@@ -1127,7 +1163,7 @@ static void ui_new_tab(void) {
     int i = conv_new(0);
     if (i < 0) { aiclient_add(2, "Conversation limit reached."); draw_all(); return; }
     conv_restore(i);
-    g_scroll = 0; g_input[0] = 0; g_input_len = 0;
+    g_vscroll.offset = 0; g_stick_bottom = 1; g_input[0] = 0; g_input_len = 0;
     aiclient_add(aiclient_have_key() ? 1 : 2,
                  aiclient_have_key() ? GREET_TEXT : NOKEY_TEXT);
     conv_snapshot(i);
@@ -1330,16 +1366,13 @@ static void resize_drag_end(void) {
 
 static void handle_scroll(int delta) {
     if (!g_popped && g_dock == DOCK_COLLAPSED) return;
-    int trans_top = HEADER_H + 1 + STRIP_H;
-    int trans_bot = (WIN_H - g_ins_b) - INPUT_H;
-    int trans_h   = trans_bot - trans_top;
-    int max_scroll = g_total_height - trans_h;
-    if (max_scroll < 0) max_scroll = 0;
-    // Each wheel notch jumps ~4 text lines for a responsive feel. delta>0 =
-    // wheel up -> reveal older messages (increase g_scroll toward the top).
-    g_scroll += delta * (LINE_H * 4);
-    if (g_scroll > max_scroll) g_scroll = max_scroll;
-    if (g_scroll < 0) g_scroll = 0;
+    // Shared wheel handling (#291/#438): positive delta = up, toward the oldest
+    // message, matching every other list in the OS. gui_scroll_wheel owns the
+    // step and the clamp against gui_scroll_max(). Landing back on the very
+    // bottom re-pins autoscroll; scrolling up at all unpins it, so a new
+    // message will not yank the view away from what the user is reading.
+    if (gui_scroll_wheel(&g_vscroll, delta))
+        g_stick_bottom = (g_vscroll.offset >= gui_scroll_max(&g_vscroll));
 }
 
 // ---------------------------------------------------------------------------
@@ -1539,18 +1572,18 @@ static void process_ask_file(void) {
     if (!aiclient_have_key()) {
         aiclient_add(0, ask);
         aiclient_add(2, "Set your API key in Settings > AI.");
-        g_scroll = 0; draw_all();
+        g_stick_bottom = 1; draw_all();
         return;
     }
     aiclient_add(0, ask);                     // show the user's turn
-    g_thinking = 1; g_scroll = 0; draw_all();
+    g_thinking = 1; g_stick_bottom = 1; draw_all();
     static char sc[RESP_MAX];
     int rc = aiclient_run_turn(sc, sizeof(sc), 1 /* verbose */);
     g_thinking = 0;
     if (rc != 0)      aiclient_add(2, sc);
     else if (sc[0])   aiclient_add(1, sc);
     else              aiclient_add(2, "Could not parse assistant reply.");
-    g_scroll = 0; draw_all();
+    g_stick_bottom = 1; draw_all();
 }
 
 // ---------------------------------------------------------------------------
@@ -1808,12 +1841,12 @@ int main(int argc, char **argv) {
     {
         int want_slot = 0;
         for (int i = 1; i < argc; i++) {
-            if (strcmp(argv[i], "--popped") == 0) { g_popped = 1; }
+            if (strcmp(argv[i], "--popped") == 0) { g_popped = 1; g_popped_from_argv = 1; }
             else if (strcmp(argv[i], "--conv") == 0 && i + 1 < argc) {
                 const char *s = argv[++i];
                 int v = 0;
                 while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
-                want_slot = v; g_detached = 1; g_popped = 1;
+                want_slot = v; g_detached = 1; g_popped = 1; g_popped_from_argv = 1;
             }
             else if (strcmp(argv[i], "--convdump") == 0) return run_convdump();
             else if (strcmp(argv[i], "--convtest") == 0)
@@ -1909,14 +1942,14 @@ int main(int argc, char **argv) {
                     if (!line[0]) continue;
                     printf("[aichat] SEED PROMPT: %s\n", line);
                     aiclient_add(0, line);
-                    g_thinking = 1; g_scroll = 0; draw_all();
+                    g_thinking = 1; g_stick_bottom = 1; draw_all();
                     static char sc[RESP_MAX];
                     int src = aiclient_run_turn(sc, sizeof(sc), 1 /* verbose */);
                     g_thinking = 0;
                     if (src != 0)   aiclient_add(2, sc);
                     else if (sc[0]) aiclient_add(1, sc);
                     else            aiclient_add(2, "Could not parse assistant reply.");
-                    g_scroll = 0; draw_all();
+                    g_stick_bottom = 1; draw_all();
                     printf("[aichat] SEED FINAL: %s\n", sc);
                 }
                 // Dump the full transcript (incl. internal ACTION/OBSERVATION turns)
@@ -2069,6 +2102,15 @@ int main(int argc, char **argv) {
             case EVENT_WINDOW_CLOSE: running = 0; g_running = 0; break;
             case EVENT_MOUSE_MOVE:
                 if (g_resizing) { resize_drag_poll(); break; }
+                // Live scrollbar-thumb drag. Event coords are window-local
+                // (same space as handle_click), matching Settings' wiring.
+                if (g_vscroll.drag) {
+                    if (gui_scroll_motion(&g_vscroll, ev.mouse_x, ev.mouse_y)) {
+                        g_stick_bottom = (g_vscroll.offset >= gui_scroll_max(&g_vscroll));
+                        draw_all();
+                    }
+                    break;
+                }
                 // Hover-to-open is handled by the 200ms dwell in the idle tick;
                 // a bare move over the sliver no longer pops the panel.
                 break;
@@ -2077,11 +2119,20 @@ int main(int argc, char **argv) {
                     // Right-click the 9-dot handle to cycle dock position (R->L->T). (#185)
                     if (g_dock != DOCK_COLLAPSED && on_handle(ev.mouse_x, ev.mouse_y)) cycle_position();
                 } else if (ev.mouse_buttons & MOUSE_BUTTON_LEFT) {
-                    handle_click(ev.mouse_x, ev.mouse_y); draw_all();
+                    // Scrollbar gutter/thumb first: gui_scroll_press only
+                    // consumes a press inside the gutter of a scrollable view,
+                    // so a normal click still reaches handle_click().
+                    if (gui_scroll_press(&g_vscroll, ev.mouse_x, ev.mouse_y)) {
+                        g_stick_bottom = (g_vscroll.offset >= gui_scroll_max(&g_vscroll));
+                        draw_all();
+                    } else {
+                        handle_click(ev.mouse_x, ev.mouse_y); draw_all();
+                    }
                 }
                 break;
             case EVENT_MOUSE_UP:
                 if (g_resizing) { resize_drag_end(); draw_all(); }
+                else gui_scroll_release(&g_vscroll);
                 break;
             case EVENT_MOUSE_SCROLL:
                 handle_scroll(ev.scroll_delta);

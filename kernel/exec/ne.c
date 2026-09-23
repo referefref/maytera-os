@@ -144,11 +144,22 @@ typedef struct {
     uint16_t cs_para, ds_para, ss_para;   // resolved paragraphs
     uint16_t hinstance;                   // DGROUP paragraph == module hInstance
     uint16_t dll_entry_cs, dll_entry_ip;  // DLL LibEntry far ptr
+    int      refcount;                    // (#391) LoadLibrary/FreeLibrary use count
 } win16_module_t;
 
 static win16_module_t g_modules[WIN16_MAX_MODULES];
 static int            g_module_count = 0;
 static char           g_appdir[96] = "/";   // directory the launched app lives in
+// (#391) Persistent real-mode segment-placement frontier. load_ne_module()
+// advances *next_para as it places each segment (real mode only; pmode
+// segments come from the LDT/arena instead and never touch this). The
+// initial app+static-dependency load owns it for the duration of the run,
+// but a RUNTIME LoadLibrary (the app calling LoadLibrary on a companion DLL
+// that was never one of its declared NE imports, e.g. Photoshop 2.5.1's
+// PHOTOS00/01/02.DLL) needs to keep placing new segments AFTER whatever the
+// static load already claimed, so it is kept here instead of on the stack of
+// win16_run_file_inner. Reset to WIN16_LOAD_SEG at the top of every run.
+static uint16_t g_win16_next_para = WIN16_LOAD_SEG;
 
 // Forward decls.
 static void rd_cstr(x86_16_cpu_t *c, uint16_t seg, uint16_t off, char term,
@@ -363,6 +374,23 @@ static int load_ne_module(win16_module_t *mod, const char *name,
         mod->seg_foff[si] = foff;
         mod->seg_dlen[si] = slen;
         mod->seg_flags[si]= sflags;
+        // (#391) A segment whose declared on-disk image (soff!=0, slen bytes at
+        // foff) runs past the end of the loaded file is SILENTLY zero-filled by
+        // the (foff+i)<size clamp below, leaving its tail - and every relocation
+        // record that follows this segment's data on disk - as zero. At runtime
+        // that is indistinguishable from "the app zero-inits this data", so a
+        // corrupt/incompletely-decompressed image reads as a phantom interpreter
+        // bug. This exact fault (Photoshop 2.5.1's PHOTOSHP.EXE reassembled by
+        // decompressing two concatenated KWAJ disk parts as one stream, dropping
+        // its DGROUP tail + relocations -> a NULL C++ constructor table -> an
+        // infinite ctor-dispatch loop, plus garbage LoadLibrary names and a -7
+        // colour count) cost multiple passes. Diagnose it at load, loudly.
+        if (soff != 0 && (uint32_t)foff + (uint32_t)slen > size) {
+            kprintf("[win16] %s: seg %u IMAGE TRUNCATED: file data 0x%lx..0x%lx exceeds image size 0x%lx (missing %lu bytes); tail zero-filled and this segment's relocations are absent - EXE is corrupt or was incompletely decompressed\n",
+                    name, (unsigned)(si + 1),
+                    (unsigned long)foff, (unsigned long)((uint32_t)foff + slen),
+                    (unsigned long)size, (unsigned long)(((uint32_t)foff + slen) - size));
+        }
         uint32_t span = (minall > slen) ? minall : slen;
         if (span == 0) span = 0x1000;
         if ((uint16_t)(si + 1) == mod->autodata) {
@@ -433,6 +461,7 @@ static int load_ne_module(win16_module_t *mod, const char *name,
     mod->hinstance = mod->ds_para;
     mod->dll_entry_cs = mod->cs_para;
     mod->dll_entry_ip = mod->ip;
+    mod->refcount = 1;   // (#391) fresh module: one implicit reference
     return 0;
 }
 
@@ -951,17 +980,130 @@ static void lib_basename(const char *in, char *out, int outsz) {
     out[n] = 0;
 }
 
-// LoadLibrary (KERNEL.95): return a handle for an already-loaded module so a later
-// GetProcAddress can resolve real exports. Modules statically referenced by the
-// app (and their dependencies) are already in the registry; we match by basename.
-// If the module is not loaded we return a small fake success handle (>=32) so the
+// (#391) RUNTIME companion NE DLL loading. Real Win16 LoadLibrary(), when the
+// named module is not already resident, maps its NE image from disk right
+// then: applies its relocations (which may in turn resolve against modules
+// already loaded, or pull in further companion DLLs of its own), patches its
+// exported-entry DGROUP-reload prologues, runs its LibEntry, and only THEN
+// hands back a real module handle. This mirrors load_dependencies() (the
+// load-time static-import walk) but is invoked MID-RUN, from inside the
+// calling app's own LoadLibrary far-call trap (k_loadlibrary in win16api.c),
+// while the SAME g_win16_cpu the app is executing on is live.
+//
+// Why this was missing: load_dependencies() only walks a module's NE modref
+// table, i.e. modules the app statically IMPORTS (has fixup records against).
+// Photoshop 2.5.1's PHOTOSHP.EXE never imports from PHOTOS00/01/02.DLL that
+// way; DGROUP:0x46cc merely holds "photos01" as a STRING, which the app's own
+// init code passes to a runtime LoadLibrary call. Those DLLs were therefore
+// never in the module registry at all, so the old win16_load_library() (which
+// only matched already-loaded modules) fell through to the synthetic
+// non-error handle 0x0040, and GetProcAddress on that handle always failed
+// 0:0 (module_by_hinstance found nothing) -- the DLLs' menu/toolbox code and
+// resources could never run, hence the painted frame + blank client area.
+//
+// Re-entrancy: x86_16_call_far (used below by run_dll_init) snapshots and
+// restores the FULL register file around the call and explicitly supports
+// nested invocation (g_callfar_stop is a nesting depth, not a single flag;
+// see x86_16.c), which is what makes it safe to run a DLL's LibEntry from
+// inside a farcall-trap handler that is itself executing inside the
+// interpreter's own instruction loop. Segment placement is like the initial
+// load: real mode advances the persistent g_win16_next_para frontier (so a
+// runtime DLL is placed after everything the static load already claimed);
+// protected mode instead pulls a fresh LDT selector per segment from the
+// arena (win16_arena_alloc/ldt_alloc), which load_ne_module already does
+// unconditionally when g_win16_pmode is set, and which is routinely called
+// at arbitrary points during a run elsewhere in win16api.c (e.g. GDI object
+// creation), so there is nothing load-time-only about it.
+static uint16_t load_companion_dll_runtime(const char *base) {
+    if (g_module_count >= WIN16_MAX_MODULES) {
+        kprintf("[win16] LoadLibrary(\"%s\"): module table full (%d)\n", base, g_module_count);
+        return 0x0040;
+    }
+    uint32_t dsz = 0;
+    uint8_t *dd = find_dll_file(base, &dsz);
+    if (!dd) return 0x0040;   // not found on disk: harmless non-error handle (GetProcAddress -> 0:0)
+
+    int old_count = g_module_count;
+    win16_module_t *dm = &g_modules[g_module_count];
+    if (load_ne_module(dm, base, dd, dsz, &g_win16_next_para, 1) != 0) {
+        kprintf("[win16] LoadLibrary(\"%s\"): NE load failed\n", base);
+        kfree(dd);
+        return 0x0040;
+    }
+    g_module_count++;
+    module_fix_sp(dm);
+
+    // The new DLL may itself reference further companion DLLs (depth-limited,
+    // same walk the load-time static-import resolution uses).
+    load_dependencies(dm, &g_win16_next_para, 0);
+
+    // Apply relocations for every module just added (the new DLL AND any of
+    // its own nested dependencies) so cross-module imports resolve to real
+    // far pointers instead of falling back to API-thunk stubs.
+    for (int i = old_count; i < g_module_count; i++)
+        apply_module_relocs(&g_modules[i]);
+
+    // (#391) The relocation pass above can grow g_import_count (a brand-new
+    // (module,ordinal)/(module,name) import the new DLL references for the
+    // first time anywhere in this run gets a fresh id via win16_add_import).
+    // win16api.c's win16_api_dispatch() bounds-checks calls against its OWN
+    // cached copy of this count, snapshotted ONCE at app launch by
+    // win16_api_begin() -- so without this resync, any such newly-created id
+    // is invisible to the dispatcher's `off < g_import_count` guard even
+    // though g_imports[id] itself is fully populated, and a real far call to
+    // it is misclassified as an unknown import (which then desyncs the
+    // Pascal stack by popping 0 argbytes instead of the real contract's
+    // count). MEASURED: this was exactly why PHOTOS01.DLL's own LibEntry
+    // halted before RETF-ing cleanly (see win16_api_resync_import_count's
+    // comment in win16api.h/.c for the full trace). Must run BEFORE
+    // run_dll_init below, since the new module's own LibEntry is what calls
+    // into its own newly-registered imports.
+    win16_api_resync_import_count(g_imports, g_import_count);
+
+    // Patch exported-entry DGROUP-reload prologues and run LibEntry for each
+    // newly loaded module, deepest/earliest-loaded first (the same order
+    // load-time init uses for the static dependency set).
+    for (int i = old_count; i < g_module_count; i++)
+        patch_dll_entry_prologues(&g_modules[i]);
+    for (int i = old_count; i < g_module_count; i++)
+        run_dll_init(&g_modules[i]);
+
+    kprintf("[win16] LoadLibrary(\"%s\"): runtime-loaded %d module(s), hinst=%04x\n",
+            base, g_module_count - old_count, dm->hinstance);
+    win16_trace("LoadLibrary(\"%s\") runtime-loaded %d module(s), hinst=%04x\n",
+                base, g_module_count - old_count, dm->hinstance);
+    return dm->hinstance;
+}
+
+// LoadLibrary (KERNEL.95): return a handle for a loaded module so a later
+// GetProcAddress can resolve real exports. Modules statically referenced by
+// the app (and their static dependencies) are already in the registry at
+// this point; matched by basename, ref-count bumped, done. Otherwise (#391)
+// attempt a REAL runtime load of the named NE DLL from the app's directory.
+// If neither finds it we return a small fake success handle (>=32) so the
 // caller does not treat it as an error, but GetProcAddress on it yields 0:0.
 uint16_t win16_load_library(const char *name) {
     char base[WIN16_NAME_MAX];
     lib_basename(name, base, sizeof(base));
     win16_module_t *m = module_by_name(base);
-    if (m) return m->hinstance;
-    return 0x0040;   // not loaded: harmless non-error handle
+    if (m) { m->refcount++; return m->hinstance; }
+    uint16_t h = load_companion_dll_runtime(base);
+    return h;
+}
+
+// FreeLibrary (KERNEL.96): decrement the matched module's reference count.
+// We deliberately never actually unload/free a module's retained image at
+// runtime: other loaded modules (or thunk exports/far pointers already
+// handed to the caller) may still reference it, and shipping Win16 apps
+// routinely FreeLibrary a companion DLL well before they stop calling into
+// it. Real unload-and-reclaim is future work; getting the call/return
+// contract right (a valid handle always reports success) is what matters for
+// argbytes/return-value faithfulness. Returns 1 (TRUE) unconditionally, which
+// matches real FreeLibrary's success return and is what apps expect back.
+int win16_free_library(uint16_t hinstance) {
+    win16_module_t *m = module_by_hinstance(hinstance);
+    if (m && m->refcount > 0) m->refcount--;
+    return 1;
 }
 
 // GetProcAddress (KERNEL.50): resolve an export of the module identified by
@@ -1290,9 +1432,9 @@ static int win16_run_file_inner(const char *path) {
                 base[bn++] = path[i];
             base[bn] = '\0';
 
-            uint16_t next_para = WIN16_LOAD_SEG;
+            g_win16_next_para = WIN16_LOAD_SEG;   // (#391) reset the runtime-LoadLibrary frontier for this run
             win16_module_t *app = &g_modules[0];
-            if (load_ne_module(app, base, f, size, &next_para, 0) != 0) {
+            if (load_ne_module(app, base, f, size, &g_win16_next_para, 0) != 0) {
                 kprintf("[win16] NE load failed for %s\n", path);
                 registry_reset(); return -1;
             }
@@ -1300,7 +1442,7 @@ static int win16_run_file_inner(const char *path) {
 
             // Pull in dependent DLLs, then apply ALL relocations (so app imports
             // can resolve to real DLL exports), then run DLL inits.
-            load_dependencies(app, &next_para, 0);
+            load_dependencies(app, &g_win16_next_para, 0);
             for (int i = 0; i < g_module_count; i++) apply_module_relocs(&g_modules[i]);
             { if (g_win16_pmode) {
                 for (int mi = 0; mi < g_module_count; mi++) {

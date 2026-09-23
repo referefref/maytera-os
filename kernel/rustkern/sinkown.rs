@@ -15,7 +15,7 @@
 // therefore interleave chunks into one ring and each reprogram the stream
 // format under the other.
 //
-// MEASURED, 2026-08-26, VM <vmid> (golden byte copy, QEMU -audiodev wav): the
+// MEASURED, 2026-08-26, VM 2760 (golden byte copy, QEMU -audiodev wav): the
 // 18.6 s boot chime was still playing when a DOS guest's /APPS/FMSYNTH opened
 // its stream. From that instant hda_avail() returned 0 to the PCM pump for as
 // long as it was asked, because the chime held every slot the arithmetic would

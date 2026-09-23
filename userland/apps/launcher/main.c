@@ -321,10 +321,44 @@ static int calc_height(void) {
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
+// (ncursespty) MyMan/Rogue/Angband are ncurses ports that need a real pty
+// (rows/cols, termios) to present anything at all; a bare sys_spawn() gives
+// them none, which is why they silently fail/fault/hang when launched this
+// way instead of typed into Terminal (blame.md's appqa Finding 2). Same fix
+// and same small bounded list as compositor/desktop.c's desk_is_console_app()
+// / compositor_spawn_app() - duplicated here rather than shared, because this
+// app is deliberately self-contained (see this file's own header comment:
+// "uses only existing syscalls") and is a separate binary from the
+// compositor, not linked against it.
+static int launcher_is_console_app(const char *path) {
+    static const char *const console_apps[] = { "myman", "rogue", "angband" };
+    const char *base = path;
+    for (const char *p = path; *p; p++) if (*p == '/') base = p + 1;
+    for (unsigned i = 0; i < sizeof(console_apps) / sizeof(console_apps[0]); i++) {
+        const char *a = base, *b = console_apps[i];
+        while (*a && *b) {
+            char ca = *a, cb = *b;
+            if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
+            if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
+            if (ca != cb) break;
+            a++; b++;
+        }
+        if (*a == '\0' && *b == '\0') return 1;
+    }
+    return 0;
+}
+
 static void launch_selected(void) {
     if (g_sel < 0 || g_sel >= g_match_count) return;
     app_entry_t *a = &g_apps[g_match[g_sel]];
-    sys_spawn(a->path);
+    if (launcher_is_console_app(a->path)) {
+        char *av[2];
+        av[0] = (char *)"/APPS/TERMINAL";
+        av[1] = (char *)a->path;
+        sys_spawn_args("/APPS/TERMINAL", av, 2);
+    } else {
+        sys_spawn(a->path);
+    }
     // Palette semantics: launch and get out of the way.
     win_destroy(g_win);
     sys_exit(0);

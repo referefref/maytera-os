@@ -1,0 +1,75 @@
+# mports recipe: frotz 2.44 (dumb/terminal interface only). tuigames batch
+# (owner request 2026-09-18): "frotz (dumb/terminal Z-machine interpreter -
+# ship it with at least one freely-distributable .z5 story file or make it
+# load from a path)". GPL-2.0-or-later, dependency closure 0 (plain POSIX
+# stdio/stdlib/string, no curses at all for the dumb interface).
+#
+# WHAT THIS PORT SHIPS. Only the "dumb" (non-curses, non-SDL) interface:
+# src/common/*.c (18 files, the portable Z-machine core - the interpreter
+# itself) + src/dumb/*.c (4 files, the terminal frontend: plain-text output,
+# line-buffered input, no colour/graphics). src/curses, src/sdl, src/blorb,
+# src/x and src/dos are NOT built - upstream's own Makefile `dumb` target
+# does not link blorb either, and this port has no use for curses or SDL.
+#
+# NO BUNDLED STORY FILE (see PORT NOTE below): matches the gbemu precedent
+# (userland/apps/gbemu ships no ROM). /APPS/FROTZ takes a story file path on
+# argv; there is no widely-agreed freely-redistributable .z5 game to bundle
+# without a specific licence check per title (even well-known z-machine
+# "freeware" titles carry per-author terms this batch has not individually
+# verified), so this ships the interpreter and lets the owner supply a story.
+#
+# The sha256 below is of the tag's GitHub archive tarball, MEASURED after
+# fetching it with curl and running sha256sum on the bytes on disk, not
+# copied from a web page:
+#   curl -sL -o frotz-2.44.tar.gz \
+#     https://github.com/DavidGriffith/frotz/archive/refs/tags/2.44.tar.gz
+#   sha256sum frotz-2.44.tar.gz
+#   -> dbb5eb3bc95275dcb984c4bdbaea58bc1f1b085b20092ce6e86d9f0bf3ba858f (276,815 bytes)
+
+name=frotz
+version=2.44
+class=C
+homepage=https://gitlab.com/DavidGriffith/frotz
+
+source_url=https://github.com/DavidGriffith/frotz/archive/refs/tags/2.44.tar.gz
+tarball=frotz-2.44.tar.gz
+sha256=dbb5eb3bc95275dcb984c4bdbaea58bc1f1b085b20092ce6e86d9f0bf3ba858f
+srcdir=frotz-2.44
+
+licence=GPL-2.0-or-later
+licence_files=COPYING
+copyleft=combined
+copyleft_note=Statically combined into one binary (/APPS/FROTZ) with userland/libc (permissive). The combined binary as a whole must be offered under GPL-2.0-or-later, the same shape as the ninvaders/moon-buggy precedents in this batch. userland/libc is not thereby made GPL; it remains available under its own permissive terms and is not modified by this port. Corresponding source is the pinned frotz-2.44.tar.gz and this repository's own libc source (no patches - see below).
+
+# No needs=: the dumb interface uses no curses/ncurses API at all, only
+# plain POSIX stdio/stdlib/string/termios. libc is the shared platform
+# library, not a port.
+
+# THE ADOPTION TEST (owner rule 2): USES. The Z-machine core (src/common)
+# and the dumb frontend (src/dumb) are ordinary Ring-3 C driven by stdio and
+# libc string/mem calls; the dumb interface reads input a line at a time
+# with plain fgets()-family calls, not raw termios. Measured: the 22 objects
+# link against userland/libc/libc.a with zero undefined symbols. It owns its
+# own interpreter loop and calls read functions itself; it imposes no event
+# loop or window system on anything else.
+adoption=USES. Measured: the 22 compiled objects (18 src/common + 4 src/dumb) link against userland/libc/libc.a with zero undefined symbols. frotz owns its own Z-machine interpreter loop; it imposes no event loop or window system on any other program.
+needs=libc
+
+prepare=none
+patches=none
+
+# build=script rather than build=objects: the source list spans two
+# directories (src/common/*.c, src/dumb/*.c) with different -I needs
+# (dumb_*.c want -Isrc/dumb for dumb_frotz.h), which a single flat
+# `sources=` list handles less clearly than an explicit build.sh loop. See
+# build.sh for the exact two-directory compile.
+build=script
+
+headers=none
+lib=libfrotz.a
+
+# THE ANTI-NO-OP CHECK: main (src/common/main.c, the interpreter entry
+# point) and dumb_init_screen (src/dumb/dumb_init.c, the dumb frontend's
+# startup hook) - one symbol from each of the two source directories, so a
+# build that lost either half to a bad path cannot pass.
+symbols=main os_init_screen

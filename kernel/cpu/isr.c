@@ -5,6 +5,7 @@
 #include "inputlat.h"   // #affinity: input-to-present latency instrument
 #include "pic.h"
 #include "apic.h"        // #62: lapic_eoi() for the redundant tick source
+#include "tickack.h"     // #tickdead: acknowledge the tick BEFORE the BKL
 #include "../fs/bootlog.h"  // #62: the arming result must reach the stick
 #include "../serial.h"
 #include "../proc/process.h"
@@ -393,17 +394,53 @@ extern uint64_t tick_synth_decide_rs(uint64_t now_us, uint64_t last_native_us,
                                      uint64_t last_synth_us, uint64_t period_us,
                                      uint64_t max_catchup);
 
-// Timer interrupt handler - the NATIVE source (8254 PIT on IRQ0, vector 32).
-static void timer_handler(interrupt_frame_t *frame) {
-    (void)frame;
+// #tickdead: THE NATIVE TICK'S ACCOUNTING, AS A NAMED FUNCTION.
+//
+// It was the first three statements of timer_handler(). It is a function now so
+// that cpu/tickack.c can run it BEFORE isr_handler() contends for the BKL, in
+// the same breath as the EOI, which is where both belong.
+//
+// Both halves have to move together, and that is not a tidiness preference.
+// timer_ticks is the clock; leaving it below the lock means the count advances
+// in whatever bursty pattern lock contention allows, which is the "ticks are not
+// a wall clock" defect blame.md already records, manufactured by our own hand.
+// And g_tick_last_native_us is what tick_synth_decide_rs() reads to decide the
+// native source is dead: a stamp deferred behind a multi-millisecond lock wait
+// makes the redundant source synthesise ticks the PIT is about to deliver
+// anyway, so the two clocks double-count and `timer_ticks` runs FAST while the
+// tick-health verdict reports the native source DEAD. One deferred store,
+// two contradictory wrong answers.
+void timer_tick_account(void) {
     timer_ticks++;
     // Reuse the timestamp tickburst_sample() already took rather than paying a
     // second rdtsc per tick.
     uint64_t now = tickburst_sample();
     if (now) g_tick_last_native_us = now;
+}
 
-    // Send EOI first to allow nested interrupts
-    pic_send_eoi(0);
+// Timer interrupt handler - the NATIVE source (8254 PIT on IRQ0, vector 32).
+//
+// #tickdead: IN THE SHIPPING ARM THIS TICK HAS ALREADY BEEN COUNTED AND
+// ACKNOWLEDGED. tick_ack_pre_dispatch() (cpu/tickack.c) did both from
+// isr_handler(), before bkl_acquire(), because the EOI is the 8259's permission
+// to deliver IRQ0 again and sending it below an unbounded lock wait switches
+// this kernel's own clock off for the duration of the wait. What is left here
+// is the part that genuinely needs the lock: the scheduler tick.
+//
+// The old ordering is retained under the control arm, selected by
+// /CONFIG/TICKEOI.CFG holding "0", so the fixed and broken behaviours can be
+// compared on ONE kernel.elf. See cpu/tickack.h.
+static void timer_handler(interrupt_frame_t *frame) {
+    (void)frame;
+    if (!g_tick_early_eoi) {
+        timer_tick_account();
+        // "EOI first to allow nested interrupts" was this comment's original
+        // claim, and it was true only relative to the rest of this function. By
+        // the time control reaches here the frame has already spent its entire
+        // BKL wait with IRQ0 in service.
+        pic_send_eoi(0);
+        tick_ack_note_eoi(32);
+    }
 
     // Call scheduler tick (handles preemption)
     sched_tick();
@@ -427,7 +464,15 @@ static void lapic_tick_handler(interrupt_frame_t *frame) {
     // pic_send_eoi(0) and a LAPIC-delivered one needs lapic_eoi(), and a
     // handler that sent both would be lying about where its interrupt came
     // from.
-    lapic_eoi();
+    //
+    // #tickdead: AND IT WAS STILL TOO LATE, because "first" here meant first
+    // inside the handler, and isr_handler() takes the BKL before it reaches any
+    // handler. The redundant clock was therefore gated behind exactly the
+    // contention it exists to survive: a core waiting for the lock holds vector
+    // 0x41 in service, which blocks the next 0x41, so the backup clock stopped
+    // whenever the primary one did and for the same reason. It is acknowledged
+    // in tick_ack_pre_dispatch() now; this remains only for the control arm.
+    if (!g_tick_early_eoi) { lapic_eoi(); tick_ack_note_eoi(0x41); }
 
     if (!mono_ready()) return;
     uint64_t now = mono_us();
@@ -505,7 +550,14 @@ static void ap_preempt_tick_handler(interrupt_frame_t *frame) {
     // failure that looks identical to not having made this change at all.
     // Sent BEFORE sched_tick_ap() because that call ends in sched_schedule(),
     // which does not return to this frame on the switching path.
-    lapic_eoi();
+    //
+    // #tickdead: same correction as the 0x41 handler above. Being first inside
+    // the handler is not first: isr_handler() has already waited for the BKL,
+    // with this vector in service, blocking the next one. An AP whose
+    // preemption tick is latched off is COOPERATIVE ONLY, which is precisely
+    // the failure #169 was written to end. Acknowledged in
+    // tick_ack_pre_dispatch() now; this remains only for the control arm.
+    if (!g_tick_early_eoi) { lapic_eoi(); tick_ack_note_eoi(0x42); }
     { extern void sched_tick_ap(void); sched_tick_ap(); }
 }
 
@@ -684,7 +736,7 @@ void keyboard_process_scancode(uint8_t scancode) {
                 // KEY_ALT_UP so either Alt key drives WM_SYSKEYUP/menu-mnemonic
                 // gating in exec/win16api.c.
                 case 0x38: c = KEY_ALT_UP; break;       // Right Alt release
-                // #221 phase 0, RIGHT CTRL. MEASURED on VM <vmid> (golden
+                // #221 phase 0, RIGHT CTRL. MEASURED on VM 2221 (golden
                 // 2040) with the #334 serial injector: E0 1D / E0 9D
                 // produced NOTHING AT ALL. No cooked key reached any app,
                 // AND ctrl_pressed was never set, so `Right Ctrl + c`

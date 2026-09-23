@@ -10,23 +10,23 @@
 #include "../types.h"
 
 #define X86_32_MISS_BASE     0x00020000U
-#define X86_32_MISS_CODE_LEN 19U
+#define X86_32_MISS_CODE_LEN 17U
 
 typedef struct { uint32_t addr; uint32_t len; const char *text; } x86_32_miss_case_t;
 
 static const x86_32_miss_case_t g_x86_32_miss_cases[] = {
-    { 0x00020000U, 3U, "fldl" },
-    { 0x00020003U, 3U, "mov" },
-    { 0x00020006U, 2U, "arpl" },
-    { 0x00020008U, 3U, "bound" },
-    { 0x0002000BU, 3U, "lgdtl" },
-    { 0x0002000EU, 3U, "fistpl -0xc(%ebp)" },
+    { 0x00020000U, 2U, "wbinvd" },
+    { 0x00020002U, 3U, "mov" },
+    { 0x00020005U, 2U, "arpl" },
+    { 0x00020007U, 3U, "bound" },
+    { 0x0002000AU, 3U, "lgdtl" },
+    { 0x0002000DU, 2U, "invd" },
 };
 #define X86_32_MISS_CASE_COUNT (sizeof(g_x86_32_miss_cases)/sizeof(g_x86_32_miss_cases[0]))
 
-static const uint8_t g_x86_32_miss_code[19] = {
-    0xDD, 0x45, 0xF8, 0x0F, 0x20, 0xC0, 0x63, 0x03, 0x62, 0x45, 0x08, 0x0F, 0x01, 0x10, 0xDB, 0x5D,
-    0xF4, 0x90, 0x90,
+static const uint8_t g_x86_32_miss_code[17] = {
+    0x0F, 0x09, 0x0F, 0x20, 0xC0, 0x63, 0x03, 0x62, 0x45, 0x08, 0x0F, 0x01, 0x10, 0x0F, 0x08, 0x90,
+    0x90,
 };
 
 #endif /* X86_32_MISS_H */

@@ -163,6 +163,7 @@ const fn wec(i: u8, e: u16, cap: u16) -> A {
 const fn wm2(i: u8, j: u8, e: u16) -> A { A { kind: Kind::W, len: Len::Mul2(i, j, e), sx: false } }
 const fn rm2(i: u8, j: u8, e: u16) -> A { A { kind: Kind::R, len: Len::Mul2(i, j, e), sx: false } }
 const fn rp16(i: u8, e: u16) -> A { A { kind: Kind::R, len: Len::Packed16(i, e), sx: false } }
+const fn re(i: u8, e: u16) -> A { A { kind: Kind::R, len: Len::Elems(i, e), sx: false } }   // #404 disk-mgr: read an array of `e`-byte elems, count in argN
 const fn s(max: u32) -> A { A { kind: Kind::Str, len: Len::StrMax(max), sx: false } }
 
 /// Mark an argument as one the handler SANITIZE_USER_PTR's. Wraps a normal
@@ -216,6 +217,17 @@ const SZ_DEVINFO_SYSINFO: u32 = 160;
 // #745 elevation. Locked in proc/syscall_argtab_lock.c.
 const SZ_ELEV_REQUEST: u32 = 160;
 const SZ_ELEV_VIEW: u32 = 296;
+// Stage 1 capability API (proc/caps.h). Sizes locked in syscall_argtab_lock.c
+// against the C structs and the CapState/CapReq/CapView in rustkern/caps.rs.
+const SZ_CAP_STATE: u32 = 96;
+const SZ_CAP_REQ: u32 = 200;
+const SZ_CAP_VIEW: u32 = 288;
+// Stage 2 serial.port: serial_pub_t (drivers/serialport.h) = name[16] + u32 + u32.
+// Locked in syscall_argtab_lock.c. SYS_SERIAL_LIST writes an array of these.
+const SZ_SERIAL_PUB: u16 = 24;
+// SERIALPORT_MAX: the SYS_SERIAL_LIST handler clamps `max` to this, so the
+// validator proves min(argN, cap) elements writable, exactly the handler reach.
+const SERIAL_PORTS_CAP: u16 = 4;
 const SZ_DEVINFO_PCI: u16 = 76;
 const SZ_DEVINFO_USB: u16 = 16;
 const SZ_DEVINFO_IRQ: u16 = 16;
@@ -231,6 +243,11 @@ const SZ_GFSJ_VERIFY: u32 = 80;
 // #306: inst_target_t (gui/installer.h), locked by a _Static_assert there AND
 // in proc/syscall_argtab_lock.c.
 const SZ_INST_TARGET: u16 = 16;
+// #404 disk-mgr. Locked in proc/syscall_argtab_lock.c against fs/blkmgr.h.
+const SZ_BLK_DEV: u16 = 56;
+const SZ_PART_SPEC: u16 = 72;
+const SZ_PART_TOKEN: u32 = 40;
+const SZ_MOUNT_ENT: u16 = 72; // #404 disk-mgr Stage 4: mount_ent_t
 const SZ_GFS_STATS: u32 = 128;
 const SZ_GFS_NODE_VIEW: u32 = 32;
 const SZ_GFS_EDGE_VIEW: u32 = 48;
@@ -241,7 +258,7 @@ const SZ_DISKIMG_INFO: u32 = 288;
 // _Static_assert in proc/syscall_argtab_lock.c AND in both copies of the
 // struct (kernel + userland), because it is duplicated three ways.
 const SZ_DRAG_INFO: u32 = 104;
-const SZ_WM_WINDOW_INFO: u16 = 136;   // #44: + int maximized; #41: + char app_id[32] (locked by syscall_argtab_lock.c)
+const SZ_WM_WINDOW_INFO: u16 = 140;   // #opacityglass: + int opacity; #44: + int maximized; #41: + char app_id[32] (locked by syscall_argtab_lock.c)
 const SZ_CRON_JOB: u16 = 128;
 const SZ_SC_USER_INFO: u16 = 140;
 const SZ_FB_INFO_USER: u32 = 24;
@@ -265,7 +282,7 @@ const SZ_K_SIGACTION: u32 = 40;
 // _Static_assert at its definition; syscall_argtab_lock.c re-asserts them here
 // so a change to procinfo.h fails the build pointing at THIS table.
 // #745: net_status_t (proc/syscall.h), locked by its own _Static_assert there.
-const SZ_NET_STATUS: u32 = 48;
+const SZ_NET_STATUS: u32 = 52;
 // #238: fw_xfer_t = fw_config_t(104) + fw_stats_t(136). Locked by the
 // _Static_assert in proc/syscall.c.
 const SZ_FW_XFER: u32 = 240;
@@ -369,6 +386,9 @@ static TAB: &[Desc] = &[
     // the other fs-permission syscalls despite the high number (333, next free
     // after 332 at the time this was added) - see rustkern/fsperm.rs.
     Desc { num: 333, args: [s(PATH_MAX), NONE, wf(SZ_FSPERM_INFO), NONE, NONE, NONE] },
+    // #dosperm sys_access((const char *)arg1, (int)arg2 mode). arg2 is a bit
+    // mask, not a pointer or a length, so only arg1 needs a descriptor.
+    Desc { num: 424, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
 
     // --- process ----------------------------------------------------------
     // sys_exec((const char *)arg1)
@@ -414,6 +434,11 @@ static TAB: &[Desc] = &[
     Desc { num: 221, args: [NONE, NONE, s(TEXT_MAX), NONE, NONE, NONE] },
     // ttf_measure_string((const char *)arg1, (int)arg2)
     Desc { num: 222, args: [s(TEXT_MAX), NONE, NONE, NONE, NONE, NONE] },
+    // ttf_measure_string_f(face, (const char *)arg1, size, style) - #245. The
+    // face/size/style are PACKED INTO arg2 as an integer, so arg1 is the only
+    // pointer and it is the same string argument, with the same bound, as its
+    // active-face sibling num 222 directly above.
+    Desc { num: 427, args: [s(TEXT_MAX), NONE, NONE, NONE, NONE, NONE] },
     // sys_win_draw_text_small(win, x, y, (const char *)arg4, colour)
     Desc { num: 232, args: [NONE, NONE, NONE, s(TEXT_MAX), NONE, NONE] },
     // sys_win_draw_text_ttf(win, x, y, (const char *)arg4, colour|size)
@@ -503,6 +528,10 @@ static TAB: &[Desc] = &[
     Desc { num: 243, args: [wa(2), NONE, NONE, NONE, NONE, NONE] },
     // (#745) sys_net_status((net_status_t *)arg1) - fixed 48-byte write.
     Desc { num: 371, args: [wf(SZ_NET_STATUS), NONE, NONE, NONE, NONE, NONE] },
+    // #netfix2 SYS_NET_LAST_ERROR(char *ubuf, u32 cap): arg1 is a WRITE buffer
+    // whose length is arg2, so the length is described by reference rather than
+    // trusted from the handler.
+    Desc { num: 425, args: [wa(2), NONE, NONE, NONE, NONE, NONE] },
     // (#238) sys_net_fw((int)arg1, (fw_xfer_t *)arg2) - fixed 240-byte
     // read-write buffer for EVERY op, which is why the op is arg1 and not
     // a second pointer shape.
@@ -599,6 +628,9 @@ static TAB: &[Desc] = &[
     // #250 sys_vol_eject((int)arg1) - no pointers at all. Declared anyway, so
     // it is not in the syscall-ptr-lint debt ledger by omission.
     Desc { num: 284, args: [NONE, NONE, NONE, NONE, NONE, NONE] },
+    // #708 sys_vol_busy((int)arg1) - no pointers either. Declared for the same
+    // reason as 284: kept out of the syscall-ptr-lint debt ledger by omission.
+    Desc { num: 285, args: [NONE, NONE, NONE, NONE, NONE, NONE] },
 
     // --- cross-window drag ("docking"), SYS_DRAG_* --------------------------
     // sys_drag_begin(win, kind, payload=arg3, plen=arg4, label=arg5, llen=arg6).
@@ -651,6 +683,10 @@ static TAB: &[Desc] = &[
     Desc { num: 270, args: [s(PATH_MAX), wa(3), NONE, NONE, NONE, NONE] },
     // sys_net_unmount((const char *)arg1 server, (const char *)arg2 share)
     Desc { num: 271, args: [s(PATH_MAX), s(PATH_MAX), NONE, NONE, NONE, NONE] },
+    // sys_net_list_exports((const char *)arg1 server, (char *)arg2 out, (uint32_t)arg3 maxlen)
+    Desc { num: 458, args: [s(PATH_MAX), wa(3), NONE, NONE, NONE, NONE] },
+    // sys_nfs_mount((const char *)arg1 server, (const char *)arg2 export, (char *)arg3 mp_out, (uint32_t)arg4 mp_outsz)
+    Desc { num: 459, args: [s(PATH_MAX), s(PATH_MAX), wa(4), NONE, NONE, NONE] },
     // sys_print_job((const char *)arg1 printer, arg2 title, arg3 text) - the
     // text is arbitrary document content, so it gets the generous TEXT_MAX bound
     // rather than PATH_MAX; a false reject here silently drops a print job.
@@ -709,6 +745,30 @@ static TAB: &[Desc] = &[
     Desc { num: 378, args: [rf(SZ_ELEV_REQUEST), NONE, NONE, NONE, NONE, NONE] },
     Desc { num: 380, args: [wf(SZ_ELEV_VIEW), NONE, NONE, NONE, NONE, NONE] },
     Desc { num: 381, args: [NONE, NONE, s(128), NONE, NONE, NONE] },
+    // Stage 1 SYSTEM CAPABILITY API (proc/caps.h). Pointer syscalls:
+    //   429 SYS_CAP_QUERY          arg2 WRITE cap_state_t (96)
+    //   430 SYS_CAP_REQUEST        arg1 READ  cap_req_t   (200)
+    //   432 SYS_CAP_VIEW           arg1 WRITE cap_view_t  (288)
+    //   435 SYS_SCREENSHOT_REQUEST arg1 READ  a NUL-terminated path string
+    //   436 SYS_SCREENSHOT_POLL    arg1 WRITE arg2 bytes (compositor out buffer)
+    // Sizes locked in syscall_argtab_lock.c. 431/433/434 are scalar-only and
+    // therefore correctly have no descriptor.
+    Desc { num: 429, args: [NONE, wf(SZ_CAP_STATE), NONE, NONE, NONE, NONE] },
+    Desc { num: 430, args: [rf(SZ_CAP_REQ), NONE, NONE, NONE, NONE, NONE] },
+    Desc { num: 432, args: [wf(SZ_CAP_VIEW), NONE, NONE, NONE, NONE, NONE] },
+    Desc { num: 435, args: [s(256), NONE, NONE, NONE, NONE, NONE] },
+    Desc { num: 436, args: [wa(2), NONE, NONE, NONE, NONE, NONE] },
+    // Stage 2 serial.port (proc/caps.h + drivers/serialport.h):
+    //   437 SYS_SERIAL_LIST  arg1 WRITE serial_pub_t[min(arg2,4)]
+    //   438 SYS_SERIAL_OPEN  arg1 READ  a NUL-terminated port name (<=16)
+    Desc { num: 437, args: [wec(2, SZ_SERIAL_PUB, SERIAL_PORTS_CAP), NONE, NONE, NONE, NONE, NONE] },
+    Desc { num: 438, args: [s(16), NONE, NONE, NONE, NONE, NONE] },
+    // #246/#305 AI escrow kernel enforcement (fs/escrow_guard.c):
+    //   445 SYS_ESCROW_ENTER  arg1 READ  a NUL-terminated scope-path string
+    //                         arg2 scalar ttl_ms
+    //   446 SYS_ESCROW_EXIT   no arguments -> no descriptor (scalar-only), like
+    //                         431/433/434.
+    Desc { num: 445, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
     // sys_get_autologin((char*)buf, (int)cap) - writes cap bytes into buf
     Desc { num: 340, args: [wa(2), NONE, NONE, NONE, NONE, NONE] },
     // sys_auth_lockout((const char*)user)
@@ -882,6 +942,21 @@ static TAB: &[Desc] = &[
     // silently truncated later. arg2 is a scalar timeout.
     Desc { num: 367, args: [s(128), NONE, NONE, NONE, NONE, NONE] }, // SYS_NTP_SYNC_SERVER
     Desc { num: 368, args: [NONE, wf(4), wf(4), wf(4), NONE, NONE] }, // SYS_HTTP_FETCH_PROGRESS
+    // SYS_GETRANDOM(buf=arg1, len=arg2, flags=arg3): WRITE of arg2 bytes at
+    // arg1, so the [buf, buf+len) range is proven user-writable at entry.
+    // flags is a scalar. Same shape as SYS_GETCWD (num 99).
+    Desc { num: 448, args: [wa(2), NONE, NONE, NONE, NONE, NONE] }, // SYS_GETRANDOM
+    // #404 disk-mgr. buf/layout/token/nonce pointers validated at entry.
+    Desc { num: 449, args: [wec(2, SZ_BLK_DEV, 32), NONE, NONE, NONE, NONE, NONE] }, // SYS_BLK_ENUM (buf=arg1, count=arg2, kernel clamps to 32)
+    Desc { num: 450, args: [NONE, NONE, NONE, NONE, we(4, 512), NONE] }, // SYS_BLK_READ (buf=arg5, count=arg4)
+    Desc { num: 451, args: [NONE, NONE, NONE, NONE, re(4, 512), NONE] }, // SYS_BLK_WRITE (buf=arg5, count=arg4)
+    Desc { num: 452, args: [NONE, NONE, re(4, SZ_PART_SPEC), NONE, wf(SZ_PART_TOKEN), NONE] }, // SYS_PART_PREPARE (layout=arg3 * nparts=arg4, token=arg5)
+    Desc { num: 453, args: [NONE, NONE, re(4, SZ_PART_SPEC), NONE, rf(16), NONE] }, // SYS_PART_WRITE (layout=arg3 * nparts=arg4, nonce=arg5)
+    Desc { num: 454, args: [NONE, NONE, NONE, NONE, s(64), NONE] }, // SYS_MKFS (label string=arg5, optional; NULL skipped)
+    // #404 disk-mgr Stage 4: mount table. path strings + the mount_ent_t array.
+    Desc { num: 455, args: [wec(2, SZ_MOUNT_ENT, 32), NONE, NONE, NONE, NONE, NONE] }, // SYS_MOUNT_LIST (buf=arg1, count=arg2, kernel clamps to 32)
+    Desc { num: 456, args: [NONE, NONE, NONE, s(32), NONE, NONE] }, // SYS_MOUNT (path string=arg4)
+    Desc { num: 457, args: [s(32), NONE, NONE, NONE, NONE, NONE] }, // SYS_UMOUNT (path string=arg1)
 ];
 
 /// Resolve a Len to a byte count, or None if the caller's numbers cannot

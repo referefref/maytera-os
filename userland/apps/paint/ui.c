@@ -9,11 +9,20 @@
 #include "brushes.h"        // brush/pattern/gradient engine (SEC_BRUSHES/SEC_PATTERNS + gradient options)
 #include "../../libc/gui.h"
 #include "../../libc/dirent.h"
+#include "../../libc/gui_scroll.h"   // assistant transcript viewport (shared scroll widget)
+#include "../../libc/syscall.h"      // uptime_ms() for the assistant's thinking indicator
 
 // ---------------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------------
 #define MENU_H    22
+// Studio plan P6: the docked Assistant panel. A column between the canvas and
+// the right dock, toggled from AI > Assistant Panel (F9). While open it takes
+// ASSIST_W off the canvas viewport (cv_w) and nothing else moves: the dock
+// stays at g_w-DOCK_W, the status bar stays full width. Geometry inside the
+// panel is single-sourced by the assist_*() helpers below the dock code.
+#define ASSIST_W  272
+static int assist_open = 0;
 // #473: the left column is now one panel - a tool icon grid at the top, then
 // the active tool's options (sliders/cycles/brush picker/FG-BG colour) stacked
 // below it, GIMP-style (Toolbox + Tool Options in the same left dock). This
@@ -43,7 +52,7 @@ static int toolgrid_bottom(void){
 // the left ruler eats RULER_Y px off the left.
 static int cv_x(void){ return PANEL_W + RULER_Y; }
 static int cv_y(void){ return MENU_H + RULER; }
-static int cv_w(void){ int v = g_w - PANEL_W - RULER_Y - DOCK_W; return v < 16 ? 16 : v; }
+static int cv_w(void){ int v = g_w - PANEL_W - RULER_Y - DOCK_W - (assist_open ? ASSIST_W : 0); return v < 16 ? 16 : v; }
 static int cv_h(void){ int v = g_h - MENU_H - RULER - STATUS_H; return v < 16 ? 16 : v; }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +217,9 @@ static void draw_filebrowser(void);   // item 3: file-browser modal overlay
 static void draw_guard(void);         // item 3: unsaved-changes guard overlay
 static void draw_print_preview(void); // Print / Preview modal overlay
 static int  click_print_preview(int mx,int my);
+static void draw_assist(void);        // P6 assistant panel (defined after the overlays it checks)
+static void assist_toggle(void);
+static void assist_doc_changed(void); // New/Open: the transcript's scope ended
 static void open_print_preview(void);
 static unsigned int g_hist_cache[256];
 static int g_hist_ch_cache = -1, g_hist_dirty = 1;
@@ -221,7 +233,8 @@ static int   modal_purpose = 0;
 static char  modal_msg[512];
 enum { MP_OPEN = 1, MP_SAVEAS, MP_EXPORT, MP_AICMD, MP_AIPAL, MP_NEWSZ,
        MP_SGROW, MP_SSHRINK, MP_SBORDER, MP_SFEATHER, MP_SROUND,
-       MP_ROT, MP_SCALE, MP_SHEAR, MP_CANVAS, MP_GRIDSP, MP_LRENAME, MP_EXPORTBMP };
+       MP_ROT, MP_SCALE, MP_SHEAR, MP_CANVAS, MP_GRIDSP, MP_LRENAME, MP_EXPORTBMP,
+       MP_EXPORTJPG };
 
 // Print / Preview modal state (its own overlay, like the file browser).
 static int   pr_open = 0, pr_have = 0;
@@ -614,6 +627,8 @@ enum {
     A_AICMD, A_AIPAL, A_ABOUT,
     A_REVERT,
     A_CUT, A_COPY, A_PASTE, A_FILLFG, A_FILLBG, A_STROKE,
+    A_EXPORTJPG,
+    A_AIASSIST,           // toggle the docked Assistant panel (P6)
     A_SEP = 4000,         // separator sentinel (non-selectable divider row)
     A_OP_BASE = 5000,     // + registry op index
     A_CAT_BASE = 6000     // + category index (Filters submenu open)
@@ -629,7 +644,7 @@ enum { MK_STATIC=0, MK_COLORS, MK_FILTERS };
 static const mitem_t M_FILE[] = {
     {"New", A_NEW}, {"Open..", A_OPEN}, {"", A_SEP},
     {"Save", A_SAVE, "Ctrl+S"}, {"Save As..", A_SAVEAS}, {"", A_SEP},
-    {"Export PNG..", A_EXPORTPNG}, {"Export BMP..", A_EXPORTBMP},
+    {"Export PNG..", A_EXPORTPNG}, {"Export JPEG..", A_EXPORTJPG}, {"Export BMP..", A_EXPORTBMP},
     {"Print / Preview..", A_PRINT}, {"", A_SEP},
     {"Revert", A_REVERT}, {"", A_SEP}, {"Quit", A_QUIT}
 };
@@ -662,7 +677,8 @@ static const mitem_t M_VIEW[] = {
     {"Actual Size (100%)", A_ZACTUAL, "1"}, {"", A_SEP},
     {"Grid", A_VGRID}, {"Snap to Grid", A_VSNAP}, {"Grid Spacing..", A_VGRIDSP}, {"Clear Guides", A_VGCLEAR}
 };
-static const mitem_t M_AI[] = { {"AI Command..", A_AICMD}, {"AI Palette..", A_AIPAL} };
+static const mitem_t M_AI[] = { {"Assistant Panel", A_AIASSIST, "F9"}, {"", A_SEP},
+                                {"AI Command..", A_AICMD}, {"AI Palette..", A_AIPAL} };
 static const mitem_t M_HELP[] = { {"About Maytera Studio", A_ABOUT} };
 
 #define MKA(a) (a), (int)(sizeof(a)/sizeof(a[0]))
@@ -735,6 +751,7 @@ static int action_checked(int a){
         case A_VSNAP:    return grid_snap;
         case A_LMASKTOG: return g_doc.layer[g_doc.active].mask && g_doc.layer[g_doc.active].mask_active;
         case A_LLOCKA:   return g_doc.layer[g_doc.active].lock_alpha;
+        case A_AIASSIST: return assist_open;
         default:         return 0;
     }
 }
@@ -1240,6 +1257,19 @@ static void draw_toolpanel(void){
 
 // Dock section y positions for hit testing.
 static int LP_y, LM_y, LMODE_y, CH_y, CHSB_y, CHS_y, PA_y, HI_y, HP_y, CP_y, SW_y;
+// History panel (P7 command-stack history, paintp7). Row geometry is recorded
+// during draw and hit-tested in click_dock, so both read one layout. Each row
+// maps to the undo_count() value undo_goto() must reach; row 0 is the synthetic
+// "Original" state (target 0).
+#define HIST_ROWS 10
+#define HIST_ROW_H 16
+static int hist_row_y[HIST_ROWS], hist_row_target[HIST_ROWS], hist_nrows=0;
+static int hist_btn_y=0;
+static void fmt_bytes(char *out,int cap,size_t b){
+    if(b<1024) snprintf(out,cap,"%uB",(unsigned)b);
+    else if(b<(1024u*1024u)) snprintf(out,cap,"%uK",(unsigned)(b>>10));
+    else snprintf(out,cap,"%u.%uM",(unsigned)(b>>20),(unsigned)((b&0xFFFFF)*10>>20));
+}
 static int BR_y, PT_y;   // Brushes / Patterns grid body top-y (for hit testing)
 
 // --- Dock helpers: layer thumbnails, eye glyph, collapsible section header ---
@@ -1498,12 +1528,47 @@ static void draw_dock(void){
         y+=gh+6;
     }
 
-    // ---- History ----
+    // ---- History (P7: the sealed delta journal in doc.c) ----
+    // Rows are the whole timeline: 00 "Original", then every undo step (past,
+    // accent bar), the current state (accent gradient), a hairline, then the
+    // undone steps (redo, C_DIM). At most HIST_ROWS rows are shown and the
+    // window is placed so the current state is always inside it; truncation
+    // is announced by "+N earlier" / "+N later" captions. Clicking a row jumps
+    // there (undo_goto). The right column is each step's sealed payload, so a
+    // stroke reads in KB and a whole-canvas op in MB: that is the proof the
+    // journal keeps deltas, not documents.
     if(dock_header(dx,&y,SEC_HISTORY)){
-        HP_y=y;
-        int n=undo_count(), start=n>4?n-4:0;
-        for(int i=start;i<n;i++){ Ts(dx+12,y,undo_label(i),(i==n-1)?C_TEXT:C_DIM); y+=14; }
-        if(n==0){ Ts(dx+12,y,"(empty)",C_DIM); y+=14; }
+        HP_y=y; hist_btn_y=y;
+        int n=undo_count(), r=undo_redo_count(), total=1+n+r, cur=n;
+        sbutton(dx+8,y,46,16,"Undo",0);
+        sbutton(dx+58,y,46,16,"Redo",0);
+        { char sb[40], mb[16]; fmt_bytes(mb,sizeof mb,undo_mem_total());
+          snprintf(sb,sizeof sb,"%d step%s . %s",n+r,(n+r)==1?"":"s",mb);
+          Ts(dx+DOCK_W-8-gui_ttf_width(sb,11),y+2,sb,C_DIM); }
+        y+=20;
+        int first=cur-(HIST_ROWS-3); if(first>total-HIST_ROWS) first=total-HIST_ROWS; if(first<0) first=0;
+        int last=first+HIST_ROWS; if(last>total) last=total;
+        if(first>0){ char cb[24]; snprintf(cb,sizeof cb,"+%d earlier",first); Ts(dx+12,y,cb,C_DIM); y+=14; }
+        hist_nrows=0;
+        for(int i=first;i<last;i++){
+            int is_cur=(i==cur), is_redo=(i>cur);
+            if(i==cur+1){ R(dx+8,y,DOCK_W-16,1,C_LINE); y+=2; }
+            int hov=IN(g_mx,g_my,dx+8,y,DOCK_W-16,HIST_ROW_H);
+            if(is_cur)      vgrad(dx+8,y,DOCK_W-16,HIST_ROW_H, C_ACCENT2, C_ACCENT);
+            else if(hov)    R(dx+8,y,DOCK_W-16,HIST_ROW_H, C_PANEL2);
+            if(!is_redo) R(dx+8,y+2,3,HIST_ROW_H-4, is_cur?0x00ffffff:C_ACCENT2);
+            uint32_t tc = is_cur?0x00ffffff:(is_redo?C_DIM:C_TEXT);
+            uint32_t dc = is_cur?0x00d8e8f8:C_DIM;
+            char ib[8]; snprintf(ib,sizeof ib,"%02d",i);
+            Ts(dx+14,y+2,ib,dc);
+            const char *lb = i==0 ? "Original" : (i<=n ? undo_label(i-1) : redo_label(i-cur-1));
+            Ts(dx+34,y+2,lb,tc);
+            if(i>0){ char zb[16]; size_t b = i<=n ? undo_bytes(i-1) : redo_bytes(i-cur-1); fmt_bytes(zb,sizeof zb,b);
+                     Ts(dx+DOCK_W-12-gui_ttf_width(zb,11),y+2,zb,dc); }
+            if(hist_nrows<HIST_ROWS){ hist_row_y[hist_nrows]=y; hist_row_target[hist_nrows]=i; hist_nrows++; }
+            y+=HIST_ROW_H;
+        }
+        if(last<total){ char cb[24]; snprintf(cb,sizeof cb,"+%d later",total-last); Ts(dx+12,y,cb,C_DIM); y+=14; }
         y+=6;
     }
 
@@ -2359,6 +2424,7 @@ void ui_full_redraw(void){
     draw_menubar();
     draw_toolpanel();
     draw_dock();
+    draw_assist();
     draw_status();
     draw_dropdown();
     draw_blend_pop();
@@ -2514,6 +2580,7 @@ static void do_action(int a){
         case A_SAVEAS: fb_start(MP_SAVEAS); break;
         case A_EXPORTPNG: fb_start(MP_EXPORT); break;
         case A_EXPORTBMP: fb_start(MP_EXPORTBMP); break;
+        case A_EXPORTJPG: fb_start(MP_EXPORTJPG); break;
         case A_PRINT: open_print_preview(); break;
         case A_REVERT:
             if(g_doc.path[0] && io_load(g_doc.path)==0){ g_doc.comp_dirty=1; g_doc.modified=0; ui_status("Reverted"); }
@@ -2578,6 +2645,7 @@ static void do_action(int a){
             if(!ai_available()){ open_msg("AI","AI is unavailable. Set your API key in Settings > AI and connect to a network."); ui_full_redraw(); }
             else open_modal_text(MP_AIPAL,"Palette prompt:","autumn forest");
             break;
+        case A_AIASSIST: assist_toggle(); break;
         case A_ABOUT:
             open_msg("Maytera Studio",
                 "Maytera Studio - GIMP-class layered image editor.\n"
@@ -2599,12 +2667,12 @@ static void modal_confirm(void){
             if(buf[s]=='x'||buf[s]=='X'){ s++; while(buf[s]>='0'&&buf[s]<='9'){h=h*10+buf[s]-'0';s++;} }
             if(w<1||h<1){w=STUDIO_DEF_W;h=STUDIO_DEF_H;}
             w=clampi(w,1,STUDIO_MAX_W); h=clampi(h,1,STUDIO_MAX_H);
-            if(purpose==MP_NEWSZ){ doc_new(w,h,argb(255,255,255,255)); }
+            if(purpose==MP_NEWSZ){ doc_new(w,h,argb(255,255,255,255)); assist_doc_changed(); }
             else { undo_push("Canvas Size"); doc_resize(w,h,canvas_anchor); }
             g_zoom_pct=100; pan_x=pan_y=0; ui_status("Resized");
         } break;
         case MP_OPEN:
-            if(io_load(buf)==0){ int j=0; while(buf[j]&&j<STUDIO_PATH_LEN-1){g_doc.path[j]=buf[j];j++;} g_doc.path[j]=0; g_doc.comp_dirty=1; g_zoom_pct=100; pan_x=pan_y=0; ui_status("Opened"); }
+            if(io_load(buf)==0){ int j=0; while(buf[j]&&j<STUDIO_PATH_LEN-1){g_doc.path[j]=buf[j];j++;} g_doc.path[j]=0; g_doc.comp_dirty=1; g_zoom_pct=100; pan_x=pan_y=0; ui_status("Opened"); assist_doc_changed(); }
             else ui_status("Open failed");
             break;
         case MP_SAVEAS:
@@ -2650,7 +2718,7 @@ static void modal_confirm(void){
 #define FBT    112                          // thumbnail preview edge (px)
 #define FB_SBW 10                           // list scrollbar width (px)
 static int   fb_open=0;
-static int   fb_purpose=0;                  // MP_OPEN / MP_SAVEAS / MP_EXPORT
+static int   fb_purpose=0;                  // MP_OPEN / MP_SAVEAS / MP_EXPORT / MP_EXPORTBMP / MP_EXPORTJPG
 static char  fb_dir[128]="/HOME";
 static int   fb_n=0, fb_selrow=-1, fb_scroll=0;
 static int   fb_sb_drag=0;                  // 1 while dragging the list scrollbar thumb
@@ -2662,6 +2730,42 @@ static uint32_t *fb_thumb=0;                // FBT*FBT preview buffer
 static int   fb_thumb_ok=0;
 
 static void sset(char*d,int cap,const char*s){ int i=0; if(s) while(s[i]&&i<cap-1){d[i]=s[i];i++;} d[i]=0; }
+
+// ---- JPEG export options strip (Studio plan P5) ----------------------------
+// Lives inside the file browser and appears whenever the FILE NAME ends in
+// .jpg/.jpeg, whatever opened the dialog (Export JPEG.., Save As.., a typed
+// name): the controls follow the format that will actually be written, not
+// the menu item. Quality slider (1..100) with a numeric read-out and four
+// presets, a chroma-subsampling toggle, and a live "estimated file size"
+// computed by really encoding the document into memory (io_jpeg_estimate),
+// cached until a setting changes. The strip adds FB_OPTS_H to the modal's
+// height and takes it back off the file list, so nothing else moves.
+#define FB_OPTS_H 46
+static int  fb_jq=90, fb_j444=0;            // mirror of io_jpeg_get/set for this dialog
+static int  fb_q_drag=0;                    // 1 while dragging the quality slider
+static long fb_jest=-1;                     // cached io_jpeg_estimate() bytes; -1 = stale
+static int  fb_last_optsh=0;                // strip height at the last full draw (grow/shrink repaint)
+static const int   FB_JPRESET[4]      = {50,75,90,98};
+static const char *FB_JPRESET_NAME[4] = {"Low","Medium","High","Max"};
+static int fb_jpeg_mode(void){
+    if(fb_purpose==MP_OPEN) return 0;      // options describe a WRITE; picking a .jpg to open has none
+    int L=0; while(fb_fname[L]) L++;
+    for(int i=L-1;i>=0 && i>=L-6;i--) if(fb_fname[i]=='.'){
+        const char*e=&fb_fname[i+1]; char x[8]; int j=0;
+        while(e[j]&&j<7){ char c=e[j]; if(c>='A'&&c<='Z')c+=32; x[j]=c; j++; } x[j]=0;
+        return !strcmp(x,"jpg")||!strcmp(x,"jpeg");
+    }
+    return 0;
+}
+static int  fb_opts_h(void){ return fb_jpeg_mode()?FB_OPTS_H:0; }
+static void fb_jpeg_apply(void){ io_jpeg_set(fb_jq,fb_j444); fb_jest=-1; }
+static void fb_jest_refresh(void){ if(fb_jest<0){ io_jpeg_set(fb_jq,fb_j444); fb_jest=io_jpeg_estimate(); } }
+static void fb_jest_text(char*out,int cap){
+    if(fb_q_drag)      snprintf(out,cap,"Estimated file size: ...");
+    else if(fb_jest<0) snprintf(out,cap,"Estimated file size: unavailable");
+    else if(fb_jest<10240) snprintf(out,cap,"Estimated file size: %ld bytes",fb_jest);
+    else               snprintf(out,cap,"Estimated file size: %ld.%ld KB",fb_jest/1024,(fb_jest%1024)*10/1024);
+}
 static int  fb_ext_ok(const char*n){
     int L=0; while(n[L])L++;
     for(int i=L-1;i>=0 && i>=L-6;i--){ if(n[i]=='.'){
@@ -2718,9 +2822,11 @@ static void fb_start(int purpose){
     fb_purpose=purpose; fb_open=1;
     if(purpose==MP_EXPORT) sset(fb_fname,sizeof fb_fname,"IMAGE.PNG");
     else if(purpose==MP_EXPORTBMP) sset(fb_fname,sizeof fb_fname,"IMAGE.BMP");
+    else if(purpose==MP_EXPORTJPG) sset(fb_fname,sizeof fb_fname,"IMAGE.JPG");
     else if(purpose==MP_SAVEAS) sset(fb_fname,sizeof fb_fname,"DRAW.MSTU");
     else fb_fname[0]=0;
     tf_init(&fb_ftf, fb_fname, sizeof fb_fname);
+    io_jpeg_get(&fb_jq,&fb_j444); fb_jest=-1; fb_q_drag=0; fb_last_optsh=fb_opts_h();
     fb_load_dir();
     ui_full_redraw();
 }
@@ -2740,20 +2846,46 @@ static void fb_enter(int row){
 // anywhere a one-shot load is needed). Mirrors the file-browser Open branch.
 void ui_open_path(const char *path){
     if(!path||!path[0]) return;
-    if(io_load(path)==0){ sset(g_doc.path,sizeof g_doc.path,path); g_doc.comp_dirty=1; g_zoom_pct=100; pan_x=pan_y=0; ui_status("Opened"); }
+    if(io_load(path)==0){ sset(g_doc.path,sizeof g_doc.path,path); g_doc.comp_dirty=1; g_zoom_pct=100; pan_x=pan_y=0; ui_status("Opened"); assist_doc_changed(); }
     else ui_status("Open failed");
     ui_full_redraw();
 }
-static void fb_geom(int*bx,int*by,int*bw,int*bh){ *bw=620; *bh=452; *bx=(g_w-*bw)/2; *by=(g_h-*bh)/2; }
+static void fb_geom(int*bx,int*by,int*bw,int*bh){ *bw=620; *bh=452+fb_opts_h(); *bx=(g_w-*bw)/2; *by=(g_h-*bh)/2; }
+// File list rect (shared by draw, scrollbar and hit-test; the JPEG strip is
+// carved out of its bottom).
+static void fb_list_geom(int*lx,int*ly,int*lw,int*lh){
+    int bx,by,bw,bh; fb_geom(&bx,&by,&bw,&bh);
+    *lx=bx+14; *ly=by+60; *lw=bw-28-FBT-24; *lh=bh-60-84-fb_opts_h();
+}
+// JPEG strip rect: sits between the list and the "File name:" field.
+static void fb_opts_geom(int*sx,int*sy,int*sw,int*sh){
+    int bx,by,bw,bh; fb_geom(&bx,&by,&bw,&bh);
+    int lx,ly,lw,lh; fb_list_geom(&lx,&ly,&lw,&lh);
+    *sx=bx+14; *sy=ly+lh+8; *sw=bw-28; *sh=FB_OPTS_H-8;
+}
+// Quality slider: 170px track at strip-x+62, knob 12px (see slider()).
+#define FB_QS_X   62
+#define FB_QS_W   170
+static void fb_q_to(int mx){
+    int sx,sy,sw,sh; fb_opts_geom(&sx,&sy,&sw,&sh);
+    fb_jq = 1 + clampi((mx-(sx+FB_QS_X)-6)*99/(FB_QS_W-12), 0, 99);
+    fb_jest=-1;
+}
 static void fb_commit(void){
     if(fb_fname[0]==0){ fb_open=0; ui_full_redraw(); return; }
     char full[192]; path_join(full,sizeof full,fb_dir,fb_fname);
-    int purpose=fb_purpose; fb_open=0;
+    int purpose=fb_purpose, jpeg=fb_jpeg_mode(); fb_open=0;
     if(purpose==MP_OPEN){
-        if(io_load(full)==0){ sset(g_doc.path,sizeof g_doc.path,full); g_doc.comp_dirty=1; g_zoom_pct=100; pan_x=pan_y=0; ui_status("Opened"); }
+        if(io_load(full)==0){ sset(g_doc.path,sizeof g_doc.path,full); g_doc.comp_dirty=1; g_zoom_pct=100; pan_x=pan_y=0; ui_status("Opened"); assist_doc_changed(); }
         else ui_status("Open failed");
     }else{
-        if(io_save(full)==0){ sset(g_doc.path,sizeof g_doc.path,full); g_doc.modified=0; ui_status((purpose==MP_EXPORT||purpose==MP_EXPORTBMP)?"Exported":"Saved"); }
+        if(jpeg) io_jpeg_set(fb_jq,fb_j444);   // the strip's settings are what io_save writes with
+        if(io_save(full)==0){
+            sset(g_doc.path,sizeof g_doc.path,full); g_doc.modified=0;
+            int exported=(purpose==MP_EXPORT||purpose==MP_EXPORTBMP||purpose==MP_EXPORTJPG);
+            if(jpeg && fb_jest>0){ char s[64]; snprintf(s,sizeof s,"%s JPEG, quality %d, %ld KB",exported?"Exported":"Saved",fb_jq,(fb_jest+512)/1024); ui_status(s); }
+            else ui_status(exported?"Exported":"Saved");
+        }
         else ui_status("Save failed");
     }
     ui_full_redraw();
@@ -2762,8 +2894,7 @@ static void fb_commit(void){
 // when the list fits and no scrollbar is needed. Fills the track rect (sx..sh)
 // and the proportional thumb (tby/tbh).
 static int fb_scrollbar(int*sx,int*sy,int*sw,int*sh,int*tby,int*tbh){
-    int bx,by,bw,bh; fb_geom(&bx,&by,&bw,&bh);
-    int lx=bx+14, ly=by+60, lw=bw-28-FBT-24, lh=bh-60-84;
+    int lx,ly,lw,lh; fb_list_geom(&lx,&ly,&lw,&lh);
     int rowh=20, vis=lh/rowh;
     int maxs=fb_n-vis; if(maxs<1) return 0;
     *sx=lx+lw-FB_SBW; *sy=ly; *sw=FB_SBW; *sh=lh;
@@ -2783,13 +2914,17 @@ static void fb_sb_to(int my){
 }
 static void draw_filebrowser(void){
     if(!fb_open) return;
+    // The strip appearing/disappearing (a typed .jpg name) changes the modal's
+    // height; a partial repaint would leave the old outline behind, so take
+    // the full redraw once and let it call back in here at the new size.
+    if(fb_opts_h()!=fb_last_optsh){ fb_last_optsh=fb_opts_h(); ui_full_redraw(); return; }
     int bx,by,bw,bh; fb_geom(&bx,&by,&bw,&bh);
     R(bx-2,by-2,bw+4,bh+4,C_LINE); R(bx,by,bw,bh,C_PANEL); OUT(bx,by,bw,bh,C_ACCENT);
-    const char*title=(fb_purpose==MP_OPEN)?"Open Image":(fb_purpose==MP_EXPORT)?"Export PNG":(fb_purpose==MP_EXPORTBMP)?"Export BMP":"Save As";
+    const char*title=(fb_purpose==MP_OPEN)?"Open Image":(fb_purpose==MP_EXPORT)?"Export PNG":(fb_purpose==MP_EXPORTBMP)?"Export BMP":(fb_purpose==MP_EXPORTJPG)?"Export JPEG":"Save As";
     T(bx+14,by+12,title,C_ACCENT2);
     R(bx+14,by+32,bw-28,20,C_PANEL2); OUT(bx+14,by+32,bw-28,20,C_LINE);
     Ts(bx+20,by+37,fb_dir,C_DIM);
-    int lx=bx+14, ly=by+60, lw=bw-28-FBT-24, lh=bh-60-84;
+    int lx,ly,lw,lh; fb_list_geom(&lx,&ly,&lw,&lh);
     R(lx,ly,lw,lh,C_PANEL2); OUT(lx,ly,lw,lh,C_LINE);
     int sbx,sby,sbw,sbh,tby,tbh; int sbmax=fb_scrollbar(&sbx,&sby,&sbw,&sbh,&tby,&tbh);
     int iw=lw-2-(sbmax>0?FB_SBW:0);    // row highlight width, clearing the scrollbar gutter
@@ -2816,6 +2951,23 @@ static void draw_filebrowser(void){
         for(int yy=0;yy<FBT;yy++) for(int xx=0;xx<FBT;xx++)
             win_draw_pixel(g_win,pxp+xx,pyp+yy, fb_thumb[yy*FBT+xx]|0xFF000000u);
     }else gui_text_ttf_centered(g_win,pxp,pyp+FBT/2-8,FBT,16,"No preview",C_DIM,12);
+    // JPEG options strip (only when the name being written is .jpg/.jpeg)
+    if(fb_jpeg_mode()){
+        if(!fb_q_drag) fb_jest_refresh();          // real encode, cached per setting
+        int sx,sy,sw,sh; fb_opts_geom(&sx,&sy,&sw,&sh);
+        R(sx,sy,sw,sh,C_PANEL2); OUT(sx,sy,sw,sh,C_LINE);
+        int y1=sy+6;
+        Ts(sx+10,y1+2,"Quality",C_DIM);
+        slider(sx+FB_QS_X,y1,FB_QS_W,fb_jq-1,99);
+        char qb[8]; snprintf(qb,sizeof qb,"%d",fb_jq);
+        field_inset(sx+240,y1-1,36,16); gui_text_ttf_centered(g_win,sx+240,y1-1,36,16,qb,C_TEXT,11);
+        for(int i=0;i<4;i++) sbutton(sx+284+i*50,y1-1,46,16,FB_JPRESET_NAME[i],fb_jq==FB_JPRESET[i]);
+        sbutton(sx+496,y1-1,84,16,fb_j444?"Chroma 4:4:4":"Chroma 4:2:0",fb_j444);
+        int y2=sy+24;
+        Ts(sx+10,y2,"Lossy: layers and transparency flatten onto white.",C_DIM);
+        char eb[64]; fb_jest_text(eb,sizeof eb);
+        Ts(sx+372,y2,eb,C_TEXT);
+    }
     // filename field
     int fy=by+bh-58;
     Ts(bx+14,fy-14,"File name:",C_DIM);
@@ -2833,7 +2985,15 @@ static int click_filebrowser(int mx,int my){
     // scrollbar track: click/drag jumps the list (handle before the row hit-test)
     int sbx,sby,sbw,sbh,tby,tbh; int sbmax=fb_scrollbar(&sbx,&sby,&sbw,&sbh,&tby,&tbh);
     if(sbmax>0 && IN(mx,my,sbx,sby,sbw,sbh)){ fb_sb_drag=1; fb_sb_to(my); ui_full_redraw(); return 1; }
-    int lx=bx+14, ly=by+60, lw=bw-28-FBT-24, lh=bh-60-84;
+    // JPEG options strip
+    if(fb_jpeg_mode()){
+        int sx,sy,sw,sh; fb_opts_geom(&sx,&sy,&sw,&sh); int y1=sy+6;
+        if(IN(mx,my,sx+FB_QS_X-2,y1-2,FB_QS_W+4,18)){ fb_q_drag=1; fb_q_to(mx); draw_filebrowser(); win_invalidate(g_win); return 1; }
+        for(int i=0;i<4;i++) if(IN(mx,my,sx+284+i*50,y1-1,46,16)){ fb_jq=FB_JPRESET[i]; fb_jpeg_apply(); draw_filebrowser(); win_invalidate(g_win); return 1; }
+        if(IN(mx,my,sx+496,y1-1,84,16)){ fb_j444=!fb_j444; fb_jpeg_apply(); draw_filebrowser(); win_invalidate(g_win); return 1; }
+        if(IN(mx,my,sx,sy,sw,sh)) return 1;
+    }
+    int lx,ly,lw,lh; fb_list_geom(&lx,&ly,&lw,&lh);
     if(IN(mx,my,lx,ly,lw,lh)){ int r=(my-ly)/20; fb_enter(fb_scroll+r); return 1; }
     return 1;   // consume all clicks inside the modal region
 }
@@ -3087,6 +3247,19 @@ static int click_dock(int mx,int my){
         if(IN(mx,my,dx+DOCK_W-108,HI_y,32,16)){ hist_log=!hist_log; ui_full_redraw(); return 1; }
         for(int i=0;i<4;i++){ if(IN(mx,my,dx+DOCK_W-70+i*17,HI_y,15,16)){ hist_ch=i; ui_full_redraw(); return 1; } }
     }
+    // ===== History =====
+    if(!SEC_COL[SEC_HISTORY]){
+        if(IN(mx,my,dx+8,hist_btn_y,46,16)){ do_action(A_UNDO); return 1; }
+        if(IN(mx,my,dx+58,hist_btn_y,46,16)){ do_action(A_REDO); return 1; }
+        for(int i=0;i<hist_nrows;i++){
+            if(IN(mx,my,dx+8,hist_row_y[i],DOCK_W-16,HIST_ROW_H)){
+                int target=hist_row_target[i];
+                int moved=undo_goto(target);
+                if(moved){ char sb[48]; snprintf(sb,sizeof sb,"History: %s (%d step%s)", target==0?"Original":undo_next_label(), moved, moved==1?"":"s"); ui_status(sb); }
+                g_doc.comp_dirty=1; ui_full_redraw(); return 1;
+            }
+        }
+    }
     // ===== Color (professional picker) =====
     if(!SEC_COL[SEC_COLOR]){
         if(cp_click_dock(dx,CP_y,mx,my,mod_shift,mod_alt)) return 1;
@@ -3239,10 +3412,200 @@ static void canvas_up(int mx,int my){
 // ---------------------------------------------------------------------------
 // Keyboard
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Assistant panel (Studio plan P6). Layout per the design spec: header band
+// (26), context caption, input row (26) + Send, hint caption, then a
+// pixel-scrolled transcript on gui_scroll_t. Bubbles: user right-aligned on
+// C_ACCENT with gui_ink_on(); assistant left on C_PANEL2 with a C_LINE ring;
+// notices are bare C_DIM captions. Text is TTF 12 on a 17 px line (the
+// ladder's 12 bucket); captions TTF 11. Nothing here blocks: the request is
+// polled from ui_tick(), which also cycles the three "thinking" dots.
+// ---------------------------------------------------------------------------
+static int          assist_focus = 0;
+static char         assist_buf[512];
+static textfield_t  assist_tf;
+static gui_scroll_t assist_sc;
+static int          assist_follow = 1;        // keep the newest turn in view
+static int          assist_anim = 0;          // lit dot 0..2
+static unsigned long assist_anim_t = 0;
+static int          assist_inited = 0;
+static char         al_lines[48][GUI_WRAP_COL];   // wrap scratch (one row at a time)
+
+#define AS_HDR_H   26
+#define AS_FIELD_Y 46
+#define AS_FIELD_H 26
+#define AS_SEND_W  48
+#define AS_TX_Y    92
+#define AS_LINE_H  17
+#define AS_CAP_H   15
+static int assist_x(void){ return g_w - DOCK_W - ASSIST_W; }
+static int assist_h(void){ int v = g_h - MENU_H - STATUS_H; return v < 120 ? 120 : v; }
+static int assist_field_w(void){ return ASSIST_W - 16 - 4 - AS_SEND_W; }
+static void assist_ensure(void){
+    if(assist_inited) return;
+    assist_inited=1; assist_buf[0]=0; tf_init(&assist_tf, assist_buf, sizeof assist_buf);
+    ai_assist_reset();
+}
+static void assist_doc_changed(void){ assist_ensure(); ai_assist_reset(); assist_follow=1; }
+static int overlay_open(void){
+    return menu_open>=0 || blend_pop || modal || pd_open || fb_open || pr_open || guard_open || cp_modal_open();
+}
+
+// Measure (draw=0) or draw one transcript row at top-y `y` inside viewport
+// columns [vx, vx+vw). Drawing is clipped to rows [cy0, cy1) by skipping any
+// text line or rect slice outside it (win_draw_* has no clip of its own).
+static int assist_row(int i,int y,int vx,int vw,int draw,int cy0,int cy1){
+    int role=ai_assist_role(i); const char *txt=ai_assist_text(i);
+    if(role==2){
+        int n=gui_wrap_text_ttf(txt,11,vw-8,8,al_lines); if(n<1){ n=1; al_lines[0][0]=0; }
+        if(draw) for(int k=0;k<n;k++){ int ly=y+k*AS_CAP_H; if(ly>=cy0 && ly+AS_CAP_H<=cy1) Ts(vx+4,ly,al_lines[k],C_DIM); }
+        return n*AS_CAP_H+6;
+    }
+    int maxw=vw-24, inner=maxw-12;
+    int n=gui_wrap_text_ttf(txt,12,inner,48,al_lines); if(n<1){ n=1; al_lines[0][0]=0; }
+    int widest=0; for(int k=0;k<n;k++){ int w=gui_ttf_width(al_lines[k],12); if(w>widest) widest=w; }
+    int bw=widest+12; if(bw>maxw) bw=maxw; if(bw<24) bw=24;
+    int bh=n*AS_LINE_H+12;
+    int bx=(role==0)? vx+vw-bw : vx;
+    if(draw){
+        int ry0=y>cy0?y:cy0, ry1=(y+bh<cy1)?y+bh:cy1;
+        if(ry1>ry0){
+            uint32_t fill=(role==0)?C_ACCENT:C_PANEL2;
+            R(bx,ry0,bw,ry1-ry0,fill);
+            if(role==1){
+                R(bx,ry0,1,ry1-ry0,C_LINE); R(bx+bw-1,ry0,1,ry1-ry0,C_LINE);
+                if(y>=cy0)     { R(bx,y,bw,1,C_LINE); }
+                if(y+bh<=cy1)  { R(bx,y+bh-1,bw,1,C_LINE); }
+            }
+        }
+        uint32_t ink=(role==0)?gui_ink_on(C_ACCENT):C_TEXT;
+        for(int k=0;k<n;k++){ int ly=y+6+k*AS_LINE_H; if(ly>=cy0 && ly+AS_LINE_H<=cy1) win_draw_text_ttf(g_win,bx+6,ly,al_lines[k],12,ink); }
+    }
+    int hgt=bh+6;
+    int applied=ai_assist_applied(i);
+    if(role==1 && applied>0){
+        char tb[64]; snprintf(tb,sizeof tb,"Applied %d edit step%s (Undo available)",applied,applied==1?"":"s");
+        int ly=y+bh+2; if(draw && ly>=cy0 && ly+AS_CAP_H<=cy1) Ts(vx+2,ly,tb,C_ACCENT2);
+        hgt+=AS_CAP_H;
+    }
+    return hgt;
+}
+static void draw_assist(void){
+    if(!assist_open) return;
+    assist_ensure();
+    int x=assist_x(), y0=MENU_H, h=assist_h();
+    R(x,y0,ASSIST_W,h,C_PANEL); R(x,y0,1,h,C_LINE);
+    // header band
+    vgrad(x+1,y0,ASSIST_W-1,AS_HDR_H,C_PANEL,C_PANEL2); R(x,y0+AS_HDR_H,ASSIST_W,1,C_LINE);
+    T(x+10,y0+5,"Assistant",C_TEXT);
+    sbutton(x+ASSIST_W-26,y0+4,18,18,"x",0);
+    sbutton(x+ASSIST_W-74,y0+4,44,18,"Clear",0);
+    // context caption: the scope the assistant sees
+    char cx[96];
+    // ASCII separators on purpose: the 11 px caption path drew U+00B7 as "A·"
+    // (VM-verified 2026-09-11), so no UTF-8 in this string.
+    snprintf(cx,sizeof cx,"%d layer%s  |  %dx%d  |  selection %s",
+             g_doc.nlayers, g_doc.nlayers==1?"":"s", g_doc.w, g_doc.h, g_doc.sel_active?"active":"none");
+    Ts(x+10,y0+30,cx,C_DIM);
+    // input row
+    int fx=x+8, fy=y0+AS_FIELD_Y, fw=assist_field_w();
+    field_inset(fx,fy,fw,AS_FIELD_H);
+    if(assist_focus) OUT(fx,fy,fw,AS_FIELD_H,C_ACCENT2);
+    if(assist_buf[0]){
+        const char *s=assist_buf; int avail=fw-14;
+        while(*s && gui_ttf_render_width(s,13)>avail) s++;   // keep the tail (and the caret) visible
+        T(fx+6,fy+5,s,C_TEXT);
+        if(assist_focus){ int cw=gui_ttf_render_width(s,13); R(fx+6+cw+1,fy+5,2,16,C_ACCENT2); }
+    }else{
+        Ts(fx+6,fy+7,"Ask, or describe an edit...",C_DIM);
+        if(assist_focus) R(fx+6,fy+5,2,16,C_ACCENT2);
+    }
+    button(fx+fw+4,fy,AS_SEND_W,AS_FIELD_H,"Send",0,0);
+    Ts(x+10,y0+76,"Enter sends. Edits land as one Undo step.",C_DIM);
+    // transcript viewport
+    int tx=x+8, ty=y0+AS_TX_Y, tw=ASSIST_W-16, th=h-AS_TX_Y-8;
+    int n=ai_assist_count(), busy=ai_assist_busy();
+    int inner=tw-GUI_SCROLL_W;                 // measure at the narrower width so a gutter never reflows rows
+    int total=0; for(int i=0;i<n;i++) total+=assist_row(i,0,tx,inner,0,0,0);
+    if(busy) total+=22;
+    gui_scroll_config(&assist_sc,tx,ty,tw,th,total,AS_LINE_H);
+    if(assist_follow) gui_scroll_set(&assist_sc,gui_scroll_max(&assist_sc));
+    int cy0=ty, cy1=ty+th, yy=ty-assist_sc.offset;
+    for(int i=0;i<n;i++) yy+=assist_row(i,yy,tx,inner,1,cy0,cy1);
+    if(busy){   // three dots, the lit one cycles from ui_tick(): the panel's liveness tell
+        for(int k=0;k<3;k++){ int dx=tx+6+k*10, dy=yy+8; if(dy>=cy0 && dy+6<=cy1) R(dx,dy,6,6,k==assist_anim?C_ACCENT2:C_LINE); }
+    }
+    gui_scroll_draw_on(g_win,&assist_sc,C_PANEL);
+}
+static void assist_submit(void){
+    assist_ensure();
+    if(!assist_buf[0]) return;
+    int rc=ai_assist_send(assist_buf);
+    assist_buf[0]=0; tf_init(&assist_tf,assist_buf,sizeof assist_buf);
+    assist_follow=1; assist_focus=1;
+    if(rc==0) ui_status("Assistant: thinking...");
+    draw_assist(); win_invalidate(g_win);
+}
+static void assist_toggle(void){
+    assist_ensure();
+    assist_open=!assist_open;
+    assist_focus=assist_open;
+    if(assist_open) assist_follow=1;
+    ui_full_redraw();
+}
+static int click_assist(int mx,int my){
+    if(!assist_open) return 0;
+    int x=assist_x(), y0=MENU_H, h=assist_h();
+    if(!IN(mx,my,x,y0,ASSIST_W,h)){
+        if(assist_focus){ assist_focus=0; draw_assist(); win_invalidate(g_win); }
+        return 0;
+    }
+    if(IN(mx,my,x+ASSIST_W-26,y0+4,18,18)){ assist_open=0; assist_focus=0; ui_full_redraw(); return 1; }
+    if(IN(mx,my,x+ASSIST_W-74,y0+4,44,18)){ ai_assist_reset(); assist_follow=1; ui_full_redraw(); return 1; }
+    int fx=x+8, fy=y0+AS_FIELD_Y, fw=assist_field_w();
+    if(IN(mx,my,fx,fy,fw,AS_FIELD_H)){ assist_focus=1; draw_assist(); win_invalidate(g_win); return 1; }
+    if(IN(mx,my,fx+fw+4,fy,AS_SEND_W,AS_FIELD_H)){ assist_submit(); return 1; }
+    if(gui_scroll_press(&assist_sc,mx,my)){ assist_follow=0; draw_assist(); win_invalidate(g_win); return 1; }
+    return 1;   // inside the panel: consumed, nothing under it may see the click
+}
+int ui_tick(void){
+    // P7: compact the pending undo baseline once the mutation is complete. A
+    // stroke is the only multi-event mutation (painting != 0 while the pointer
+    // is down), so sealing between strokes can never split a step. Repaint so
+    // the History panel's payload column settles from the full baseline to
+    // the sealed delta (unless a modal overlay owns the surface right now).
+    if(!painting && undo_seal()){ if(!overlay_open()) ui_full_redraw(); }
+    if(!assist_inited) return 0;
+    if(ai_assist_poll()){
+        // A turn landed (reply, notice, or an applied edit). The document
+        // may have changed, so a full repaint whenever the composite is dirty
+        // or an overlay would otherwise be painted over; else just the panel.
+        assist_follow=1;
+        int last=ai_assist_count()-1;
+        if(last>=0 && ai_assist_role(last)==1){
+            int ap=ai_assist_applied(last);
+            if(ap>0){ char s[48]; snprintf(s,sizeof s,"Assistant applied %d edit step%s",ap,ap==1?"":"s"); ui_status(s); }
+            else ui_status("Assistant replied");
+        }
+        if(g_doc.comp_dirty || overlay_open() || !assist_open) ui_full_redraw();
+        else { draw_assist(); win_invalidate(g_win); }
+        return 1;
+    }
+    if(assist_open && ai_assist_busy()){
+        unsigned long now=uptime_ms();
+        if(now-assist_anim_t>=300){
+            assist_anim_t=now; assist_anim=(assist_anim+1)%3;
+            if(!overlay_open()){ draw_assist(); win_invalidate(g_win); return 1; }
+        }
+    }
+    return 0;
+}
+
 static int handle_key(gui_event_t *e){
     char ch=e->key_char;
     if(ch==26){ do_action(A_UNDO); return 1; }
     if(ch==25){ do_action(A_REDO); return 1; }
+    if(ch==19){ do_action(A_SAVE); return 1; }    // Ctrl+S: the File menu has advertised it since the menu existed
     if(ch==1){ do_action(A_SELALL); return 1; }
     if(ch==4){ do_action(A_SELNONE); return 1; }
     if(ch==9){ do_action(A_SELINV); return 1; }
@@ -3338,6 +3701,14 @@ int ui_handle_event(void *evp){
                 if(ch==27){ modal=0; ui_full_redraw(); return 1; }
                 tf_handle_key(&modal_tf, e); draw_modal(); win_invalidate(g_win); return 1; }
             if(modal==2){ if(e->key_char=='\n'||e->key_char==27){ modal=0; ui_full_redraw(); } return 1; }
+            if(e->keycode==GUI_KEY_F9){ assist_toggle(); return 1; }   // works with or without field focus
+            if(assist_open && assist_focus){ char ch=e->key_char;
+                if(ch=='\n'||ch=='\r'||e->keycode==0x1C){ assist_submit(); return 1; }
+                if(ch==27){ assist_focus=0; draw_assist(); win_invalidate(g_win); return 1; }
+                if(e->keycode==GUI_KEY_PGUP||e->keycode==GUI_KEY_PGDN){   // page the transcript from the field
+                    if(gui_scroll_key(&assist_sc,e->keycode)){ assist_follow=0; draw_assist(); win_invalidate(g_win); }
+                    return 1; }
+                tf_handle_key(&assist_tf,e); draw_assist(); win_invalidate(g_win); return 1; }
             if(text_typing){
                 char tch=e->key_char; unsigned int tkc=e->keycode;
                 if(tch=='\n'||tch=='\r'||tkc==0x1C){ text_finish(); ui_full_redraw(); return 1; }
@@ -3391,6 +3762,7 @@ int ui_handle_event(void *evp){
                 if(a!=A_NONE){ do_action(a); if(g_want_quit) return 0; return 1; }
             }
             if(click_menubar(mx,my)) return 1;
+            if(click_assist(mx,my)) return 1;   // P6 panel; also drops field focus on an outside click
             // ruler drag -> new guide
             if(my>=cv_y() && my<cv_y()+cv_h() && mx>=cv_x()-RULER_Y && mx<cv_x()){ // left ruler
                 int cx,cy; screen_to_canvas(cv_x(),my,&cx,&cy); dragging_guide=2; drag_guide_pos=cy; ui_full_redraw(); return 1; }
@@ -3413,7 +3785,8 @@ int ui_handle_event(void *evp){
             g_mx=mx; g_my=my;
             if(cp_modal_open()){ cp_drag_modal(mx,my); return 1; }
             if(cp_drag_dock(mx,my)) return 1;
-            if(fb_open){ if(fb_sb_drag) fb_sb_to(my); draw_filebrowser(); win_invalidate(g_win); return 1; }
+            if(assist_open && gui_scroll_motion(&assist_sc,mx,my)){ assist_follow=0; draw_assist(); win_invalidate(g_win); return 1; }
+            if(fb_open){ if(fb_sb_drag) fb_sb_to(my); if(fb_q_drag) fb_q_to(mx); draw_filebrowser(); win_invalidate(g_win); return 1; }
             if(pr_open){ return 1; }   // static preview; ignore hover churn
             if(guard_open){ draw_guard(); win_invalidate(g_win); return 1; }
             if(pd_open){
@@ -3496,7 +3869,10 @@ int ui_handle_event(void *evp){
             g_mx=mx; g_my=my; g_mdown=0;
             if(cp_modal_open()){ cp_modal_release(); return 1; }
             cp_dock_release();
-            if(fb_open){ fb_sb_drag=0; return 1; }
+            gui_scroll_release(&assist_sc);
+            if(fb_open){ fb_sb_drag=0;
+                if(fb_q_drag){ fb_q_drag=0; fb_jpeg_apply(); draw_filebrowser(); win_invalidate(g_win); }   // estimate recomputes on release, not per pixel
+                return 1; }
             if(guard_open) return 1;
             if(zoom_slider_drag){ zoom_slider_drag=0; return 1; }
             if(opt_drag>=0){ opt_drag=-1; draw_toolopts(); win_invalidate(g_win); return 1; }
@@ -3512,6 +3888,7 @@ int ui_handle_event(void *evp){
             if(my<MENU_H){ draw_menubar(); win_invalidate(g_win); }
             else if(mx<PANEL_W){ draw_toolpanel(); win_invalidate(g_win); }
             else if(mx>=g_w-DOCK_W){ draw_dock(); win_invalidate(g_win); }
+            else if(assist_open && mx>=assist_x()){ draw_assist(); win_invalidate(g_win); }
             break;
         }
         case EVENT_MOUSE_SCROLL:
@@ -3523,6 +3900,10 @@ int ui_handle_event(void *evp){
                 ui_full_redraw(); break;
             }
             if(guard_open) break;
+            if(assist_open && IN(g_mx,g_my,assist_x(),MENU_H,ASSIST_W,assist_h())){
+                if(gui_scroll_wheel(&assist_sc,e->scroll_delta)){ assist_follow=0; draw_assist(); win_invalidate(g_win); }
+                break;
+            }
             if(g_mx>=g_w-DOCK_W && g_my>=MENU_H){
                 int step=48;
                 if(e->scroll_delta>0) dock_scroll-=step; else if(e->scroll_delta<0) dock_scroll+=step;

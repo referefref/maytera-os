@@ -52,6 +52,7 @@
 #include "../serial.h"
 #include "../cpu/mono.h"        // #115: bound the RTC update-in-progress waits
 #include "../fs/bootlog.h"
+#include "../sync/spinlock.h"   // (rtclock) cmos_lock: serialise the 0x70/0x71 pair
 
 // The codec, rustkern/rtcenc.rs. Both directions, one definition.
 extern int rtc_encode_field_rs(int value, int is_bcd);
@@ -72,6 +73,46 @@ extern int rtc_selftest_rs(uint32_t *out_checks);
 #define RTC_YEAR        0x09
 #define RTC_STATUS_A    0x0A
 #define RTC_STATUS_B    0x0B
+// #dnsfallback: Status Register D, bit 7 = VRT, "Valid RAM and Time". The
+// MC146818 clears it when CMOS loses power and it stays clear until the part is
+// read after power is restored. It was never read anywhere in this kernel.
+//
+// WHY IT IS WORTH TWO PORT I/Os. The owner's 2013 iMac booted with a clock four
+// days slow and every TLS handshake failed on it. "Wrong clock" today has
+// exactly one diagnosis in this tree - netfail_clock_check_rs() compares the
+// RTC year against __DATE__ - and that verdict cannot tell a FLAT CMOS BATTERY
+// (a part to replace) from a clock that merely drifted or was never set (a
+// button to press). On a machine of that age the battery is the likely cause,
+// and it changes the advice completely.
+//
+// READ THE ASYMMETRY HONESTLY: VRT==0 is a positive hardware assertion that
+// CMOS lost power. VRT==1 proves much less, because QEMU's mc146818 and many
+// other emulated and real southbridges tie it high unconditionally. So this is
+// logged as evidence, and the wording below only makes the strong claim in the
+// direction the bit actually supports.
+#define RTC_STATUS_D    0x0D
+#define RTC_REGD_VRT    0x80
+
+// (rtclock, #168 BKL stage-0-adjacent) DEDICATED CMOS LOCK.
+//
+// Ports 0x70/0x71 are a stateful index/data PAIR: outb(0x70,reg) selects a
+// register, the following 0x71 access hits it. Two cores interleaving those two
+// I/Os read each other's register. Until now that race was masked ONLY by the
+// BKL (every RTC caller held it), which is exactly why sys_get_rtc_date (sc 143)
+// held the BKL across the whole read: the #0 cumulative BKL holder per
+// [SCPROF-BKLHOLD]. This lock lets sc 142-145 DROP the BKL for the CMOS work
+// (bkl_release_all/bkl_reacquire in proc/syscall.c) while this leaf lock keeps
+// the port pair exclusive. It is a STRICT LEAF: nothing but port I/O runs under
+// it, so the order is always (BKL or nothing) -> cmos_lock, never inverted.
+// rtc.c is the SOLE 0x70/0x71 site in the kernel (#135 consolidated all four
+// old decoders here), so covering these entry points covers every access.
+//
+// Held only across microsecond register bursts. The bounded update-in-progress
+// wait re-takes it PER POLL (see rtc_update_in_progress), so the up-to-20ms
+// budget is spent with interrupts ON and the lock free, never as a 20ms
+// interrupts-off hold. This is the lock drivers/rtc.c previously recorded as
+// found-not-fixed; it is now taken and verified.
+static spinlock_t cmos_lock = SPINLOCK_INIT_NAMED("cmos");
 
 static inline uint8_t rtc_reg_read(uint8_t reg) {
     outb(RTC_INDEX_PORT, reg);
@@ -84,11 +125,20 @@ static inline void rtc_reg_write(uint8_t reg, uint8_t val) {
 }
 
 uint8_t rtc_status_b(void) {
-    return rtc_reg_read(RTC_STATUS_B);
+    uint64_t f = spinlock_acquire_irqsave(&cmos_lock);
+    uint8_t v = rtc_reg_read(RTC_STATUS_B);
+    spinlock_release_irqrestore(&cmos_lock, f);
+    return v;
 }
 
 static bool rtc_update_in_progress(void) {
-    return (rtc_reg_read(RTC_STATUS_A) & 0x80) != 0;
+    // (rtclock) Locked per poll so the up-to-20ms wait in rtc_wait_update_done()
+    // runs with interrupts ON between iterations, never as one long
+    // interrupts-off hold.
+    uint64_t f = spinlock_acquire_irqsave(&cmos_lock);
+    bool uip = (rtc_reg_read(RTC_STATUS_A) & 0x80) != 0;
+    spinlock_release_irqrestore(&cmos_lock, f);
+    return uip;
 }
 
 // #115: BOUNDED wait for the RTC's update cycle to end.
@@ -129,11 +179,13 @@ static void rtc_wait_update_done(void) {
 void rtc_read_time(int *hour, int *minute, int *second) {
     rtc_wait_update_done();
 
+    uint64_t __cf = spinlock_acquire_irqsave(&cmos_lock);   // (rtclock)
     uint8_t sec = rtc_reg_read(RTC_SECONDS);
     uint8_t min = rtc_reg_read(RTC_MINUTES);
     uint8_t hr  = rtc_reg_read(RTC_HOURS);
-
     uint8_t status_b = rtc_reg_read(RTC_STATUS_B);
+    spinlock_release_irqrestore(&cmos_lock, __cf);
+
     int is_bcd = (status_b & RTC_REGB_DM_BINARY) ? 0 : 1;
     int is_24h = (status_b & RTC_REGB_24HOUR) ? 1 : 0;
 
@@ -153,12 +205,14 @@ void rtc_read_time(int *hour, int *minute, int *second) {
 void rtc_read_date(int *day, int *month, int *year, int *weekday) {
     rtc_wait_update_done();
 
+    uint64_t __cf = spinlock_acquire_irqsave(&cmos_lock);   // (rtclock)
     uint8_t d = rtc_reg_read(RTC_DAY);
     uint8_t m = rtc_reg_read(RTC_MONTH);
     uint8_t y = rtc_reg_read(RTC_YEAR);
     uint8_t w = rtc_reg_read(RTC_WEEKDAY);
-
     uint8_t status_b = rtc_reg_read(RTC_STATUS_B);
+    spinlock_release_irqrestore(&cmos_lock, __cf);
+
     int is_bcd = (status_b & RTC_REGB_DM_BINARY) ? 0 : 1;
 
     int dd = rtc_decode_field_rs(d, is_bcd);
@@ -202,7 +256,9 @@ static inline void rtc_irq_restore(uint64_t flags) {
 // nothing at all: a partial write would leave the chip holding a time that is
 // neither the old one nor the requested one.
 int rtc_set_time(int hour, int minute, int second) {
+    uint64_t __cf0 = spinlock_acquire_irqsave(&cmos_lock);   // (rtclock)
     uint8_t status_b = rtc_reg_read(RTC_STATUS_B);
+    spinlock_release_irqrestore(&cmos_lock, __cf0);
     int is_bcd = (status_b & RTC_REGB_DM_BINARY) ? 0 : 1;
     int is_24h = (status_b & RTC_REGB_24HOUR) ? 1 : 0;
 
@@ -217,20 +273,25 @@ int rtc_set_time(int hour, int minute, int second) {
 
     rtc_wait_update_done();
 
-    uint64_t flags = rtc_irq_save_cli();
+    // (rtclock) cmos_lock (irqsave) both freezes local IRQs for the update
+    // window AND excludes other cores from the port pair, replacing the old
+    // bare cli/sti that only did the former.
+    uint64_t flags = spinlock_acquire_irqsave(&cmos_lock);
     uint8_t saved = rtc_reg_read(RTC_STATUS_B);
     rtc_reg_write(RTC_STATUS_B, (uint8_t)(saved | RTC_REGB_SET));
     rtc_reg_write(RTC_SECONDS, (uint8_t)es);
     rtc_reg_write(RTC_MINUTES, (uint8_t)em);
     rtc_reg_write(RTC_HOURS,   (uint8_t)eh);
     rtc_reg_write(RTC_STATUS_B, (uint8_t)(saved & (uint8_t)~RTC_REGB_SET));
-    rtc_irq_restore(flags);
+    spinlock_release_irqrestore(&cmos_lock, flags);
 
     return 0;
 }
 
 int rtc_set_date(int day, int month, int year) {
+    uint64_t __cf0 = spinlock_acquire_irqsave(&cmos_lock);   // (rtclock)
     uint8_t status_b = rtc_reg_read(RTC_STATUS_B);
+    spinlock_release_irqrestore(&cmos_lock, __cf0);
     int is_bcd = (status_b & RTC_REGB_DM_BINARY) ? 0 : 1;
 
     // The chip holds a two-digit year and no decoder in this tree reads a
@@ -250,14 +311,15 @@ int rtc_set_date(int day, int month, int year) {
 
     rtc_wait_update_done();
 
-    uint64_t flags = rtc_irq_save_cli();
+    // (rtclock) see rtc_set_time: cmos_lock freezes local IRQs and excludes cores.
+    uint64_t flags = spinlock_acquire_irqsave(&cmos_lock);
     uint8_t saved = rtc_reg_read(RTC_STATUS_B);
     rtc_reg_write(RTC_STATUS_B, (uint8_t)(saved | RTC_REGB_SET));
     rtc_reg_write(RTC_DAY,   (uint8_t)ed);
     rtc_reg_write(RTC_MONTH, (uint8_t)emo);
     rtc_reg_write(RTC_YEAR,  (uint8_t)ey);
     rtc_reg_write(RTC_STATUS_B, (uint8_t)(saved & (uint8_t)~RTC_REGB_SET));
-    rtc_irq_restore(flags);
+    spinlock_release_irqrestore(&cmos_lock, flags);
 
     return 0;
 }
@@ -285,6 +347,7 @@ void rtc_mode_report(void) {
 
     uint8_t b = rtc_reg_read(RTC_STATUS_B);
     uint8_t a = rtc_reg_read(RTC_STATUS_A);
+    uint8_t dreg = rtc_reg_read(RTC_STATUS_D);
     uint8_t rs = rtc_reg_read(RTC_SECONDS);
     uint8_t rm = rtc_reg_read(RTC_MINUTES);
     uint8_t rh = rtc_reg_read(RTC_HOURS);
@@ -300,16 +363,30 @@ void rtc_mode_report(void) {
     const char *hfmt = (b & RTC_REGB_24HOUR) ? "24h" : "12h";
 
     kprintf("[RTC] codec selftest %s (%u checks); regA=0x%02x regB=0x%02x "
-            "mode=%s/%s%s\n",
-            rc == 0 ? "PASS" : "FAIL", checks, a, b, mode, hfmt,
+            "regD=0x%02x vrt=%d mode=%s/%s%s\n",
+            rc == 0 ? "PASS" : "FAIL", checks, a, b, dreg,
+            (dreg & RTC_REGD_VRT) ? 1 : 0, mode, hfmt,
             (b & RTC_REGB_DSE) ? "/DSE" : "");
     kprintf("[RTC] raw s=%02x m=%02x h=%02x d=%02x mo=%02x y=%02x -> "
             "%04d-%02d-%02d %02d:%02d:%02d\n",
             rs, rm, rh, rd, rmo, ry, y, mo, d, h, mi, s);
 
-    bootlog_write("[RTC] selftest=%s checks=%u regA=0x%02x regB=0x%02x mode=%s/%s%s",
-                  rc == 0 ? "PASS" : "FAIL", checks, a, b, mode, hfmt,
+    bootlog_write("[RTC] selftest=%s checks=%u regA=0x%02x regB=0x%02x "
+                  "regD=0x%02x vrt=%d mode=%s/%s%s",
+                  rc == 0 ? "PASS" : "FAIL", checks, a, b, dreg,
+                  (dreg & RTC_REGD_VRT) ? 1 : 0, mode, hfmt,
                   (b & RTC_REGB_DSE) ? "/DSE" : "");
+    // Only the ZERO case gets a sentence, because only the zero case means
+    // anything. See the RTC_STATUS_D comment for why VRT=1 is not evidence of
+    // a healthy battery.
+    if (!(dreg & RTC_REGD_VRT)) {
+        bootlog_write("[RTC] VRT=0: the RTC reports that CMOS LOST POWER. On a "
+                      "machine of any age this is a FLAT CMOS BATTERY, not a "
+                      "clock that merely drifted. The date will be wrong on "
+                      "every boot and every HTTPS connection will fail on it "
+                      "until the battery is replaced; setting the time in "
+                      "Settings > Date and Time will hold only until shutdown.");
+    }
     bootlog_write("[RTC] raw s=%02x m=%02x h=%02x d=%02x mo=%02x y=%02x decoded=%04d-%02d-%02d %02d:%02d:%02d",
                   rs, rm, rh, rd, rmo, ry, y, mo, d, h, mi, s);
 }

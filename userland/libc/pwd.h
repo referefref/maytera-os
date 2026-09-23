@@ -36,4 +36,10 @@ struct passwd *getpwuid(uid_t uid);
 // Returns pointer to static struct (overwritten on next call), or NULL
 struct passwd *getpwnam(const char *name);
 
+// Sequential enumeration of the password database, added for the libedit
+// port (#745): filecomplete uses it for ~user tab completion.
+void setpwent(void);
+struct passwd *getpwent(void);
+void endpwent(void);
+
 #endif // _PWD_H

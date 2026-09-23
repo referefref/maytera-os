@@ -16,6 +16,7 @@
 // than left beside it: two declarations of the same function, one of them
 // weaker, is exactly how a format-string mismatch reaches a golden.
 #include "../fs/panic.h"
+#include "../fs/bootlog.h"   // #dosmem: the corrupt-context headline, persistently
 
 // ---------------------------------------------------------------------------
 // 1. THE RING
@@ -178,6 +179,55 @@ int schedrace_check(uint32_t cpu, const void *prevv, const void *nextv,
         kprintf("[SCHEDRACE] *** CORRUPT CONTEXT DETECTED at %s on cpu %u ***\n",
                 when ? when : "?", cpu);
         kprintf("[SCHEDRACE] reason %d: %s\n", r, sr_reason(r));
+        // #dosmem: THE HEADLINE, PERSISTENTLY, AND ONLY THE HEADLINE.
+        //
+        // This whole dump is serial-only, and neither of the owner's machines
+        // has a serial port, so a #75 corrupt-context event has never been
+        // readable on the hardware it matters on. Three self-contained records
+        // go to the fault ring (no lock, no allocation, no filesystem, which is
+        // all that is legal here): what was detected, and the identity plus
+        // scheduler state of both tasks. The per-core switch RING below stays
+        // on serial deliberately - it is 8 cores x 16 entries and would not fit
+        // the 2 KB fault ring, and evicting the headline to carry the history
+        // would be the wrong trade.
+        //
+        // HONEST LIMIT, do not read this as a guarantee: the fault ring is
+        // drained by the 2 s heartbeat thread, and the tail of this function
+        // calls kpanic() whenever g_smp_user_sched is set, which is the default
+        // now that SMP is on. A halted CPU never reaches the drain, so on the
+        // panicking path these records survive only if something else flushes
+        // the ring first. fs/panic.c already flushes the HEARTBEAT ring
+        // (panic.c:310) and does NOT flush the fault ring; bootlog_fault_ring()
+        // now exists so that gap can be closed by one call there. Until it is,
+        // this is a genuine improvement on the non-panicking arm and no
+        // improvement at all on the panicking one.
+        bootlog_fault_write("[SCHEDRACE] CORRUPT CONTEXT at %s on cpu %u: "
+                            "reason %d (%s)", when ? when : "?", cpu, r,
+                            sr_reason(r));
+        if (next)
+            bootlog_fault_write("[SCHEDRACE] incoming '%s' pid=%u state=%u "
+                                "enq=%u pop=%u route=%u hot=%u pinned=%d "
+                                "on_cpu=%d rsp=0x%lx stack=[0x%lx,0x%lx) "
+                                "cr3=0x%lx priv=%u queued_by=0x%lx",
+                                next->name, next->pid, (uint32_t)next->state,
+                                next->sched_state_at_enq, next->sched_state_at_pop,
+                                next->enq_route, next->enq_allowed_hot,
+                                next->sched_pinned, next->sched_on_cpu,
+                                (unsigned long)next->rsp,
+                                (unsigned long)next->stack_base,
+                                (unsigned long)((uint64_t)next->stack_base +
+                                                next->stack_size),
+                                (unsigned long)next->cr3,
+                                (uint32_t)next->privilege,
+                                (unsigned long)(uint64_t)next->sched_enq_ra);
+        if (prev)
+            bootlog_fault_write("[SCHEDRACE] outgoing '%s' pid=%u state=%u "
+                                "on_cpu=%d rsp=0x%lx stack=[0x%lx,0x%lx)",
+                                prev->name, prev->pid, (uint32_t)prev->state,
+                                prev->sched_on_cpu, (unsigned long)prev->rsp,
+                                (unsigned long)prev->stack_base,
+                                (unsigned long)((uint64_t)prev->stack_base +
+                                                prev->stack_size));
         if (next) {
             // #75: the line that separates (a) from (b). enq=<state when it was
             // queued> pop=<state when this core took it> now=<state at the

@@ -597,6 +597,106 @@ static const uint8_t icon_eject_data[] = {
 };
 
 // ============================================================================
+// #titlebar-icon: three new app-class glyphs (window titlebar identity fix)
+//
+// window_title_icon() (window.c) used to resolve a titlebar icon purely by
+// matching keywords against the window's own (app-chosen, arbitrary) TITLE,
+// which meant Browser, Planetarium and App Repo could never match - none of
+// their titles contain a keyword this file recognised - and fell back to
+// ICON_WINDOW (a plain box) every time. These three glyphs give those app
+// classes a real icon instead of adding more keywords that would only ever
+// work by coincidence. Hand-drawn 1bpp 24x24, same coordinate/byte layout as
+// every icon above (generated at authoring time from simple analytic shapes
+// - circle/arc/polygon - rather than freehand, to keep the outline clean at
+// this resolution; not a different format or a different code path).
+// ============================================================================
+
+// ICON_BROWSER - globe (circle + meridian + two latitude arcs)
+static const uint8_t icon_browser_data[] = {
+    0x00, 0x00, 0x00,  // Row  0
+    0x00, 0xFE, 0x00,  // Row  1
+    0x03, 0xFF, 0x80,  // Row  2
+    0x07, 0x8B, 0xC0,  // Row  3
+    0x0E, 0x08, 0xE0,  // Row  4
+    0x1C, 0x08, 0x30,  // Row  5
+    0x38, 0x3C, 0x38,  // Row  6
+    0x30, 0xEF, 0x18,  // Row  7
+    0x71, 0x89, 0x9C,  // Row  8
+    0x61, 0x08, 0x8C,  // Row  9
+    0x61, 0x08, 0x8C,  // Row 10
+    0x60, 0x08, 0x0C,  // Row 11
+    0x60, 0x08, 0x0C,  // Row 12
+    0x61, 0x08, 0x8C,  // Row 13
+    0x71, 0x08, 0x9C,  // Row 14
+    0x31, 0x89, 0x98,  // Row 15
+    0x38, 0xEF, 0x38,  // Row 16
+    0x18, 0x3C, 0x38,  // Row 17
+    0x0E, 0x08, 0xF0,  // Row 18
+    0x07, 0x8B, 0xE0,  // Row 19
+    0x03, 0xFF, 0xC0,  // Row 20
+    0x00, 0xFE, 0x00,  // Row 21
+    0x00, 0x00, 0x00,  // Row 22
+    0x00, 0x00, 0x00,  // Row 23
+};
+
+// ICON_PLANETARIUM - four-point sparkle star (planetarium/night sky), plus
+// two small companion sparkles for a starfield feel.
+static const uint8_t icon_planetarium_data[] = {
+    0x00, 0x00, 0x00,  // Row  0
+    0x00, 0x00, 0x00,  // Row  1
+    0x00, 0x00, 0x00,  // Row  2
+    0x08, 0x00, 0x00,  // Row  3
+    0x08, 0x18, 0x00,  // Row  4
+    0x08, 0x18, 0x00,  // Row  5
+    0x08, 0x18, 0x00,  // Row  6
+    0x00, 0x18, 0x00,  // Row  7
+    0x00, 0x3C, 0x00,  // Row  8
+    0x00, 0x7E, 0x00,  // Row  9
+    0x07, 0xFF, 0xE0,  // Row 10
+    0x07, 0xFF, 0xE0,  // Row 11
+    0x00, 0x7E, 0x00,  // Row 12
+    0x00, 0x3C, 0x00,  // Row 13
+    0x00, 0x18, 0x00,  // Row 14
+    0x00, 0x18, 0x10,  // Row 15
+    0x00, 0x18, 0x10,  // Row 16
+    0x00, 0x18, 0x10,  // Row 17
+    0x00, 0x00, 0x10,  // Row 18
+    0x00, 0x00, 0x10,  // Row 19
+    0x00, 0x00, 0x10,  // Row 20
+    0x00, 0x00, 0x00,  // Row 21
+    0x00, 0x00, 0x00,  // Row 22
+    0x00, 0x00, 0x00,  // Row 23
+};
+
+// ICON_APPSTORE - shopping bag (trapezoid body, arc handle, fold band)
+static const uint8_t icon_appstore_data[] = {
+    0x00, 0x00, 0x00,  // Row  0
+    0x00, 0x00, 0x00,  // Row  1
+    0x00, 0x00, 0x00,  // Row  2
+    0x00, 0x00, 0x00,  // Row  3
+    0x00, 0x00, 0x00,  // Row  4
+    0x00, 0x7E, 0x00,  // Row  5
+    0x00, 0xC3, 0x00,  // Row  6
+    0x01, 0x81, 0x80,  // Row  7
+    0x01, 0x00, 0x80,  // Row  8
+    0x03, 0xFF, 0xC0,  // Row  9
+    0x02, 0x00, 0x40,  // Row 10
+    0x02, 0x00, 0x40,  // Row 11
+    0x07, 0xFF, 0xE0,  // Row 12
+    0x04, 0x00, 0x20,  // Row 13
+    0x04, 0x00, 0x20,  // Row 14
+    0x0C, 0x00, 0x30,  // Row 15
+    0x08, 0x00, 0x10,  // Row 16
+    0x08, 0x00, 0x10,  // Row 17
+    0x08, 0x00, 0x10,  // Row 18
+    0x10, 0x00, 0x08,  // Row 19
+    0x10, 0x00, 0x08,  // Row 20
+    0x1F, 0xFF, 0xF8,  // Row 21
+    0x00, 0x00, 0x00,  // Row 22
+    0x00, 0x00, 0x00,  // Row 23
+};
+
+// ============================================================================
 // Icon Table
 // ============================================================================
 
@@ -676,6 +776,10 @@ static const icon_t icons[ICON_COUNT] = {
     { icon_usb_drive_data,  24, 24 },   // ICON_USB_DRIVE
     { icon_hard_drive_data, 24, 24 },   // ICON_HARD_DRIVE
     { icon_eject_data,      24, 24 },   // ICON_EJECT
+    // #titlebar-icon new app-class icons (67-69)
+    { icon_browser_data,     24, 24 },  // ICON_BROWSER
+    { icon_planetarium_data, 24, 24 },  // ICON_PLANETARIUM
+    { icon_appstore_data,    24, 24 },  // ICON_APPSTORE
 };
 
 // ============================================================================

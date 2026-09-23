@@ -189,7 +189,7 @@ int dos_fmq_host_selftest(void) {
     // The self-test leaves the queue CLOSED as a postcondition (a self-test must
     // not leave a device armed). The caller only ever runs it because a guest is
     // starting, so the re-open belongs here, next to the close that made it
-    // necessary. MEASURED on VM <vmid> build 2001 before this existed: the caller
+    // necessary. MEASURED on VM 2782 build 2001 before this existed: the caller
     // opened the queue, the test closed it, FMSYNTH's first drain returned
     // ENODEV and it exited, and Keen 5 wrote its whole 264-register instrument
     // bank into a queue nobody was reading.

@@ -12,6 +12,11 @@ item: Device Manager | /APPS/DEVMGR | icon=computer
 # a new icon added: icon files live outside the repo in the asset base, so a
 # new id would silently fall back to a vector glyph on the real image.
 item: Disk Images | /APPS/DISKIMG | icon=computer
+# (#404 Stage 6) Disk Manager suite: the ncdu-style Usage analyzer plus tabs for
+# Partitions (GPT edit via two-phase PREPARE/APPLY), Format (mkfs FAT/ext2), Mount
+# and Removable safe-eject. Target stays /APPS/DISKUSE; icon=computer reused for the
+# same asset-base reason as Disk Images above.
+item: Disk Manager | /APPS/DISKUSE | icon=computer
 item: Install MayteraOS to Disk | /APPS/INSTALL | icon=computer
 item: App Repo | /APPS/APPSTORE | icon=appstore
 item: System Log | /APPS/SYSLOG | icon=log

@@ -8,11 +8,16 @@
 #include "../../string.h"
 #include "../../mm/heap.h"
 #include "../../serial.h"
+#include "fs/bootlog.h"          // ecdhkat: durable KAT result sink
 
 // =============================================================================
 // X25519 Key Exchange (Curve25519)
 // =============================================================================
 
+// X25519_KAT_REGION_BEGIN  (ecdhkat) - everything from here through
+// x25519_selftest() is the self-contained Curve25519 field arithmetic + ladder
+// + agreement; ecdhkat_x25519_kat.sh extracts exactly this span and compiles it
+// host-side so the oracle can never rot out of sync with the shipping code.
 // Field element: 256-bit number represented as 10 limbs of ~25.5 bits each
 typedef int64_t fe[10];
 
@@ -225,6 +230,16 @@ static void fe_invert(fe out, const fe z) {
 
 // X25519 scalar multiplication using Montgomery ladder
 static void x25519_scalar_mult(uint8_t out[32], const uint8_t scalar[32], const uint8_t point[32]) {
+#ifdef X25519_KAT_FAULT
+    /* HOST KAT RED-TEAM ONLY. The kernel build NEVER defines this flag (it
+       appears in no Makefile). ecdhkat_x25519_kat.sh compiles a second copy
+       WITH it, stubbing the ladder to return the peer point unchanged (an
+       identity/passthrough shared secret - the worst realistic ECDH bug), to
+       prove x25519_selftest()~s known-answer + agreement + negative checks
+       actually FIRE and are not a no-op. See ecdhkat / blame.md. */
+    memcpy(out, point, 32);
+    return;
+#endif
     uint8_t e[32];
     memcpy(e, scalar, 32);
     e[0] &= 248;
@@ -331,6 +346,98 @@ void x25519_shared_secret(const uint8_t *their_public,
                           uint8_t *shared) {
     x25519_scalar_mult(shared, my_private, their_public);
 }
+
+// =============================================================================
+// X25519 known-answer self-test (ecdhkat). The TLS 1.3 key_share AND the TLS
+// 1.2 x25519 ECDHE both derive the entire session shared secret from
+// x25519_scalar_mult(); a silently-wrong ladder yields the wrong secret and
+// breaks (or, worse, weakens) every handshake, and nothing in the tree proved
+// it against a published vector. This is that proof. It drives ONLY the public
+// entry point x25519_shared_secret(their_public=u, my_private=scalar, out),
+// which is exactly scalar_mult(out, scalar, u), so it needs no file-static
+// access beyond what already ships. Checks:
+//   (a) RFC 7748 section 5.2 : two scalar*u known-answer vectors.
+//   (b) RFC 7748 section 6.1 : Alice/Bob private -> public -> the SAME K.
+//   (c) NEGATIVE (not a tautology): one flipped private-key bit changes K.
+//   (d) NEGATIVE (contributory): an all-zero (small-order) peer point gives an
+//       all-zero output - the very condition tls.c rejects as attacker-known.
+// ecdhkat_x25519_kat.sh runs it host-side: GREEN as shipped, RED under
+// -DX25519_KAT_FAULT. main.c runs it at boot. Returns the FAILED-check count.
+static void x25519_kat_hex(uint8_t *out, const char *hex, int outlen) {
+    int i;
+    for (i = 0; i < outlen; i++) {
+        int hi = (unsigned char)hex[2 * i];
+        int lo = (unsigned char)hex[2 * i + 1];
+        hi = (hi <= '9') ? hi - '0' : (hi | 0x20) - 'a' + 10;
+        lo = (lo <= '9') ? lo - '0' : (lo | 0x20) - 'a' + 10;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+}
+
+int x25519_selftest(void) {
+    int fail = 0, checks = 0, i;
+    uint8_t scalar[32], u[32], expect[32], out[32];
+
+    // (a) RFC 7748 section 5.2 scalar-mult known-answer vectors.
+    static const struct { const char *k; const char *u; const char *r; } KAT[2] = {
+        { "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4",
+          "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c",
+          "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552" },
+        { "4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d",
+          "e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493",
+          "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957" },
+    };
+    for (i = 0; i < 2; i++) {
+        x25519_kat_hex(scalar, KAT[i].k, 32);
+        x25519_kat_hex(u, KAT[i].u, 32);
+        x25519_kat_hex(expect, KAT[i].r, 32);
+        x25519_shared_secret(u, scalar, out);   // == scalar_mult(out, scalar, u)
+        checks++;
+        if (memcmp(out, expect, 32) != 0) fail++;
+    }
+
+    // (b) RFC 7748 section 6.1 Diffie-Hellman agreement.
+    uint8_t apriv[32], bpriv[32], apub[32], bpub[32], ka[32], kb[32], K[32];
+    uint8_t apub_expect[32], bpub_expect[32];
+    x25519_kat_hex(apriv, "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a", 32);
+    x25519_kat_hex(bpriv, "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb", 32);
+    x25519_kat_hex(apub_expect, "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a", 32);
+    x25519_kat_hex(bpub_expect, "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f", 32);
+    x25519_kat_hex(K, "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742", 32);
+
+    x25519_shared_secret(x25519_basepoint, apriv, apub);   // pub = X25519(priv, 9)
+    checks++; if (memcmp(apub, apub_expect, 32) != 0) fail++;
+    x25519_shared_secret(x25519_basepoint, bpriv, bpub);
+    checks++; if (memcmp(bpub, bpub_expect, 32) != 0) fail++;
+
+    x25519_shared_secret(bpub, apriv, ka);   // K = X25519(a_priv, b_pub)
+    x25519_shared_secret(apub, bpriv, kb);   // K = X25519(b_priv, a_pub)
+    checks++; if (memcmp(ka, kb, 32) != 0) fail++;   // agreement
+    checks++; if (memcmp(ka, K, 32) != 0) fail++;    // == published K
+
+    // (c) NEGATIVE: a flipped private-key bit must change the secret. Bit 0x08
+    // survives the low clamp (&248), so the clamped scalar genuinely differs.
+    uint8_t apriv2[32], ka2[32];
+    memcpy(apriv2, apriv, 32);
+    apriv2[0] ^= 0x08;
+    x25519_shared_secret(bpub, apriv2, ka2);
+    checks++; if (memcmp(ka2, K, 32) == 0) fail++;   // must DIFFER from K
+
+    // (d) NEGATIVE / contributory: X25519(anything, all-zero point) == 0.
+    uint8_t zero[32], zout[32], acc = 0;
+    memset(zero, 0, 32);
+    x25519_shared_secret(zero, apriv, zout);
+    for (i = 0; i < 32; i++) acc |= zout[i];
+    checks++; if (acc != 0) fail++;   // must be all-zero (small-order output)
+
+    kprintf("[X25519-KAT] RFC7748 scalarmult+DH accept + negatives : %s (checks=%d fail=%d)\n",
+            fail ? "FAIL" : "PASS", checks, fail);
+    bootlog_write("[X25519-KAT] %s checks=%d fail=%d",
+                  fail ? "FAIL" : "PASS", checks, fail);
+    return fail;
+}
+// X25519_KAT_REGION_END  (ecdhkat)
+
 
 // =============================================================================
 // HKDF (RFC 5869)

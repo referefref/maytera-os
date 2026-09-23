@@ -16,6 +16,7 @@
 #include "../fs/fat.h"
 #include "../video/framebuffer.h"
 #include "../cpu/mono.h"
+#include "../sync/spinlock.h"
 
 
 // ============================================================================
@@ -163,6 +164,11 @@ static const int size_cache_sizes[NUM_SIZE_CACHES] = {
 // slot costs ~5 KB per face) rather than reinstating snapping.
 // ---------------------------------------------------------------------------
 static uint64_t g_size_cache_clock = 1;
+
+// #diskusefix (SMP): one lock serialises ALL access to the SHARED per-face
+// size caches (get_size_cache LRU/eviction/scale) AND the glyph caches. The
+// old #302 protection was a per-core cli, which is NOT cross-core exclusion.
+static spinlock_t g_ttf_lock;
 
 static void size_cache_release(size_cache_t *c) {
     for (int i = 0; i < MAX_CACHED_GLYPHS; i++) {
@@ -539,6 +545,7 @@ int ttf_face_remove(int idx) {
 }
 
 int ttf_init(void) {
+    spinlock_init(&g_ttf_lock);
     if (ttf_ready) return 0;
 
     g_nfaces = 0;
@@ -653,7 +660,6 @@ ttf_glyph_t *ttf_get_glyph_f(int face_idx, int codepoint, int size, int style) {
     // #536: bring the face's outlines resident on first use. MUST be before the
     // cli block below, as it does block-layer I/O (needs interrupts enabled).
     if (!ensure_face_loaded(f)) return NULL;
-    size_cache_t *cache = get_size_cache(f, size);
 
     /* CRITICAL (#302): the glyph cache is SHARED global state and stb_truetype
        uses SSE float math (this file is compiled with TTF_CFLAGS, Makefile:1725,
@@ -672,11 +678,18 @@ ttf_glyph_t *ttf_get_glyph_f(int face_idx, int codepoint, int size, int style) {
        would corrupt the rasterizer mid-glyph; kernel C being built -mno-sse is
        what stops that. The shared-cache race is the second, independent
        reason. */
-    uint64_t saved_flags;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(saved_flags) :: "memory");
+    // #diskusefix (SMP): upgrade the former per-core cli to the subsystem
+    // spinlock. cli gives no cross-core exclusion; two cores rasterising at once
+    // (compositor + a busy multi-threaded app such as diskuse) raced the shared
+    // caches below and produced a garbage glyph scale -> kmalloc(~1.8GB) ->
+    // kernel-heap exhaustion -> #GP panic. irqsave also keeps interrupts off for
+    // the SSE-float rasteriser (idt.asm saves no xmm), the second reason for cli.
+    uint64_t saved_flags = spinlock_acquire_irqsave(&g_ttf_lock);
     #define TTF_GLYPH_RETURN(v) do { \
-        __asm__ volatile("push %0; popfq" :: "r"(saved_flags) : "memory", "cc"); \
+        spinlock_release_irqrestore(&g_ttf_lock, saved_flags); \
         return (v); } while (0)
+
+    size_cache_t *cache = get_size_cache(f, size);
 
     // Check cache
     for (int i = 0; i < cache->count; i++) {
@@ -837,12 +850,14 @@ void ttf_get_metrics_f(int face_idx, int size, int *ascent, int *descent, int *l
     if (!ttf_ready) { *ascent = size; *descent = 0; *line_gap = 0; return; }
     font_face_t *f = face_at(face_idx);
     if (!ensure_face_loaded(f)) { *ascent = size; *descent = 0; *line_gap = 0; return; }
+    uint64_t __ttf_f = spinlock_acquire_irqsave(&g_ttf_lock);  // #diskusefix SMP
     size_cache_t *cache = get_size_cache(f, size);
     int a, d, lg;
     stbtt_GetFontVMetrics(&f->info, &a, &d, &lg);
     *ascent = (int)(a * cache->scale);
     *descent = (int)(d * cache->scale);
     *line_gap = (int)(lg * cache->scale);
+    spinlock_release_irqrestore(&g_ttf_lock, __ttf_f);
 }
 void ttf_get_metrics(int size, int *ascent, int *descent, int *line_gap) {
     ttf_get_metrics_f(g_active, size, ascent, descent, line_gap);
@@ -852,10 +867,13 @@ int ttf_get_advance_f(int face_idx, int codepoint, int size) {
     if (!ttf_ready) return size / 2;
     font_face_t *f = face_at(face_idx);
     if (!ensure_face_loaded(f)) return size / 2;
+    uint64_t __ttf_f = spinlock_acquire_irqsave(&g_ttf_lock);  // #diskusefix SMP
     size_cache_t *cache = get_size_cache(f, size);
     int advance, lsb;
     stbtt_GetCodepointHMetrics(&f->info, codepoint, &advance, &lsb);
-    return (int)(advance * cache->scale);
+    int __adv = (int)(advance * cache->scale);
+    spinlock_release_irqrestore(&g_ttf_lock, __ttf_f);
+    return __adv;
 }
 int ttf_get_advance(int codepoint, int size) {
     return ttf_get_advance_f(g_active, codepoint, size);
@@ -865,9 +883,12 @@ int ttf_get_kerning_f(int face_idx, int cp1, int cp2, int size) {
     if (!ttf_ready) return 0;
     font_face_t *f = face_at(face_idx);
     if (!ensure_face_loaded(f)) return 0;
+    uint64_t __ttf_f = spinlock_acquire_irqsave(&g_ttf_lock);  // #diskusefix SMP
     size_cache_t *cache = get_size_cache(f, size);
     int kern = stbtt_GetCodepointKernAdvance(&f->info, cp1, cp2);
-    return (int)(kern * cache->scale);
+    int __k = (int)(kern * cache->scale);
+    spinlock_release_irqrestore(&g_ttf_lock, __ttf_f);
+    return __k;
 }
 int ttf_get_kerning(int cp1, int cp2, int size) {
     return ttf_get_kerning_f(g_active, cp1, cp2, size);
@@ -962,6 +983,33 @@ int ttf_measure_string(const char *str, int size) {
         ttf_glyph_t *g = ttf_get_glyph((unsigned char)str[i], size, TTF_STYLE_NORMAL);
         width += ttf_cursor_step(g, (unsigned char)str[i],
                                  str[i + 1] ? (unsigned char)str[i + 1] : 0, size);
+    }
+    return width;
+}
+
+// #245: face-explicit sibling of ttf_measure_string(). SAME shape, SAME shared
+// cursor-step, so measured width == drawn width for sys_win_draw_text_ttf_ex()
+// exactly as the non-_f pair holds it for sys_win_draw_text_ttf().
+//
+// WHY THIS EXISTS. The face registry, the face-aware glyph cache and the
+// face-aware DRAW have all been here since the Font Browser; only MEASURE was
+// missing, so an app that wanted to draw in a face other than the active one had
+// no way to ask how wide that would be. The browser needs it to render a page
+// that names three font families. Measuring in face A and drawing in face B is
+// not a small error: a monospace run measured against a proportional face wraps
+// at the wrong word and overlaps its neighbour.
+//
+// WHY IT IS C AND NOT RUST (per the Rust-first rule). #589's whole point is that
+// measure and every draw advance the pen through ONE function. Splitting the
+// measure half into another language and another file is precisely how that
+// invariant gets broken, and the invariant is worth more here than the language.
+int ttf_measure_string_f(int face, const char *str, int size, int style) {
+    if (!ttf_ready || !str) return 0;
+    int width = 0;
+    for (int i = 0; str[i]; i++) {
+        ttf_glyph_t *g = ttf_get_glyph_f(face, (unsigned char)str[i], size, style);
+        width += ttf_cursor_step_f(face, g, (unsigned char)str[i],
+                                   str[i + 1] ? (unsigned char)str[i + 1] : 0, size);
     }
     return width;
 }

@@ -213,6 +213,7 @@ volatile uint64_t g_wq_unpark_rescues = 0;
 static int g_wq_unpark_logged = 0;
 #define WQ_UNPARK_LOG_MAX 16
 extern int kprintf(const char *fmt, ...);
+#include "../fs/bootlog.h"   // #dosmem: the #610 rescue, persistently
 
 void __wait_finish(wait_queue_head_t *wq, wait_queue_entry_t *entry) {
     // ------------------------------------------------------------------
@@ -281,10 +282,18 @@ void __wait_finish(wait_queue_head_t *wq, wait_queue_entry_t *entry) {
     // the serial port and must never run under a spinlock with IF clear.
     if (rescued && g_wq_unpark_logged < WQ_UNPARK_LOG_MAX) {
         g_wq_unpark_logged++;
-        kprintf("[WQ] #610 un-parked pid=%u '%s' after a condition-became-true "
-                "wait_event break (rescue #%lu)\n",
-                me ? me->pid : 0u, me ? me->name : "?",
-                (unsigned long)g_wq_unpark_rescues);
+        // #dosmem: TO THE PERSISTENT LOG. A rescue only happens when a wake
+        // was nearly lost, so it is an anomaly and belongs on disk rather than
+        // on a serial port neither of the owner's machines has. Already
+        // bounded: the g_wq_unpark_logged < WQ_UNPARK_LOG_MAX test above caps
+        // this at a fixed number of records per boot, so promoting it cannot
+        // turn into a whole-file-rewrite storm on the FAT ESP. Safe context by
+        // construction: the comment above establishes we are outside the queue
+        // lock with interrupts restored, which is what bootlog_write() needs.
+        bootlog_write("[WQ] #610 un-parked pid=%u '%s' after a "
+                      "condition-became-true wait_event break (rescue #%lu)",
+                      me ? me->pid : 0u, me ? me->name : "?",
+                      (unsigned long)g_wq_unpark_rescues);
     }
 }
 

@@ -2,10 +2,10 @@
 set -e
 L=<workspace>
 U=<workspace>
-SH=<workspace>
+SH=/root/cpython-port/shim
 GI=/usr/lib/gcc/x86_64-linux-gnu/12/include
-S=<workspace>
-CP=<workspace>
+S=/root/cpython-port/Python-3.11.9
+CP=/root/cpython-port
 cd $CP/build
 
 FLAGS="-ffreestanding -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=large -nostdinc -fno-builtin -O2 -std=c11 -I$SH -I$L -isystem $GI -I. -I$S/Include -U__linux__ -D_Py_FORCE_UTF8_LOCALE -D_SYSCALL_H -Wno-implicit-function-declaration"

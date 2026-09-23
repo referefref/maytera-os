@@ -1,0 +1,19 @@
+--- a/main.c
++++ b/main.c
+@@ -44,6 +44,7 @@
+ #endif /* not lint */
+ 
+ #include	<err.h>
++#include	<getopt.h>
+ #include	"hangman.h"
+ 
+ /*
+@@ -57,7 +58,7 @@
+ 	int ch;
+ 
+ 	/* Revoke setgid privileges */
+-	setregid(getgid(), getgid());
++	/* MAYTERA CHANGE: no setgid privilege to revoke on this OS; call removed. */
+ 
+ 	while ((ch = getopt(argc, argv, "d:m:")) != -1) {
+ 		switch (ch) {

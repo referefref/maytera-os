@@ -1,0 +1,47 @@
+--- a/nInvaders.c	2003-05-08 19:19:50.000000000 +0000
++++ b/nInvaders.c	2026-09-07 10:07:11.136010069 +0000
+@@ -309,20 +309,25 @@
+ 
+ /**
+  * set up timer
++ *
++ * MayteraOS PORT NOTE (#745): upstream drives the 1/FPS game tick from a
++ * SIGALRM fired by setitimer(ITIMER_REAL, ...), with handleTimer() as the
++ * signal handler, relying on the OS being able to deliver a periodic signal
++ * while the process sits blocked in getch() reading the terminal. MayteraOS
++ * userland libc has no setitimer()/ITIMER_REAL (measured: absent from
++ * userland/libc; only the one-second-granularity alarm() exists), and async
++ * signal delivery into a syscall blocked on the compositor pty is not a path
++ * this port wants to depend on. So the tick is driven by ncurses' own timeout
++ * mechanism instead: timeout(MS) makes getch() return ERR after MS
++ * milliseconds of no input, so the main loop below can call handleTimer()
++ * once per readInput() unconditionally, which reproduces the same ~FPS
++ * cadence without an OS timer signal at all. See docs/MPORTS.md and
++ * CHANGELOG.md #745 for the pattern (ncurses already gives every port
++ * napms()/timeout() for exactly this).
+  */
+ void setUpTimer()
+ {
+-	struct itimerval myTimer;
+-	struct sigaction myAction;
+-	myTimer.it_value.tv_sec = 0;
+-	myTimer.it_value.tv_usec = 1000000 / FPS;
+-	myTimer.it_interval.tv_sec = 0;
+-	myTimer.it_interval.tv_usec = 1000000 / FPS;
+-	setitimer(ITIMER_REAL, &myTimer, NULL);
+-	
+-	myAction.sa_handler = &handleTimer;
+-	myAction.sa_flags = SA_RESTART;
+-	sigaction(SIGALRM, &myAction, NULL);
++	timeout(1000 / FPS);
+ }
+ 
+ 
+@@ -345,6 +350,7 @@
+ 	do {
+ 		// do movements and key-checking
+ 		readInput();
++		handleTimer();
+ 	} while (0 == 0);
+ 	
+ 	return 0;

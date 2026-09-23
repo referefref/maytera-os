@@ -1,0 +1,25 @@
+--- /dev/null
++++ b/src/config.h
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier: MIT */
++/* MayteraOS config.h for the mports libyaml port (userland/ports/libyaml).
++ *
++ * First-party MayteraOS file added to the upstream tree by patch, the same way
++ * musl-regex adds gnuregex.h. libyaml's src/yaml_private.h does
++ * `#if HAVE_CONFIG_H / #include "config.h"`, and src/api.c reads the
++ * YAML_VERSION_* macros from it. Upstream generates this via autotools; we do
++ * not run configure, so this supplies exactly the four version constants the
++ * library sources reference (nothing else in src/ uses config.h). Enabled by
++ * -DHAVE_CONFIG_H=1 in the recipe cflags.
++ *
++ * Copyright (c) 2026 MayteraOS. Licensed MIT, matching the port's libc.
++ */
++#ifndef MAYTERA_LIBYAML_CONFIG_H
++#define MAYTERA_LIBYAML_CONFIG_H 1
++
++#define YAML_VERSION_MAJOR 0
++#define YAML_VERSION_MINOR 2
++#define YAML_VERSION_PATCH 5
++#define YAML_VERSION_STRING "0.2.5"
++
++#endif /* MAYTERA_LIBYAML_CONFIG_H */

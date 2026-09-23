@@ -10,7 +10,7 @@
 //
 // REPORTED: `ls | less` printed the first screenful and returned straight to
 // the prompt; no key would page it. `less FILE` worked. REPRODUCED on golden
-// 2057 (VM <vmid>) before changing anything, and the cause is visible in the
+// 2057 (VM 2611) before changing anything, and the cause is visible in the
 // code that used to be here:
 //
 //   * with no file operands the content was slurped from fd 0, and

@@ -1,0 +1,49 @@
+# mports recipe: MD4C 0.5.2, a fast, self-contained CommonMark parser with an
+# HTML renderer. Item 6 of the 2026-09 library-ports batch. Turns Markdown into
+# HTML in-process: useful for rendering README/help/changelog and AI-authored
+# Markdown in the browser or a help viewer.
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA.
+
+name=md4c
+version=0.5.2
+class=A
+homepage=https://github.com/mity/md4c
+
+# The GitHub source tarball for tag release-0.5.2. sha256 below is of THIS file
+# and was MEASURED on the build container, not copied from a web page:
+#   wget -O md4c-0.5.2.tar.gz https://github.com/mity/md4c/archive/refs/tags/release-0.5.2.tar.gz
+#   sha256sum -> 55d0111d48fb11883aaee91465e642b8b640775a4d6993c2d0e7a8092758ef21
+source_url=https://github.com/mity/md4c/archive/refs/tags/release-0.5.2.tar.gz
+tarball=md4c-0.5.2.tar.gz
+sha256=55d0111d48fb11883aaee91465e642b8b640775a4d6993c2d0e7a8092758ef21
+srcdir=md4c-release-0.5.2
+
+licence=MIT
+licence_files=LICENSE.md
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): USES. MD4C is a push-parser over a
+# caller-supplied Markdown buffer; md_html() drives it and streams HTML to a
+# caller-provided callback. The only platform surface is malloc/realloc/free and
+# memcpy/memcmp/strlen. No event loop, no main(), no filesystem, no window system.
+adoption=USES. Push-parser over a caller-supplied Markdown buffer that streams output to a caller callback; the only platform surface is malloc/realloc/free and memcpy/memcmp. It never wants to own the process.
+
+needs=libc
+
+prepare=none
+patches=none
+
+build=objects
+
+# The parser (md4c.c), the HTML renderer (md4c-html.c) and the HTML entity table
+# the renderer needs for named references (entity.c). This is upstream's own src/
+# list minus the CLI (md2html/, not in the tarball's src/).
+sources=src/md4c.c src/md4c-html.c src/entity.c
+
+headers=src/md4c.h src/md4c-html.h
+lib=libmd4c.a
+
+# THE ANTI-NO-OP CHECK. Proven defined in libmd4c.a by nm: the core parser
+# entry and the HTML rendering entry.
+symbols=md_parse md_html

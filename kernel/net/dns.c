@@ -13,12 +13,17 @@
 //     whole lookup, which was the cause of intermittent CDN resolution misses).
 
 #include "dns.h"
+#include "netfail.h"   // #netfix2: record WHY a lookup failed
+#include "dhcp.h"      // #netfix2: dhcp_get_dns() is the hedge candidate
 #include "udp.h"
 #include "../string.h"
 #include "../mm/heap.h"
 #include "../serial.h"
 #include "../gui/syslog.h"
 #include "../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
+#include "ip.h"          // #imacnet: ip_get_gateway() from its OWNING header (#665)
+#include "../sync/waitq.h" // #netpolls: wait_event_timeout() replaces the DNS poll (#426)
+#include "socket.h"        // #netpolls: net_rx_waitq() - woken on every delivered IP frame
 #include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // External declarations
@@ -68,6 +73,18 @@ typedef struct {
     uint64_t expiry_ms;     // #499: absolute expiry in sched_now_ms() REAL ms
     int valid;
     int negative;           // 1 = cached failure (do not re-query until expiry)
+    // #netfix2: WHY it is negative, as a netfail NF_* reason.
+    //
+    // MEASURED on the ICS bench, and this is the whole reason the field exists.
+    // With a blocked resolver, the boot's FIRST lookup fails with the useful
+    // reason and negative-caches the name; every later lookup, including the
+    // browser's, then short-circuits on the cache and could only report
+    // "cached earlier failure". The screen literally read "Fetch failed:
+    // DNS-NEGATIVE-CACHED-earlier-failure", which is true, useless, and sends
+    // the reader hunting for an earlier line that the log budget may already
+    // have dropped. A cached failure must carry the failure, not a note saying
+    // that there was one.
+    uint8_t fail_reason;
 } dns_cache_entry_t;
 
 // DNS state
@@ -76,6 +93,78 @@ static uint32_t dns_server = 0;     // DNS server IP (host byte order)
 // Settings) has selected the resolver. A DHCP lease may fill an UNPINNED
 // resolver but must never overrule a pinned one.
 static int dns_server_pinned = 0;
+
+// #imacnet: resolver-failover policy + DNS outcome counters live in Rust
+// (rustkern/netbread.rs). dns_server above stays the C-side answer to "what do
+// we send to"; netbread owns the DECISION of when that should change and what
+// it should change to, and it remembers the DHCP-offered resolver even when
+// the pin refuses it, because on an ICS/home segment that is the only resolver
+// the local network has actually endorsed.
+extern void     netbread_dns_set_preferred_rs(uint32_t ip);
+extern void     netbread_dns_set_dhcp_rs(uint32_t ip);
+extern void     netbread_dns_set_gateway_rs(uint32_t ip);
+extern void     netbread_dns_note_sent_rs(void);
+extern void     netbread_dns_note_answer_rs(int rcode, uint32_t from);
+extern uint32_t netbread_dns_note_timeout_rs(uint32_t cur);
+extern uint32_t netbread_dns_preferred_rs(void);
+// #dnsfallback: the candidate ladder now escalates OFF-NETWORK when every
+// locally-endorsed resolver is the same silent host. See netbread.rs.
+extern uint32_t netbread_dns_hedge_candidate_rs(uint32_t cur);
+extern uint32_t netbread_dns_learned_rs(void);
+extern int      netbread_dns_is_public_rs(uint32_t ip);
+
+// #httpdns: THE DNS TRANSACTION TABLE (rustkern/dnstx.rs).
+//
+// dns_query below used to be the ONE in-flight lookup for the whole machine,
+// with no lock and no ownership. Every resolver shared it: the six httpfetch
+// worker threads sys_http_fetch_start() spawns, the sync https/wget path, SMB,
+// NFS, SNTP, netfs, and the userland SYS_DNS_START/POLL pair. Two overlapping
+// lookups clobbered each other's transaction id and hostname, so one reply was
+// dropped as a mismatch and the other was handed to BOTH callers - one of whom
+// then connected to somebody else's address with its own Host header.
+//
+// MEASURED 2026-09-03 on a healthy LAN with a 1ms resolver (VM 2977, golden
+// 2346): six concurrent fetches to six distinct hosts produced 5 clobbers, 5
+// dropped replies, 8 CROSS-WIRES and 2 wrong-or-failed fetches per boot. The
+// window is the round-trip time, so it is far worse on a USB dongle (~40ms per
+// send) or behind an ICS DNS proxy, which is exactly where "ping works but the
+// browser and App Store do not" was reported.
+//
+// Each lookup now owns a slot for its whole life and the transaction id is
+// unique across live slots, so a reply reaches the one lookup that asked. The
+// #netfix2 hedge bookkeeping (which servers this question went to, and which
+// one answered) lives in the slot too, because it decides whether to abandon
+// the configured resolver and that decision must rest on THIS lookup's
+// evidence, not on whichever lookup wrote the global last.
+extern int      dnstx_alloc_rs(const uint8_t *host, uint32_t hlen, uint32_t id_seed,
+                               uint32_t owner, uint64_t now_ms, uint32_t ttl_ms);
+extern uint32_t dnstx_id_rs(uint32_t slot);
+extern uint32_t dnstx_rearm_rs(uint32_t slot, uint32_t id_seed, uint64_t now_ms, uint32_t ttl_ms);
+extern void     dnstx_touch_rs(uint32_t slot, uint64_t now_ms, uint32_t ttl_ms);
+extern int      dnstx_match_rs(uint32_t id);
+extern uint32_t dnstx_host_copy_rs(uint32_t slot, uint8_t *out, uint32_t cap);
+extern int      dnstx_complete_rs(uint32_t slot, uint32_t id, int rcode, uint32_t ip);
+extern int      dnstx_done_rs(uint32_t slot);
+extern int      dnstx_result_rs(uint32_t slot, uint32_t *ip_out);
+extern void     dnstx_free_rs(uint32_t slot);
+extern int      dnstx_owner_slot_rs(uint32_t owner);
+extern uint32_t dnstx_note_server_rs(uint32_t slot, uint32_t server);
+extern uint32_t dnstx_servers_rs(uint32_t slot, uint32_t *s0, uint32_t *s1);
+extern void     dnstx_note_answered_by_rs(uint32_t slot, uint32_t id, uint32_t from);
+extern uint32_t dnstx_answered_by_rs(uint32_t slot);
+extern void     dnstx_stats_rs(uint32_t *live, uint32_t *peak, uint32_t *allocfail,
+                               uint32_t *nomatch, uint32_t *reaped);
+
+// Ring-3 SYS_DNS_START slots: reclaimed after this long, because a process can
+// start a lookup and exit without ever polling and there is no close() in that
+// ABI.
+#define DNS_SLOT_TTL_MS 30000
+// Kernel-internal lookups free their slot on EVERY exit path and re-arm the
+// deadline on every retransmit, so this is purely a backstop against a worker
+// thread destroyed mid-lookup. It is deliberately far longer than the worst
+// case a dns_resolve() can live, so the reaper can never take a slot out from
+// under a lookup that is still using it.
+#define DNS_SLOT_TTL_KERNEL_MS 300000
 static dns_cache_entry_t dns_cache[DNS_CACHE_SIZE];
 
 // Cache statistics
@@ -91,14 +180,10 @@ static uint32_t dns_rand(void) {
     return x;
 }
 
-// Current query state for async handling
-static struct {
-    uint16_t pending_id;
-    uint32_t result_ip;     // IP in host byte order
-    int result_code;
-    int complete;
-    char hostname[128];
-} dns_query;
+// #httpdns: the single global in-flight query is GONE. Per-lookup state lives
+// in the dnstx table above, one slot per lookup, so concurrent resolvers can no
+// longer overwrite each other's transaction id, hostname, hedge server list or
+// result.
 
 // Byte order helpers
 static inline uint16_t htons(uint16_t h) {
@@ -129,6 +214,13 @@ static dns_cache_entry_t *dns_cache_lookup(const char *hostname) {
 
 // Insert/refresh a cache entry. ttl_sec is the record's TTL (positive) or
 // DNS_NEG_TTL (negative). Positive TTLs are clamped to [MIN,MAX].
+// #netfix2: the reason the NEXT dns_cache_put() should record for a negative
+// entry. Set by dns_neg_reason() immediately before the put. A file-static
+// rather than a fifth parameter because the reason has ALREADY been recorded by
+// netfail_note() at every one of the seven call sites, so this reads it back
+// instead of making each caller state it twice and risk the two disagreeing.
+static uint8_t dns_pending_neg_reason = 0;
+
 static void dns_cache_put(const char *hostname, uint32_t ip,
                           uint32_t ttl_sec, int negative) {
     if (!negative) {
@@ -176,6 +268,19 @@ static void dns_cache_put(const char *hostname, uint32_t ip,
     dns_cache[slot].expiry_ms = sched_now_ms() + (uint64_t)ttl_sec * 1000ULL;
     dns_cache[slot].valid = 1;
     dns_cache[slot].negative = negative;
+    // #netfix2: a negative entry carries the reason it is negative, so every
+    // later lookup that short-circuits on it reports the REAL fault instead of
+    // "there was an earlier failure". Consumed once, so a later put that
+    // forgets to set it cannot inherit a stale reason.
+    dns_cache[slot].fail_reason = negative ? dns_pending_neg_reason : 0;
+    dns_pending_neg_reason = 0;
+}
+
+// Record the reason for the negative entry the NEXT dns_cache_put() creates,
+// and record it with netfail at the same time so the two can never disagree.
+static void dns_neg_reason(uint32_t reason) {
+    dns_pending_neg_reason = (uint8_t)reason;
+    netfail_note(reason, 0);
 }
 
 // Encode hostname as DNS name format (length-prefixed labels)
@@ -215,7 +320,8 @@ static int dns_skip_name(const uint8_t *buf, int pos, int max_len) {
 // compression pointer by TERMINATING the name - it does NOT follow it), then walk
 // the answer records looking for the first A record and honoring its TTL. It reads
 // ONLY the msg[0..msglen) datagram, never mutates it, and touches no global / no
-// I/O. The transaction-id / QR-source match, cache-put, kprintf, and dns_query
+// I/O. The transaction-id match (which is now also the DELIVERY address, see
+// the dnstx table), the cache-put, the kprintf and the transaction
 // bookkeeping stay in dns_handle_response (C). Result is returned through a small
 // dns_result_t so the caller applies the same side effects it always did.
 //
@@ -320,7 +426,7 @@ int dns_parse_response(const uint8_t *msg, uint32_t msglen, dns_result_t *out) {
 
 // Handle DNS response (UDP callback). The untrusted message PARSE is now
 // dns_parse_response() (Rust under -DRUST_DNS); the transaction-id / QR-source
-// match, cache-put, and dns_query bookkeeping stay here in C.
+// match, cache-put, and transaction bookkeeping stay here in C.
 static void dns_handle_response(uint32_t src_ip, uint16_t src_port,
                                  const void *data, uint16_t length) {
     (void)src_ip;
@@ -330,52 +436,123 @@ static void dns_handle_response(uint32_t src_ip, uint16_t src_port,
 
     const uint8_t *buf = (const uint8_t *)data;
 
-    // Validate matching transaction id (anti-spoofing). Stays in C: needs the
-    // dns_query global. buf[0..1] big-endian == ntohs(hdr->id).
+    // #httpdns: route the reply to the lookup that asked for it. The id is
+    // still the anti-spoofing check; it is now ALSO the delivery address. A
+    // reply that matches no LIVE slot is a straggler from an abandoned query,
+    // or a duplicate for a question already answered (the #netfix2
+    // "a question that already has an answer does not get a second one" rule,
+    // which dnstx_match_rs enforces by matching only LIVE slots), and is
+    // counted and dropped.
     uint16_t id = (uint16_t)((buf[0] << 8) | buf[1]);
-    if (id != dns_query.pending_id) return;
+    int slot = dnstx_match_rs((uint32_t)id);
+    if (slot < 0) return;
+    // The name is read from the SLOT, not from a global, which is what stops
+    // one lookup's answer being filed in the cache under another one's name.
+    char qhost[128];
+    dnstx_host_copy_rs((uint32_t)slot, (uint8_t *)qhost, sizeof(qhost));
+
+    // Record WHO answered, for the hedge bookkeeping below. src_ip comes
+    // straight off the wire (ip.c passes header->src_ip unswapped) and every
+    // resolver address in this file is host order, so it is swapped once here.
+    uint32_t from = ntohl(src_ip);
+    dnstx_note_answered_by_rs((uint32_t)slot, (uint32_t)id, from);
+    // DELIBERATELY NOT A FILTER. Restricting acceptance to the servers we
+    // queried would be a real anti-spoofing improvement (today only the 16-bit
+    // transaction id gates a reply), and it is NOT made here, because some
+    // resolvers legitimately answer from a different source address and a
+    // regression in that direction would break all name resolution on the
+    // machines this change is meant to fix. It is recorded as a known gap in
+    // blame.md instead of guessed at. What we DO do is notice, once, and say
+    // so, so a future change has evidence instead of an assumption.
+    {
+        static int odd_src_reported = 0;
+        uint32_t s0 = 0, s1 = 0;
+        uint32_t nsrv_q = dnstx_servers_rs((uint32_t)slot, &s0, &s1);
+        int known = (nsrv_q > 0 && s0 == from) || (nsrv_q > 1 && s1 == from);
+        if (!known && nsrv_q > 0 && !odd_src_reported) {
+            odd_src_reported = 1;
+            uint8_t *pf = (uint8_t *)&from;
+            uint8_t *pq = (uint8_t *)&s0;
+            bootlog_write("[DNSSRC] reply for %s came from %d.%d.%d.%d but the "
+                          "query went to %d.%d.%d.%d - accepted (source is not "
+                          "checked); reported once per boot",
+                          qhost,
+                          pf[3], pf[2], pf[1], pf[0],
+                          pq[3], pq[2], pq[1], pq[0]);
+        }
+    }
 
     dns_result_t r;
     dns_parse_response(buf, length, &r);
+
+    // #imacnet: ANY reply - including NXDOMAIN and SERVFAIL - proves the
+    // resolver is reachable and answering. That is a fact about the SERVER,
+    // and it must reset the failover counter. Failing over on an error rcode
+    // would abandon a perfectly good resolver the first time a user mistyped a
+    // hostname. Only total silence counts, and it is recorded in dns_resolve().
+    if (r.status != DNS_PARSE_NOT_RESPONSE) {
+        int _rc = (r.status == DNS_PARSE_A_FOUND) ? 0 : (r.rcode ? r.rcode : DNS_RCODE_NAME_ERROR);
+        netbread_dns_note_answer_rs(_rc, from);
+    }
 
     switch (r.status) {
         case DNS_PARSE_NOT_RESPONSE:
             return;  // not a response (QR clear): drop, as the old code did
 
         case DNS_PARSE_RCODE_ERR:
+            // #netfix2: an rcode is a fact about the NAME, and the three that
+            // actually occur need different things from the reader: NXDOMAIN
+            // means the host does not exist (a typo, or a private name), 
+            // SERVFAIL means the resolver broke trying, REFUSED means it
+            // declined to answer us (a filtering/ACL resolver, which is exactly
+            // what a captive or corporate gateway does). Logging all three as
+            // "DNS failed" is how a five-second fix becomes another round trip.
             kprintf("[DNS] Error: RCODE=%d\n", r.rcode);
-            dns_cache_put(dns_query.hostname, 0, DNS_NEG_TTL, 1);   // negative cache
-            dns_query.result_code = -r.rcode;
-            dns_query.complete = 1;
+            // ORDER MATTERS from here down, in BOTH directions.
+            // dnstx_complete_rs() re-checks the transaction id, so it returns 0
+            // if the waiting thread timed out and freed the slot between the
+            // match above and now. The cache entry is filed ONLY when the
+            // answer actually landed on the transaction that asked for it;
+            // otherwise `qhost` could name a lookup that has since been
+            // recycled and we would poison the cache with another host's
+            // address. dns_neg_reason() is INSIDE the same branch because it
+            // arms a one-shot that the NEXT dns_cache_put() consumes: arming it
+            // on a path that then does not put would hand this reason to
+            // somebody else's negative entry.
+            if (dnstx_complete_rs((uint32_t)slot, id, -r.rcode, 0)) {
+                dns_neg_reason(r.rcode == DNS_RCODE_NAME_ERROR ? NF_DNS_NXDOMAIN :
+                               r.rcode == 2 ? NF_DNS_SERVFAIL :
+                               r.rcode == 5 ? NF_DNS_REFUSED : NF_DNS_SERVFAIL);
+                dns_cache_put(qhost, 0, DNS_NEG_TTL, 1);   // negative cache
+            }
             return;
 
         case DNS_PARSE_NO_ANSWER:
-            dns_cache_put(dns_query.hostname, 0, DNS_NEG_TTL, 1);
-            dns_query.result_code = -DNS_RCODE_NAME_ERROR;
-            dns_query.complete = 1;
+            if (dnstx_complete_rs((uint32_t)slot, id, -DNS_RCODE_NAME_ERROR, 0)) {
+                dns_neg_reason(NF_DNS_NO_A);   // #netfix2
+                dns_cache_put(qhost, 0, DNS_NEG_TTL, 1);
+            }
             return;
 
         case DNS_PARSE_FORMAT_ERR:
-            dns_query.result_code = -DNS_RCODE_FORMAT_ERROR;
-            dns_query.complete = 1;
+            dnstx_complete_rs((uint32_t)slot, id, -DNS_RCODE_FORMAT_ERROR, 0);
             return;
 
         case DNS_PARSE_A_FOUND:
-            dns_query.result_ip = r.ip;
-            dns_query.result_code = 0;
-            dns_query.complete = 1;
-            dns_cache_put(dns_query.hostname, r.ip, r.ttl, 0);   // TTL-honoring cache
-            kprintf("[DNS] Resolved %s -> %d.%d.%d.%d (ttl=%us)\n",
-                    dns_query.hostname, (r.ip >> 24) & 0xFF, (r.ip >> 16) & 0xFF,
-                    (r.ip >> 8) & 0xFF, r.ip & 0xFF, r.ttl);
+            if (dnstx_complete_rs((uint32_t)slot, id, 0, r.ip)) {
+                netfail_clear();   // #netfix2: a success must not leave a stale reason
+                dns_cache_put(qhost, r.ip, r.ttl, 0);   // TTL-honoring cache
+                kprintf("[DNS] Resolved %s -> %d.%d.%d.%d (ttl=%us)\n",
+                        qhost, (r.ip >> 24) & 0xFF, (r.ip >> 16) & 0xFF,
+                        (r.ip >> 8) & 0xFF, r.ip & 0xFF, r.ttl);
+            }
             return;
 
         case DNS_PARSE_NO_A:
         default:
             // Answer(s) present but no A record - treat as a (short) negative result.
-            dns_cache_put(dns_query.hostname, 0, DNS_NEG_TTL, 1);
-            dns_query.result_code = -DNS_RCODE_NAME_ERROR;
-            dns_query.complete = 1;
+            if (dnstx_complete_rs((uint32_t)slot, id, -DNS_RCODE_NAME_ERROR, 0))
+                dns_cache_put(qhost, 0, DNS_NEG_TTL, 1);
             return;
     }
 }
@@ -414,28 +591,45 @@ static uint32_t parse_ip(const char *str) {
 
 // Poll the network for up to ms milliseconds, returning early if the pending
 // query completed. Used both for response waits and inter-retry backoff.
-static int dns_wait(uint32_t ms) {
+static int dns_wait(int slot, uint32_t ms) {
     // #499: REAL elapsed ms, not timer_ticks (a tick burst made this return
     // immediately, so DNS gave up on the first query and negative-cached).
     uint64_t until_ms = sched_now_ms() + (uint64_t)ms + 1;
     while ((int64_t)(sched_now_ms() - until_ms) < 0) {
         net_poll();
-        if (dns_query.complete) return 1;
-        // Yield ~a couple ms to the scheduler each iteration instead of a
-        // busy pause-spin. net_poll() still runs every loop, so responses are
-        // still pumped, but the compositor and other procs get to run too.
-        proc_sleep(2);
+        // #httpdns: waits on THIS lookup's slot. Before, every waiter watched
+        // one global `complete` flag, so whichever answer arrived first woke
+        // them all and they all read the same single shared result.
+        if (dnstx_done_rs((uint32_t)slot)) return 1;
+        // #netpolls / #426: park on the shared net RX wait queue instead of a
+        // proc_sleep(2) busy-poll. socket_net_wake() (net/ethernet.c) wakes this
+        // queue on EVERY delivered IP frame, so the DNS UDP reply wakes us the
+        // instant it is processed off this thread; dnstx_done_rs() is a cheap
+        // BSS-only atomic read (rustkern/dnstx.rs), safe as the wait_event
+        // condition (evaluated under the wq lock). The inner slice is the tier-2
+        // backstop for a lost/absent wake, capped to the remaining budget so it
+        // never overshoots the caller's ms; the outer until_ms deadline stays
+        // the real cap. RX is pumped off this thread by net_worker()'s ~1s
+        // net_poll() pass (and the compositor flip path), and by net_poll() at
+        // the top of this loop, so parking here cannot stall the resolve.
+        // Remote DNS server: a timeout is the correct semantics (CLAUDE tier 2).
+        uint64_t _rem = until_ms - sched_now_ms();
+        uint64_t _slice = _rem < 100 ? _rem : 100;
+        (void)wait_event_timeout(net_rx_waitq(),
+                                 dnstx_done_rs((uint32_t)slot) != 0,
+                                 wq_ms_to_ticks(_slice));
     }
-    return dns_query.complete;
+    return dnstx_done_rs((uint32_t)slot);
 }
 
-// Build an A-record query for hostname into query[512]; sets dns_query state and
-// a fresh random transaction id. Returns the packet length or negative on error.
-static int dns_build_query(const char *hostname, uint8_t *query) {
+// Build an A-record query for hostname into query[512] using the transaction id
+// this lookup's slot was issued. The slot already holds the hostname, the
+// server list and the result; this function only formats the datagram.
+// Returns the packet length or negative on error.
+static int dns_build_query(const char *hostname, uint8_t *query, uint16_t txid) {
     memset(query, 0, 512);
     dns_header_t *hdr = (dns_header_t *)query;
-    dns_query.pending_id = (uint16_t)(dns_rand() & 0xFFFF);
-    hdr->id = htons(dns_query.pending_id);
+    hdr->id = htons(txid);
     hdr->flags = htons(0x0100);   // RD (recursion desired)
     hdr->qdcount = htons(1);
 
@@ -446,33 +640,97 @@ static int dns_build_query(const char *hostname, uint8_t *query) {
     query[qpos++] = 0; query[qpos++] = DNS_TYPE_A;   // QTYPE = A
     query[qpos++] = 0; query[qpos++] = 1;            // QCLASS = IN
 
-    strncpy(dns_query.hostname, hostname, sizeof(dns_query.hostname) - 1);
-    dns_query.hostname[sizeof(dns_query.hostname) - 1] = '\0';
-    dns_query.result_ip = 0;
-    dns_query.result_code = -1;
-    dns_query.complete = 0;
+    // #netfix2's "a fresh question has been asked of nobody yet" still holds and
+    // is still done where the id is minted: dnstx_alloc_rs()/dnstx_rearm_rs()
+    // clear the server list, the answered-by and the result as part of issuing
+    // the id, so the server list can never outlive the id it belongs to.
+    // #httpdns: the hostname lives in the slot for the same reason.
+    (void)hostname;
     return qpos;
 }
 
 // Send the query, tolerating transient failures (e.g. gateway ARP not resolved
 // yet) by polling the stack and retrying briefly. Returns 0 on success.
-static int dns_send(const uint8_t *query, int qlen) {
+// #netfix2: the destination is a PARAMETER now, not the dns_server global,
+// because a hedged lookup asks the same question of two servers at once. Every
+// server this query is sent to is recorded on the SLOT so the reply can be
+// attributed to whoever actually answered.
+static int dns_send_to(int slot, const uint8_t *query, int qlen, uint32_t server) {
+    if (server == 0) return -1;
+    dnstx_note_server_rs((uint32_t)slot, server);
     for (int i = 0; i < DNS_SEND_RETRIES; i++) {
-        if (udp_send(dns_server, DNS_LOCAL_PORT, DNS_PORT, query, qlen) >= 0)
+        if (udp_send(server, DNS_LOCAL_PORT, DNS_PORT, query, qlen) >= 0) {
+            // #imacnet: counted here, at the ONE place a query reaches the
+            // wire, so [NETDIAG]'s dnsq= can answer "was DNS ever even
+            // attempted" on a machine with no serial port.
+            netbread_dns_note_sent_rs();
             return 0;
-        // Likely waiting on ARP; pump the stack and give it a moment.
-        dns_wait(120);
+        }
+        // Likely waiting on ARP; pump the stack and give it a moment. The wait
+        // is on OUR slot, so an answer that arrives during the ARP warm-up is
+        // still ours and is not consumed by whoever else is resolving.
+        dns_wait(slot, 120);
     }
+    // #netfix2: the datagram never left. On a LAN that is almost always the
+    // gateway's ARP entry not being resolved, which is a completely different
+    // fault from "the resolver did not answer" and needs a different fix.
+    netfail_note(NF_ARP_UNRESOLVED, 0);
     return -1;
+}
+
+// #dnsfallback: REMEMBER WHAT WORKED.
+//
+// Once a resolver has actually put a datagram back on the wire, keep using it
+// instead of re-probing a host we have already measured as silent on every
+// single lookup. On the owner's iMac the old code sent forty-three queries to
+// one dead address; the hedge and the slow failover each rediscovered that it
+// was dead, per lookup, and then threw the discovery away.
+//
+// THIS IS NOT A PIN, AND THE DIFFERENCE IS THE WHOLE POINT. A pin is
+// PERSISTENT CONFIG: it is written to /CONFIG, it is read by dns_init(), and
+// it therefore outlives the network it was chosen on - which is exactly how
+// this machine ended up pointed at a resolver its segment did not serve. What
+// this adopts is RUNTIME STATE: it lives in a static atomic in netbread.rs,
+// nothing writes it to disk, and a power cycle erases it. The user's PREFERRED
+// resolver is never touched and is what the next boot starts from.
+static void dns_adopt_learned(void) {
+    uint32_t learned = netbread_dns_learned_rs();
+    if (learned == 0 || learned == dns_server) return;
+    static uint32_t announced = 0;
+    if (announced != learned) {
+        announced = learned;
+        uint8_t *po = (uint8_t *)&dns_server;
+        uint8_t *pn = (uint8_t *)&learned;
+        uint32_t pref = netbread_dns_preferred_rs();
+        uint8_t *pp = (uint8_t *)&pref;
+        bootlog_write("[DNSLEARN] name lookups now go to %d.%d.%d.%d: it is the "
+                      "last resolver that actually answered, and %d.%d.%d.%d "
+                      "did not. THIS BOOT ONLY and not saved anywhere; your "
+                      "preferred resolver is still %d.%d.%d.%d and is what the "
+                      "next boot starts from.%s",
+                      pn[3], pn[2], pn[1], pn[0],
+                      po[3], po[2], po[1], po[0],
+                      pp[3], pp[2], pp[1], pp[0],
+                      netbread_dns_is_public_rs(learned)
+                        ? " That is a PUBLIC resolver: your own network's DNS "
+                          "answered nothing at all, so lookups are leaving the "
+                          "LAN. Fix the local resolver to stop that."
+                        : "");
+    }
+    dns_server = learned;
+}
+
+static int dns_send(int slot, const uint8_t *query, int qlen) {
+    return dns_send_to(slot, query, qlen, dns_server);
 }
 
 // Initialize DNS subsystem
 void dns_init(void) {
     memset(dns_cache, 0, sizeof(dns_cache));
-    memset(&dns_query, 0, sizeof(dns_query));
     dns_rng = (uint32_t)(timer_ticks ? timer_ticks : 0x2545F491) | 1u;
     udp_bind(DNS_LOCAL_PORT, dns_handle_response);
     dns_server = parse_ip("8.8.8.8");   // default; overridden by DHCP if wired
+    netbread_dns_set_preferred_rs(dns_server);   // #imacnet
     kprintf("[DNS] resolver initialized (server 8.8.8.8, TTL-aware cache, neg-cache %ds)\n",
             DNS_NEG_TTL);
 }
@@ -483,6 +741,9 @@ void dns_set_server(uint32_t server_ip) {
     int changed = (dns_server != server_ip);
     dns_server = server_ip;
     dns_server_pinned = 1;
+    // #imacnet: a fresh explicit choice deserves to be tried on its own merits
+    // and must not inherit the previous server's failure count.
+    netbread_dns_set_preferred_rs(server_ip);
     uint8_t *ip = (uint8_t *)&server_ip;
     kprintf("[DNS] server set to %d.%d.%d.%d (explicit, pinned)\n",
             ip[3], ip[2], ip[1], ip[0]);
@@ -495,6 +756,14 @@ void dns_set_server(uint32_t server_ip) {
 
 void dns_set_server_dhcp(uint32_t server_ip) {
     if (server_ip == 0) return;             // lease offered no resolver
+    // #imacnet: RECORD THE OFFER FIRST, BEFORE the pin check, and record it
+    // even when the pin then refuses it. The refusal is still correct policy
+    // (#786: a lease must not overrule the user), but the offered address is
+    // the only resolver we know the local network endorses, and it is the
+    // failover candidate if the pinned one turns out to answer nothing at all.
+    // Discarding it here is exactly what left a machine pinned to an
+    // unreachable resolver with no way back.
+    netbread_dns_set_dhcp_rs(server_ip);
     if (dns_server_pinned) {                // an explicit choice wins
         uint8_t *ip = (uint8_t *)&server_ip;
         kprintf("[DNS] ignoring DHCP-offered %d.%d.%d.%d: resolver is pinned\n",
@@ -503,6 +772,14 @@ void dns_set_server_dhcp(uint32_t server_ip) {
     }
     int changed = (dns_server != server_ip);
     dns_server = server_ip;
+    // #dnsfallback: ONLY ON A REAL CHANGE. netbread_dns_set_preferred_rs()
+    // re-arms the failover ladder and forgets the learned resolver, which is
+    // right for a user's explicit choice and WRONG for a lease renewal. The
+    // owner's log shows two "[DHCP] RX other (now=BOUND)" events mid-boot; if
+    // each of those re-offered the same address and reset the ladder, an
+    // escalation that had already found a working resolver would be silently
+    // undone and the machine would fall back onto the dead host.
+    if (changed) netbread_dns_set_preferred_rs(server_ip);
     uint8_t *ip = (uint8_t *)&server_ip;
     kprintf("[DNS] server set to %d.%d.%d.%d (from DHCP lease)\n",
             ip[3], ip[2], ip[1], ip[0]);
@@ -510,6 +787,46 @@ void dns_set_server_dhcp(uint32_t server_ip) {
 }
 
 int dns_server_is_pinned(void) { return dns_server_pinned; }
+
+// #netfix2: THE WAY BACK FROM A PIN. There was none.
+//
+// `dns_server_pinned` was set in two places and cleared in none, so once a
+// resolver had been chosen even once it was chosen forever, on every network,
+// and dns_set_server_dhcp() refused every lease offer for the life of the
+// machine. That is how the owner's iMac ended up pinned to 1.1.1.1 on a Windows
+// ICS segment whose gateway drops forwarded port 53 to anything but itself:
+// ping kept working (ICMP needs no resolver) and nothing else did.
+//
+// It is worse than "the user chose badly once", because the user need not have
+// chosen at all: Settings prefills the DNS field from the LIVE resolver and
+// applies it unconditionally on OK, so opening "Set DNS...", touching nothing
+// and clicking OK pins whatever DHCP had just handed out. See the CHANGELOG.
+//
+// Automatic means: forget the choice, adopt what the network offers, and let
+// net_persist_netcfg() erase the dns= line from /CONFIG/NETIP.CFG so the next
+// boot does not resurrect it.
+void dns_set_server_auto(void) {
+    uint32_t offered = dhcp_get_dns();
+    dns_server_pinned = 0;
+    uint32_t was = dns_server;
+    if (offered) {
+        dns_server = offered;
+    } else if (ip_get_gateway()) {
+        // No lease on record. On a home router and on an ICS segment the
+        // gateway IS the resolver, and it is a far better guess than keeping a
+        // pin the user has just asked us to drop.
+        dns_server = ip_get_gateway();
+    }
+    netbread_dns_set_preferred_rs(dns_server);
+    if (dns_server != was) dns_cache_clear();
+    uint8_t *pn = (uint8_t *)&dns_server;
+    bootlog_write("[DNS] resolver set to AUTOMATIC; now using %d.%d.%d.%d "
+                  "(%s). The pin is cleared and will not come back on reboot.",
+                  pn[3], pn[2], pn[1], pn[0],
+                  offered ? "from the DHCP lease" :
+                  (dns_server ? "the gateway; no lease has offered one" :
+                                "nothing available yet"));
+}
 
 uint32_t dns_get_server(void) { return dns_server; }
 
@@ -531,7 +848,7 @@ void dns_cache_stats(uint32_t *entries, uint32_t *hits, uint32_t *misses,
 
 // Resolve hostname to IPv4 address (host byte order). Blocking.
 int dns_resolve(const char *hostname, uint32_t *ip_out) {
-    if (!hostname || !ip_out) return -1;
+    if (!hostname || !ip_out) { netfail_note(NF_DNS_BAD_NAME, 0); return -1; }
 
     if (is_ip_address(hostname)) {
         *ip_out = parse_ip(hostname);
@@ -543,6 +860,18 @@ int dns_resolve(const char *hostname, uint32_t *ip_out) {
     if (cached) {
         if (cached->negative) {
             stat_neg_hits++;
+            // #netfix2: this lookup did not fail here, it failed EARLIER and
+            // is being replayed out of the negative cache. Saying so is the
+            // difference between a log with one real diagnosis followed by
+            // twenty honest "cached" lines, and a log with twenty-one
+            // identical lines that all look like fresh independent faults.
+            // #netfix2: replay the ORIGINAL reason. Falling back to
+            // NF_DNS_NEG_CACHED only when nothing was recorded keeps that name
+            // meaningful: it now marks an entry made by a path that did not
+            // state a reason, which is a bug to go and fix, rather than being
+            // the answer for every repeat of every fault.
+            netfail_note(cached->fail_reason ? cached->fail_reason
+                                             : NF_DNS_NEG_CACHED, 0);
             return -DNS_RCODE_NAME_ERROR;   // recent failure; don't re-query
         }
         *ip_out = cached->ip;
@@ -563,47 +892,228 @@ int dns_resolve(const char *hostname, uint32_t *ip_out) {
     // clients still quiesce while FAULTY because they gate on net_is_up()
     // before they ever get here.
     if (!net_wire_usable()) {
+        // #netfix2: distinguish the two, because they need different actions.
+        // No carrier is a cable/adapter problem; carrier with no address is a
+        // DHCP problem and the network is otherwise fine.
+        dns_neg_reason(nic_link_up() ? NF_NO_ADDRESS : NF_NO_CARRIER);
         dns_cache_put(hostname, 0, DNS_NEG_TTL_SOFT, 1);   // #333/#374 transient: link/IP may return
         kprintf("[DNS] network down; skipping resolve of %s (soft-negative-cached %ds)\n",
                 hostname, DNS_NEG_TTL_SOFT);
         return -1;
     }
 
+    // #dnsfallback: before anything is sent, prefer whatever last answered.
+    dns_adopt_learned();
+
     if (dns_server == 0) {
+        netfail_note(NF_DNS_NO_SERVER, 0);   // #netfix2
         kprintf("[DNS] no server configured\n");
         return -1;
     }
 
+    // #httpdns: claim this lookup's own transaction slot. On exhaustion we fail
+    // honestly (soft negative cache, the caller retries) instead of clobbering
+    // a live transaction, which is what the single global did on EVERY overlap.
+    uint32_t hlen = 0; while (hostname[hlen] && hlen < 200) hlen++;
+    int slot = dnstx_alloc_rs((const uint8_t *)hostname, hlen, dns_rand(),
+                              0, sched_now_ms(), DNS_SLOT_TTL_KERNEL_MS);
+    if (slot < 0) {
+        netfail_note(NF_DNS_SILENT, 0);
+        dns_cache_put(hostname, 0, DNS_NEG_TTL_SOFT, 1);
+        kprintf("[DNS] no free transaction slot for %s (soft-negative-cached %ds)\n",
+                hostname, DNS_NEG_TTL_SOFT);
+        return -1;
+    }
+
     uint8_t query[512];
-    int qlen = dns_build_query(hostname, query);
-    if (qlen < 0) return qlen;
+    int qlen = dns_build_query(hostname, query,
+                               (uint16_t)dnstx_id_rs((uint32_t)slot));
+    if (qlen < 0) { dnstx_free_rs((uint32_t)slot); return qlen; }
 
     kprintf("[DNS] resolving %s\n", hostname);
 
+    // #imacnet: keep the failover policy's idea of the gateway current. Doing
+    // it here, on the resolve path, means there is no setter to hunt for and no
+    // way for a DHCP renewal or a Settings change to leave it stale.
+    netbread_dns_set_gateway_rs(ip_get_gateway());
+
+    // #imacnet: TWO PASSES. Pass 0 is the resolver we were told to use. If it
+    // answers nothing AT ALL - not an error, nothing - that is evidence about
+    // the SERVER, and pass 1 runs the same query against the failover candidate
+    // so the lookup that paid for the discovery is also the one that benefits.
+    // Without this the user's FIRST page load still fails and only the next one
+    // works, which reads as "it is broken" and is how this stays unreported.
+    // #netfix2: THE HEDGE, and why the two-pass failover on its own was not
+    // enough to close the owner's report.
+    //
+    // MEASURED from the constants: a pass that gets no reply costs
+    // 1500 + 3000 + 6000 ms of response waits plus 200 + 400 + 800 ms of
+    // backoff, i.e. about TWELVE SECONDS before the failover even becomes
+    // possible. A user whose first page load takes twelve seconds and then
+    // works has, correctly, reported that the browser does not work. Recovery
+    // that is slower than the user's patience is not recovery.
+    //
+    // So when we have a second candidate the local network has endorsed (the
+    // DHCP-offered resolver, or the gateway) and it is not the one we are
+    // already using, the SAME query goes to BOTH after a short hedge delay.
+    // Whoever answers first wins. This costs one extra 40-byte datagram on the
+    // first lookup of a boot and turns a twelve-second failure into a
+    // DNS_HEDGE_MS one, and it NEVER abandons the user's choice on a single
+    // dropped packet the way simply lowering the failover threshold would.
+    //
+    // #dnsfallback: THE CANDIDATE NOW COMES FROM THE LADDER, NOT FROM AN INLINE
+    // {DHCP, gateway} PAIR. MEASURED on the owner's iMac (golden 2353): his
+    // preferred resolver, his DHCP-offered resolver and his gateway were all
+    // 192.0.2.1, the Windows ICS host, so both candidates equalled the
+    // server already in use and this computed hedge_to = 0. Forty-one
+    // unanswered queries, zero hedged datagrams, zero failovers. The ladder can
+    // escalate off-network, which on that topology is the only place left to
+    // go. It refuses to offer a public resolver on a network whose own DNS has
+    // answered anything at all, so a healthy LAN never sends a query off it.
+    uint32_t hedge_to = netbread_dns_hedge_candidate_rs(dns_server);
+    // An off-network hedge gets a longer fuse than a local one: see
+    // DNS_HEDGE_PUBLIC_MS in dns.h for why a slow resolver is not a broken one.
+    uint32_t hedge_ms = (hedge_to && netbread_dns_is_public_rs(hedge_to))
+                        ? DNS_HEDGE_PUBLIC_MS : DNS_HEDGE_MS;
+
     uint32_t attempt_ms = DNS_TIMEOUT_MS;
+    for (int pass = 0; pass < 2; pass++) {
+    uint32_t nsrv = 0;
     for (int attempt = 0; attempt < DNS_MAX_RETRIES; attempt++) {
-        if (dns_send(query, qlen) < 0) {
+        dnstx_touch_rs((uint32_t)slot, sched_now_ms(), DNS_SLOT_TTL_KERNEL_MS);
+        if (dns_send(slot, query, qlen) < 0) {
             kprintf("[DNS] send failed (attempt %d)\n", attempt + 1);
             // fall through to backoff and try again
         } else {
-            if (dns_wait(attempt_ms) && dns_query.complete) {
-                if (dns_query.result_code == 0) *ip_out = dns_query.result_ip;
-                return dns_query.result_code;
+            // Wait a little for the server we were told to use. If it answers
+            // inside the hedge window, nothing else is sent and the behaviour
+            // is exactly as before.
+            uint32_t first = (hedge_to && attempt_ms > hedge_ms)
+                             ? hedge_ms : attempt_ms;
+            if (dns_wait(slot, first)) {
+                int rc = dnstx_result_rs((uint32_t)slot, ip_out);
+                dnstx_free_rs((uint32_t)slot);
+                return rc;
+            }
+            if (hedge_to && first < attempt_ms) {
+                dns_send_to(slot, query, qlen, hedge_to);
+                if (dns_wait(slot, attempt_ms - first)) {
+                    // If the ALTERNATE answered and the configured resolver did
+                    // not, that is real evidence about the configured one, and
+                    // the rest of this boot should not keep paying the hedge
+                    // delay to rediscover it every single lookup.
+                    uint32_t ans = dnstx_answered_by_rs((uint32_t)slot);
+                    if (ans == hedge_to && ans != dns_server) {
+                        uint8_t *po = (uint8_t *)&dns_server;
+                        uint8_t *pn = (uint8_t *)&hedge_to;
+                        uint32_t pref = netbread_dns_preferred_rs();
+                        uint8_t *pp = (uint8_t *)&pref;
+                        bootlog_write(
+                            // #dnsfallback: THE TAIL OF THIS SENTENCE USED TO
+                            // POINT AT THE THING THAT BROKE THE USER. It said
+                            // "Settings > Network > DNS Server > Automatic
+                            // makes this permanent", and MEASURED on the ICS
+                            // bench this exact line printed with 192.0.2.1
+                            // as the silent server: Automatic selects the
+                            // DHCP-offered resolver, which on that segment IS
+                            // the silent one. Following the advice would have
+                            // undone the recovery that had just happened. The
+                            // same wrong advice was in the browser status bar
+                            // and is corrected there too.
+                            "[DNSHEDGE] %d.%d.%d.%d did not answer for %s "
+                            "within %ums but %d.%d.%d.%d did; using it for the "
+                            "rest of this boot (your preferred resolver is "
+                            "still %d.%d.%d.%d and comes back on reboot;%s)",
+                            po[3], po[2], po[1], po[0], hostname,
+                            (unsigned)hedge_ms,
+                            pn[3], pn[2], pn[1], pn[0],
+                            pp[3], pp[2], pp[1], pp[0],
+                            netbread_dns_is_public_rs(hedge_to)
+                              ? " that is a PUBLIC resolver, so nothing on your "
+                                "own network answered - the fix is on your "
+                                "router or firewall (UDP port 53), not in "
+                                "these settings"
+                              : " to make the change stick, set that server "
+                                "explicitly in Settings > Network");
+                        dns_server = hedge_to;
+                        hedge_to = 0;
+                    }
+                    int rc = dnstx_result_rs((uint32_t)slot, ip_out);
+                    dnstx_free_rs((uint32_t)slot);
+                    return rc;
+                }
             }
         }
         // Exponential backoff with jitter before retransmitting (ban-safe).
         uint32_t backoff = (DNS_BACKOFF_BASE_MS << attempt);
         uint32_t jitter  = dns_rand() % (DNS_BACKOFF_BASE_MS + 1);
-        if (dns_wait(backoff + jitter) && dns_query.complete) {
-            if (dns_query.result_code == 0) *ip_out = dns_query.result_ip;
-            return dns_query.result_code;
+        if (dns_wait(slot, backoff + jitter)) {
+            int rc = dnstx_result_rs((uint32_t)slot, ip_out);
+            dnstx_free_rs((uint32_t)slot);
+            return rc;
         }
+        // #imacnet: this ATTEMPT produced no reply. Counted PER ATTEMPT, not
+        // per lookup.
+        //
+        // MEASURED 2026-09-02 on the ICS bench, and this is why the placement
+        // matters: with the note outside this loop it took DNS_FAILOVER_AFTER
+        // whole LOOKUPS to fail over, and the bench boot performed exactly ONE
+        // name lookup in its entire life ([NETDIAG] read dnsq=3/0/1/0/0: three
+        // queries sent, zero answers, one silent lookup, zero failovers). A
+        // machine that resolves one name per boot would never have reached the
+        // threshold at all, so the recovery path would have been dead code that
+        // passed its own unit test. The counter's unit has to be the thing that
+        // actually happens repeatedly, which is the ATTEMPT.
+        uint32_t _fo = netbread_dns_note_timeout_rs(dns_server);
+        if (_fo) nsrv = _fo;
         attempt_ms <<= 1;   // double the response wait each retry
+    }
+        // The whole retry budget is spent and not one datagram came back.
+        if (nsrv == 0 || nsrv == dns_server) break;   // no alternate to try
+
+        uint8_t *po = (uint8_t *)&dns_server;
+        uint8_t *pn = (uint8_t *)&nsrv;
+        uint32_t pref = netbread_dns_preferred_rs();
+        uint8_t *pp = (uint8_t *)&pref;
+        // DURABLE, not kprintf. This is the whole reason the module exists: a
+        // resolver silently failing over is exactly the kind of fact that has
+        // to survive on a machine with no serial port.
+        bootlog_write("[DNSFAIL] resolver %d.%d.%d.%d answered NOTHING for %s; "
+                      "failing over to %d.%d.%d.%d%s for this boot "
+                      "(preferred stays %d.%d.%d.%d - set it in Settings > "
+                      "Network, or reboot, to go back)",
+                      po[3], po[2], po[1], po[0], hostname,
+                      pn[3], pn[2], pn[1], pn[0],
+                      netbread_dns_is_public_rs(nsrv)
+                        ? ", a PUBLIC resolver (nothing on your own network "
+                          "answered)" : "",
+                      pp[3], pp[2], pp[1], pp[0]);
+        dns_server = nsrv;
+        // #netfix2: the slow failover has just adopted a candidate. If that is
+        // the same address the hedge was going to try, pass 1 must not send the
+        // same question to the same server twice on every attempt.
+        if (hedge_to == dns_server) hedge_to = 0;
+        dns_cache_clear();      // the dead server's negative answers are worthless
+        attempt_ms = DNS_TIMEOUT_MS;
+        // A FRESH transaction id. The old query may still be in flight to the
+        // server we just abandoned; reusing its id would let a late straggler
+        // satisfy a question we are now asking somebody else.
+        qlen = dns_build_query(hostname, query,
+                               (uint16_t)dnstx_rearm_rs((uint32_t)slot, dns_rand(),
+                                                        sched_now_ms(),
+                                                        DNS_SLOT_TTL_KERNEL_MS));
+        if (qlen < 0) break;
     }
 
     // Exhausted retries: this is usually a TRANSIENT loss (packet drop / load),
     // not a real NXDOMAIN, so use a SHORT soft negative TTL. Callers in a retry
     // loop still back off briefly but can re-query within a few seconds (#333).
+    // #netfix2: NOT ONE DATAGRAM CAME BACK, from anybody, after the whole retry
+    // budget and (where one existed) a hedge to a second resolver. That is the
+    // single most useful sentence this stack can write on a machine with no
+    // serial port, and until now it wrote it only to a serial port.
+    dnstx_free_rs((uint32_t)slot);
+    dns_neg_reason(NF_DNS_SILENT);
     dns_cache_put(hostname, 0, DNS_NEG_TTL_SOFT, 1);
     kprintf("[DNS] failed to resolve %s (soft-negative-cached %ds)\n", hostname, DNS_NEG_TTL_SOFT);
     return -1;
@@ -611,7 +1121,7 @@ int dns_resolve(const char *hostname, uint32_t *ip_out) {
 
 // Non-blocking DNS for userland syscalls (paired with dns_resolve_check).
 // 1 = resolved immediately, 0 = query sent, <0 = error (incl. negative cache).
-int dns_resolve_start(const char *hostname, uint32_t *ip_out) {
+int dns_resolve_start(const char *hostname, uint32_t *ip_out, uint32_t owner) {
     if (!hostname || !ip_out) return -1;
     if (is_ip_address(hostname)) {
         *ip_out = parse_ip(hostname);
@@ -626,23 +1136,51 @@ int dns_resolve_start(const char *hostname, uint32_t *ip_out) {
     // Fail fast on dead link (see dns_resolve): negative-cache + bail so the
     // userland caller does not retry into multi-second send/ARP waits.
     if (!nic_link_up()) {
+        dns_neg_reason(NF_NO_CARRIER);   // #netfix2
         dns_cache_put(hostname, 0, DNS_NEG_TTL, 1);
         return -1;
     }
-    if (dns_server == 0) return -1;
+    // #dnsfallback: this path has NO hedge and NO failover of its own - it sends
+    // one query and returns - so adopting the resolver that last answered is
+    // the only recovery it gets. Without this, a userland lookup would keep
+    // querying the dead server long after dns_resolve() had found a live one.
+    dns_adopt_learned();
+        if (dns_server == 0) { netfail_note(NF_DNS_NO_SERVER, 0); return -1; }   // #netfix2
+
+    // #httpdns: this pair has no handle in its syscall ABI (SYS_DNS_POLL takes
+    // only an out-pointer), so the slot is keyed on the CALLING PROCESS. Two
+    // processes resolving at once - the browser and a terminal nslookup, say -
+    // used to share the machine's one query record and read each other's
+    // answers. A previous unpolled lookup by the same process is released
+    // first, so a caller cannot leak slots by abandoning lookups.
+    if (owner == 0) return -1;
+    int prev = dnstx_owner_slot_rs(owner);
+    if (prev >= 0) dnstx_free_rs((uint32_t)prev);
+
+    uint32_t hlen = 0; while (hostname[hlen] && hlen < 200) hlen++;
+    int slot = dnstx_alloc_rs((const uint8_t *)hostname, hlen, dns_rand(),
+                              owner, sched_now_ms(), DNS_SLOT_TTL_MS);
+    if (slot < 0) return -1;
 
     uint8_t query[512];
-    int qlen = dns_build_query(hostname, query);
-    if (qlen < 0) return qlen;
-    if (dns_send(query, qlen) < 0) return -1;
+    int qlen = dns_build_query(hostname, query,
+                               (uint16_t)dnstx_id_rs((uint32_t)slot));
+    if (qlen < 0) { dnstx_free_rs((uint32_t)slot); return qlen; }
+    if (dns_send(slot, query, qlen) < 0) { dnstx_free_rs((uint32_t)slot); return -1; }
     return 0;
 }
 
 // Poll a pending dns_resolve_start. 1 = success, 0 = pending, -1 = failed.
-int dns_resolve_check(uint32_t *ip_out) {
-    if (!dns_query.complete) return 0;
-    if (dns_query.result_code == 0) {
-        if (ip_out) *ip_out = dns_query.result_ip;
+// #httpdns: answers about THIS process's lookup only.
+int dns_resolve_check(uint32_t *ip_out, uint32_t owner) {
+    int slot = dnstx_owner_slot_rs(owner);
+    if (slot < 0) return -1;
+    if (!dnstx_done_rs((uint32_t)slot)) return 0;
+    uint32_t ip = 0;
+    int rc = dnstx_result_rs((uint32_t)slot, &ip);
+    dnstx_free_rs((uint32_t)slot);
+    if (rc == 0) {
+        if (ip_out) *ip_out = ip;
         return 1;
     }
     return -1;

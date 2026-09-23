@@ -106,6 +106,28 @@ void win16_reloc_log(const char *mod, const char *name, unsigned ord,
 #define WM_CLOSE        0x0010
 #define WM_QUIT         0x0012
 #define WM_ERASEBKGND   0x0014
+// (win16owndraw, #391 generalisation) WM_DRAWITEM/WM_MEASUREITEM and the
+// DRAWITEMSTRUCT field constants a BS_OWNERDRAW control's paint dispatch
+// needs (see the "BS_OWNERDRAW / WM_DRAWITEM dispatch" section next to
+// win16_draw_button, further down, for the full contract explanation).
+// Grouped with the other WM_* message constants (not with the later BS_*
+// block) purely so win16_paint_child_tree, which is defined well above that
+// block, can reference ODA_DRAWENTIRE/ODS_CHECKED directly.
+#define WM_DRAWITEM     0x002B
+#define WM_MEASUREITEM  0x002C
+#define ODT_MENU        1
+#define ODT_LISTBOX     2
+#define ODT_COMBOBOX    3
+#define ODT_BUTTON      4
+#define ODT_STATIC      5
+#define ODA_DRAWENTIRE  0x0001
+#define ODA_SELECT      0x0002
+#define ODA_FOCUS       0x0004
+#define ODS_SELECTED    0x0001
+#define ODS_GRAYED      0x0002
+#define ODS_DISABLED    0x0004
+#define ODS_CHECKED     0x0008
+#define ODS_FOCUS       0x0010
 #define WM_KEYDOWN      0x0100
 #define WM_KEYUP        0x0101
 #define WM_CHAR         0x0102
@@ -292,6 +314,54 @@ static uint16_t lheap_alloc(uint32_t bytes) {
     return lheap_alloc_seg(seg, bytes);
 }
 
+// (docs/WORD6_LOCALHEAP_PLAN.md Section C + D "SECONDARY change", word6heap)
+// Per-block size tracking for the KERNEL.4-10 LocalAlloc/LocalReAlloc/LocalFree/
+// LocalSize ordinals. lheap_alloc_seg above is a pure bump allocator with NO
+// per-block metadata, so two real bugs existed: LocalReAlloc could not know a
+// block's OLD size and therefore never copied data into the new block (silent
+// data loss for any caller that grows a live buffer), and LocalSize had no
+// size to report and always returned 0 (the comment above the old code even
+// claimed it returned "a small non-zero size", which the code did not do -
+// the plan's Section C flagged both as required fixes). Word 6's OWN DGROUP
+// heap does NOT go through these ordinals (its statically-linked MS-C runtime
+// walks its arena directly - see the plan's TL;DR), so this table serves the
+// OLE2 DLLs (STORAGE/COMPOBJ, task #289) and any app that calls KERNEL.4-10
+// directly (FreeCell/Chips/SkiFree). Deliberately NOT the full free-block
+// chain from the plan's Section C/D (that is a larger, riskier rewrite of the
+// allocator itself); this is the bounded, additive piece: track what we
+// already hand out so ReAlloc/Size/Free can be honest about it.
+#define WIN16_MAX_LBLK 256
+typedef struct { uint16_t seg; uint16_t off; uint16_t size; int used; } lblk_t;
+static lblk_t g_lblk[WIN16_MAX_LBLK];
+static int    g_lblk_n;
+
+static lblk_t *lblk_find(uint16_t seg, uint16_t off) {
+    for (int i = 0; i < g_lblk_n; i++)
+        if (g_lblk[i].used && g_lblk[i].seg == seg && g_lblk[i].off == off) return &g_lblk[i];
+    return 0;
+}
+// Record/overwrite the tracked size of (seg,off). Reuses a freed slot when the
+// table is full so long-running apps that alloc/free in a loop do not silently
+// stop being tracked; if even that is exhausted, the block is simply untracked
+// (LocalSize/LocalReAlloc fall back to their pre-existing safe behavior for it).
+static void lblk_record(uint16_t seg, uint16_t off, uint16_t size) {
+    if (!off) return;
+    lblk_t *e = lblk_find(seg, off);
+    if (!e) {
+        if (g_lblk_n < WIN16_MAX_LBLK) {
+            e = &g_lblk[g_lblk_n++];
+        } else {
+            for (int i = 0; i < WIN16_MAX_LBLK; i++)
+                if (!g_lblk[i].used) { e = &g_lblk[i]; break; }
+        }
+    }
+    if (e) { e->seg = seg; e->off = off; e->size = size; e->used = 1; }
+}
+static void lblk_forget(uint16_t seg, uint16_t off) {
+    lblk_t *e = lblk_find(seg, off);
+    if (e) e->used = 0;
+}
+
 // FindResource/LoadResource handle table (#148: Chips Challenge loads its tiles
 // via the resource-handle API, not LoadBitmap). FindResource locates the bytes
 // in the kernel-side module image; LoadResource copies them into the Win16
@@ -308,6 +378,7 @@ static void heap_reset(void) {
     g_lheap_top = 0;
     g_lseg_n = 0;
     g_rsrc_n = 0;
+    g_lblk_n = 0;       // (word6heap) clear per-run local-heap block-size tracking
     g_gblk_count = 0;   // (#188) clear per-run GlobalSize tracking
 }
 
@@ -463,6 +534,12 @@ typedef struct {
     uint8_t  btn_pressed;
     uint8_t  btn_check;
     uint16_t ctrl_id;
+    // (win16dlgctl, #391 generalisation) SS_ICON: the gdiobj handle of the
+    // icon this predefined STATIC control loaded from its own window-text
+    // (icon resource name/ordinal) at CreateWindow time - see u_createwindow
+    // and win16_draw_static. 0 = no icon (not SS_ICON, or the resource load
+    // failed). Unused by every other ctrl_kind.
+    uint16_t static_icon;
 } win16_window_t;
 
 typedef struct {
@@ -662,6 +739,18 @@ static uint16_t  g_win16_main_hwnd = 0;  // hwnd that owns the host canvas (full
 // effect on any other code path).
 static uint16_t  g_win16_chrome_hmenu = 0;
 int              g_win16_apilog = 0;     // (#188) per-call API dispatch trace (default OFF; floods serial)
+// (#391 pslibentry pass) Gated investigative diagnostic, default OFF (matches
+// the g_win16_apilog/g_ole2_k334log convention just above/below). Track the
+// most recent win16 API call so a companion-DLL LibEntry halt (r=0 from
+// x86_16_call_far, i.e. cpu->halted before RETF) can be reported together
+// with the last API it called before halting. x86_16_call_far reads these
+// only when g_ps391_dllhalt_trace is set (see x86_16.c). Cheap (a few
+// word/byte stores) even when armed. This found the PHOTOS01.DLL "unknown
+// import id 307" stack-desync halt (see win16_api_resync_import_count in
+// this file for the fix); left armable for the next win16 DLL-halt bug.
+int              g_ps391_dllhalt_trace = 0;
+uint16_t         g_ps391_last_api_cs = 0, g_ps391_last_api_ip = 0;
+char             g_ps391_last_api_name[64] = "<none>";
 // (#278 word6) Budget-limited paint diagnostic. Set >0 to capture the first N
 // TextOut/ExtTextOut/BitBlt/PatBlt calls, then goes quiet so it never floods.
 // Default 0 (off). Routes to the persistent win16_trace buffer (->
@@ -828,7 +917,7 @@ static void win16_menu_strip_maintain(void) {
         if (!g_menu_snap) return;
     }
     // Discriminate "menu present" from "menu blanked" by counting ink (dark) pixels in
-    // the MENU-TEXT band ONLY. Empirically (per-row dark-pixel dump on VM <vmid>), Word's
+    // the MENU-TEXT band ONLY. Empirically (per-row dark-pixel dump on a test VM), Word's
     // 16px menu strip is: row 2 = a full-width separator line, rows 11-15 = the toolbar's
     // top edge/bevel, and BOTH of those are dark in either state. The menu glyphs of
     // "File Edit View ... Help" live in rows 3-10 (x in [8,470)): ~1000 dark pixels when
@@ -1536,6 +1625,28 @@ static void win16_draw_menubar(win16_window_t *win) {
     }
 }
 
+// (win16dlgctl, #391 generalisation) Tentative (un-initialised) forward
+// declarations of the modal DialogBox subsystem's own file-static state
+// (real definitions with their initialisers are much further down, next to
+// the rest of the DialogBox code at DLGC_*/dlg_parse_template). C allows a
+// file-scope static object to have more than one declaration as long as at
+// most one carries an initialiser; this is the same object, not a new one.
+// win16_draw_frame (below) needs them because a Win16 dialog PROC commonly
+// creates ADDITIONAL child controls of its own via CreateWindow(...,
+// hWndParent = hDlg, ...) - hDlg being OUR synthetic g_dlg_hwnd, which is
+// never a real win16_window_t - and those children need to be positioned
+// relative to the dialog's own on-screen rect, not silently misplaced.
+// (win16owndraw, #391 generalisation) g_dlg_dp_seg/off (the active modal
+// dialog's own DialogProc far pointer) are forward-declared here too, for the
+// same reason and by the same rule: win16_resolve_owner_proc (below,
+// win16owndraw) needs to route a SEND to the synthetic g_dlg_hwnd through the
+// real DialogProc, because g_dlg_hwnd is never a win_from_hwnd()-lookupable
+// win16_window_t.
+static uint16_t g_dlg_hwnd;
+static int      g_dlg_active;
+static int      g_dlg_x, g_dlg_y;
+static uint16_t g_dlg_dp_seg, g_dlg_dp_off;
+
 static void win16_draw_frame(win16_window_t *win) {
     if (win->w <= 0 || win->h <= 0) return;
     // The window chrome (border + title bar) is drawn by the kernel window
@@ -1547,8 +1658,26 @@ static void win16_draw_frame(win16_window_t *win) {
     if (win->is_child) {
         // Child client sits inside the parent's client area at (win->x, win->y).
         win16_window_t *par = win_from_hwnd(win->parent);
-        win->cx = (par ? par->cx : 0) + win->x;
-        win->cy = (par ? par->cy : 0) + win->y;
+        // (win16dlgctl, #391 generalisation) A child whose CreateWindow
+        // hWndParent is OUR synthetic modal-dialog handle (g_dlg_hwnd, see
+        // its declaration above) has no real win16_window_t parent to look
+        // up - win_from_hwnd returns NULL and the fallback below used to
+        // silently treat win->x/win->y as if they were already canvas-
+        // relative, which is wrong whenever the dialog itself is not at the
+        // canvas origin (the normal case: DialogBox centres it). This is a
+        // real, common Win16 idiom - a dialog PROC building extra child
+        // controls of its own inside the dialog USER.EXE already created
+        // from the RT_DIALOG template (Photoshop's About box does exactly
+        // this) - not specific to any one app. Anchor to the dialog's own
+        // client origin (g_dlg_x, g_dlg_y + its title-bar height, the same
+        // "20" dlg_parse_template/dlg_draw already use for that bar) instead.
+        if (!par && win->parent == g_dlg_hwnd && g_dlg_active) {
+            win->cx = g_dlg_x + win->x;
+            win->cy = g_dlg_y + 20 + win->y;
+        } else {
+            win->cx = (par ? par->cx : 0) + win->x;
+            win->cy = (par ? par->cy : 0) + win->y;
+        }
         win->cw = win->w;
         win->ch = win->h;
         // (#278 Word6 toolbar-layout FIX, MEASURED via a gated runtime trace then
@@ -1867,8 +1996,29 @@ static int win16_trace_writable(void) {
     return g_trace_writable;
 }
 
+// #word6blank (2026-09-12): the ROOT CAUSE of the reported blank-window bug,
+// found tracing why a fresh non-root account renders Word 6 as a permanently
+// blank chrome-only window while root does not (the #708 GUESTFS gate was the
+// suspected cause; it is not - see rustkern/dosstate.rs's win16 section for
+// the full account). Word 6 creates a startup recovery file beside its own
+// binary (/WIN16/WORD6/~WRF0000.TMP) before it ever shows its menu/toolbar.
+// perms_check_leaf()'s no-entry default now grants that (rustkern/dosstate.rs:
+// win16_state_writable_rs(), the /DOS game-state rule extended to /WIN16), but
+// ONLY when asked about the file's OWN path - and a CREATE for a leaf that
+// does not exist yet was, unconditionally, asked about the PARENT DIRECTORY
+// instead (below), which the same rule deliberately NEVER grants (so a
+// non-root guest cannot add/rename/delete arbitrary names in a shared app
+// directory). That parent-dir fallback is correct for a name outside any
+// recognized state tree; it is wrong for a state-shaped name that just
+// happens not to exist on disk YET, which is exactly a brand-new recovery
+// file's situation. So: ask about the leaf's OWN path first (this is exactly
+// what an EXISTING state file already gets via win16_fs_allow(), a few lines
+// above); only fall back to the parent-directory check when the leaf itself
+// is not covered by the state rule (a name outside /WIN16/<app>, or a
+// program-shaped name masquerading as new).
 static int win16_fs_allow_create(const char *path, int leaf_exists, const char *what) {
     if (leaf_exists) return win16_fs_allow(path, W_OK, what);
+    if (win16_fs_allow(path, W_OK, what)) return 1;
     char parent[160];
     win16_parent_path(path, parent, sizeof(parent));
     return win16_fs_allow(parent, W_OK | X_OK, what);
@@ -2315,7 +2465,7 @@ static void u_getfreesystemresources(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx
 // ordinal that lacks one (see find_stub / g_stub_table dispatch). For most
 // boolean-style stubs AX=1 means "success"; for LocalCompact it instead means
 // "the largest contiguous free block in the local heap is 1 byte". MEASURED
-// (win16_trace on VM <vmid>, #278 Word6 continuation pass): every keystroke drove
+// (win16_trace on a test VM, #278 Word6 continuation pass): every keystroke drove
 // Word's own R_reformat -> PAGINATE-engine path into two MessageBoxes, "Word has
 // insufficient memory. You will not be able to undo this action once it is
 // completed. Do you want to continue?" and "There are too many edits in the
@@ -2362,18 +2512,49 @@ static void k_localalloc(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
     uint16_t flags = arg16(c, 1);
     uint16_t bytes = arg16(c, 0);
     uint16_t off = lheap_alloc(bytes);
+    if (off) {
+        // (word6heap) Record the actual (word-aligned) allocated size so
+        // LocalReAlloc/LocalSize/LocalFree below can be honest about this
+        // block. Rounding MUST match lheap_alloc_seg's own word-alignment.
+        uint16_t rbytes = bytes ? bytes : 1; rbytes = (rbytes + 1u) & ~1u;
+        lblk_record(c ? c->ds : 0, off, rbytes);
+    }
     if (off && (flags & 0x0040)) {     // LMEM_ZEROINIT
         for (uint16_t i = 0; i < bytes; i++) x86_16_wr8(c, c->ds, (uint16_t)(off + i), 0);
     }
     *ax = off; *dx = 0; *argbytes = 4;
 }
 
-// LocalReAlloc (KERNEL.6): (hMem, wBytes, wFlags) = 3 words. Bump-allocate a new
-// block of the requested size (data not copied; adequate for startup tables).
+// LocalReAlloc (KERNEL.6): (hMem, wBytes, wFlags) = 3 words. Pascal push order
+// (hMem, wBytes, wFlags) means wFlags=arg0, wBytes=arg1, hMem=arg2 (last pushed
+// is nearest the top, matching k_localinit's arg-order comment above).
+//
+// (word6heap, docs/WORD6_LOCALHEAP_PLAN.md Section C) PREVIOUSLY this bump-
+// allocated a fresh block and returned it WITHOUT EVER READING hMem or copying
+// the old block's bytes - any caller that grows a live buffer (the plan calls
+// out the OLE2 DLLs; the same shape applies to any KERNEL.6 caller) silently
+// lost its data. Now that block sizes are tracked (lblk_record), look up the
+// old block's size and copy the overlap into the new block before handing
+// back the new handle.
 static void k_localrealloc(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
                            uint16_t *argbytes) {
+    uint16_t hmem  = arg16(c, 2);
     uint16_t bytes = arg16(c, 1);
-    *ax = lheap_alloc(bytes); *dx = 0; *argbytes = 6;
+    uint16_t seg = c ? c->ds : 0;
+    lblk_t *old = hmem ? lblk_find(seg, hmem) : 0;
+    uint16_t oldsize = old ? old->size : 0;
+    uint16_t noff = lheap_alloc(bytes);
+    if (noff) {
+        uint16_t tocopy = (hmem && oldsize) ? (oldsize < bytes ? oldsize : bytes) : 0;
+        for (uint16_t i = 0; i < tocopy; i++) {
+            uint8_t b = x86_16_rd8(c, seg, (uint16_t)(hmem + i));
+            x86_16_wr8(c, seg, (uint16_t)(noff + i), b);
+        }
+        uint16_t rbytes = bytes ? bytes : 1; rbytes = (rbytes + 1u) & ~1u;
+        lblk_record(seg, noff, rbytes);
+        if (hmem) lblk_forget(seg, hmem);
+    }
+    *ax = noff; *dx = 0; *argbytes = 6;
 }
 
 // LocalLock (KERNEL.8): LocalLock(hMem) = 1 word. The handle already IS the near
@@ -2389,18 +2570,187 @@ static void k_localunlock(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
     (void)c; *ax = 1; *dx = 0; *argbytes = 2;
 }
 
-// LocalFree (KERNEL.7): LocalFree(hMem) = 1 word. Bump allocator does not
-// reclaim; return 0 (NULL handle) to signal success.
+// LocalFree (KERNEL.7): LocalFree(hMem) = 1 word.
+//
+// (word6heap) The bump allocator still does not reclaim in general (that is
+// the plan's larger Section C/D free-block-chain rewrite, deliberately out of
+// scope here). But when the freed block is tracked AND is the MOST RECENT
+// allocation in its segment (the bump pointer sits immediately after it),
+// roll the pointer back - a LIFO reclaim, the same shape as the existing
+// heap_free() LIFO reclaim for the GLOBAL heap just above in this file, which
+// the local heap had no equivalent of. Without this, an alloc/free churn loop
+// (a common scratch-buffer pattern) monotonically grew the segment's local
+// heap until LocalAlloc started returning 0, even though every block involved
+// had already been freed.
 static void k_localfree(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
                         uint16_t *argbytes) {
-    (void)c; *ax = 0; *dx = 0; *argbytes = 2;
+    uint16_t hmem = arg16(c, 0);
+    uint16_t seg = c ? c->ds : 0;
+    lblk_t *e = hmem ? lblk_find(seg, hmem) : 0;
+    if (e) {
+        uint16_t end = (uint16_t)(hmem + e->size);
+        lseg_t *ls = lseg_find(seg);
+        if (ls && ls->top) {
+            if (ls->next == end) ls->next = hmem;
+        } else if (g_lheap_top && g_lheap_next == end) {
+            g_lheap_next = hmem;
+        }
+        e->used = 0;
+    }
+    *ax = 0; *dx = 0; *argbytes = 2;
 }
 
-// LocalSize (KERNEL.9): LocalSize(hMem) = 1 word. We do not track per-block
-// sizes; return a small non-zero size so callers proceed.
+// LocalSize (KERNEL.9): LocalSize(hMem) = 1 word.
+//
+// (word6heap) PREVIOUSLY always returned 0 regardless of hMem - the comment
+// above the old code claimed this was "a small non-zero size", which the code
+// did not actually do (comment and code disagreed); the plan's Section C flags
+// this as corrupting the MS-C runtime's/any caller's accounting. Now returns
+// the real tracked size when known. A block allocated before this table
+// existed in the run, or once WIN16_MAX_LBLK is exhausted with no freed slot
+// to reuse, falls back to a safe non-zero minimum so a caller that sizes a
+// live handle does not treat it as empty.
 static void k_localsize(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
                         uint16_t *argbytes) {
-    (void)c; *ax = 0; *dx = 0; *argbytes = 2;
+    uint16_t hmem = arg16(c, 0);
+    uint16_t seg = c ? c->ds : 0;
+    lblk_t *e = hmem ? lblk_find(seg, hmem) : 0;
+    *ax = e ? e->size : (hmem ? 1 : 0);
+    *dx = 0; *argbytes = 2;
+}
+
+// (word6heap) Local-heap regression self-test, following the <subsystem>_
+// selftest() convention used throughout the tree (main.c: FLTREC/KTIME/KTZ/
+// USBPORT/PIPE/...). Exercises the REAL KERNEL.5/6/7/9 ordinal handlers
+// (k_localalloc/k_localrealloc/k_localfree/k_localsize) through a synthetic,
+// ISOLATED x86_16_cpu_t in real mode (pmode=0) with its OWN private 64 KiB
+// backing buffer standing in for a guest data segment: no dependency on the
+// live Win16 arena/LDT/any loaded NE image, so this is safe to run at boot,
+// long before any guest exists, exactly like fltrec_selftest() runs "long
+// before there is a medium to arm" (see main.c). ds=ss=0 keeps every 16-bit
+// linear address (seg<<4+off, real mode) inside the 64 KiB buffer regardless
+// of offset, so there is no way for this test to read or write outside its
+// own scratch memory.
+//
+// Proves three things that were broken before this change
+// (docs/WORD6_LOCALHEAP_PLAN.md Section C), each against the REAL dispatch
+// functions above, not a reimplementation of them:
+//   1. LocalReAlloc preserves data across growth (previously: never copied).
+//   2. LocalSize reports the real allocated size (previously: always 0).
+//   3. LocalFree + LocalAlloc of the same size REUSES the freed space
+//      (LIFO reclaim) instead of growing the segment heap without bound - a
+//      100-cycle alloc/free stress loop must leave the bump pointer exactly
+//      where it started; a pure bump allocator (the pre-fix code) would have
+//      exhausted the 2000-byte test window after roughly 30 cycles.
+//
+// Returns 0 and *out_checks = number of assertions that ran, on PASS; -1 and
+// *out_checks = the 1-based index of the first FAILING check, on FAIL (the
+// fltrec_selftest() convention: a PASS with zero checks is vacuous and must
+// be visible as such, so checks is always reported).
+int win16_localheap_selftest(uint32_t *out_checks) {
+    static uint8_t testmem[0x10000];
+    memset(testmem, 0xCC, sizeof(testmem));   // poison: distinguishable from any real data
+
+    x86_16_cpu_t cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.mem = testmem;
+    cpu.pmode = 0;
+    cpu.ds = 0; cpu.ss = 0;
+    cpu.sp = 0xF000;   // well above the [2,2000) test heap window: args never overlap it
+
+    uint32_t n = 0;
+#define W6HCHK(cond) do { n++; if (!(cond)) { if (out_checks) *out_checks = n; return -1; } } while (0)
+#define PUSHARG(idx, v) x86_16_wr16(&cpu, cpu.ss, (uint16_t)(cpu.sp + 4 + (idx) * 2), (uint16_t)(v))
+
+    // Register a private local-heap window for "segment 0" (== cpu.ds), the
+    // same shape LocalInit gives an OLE2 DLL's freshly GlobalAlloc'd segment.
+    lseg_t *seg0 = lseg_get_or_add(0);
+    W6HCHK(seg0 != 0);
+    seg0->next = 2; seg0->top = 2000;
+
+    uint16_t ax, dx, argbytes;
+
+    // 1) LocalAlloc(37) - odd size, exercises word-alignment rounding.
+    PUSHARG(0, 37); PUSHARG(1, 0);
+    k_localalloc(&cpu, &ax, &dx, &argbytes);
+    uint16_t offA = ax;
+    W6HCHK(offA != 0);
+    W6HCHK(argbytes == 4);
+
+    // 2) LocalSize(offA) must be the real rounded size (38), not 0.
+    PUSHARG(0, offA);
+    k_localsize(&cpu, &ax, &dx, &argbytes);
+    W6HCHK(ax == 38);
+
+    // 3) Stamp a recognizable pattern into A's bytes, as guest code would.
+    for (uint16_t i = 0; i < 37; i++)
+        x86_16_wr8(&cpu, cpu.ds, (uint16_t)(offA + i), (uint8_t)(0xA5 ^ i));
+
+    // 4) LocalReAlloc(offA, 100) must return a new block AND carry A's bytes
+    //    forward (the pre-fix code left the new block full of whatever the
+    //    backing memory already held - here, the 0xCC poison - because it
+    //    never read hMem at all).
+    PUSHARG(0, 0); PUSHARG(1, 100); PUSHARG(2, offA);
+    k_localrealloc(&cpu, &ax, &dx, &argbytes);
+    uint16_t offB = ax;
+    W6HCHK(offB != 0);
+    W6HCHK(argbytes == 6);
+    int copied_ok = 1;
+    for (uint16_t i = 0; i < 37; i++)
+        if (x86_16_rd8(&cpu, cpu.ds, (uint16_t)(offB + i)) != (uint8_t)(0xA5 ^ i)) copied_ok = 0;
+    W6HCHK(copied_ok);
+
+    // 5) LocalSize(offB) reflects the new size.
+    PUSHARG(0, offB);
+    k_localsize(&cpu, &ax, &dx, &argbytes);
+    W6HCHK(ax == 100);
+
+    // 6) The old handle is no longer tracked (ReAlloc forgot it): LocalSize
+    //    falls back to the safe untracked minimum rather than the stale 38.
+    PUSHARG(0, offA);
+    k_localsize(&cpu, &ax, &dx, &argbytes);
+    W6HCHK(ax == 1);
+
+    // 7) LIFO reclaim: alloc C, free it, alloc the SAME size again - must get
+    //    the SAME offset back (space reused), not a freshly grown one.
+    PUSHARG(0, 50); PUSHARG(1, 0);
+    k_localalloc(&cpu, &ax, &dx, &argbytes);
+    uint16_t offC = ax;
+    W6HCHK(offC != 0);
+    PUSHARG(0, offC);
+    k_localfree(&cpu, &ax, &dx, &argbytes);
+    W6HCHK(ax == 0);
+    PUSHARG(0, 50); PUSHARG(1, 0);
+    k_localalloc(&cpu, &ax, &dx, &argbytes);
+    W6HCHK(ax == offC);
+
+    // 8) Heap-stress: 100 alloc(64)/free cycles must not move the bump
+    //    pointer at all (each free reclaims its own alloc before the next
+    //    runs). The pre-fix LocalFree never reclaimed, so this exact loop
+    //    would have exhausted the 2000-byte window (~30 cycles) and started
+    //    returning 0 well before the 100th iteration.
+    uint16_t before_next = seg0->next;
+    int stress_ok = 1;
+    for (int i = 0; i < 100; i++) {
+        PUSHARG(0, 64); PUSHARG(1, 0);
+        k_localalloc(&cpu, &ax, &dx, &argbytes);
+        if (!ax) { stress_ok = 0; break; }
+        PUSHARG(0, ax);
+        k_localfree(&cpu, &ax, &dx, &argbytes);
+    }
+    W6HCHK(stress_ok);
+    W6HCHK(seg0->next == before_next);
+
+#undef PUSHARG
+#undef W6HCHK
+
+    // Leave no footprint on the real interpreter's global heap state before
+    // any guest runs (heap_reset() also runs at the start of every real
+    // win16_run(), so this is a belt-and-braces cleanup, not the only one).
+    heap_reset();
+
+    if (out_checks) *out_checks = n;
+    return 0;
 }
 
 // GlobalReAlloc (KERNEL.16): (hMem, dwBytes, wFlags) = 1+2+1 = 4w = 8 bytes.
@@ -3175,11 +3525,57 @@ static void u_initapp(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
 // from u_createwindow and win16_dispatch_to_window above it.
 static int  dlg_ci_eq(const char *a, const char *b);
 static void win16_draw_button(win16_window_t *win);
+// (win16owndraw, #391 generalisation) A BUTTON child's style-aware paint:
+// BS_OWNERDRAW asks the owner to draw via WM_DRAWITEM (see the "BS_OWNERDRAW /
+// WM_DRAWITEM dispatch" section further down, next to win16_draw_button),
+// every other style keeps win16_draw_button's own chrome exactly as before.
+// win16_paint_child_tree (below) needs this forward decl the same way it
+// already needed win16_draw_button's.
+static void win16_draw_button_ownerdraw_aware(win16_window_t *win, uint16_t itemAction, uint16_t itemState);
 static int  win16_native_ctrl_proc(win16_window_t *win, uint16_t msg,
                                     uint16_t wParam, uint32_t lParam, uint32_t *out);
 static void win16_draw_combo(win16_window_t *win);
 static int  win16_native_combo_proc(win16_window_t *win, uint16_t msg,
                                     uint16_t wParam, uint32_t lParam, uint32_t *out);
+// (win16dlgctl, #391 generalisation) Forward decls for the native predefined
+// STATIC/EDIT control class procs - the same "no app wndproc, USER's own class
+// proc supplies default behaviour" pattern as BUTTON/COMBOBOX above, extended
+// to the two other predefined control classes that previously had NO native
+// paint at all (win16_dispatch_to_window's proc_seg==proc_off==0 no-op meant a
+// STATIC/EDIT child rendered as nothing but its parent's/class's flat
+// background fill - a generic dialog-manager gap, not specific to any app;
+// see docs/PHOTOSHOP_251_PAINT_PLAN.md's "dialog children still blank" blocker
+// and CHANGELOG.md for the full account). win16_load_icon_cursor is defined
+// much further down (originally written for LoadIcon/LoadCursor); SS_ICON
+// STATIC controls reuse it verbatim from u_createwindow, above its definition.
+static void win16_draw_static(win16_window_t *win);
+static int  win16_native_static_proc(win16_window_t *win, uint16_t msg,
+                                     uint16_t wParam, uint32_t lParam, uint32_t *out);
+static void win16_draw_edit(win16_window_t *win);
+static int  win16_native_edit_proc(win16_window_t *win, uint16_t msg,
+                                   uint16_t wParam, uint32_t lParam, uint32_t *out);
+static uint16_t win16_load_icon_cursor(x86_16_cpu_t *c, uint16_t name_off,
+                                       uint16_t name_seg, uint16_t hinst,
+                                       int grpType, int imgType);
+// (win16static, #391 generalisation) dlg_text_w is defined much further down
+// (originally written for the template-based dialog renderer, dlg_parse_template/
+// dlg_draw); u_createwindow reuses it verbatim, above its definition, for the
+// same reason win16_load_icon_cursor is forward-declared above.
+static int dlg_text_w(const char *s);
+// (#369 jezzball follow-up, #278 legacy-app-re) The Win16 API thunk segment
+// (mirrors WIN16_THUNK_SEG in exec/ne.c). A far pointer WIN16_API_THUNK_SEG:id
+// is NOT guest code: `id` indexes g_imports[] and a guest CALLF to it is
+// normally serviced by the farcall trap -> win16_api_dispatch. Moved up from
+// just above its original, CallWindowProc-only use further down in this file:
+// win16_call_wndproc, right below, needs the same check now (see its own
+// comment for why, and for the honest scope of what this DOES and does NOT fix).
+#define WIN16_API_THUNK_SEG 0xF000
+// Forward decl: dispatches a thunk-segment "wndproc" (e.g. DefWindowProc)
+// through the real C handler instead of executing it as guest code. Defined
+// later in this file, next to CallWindowProc (USER.122), its original caller.
+static uint32_t win16_dispatch_thunk_proc(x86_16_cpu_t *c, uint16_t thunk_off,
+                                          uint16_t hwnd, uint16_t msg,
+                                          uint16_t wParam, uint32_t lParam);
 static uint32_t win16_call_wndproc(uint16_t pseg, uint16_t poff, uint16_t hwnd,
                                    uint16_t msg, uint16_t wParam, uint32_t lParam) {
     // (#278 Word6 combobox DIAG, kept in tree default-off, see
@@ -3198,6 +3594,57 @@ static uint32_t win16_call_wndproc(uint16_t pseg, uint16_t poff, uint16_t hwnd,
           win16_trace("[W6CWPBAIL] hwnd=%04x msg=%04x wp=%04x lp=%08x (pseg:poff=0:0, swallowed here)\n",
                       hwnd, msg, wParam, (unsigned)lParam); } }
     if (!g_cpu || (pseg == 0 && poff == 0)) return 0;
+    // (#369 jezzball follow-up, #278 legacy-app-re) A window's CURRENT proc can
+    // legitimately BE a built-in API thunk directly, not only reach one as a
+    // CallWindowProc "previous proc": RegisterClass(lpfnWndProc=DefWindowProc) is
+    // a real, documented Win16 idiom (a lightweight message-sink class, or a base
+    // class meant to be subclassed via SetWindowLong only after CreateWindow
+    // returns), and CreateWindow copies the class's proc_seg/proc_off verbatim
+    // into win->proc_seg/proc_off with no thunk check. Every OTHER path into a
+    // guest wndproc funnels through THIS function (WM_CREATE at CreateWindow
+    // time, WM_SIZE/WM_MOVE's synthetic SetWindowPos dispatch,
+    // win16_dispatch_to_window's WM_PAINT/general dispatch,
+    // win16_paint_child_tree's per-child WM_PAINT), so #369 only patched the ONE
+    // call site (u_callwindowproc) that already special-cased
+    // WIN16_API_THUNK_SEG; every other caller still fell into the x86_16_call_far
+    // below with cs=F000, which sets cpu->ip running from an all-zero guard
+    // region: byte 0x00 0x00 decodes as `ADD [BX+SI], AL`, so the interpreter
+    // executes that same 2-byte instruction, corrupting whatever guest memory
+    // DS:[BX+SI] happens to point at (leftover from the caller's own registers)
+    // once per instruction, for up to x86_16_call_far's 400M-instruction
+    // CALLFAR_CAP before giving up with rc=-1.
+    //
+    // HONESTY NOTE (#278 legacy-app-re, JezzBall investigation): an EARLIER,
+    // pre-#369-generalisation /WIN16LOG.TXT capture of JezzBall
+    // (the build host:/root/win16log-jezz.txt, captured by a prior agent/patblt pass)
+    // showed exactly this failure - a window with proc=f000:0042 (thunk id
+    // 0x42=66 -> USER.#107 DefWindowProc) taking WM_CREATE and WM_SIZE both
+    // straight into this path with rc=-1 - which read as JezzBall's own root
+    // cause. THIS PASS COULD NOT REPRODUCE THAT: three independent, clean
+    // /WIN16LOG.TXT captures on dev HEAD ceb1bc67 (no keystroke contamination,
+    // confirmed via a temporary diagnostic scaffold, reverted before this commit)
+    // show JezzBall's main window's proc genuinely resolving to real guest code
+    // (14c5:00df, then a MakeProcInstance thunk 8400:00f9 after self-subclassing)
+    // for every WM_CREATE/WM_SIZE/WM_PAINT in the run - this exact path is NEVER
+    // HIT for JezzBall on the current tree. JezzBall's actual measured symptoms
+    // are two SEPARATE, already-diagnosed things (see the blame.md entry this
+    // commit adds): the OK/Paused child buttons are deliberately
+    // ShowWindow(SW_HIDE)'d by the app's OWN code right after creating them
+    // (caller=14c5:0e72, i.e. JEZZBALL.EXE itself, not an interpreter bug), and
+    // the play field never draws because the main window's entire WM_PAINT body
+    // is BeginPaint/SetBkColor/SetTextColor/CreateCompatibleDC/SelectObject(the
+    // 288x24 toolbar strip)/DeleteDC/EndPaint - no Blt/Rect/Line/TextOut ever
+    // touches the screen DC, and no MISS-logged import or WM_TIMER appears
+    // anywhere in the run. This #369 generalisation is landed anyway as a real,
+    // independently-defensible correctness fix (the OLD behaviour - execute
+    // garbage as code, corrupt one byte of guest memory, burn up to 400M
+    // interpreted instructions - was unconditionally wrong whenever ANY app hits
+    // it, so no currently-passing app can be relying on it), not as a claimed fix
+    // for JezzBall's own black field/hidden buttons, which remain undiagnosed
+    // past this point and need a real reference-execution diff (legacy-app-re)
+    // against Windows 3.1 to go further.
+    if (pseg == WIN16_API_THUNK_SEG)
+        return win16_dispatch_thunk_proc(g_cpu, poff, hwnd, msg, wParam, lParam);
     uint16_t args[5];
     args[0] = hwnd;                          // pushed first (leftmost C arg)
     args[1] = msg;
@@ -3211,7 +3658,7 @@ static uint32_t win16_call_wndproc(uint16_t pseg, uint16_t poff, uint16_t hwnd,
                 pseg, poff, msg, wParam, (unsigned)lParam);
     // (#278 P41) trace messages delivered to Word's MDI document windows
     // (frame 0040, MDI client 004d, doc child 004e, edit pane 004f, ruler 0050).
-    // (#278 DIAG typed-char-bail pass) kprintf is dropped on VM <vmid> in GUI mode
+    // (#278 DIAG typed-char-bail pass) kprintf is dropped on a test VM in GUI mode
     // (serial silent); route via win16_trace -> /WIN16LOG.TXT instead, per the
     // established rig learning (blame.md). Also: reset the trace ring the first
     // time ANY WM_CHAR/WM_KEYDOWN reaches ANY window, so the whole 256KB budget
@@ -3307,8 +3754,14 @@ static void win16_paint_child_tree(uint16_t parent_hwnd, int depth) {
         win16_call_wndproc(ch->proc_seg, ch->proc_off, ch->hwnd, WM_PAINT, 0, 0);
         // (#393b) A predefined BUTTON child has no app wndproc to render itself, so
         // draw its 3D chrome + label here (matching USER's BUTTONWNDPROC WM_PAINT).
+        // (win16owndraw, #391 generalisation) Route through the style-aware
+        // helper: BS_OWNERDRAW asks the OWNER to paint via WM_DRAWITEM (this is
+        // the recursive per-child repaint path that gives a freshly created
+        // dialog child its first real paint, exactly where Tetris's own
+        // owner-draw startup-dialog button was previously invisible); every
+        // other BUTTON style is byte-identical to before this change.
         if (ch->ctrl_kind == 1 && ch->proc_seg == 0 && ch->proc_off == 0)
-            win16_draw_button(ch);
+            win16_draw_button_ownerdraw_aware(ch, ODA_DRAWENTIRE, ch->btn_check ? ODS_CHECKED : 0);
         // (#278 Word6 combobox) Likewise for a predefined COMBOBOX (ctrl_kind==4,
         // btn_style's 0x80 marker bit set - see u_createwindow): draw its collapsed
         // chrome (+ the open item list, if dropped) here. NOT gated on proc_seg==0:
@@ -3317,6 +3770,18 @@ static void win16_paint_child_tree(uint16_t parent_hwnd, int depth) {
         // COMBOBOX needing its default chrome (see win16_native_combo_proc banner).
         else if (ch->ctrl_kind == 4 && (ch->btn_style & 0x80))
             win16_draw_combo(ch);
+        // (win16dlgctl, #391 generalisation) Likewise for predefined STATIC and
+        // EDIT children: neither had ANY native paint before this change, so
+        // every STATIC label/icon/frame and every EDIT text field in ANY Win16
+        // dialog rendered as a blank flat-fill rectangle (the class/parent
+        // background win16_draw_frame already paints, with nothing drawn on
+        // top). Gated on proc_seg==0/proc_off==0 like BUTTON: a real app
+        // wndproc (a genuinely custom or subclassed control) takes priority
+        // and is left alone.
+        else if (ch->ctrl_kind == 2 && ch->proc_seg == 0 && ch->proc_off == 0)
+            win16_draw_static(ch);
+        else if (ch->ctrl_kind == 3 && ch->proc_seg == 0 && ch->proc_off == 0)
+            win16_draw_edit(ch);
         win16_paint_child_tree(ch->hwnd, depth + 1);   // (#216) nested descendants
     }
 }
@@ -3348,6 +3813,21 @@ static uint32_t win16_dispatch_to_window(uint16_t hwnd, uint16_t msg,
     if (win->ctrl_kind == 4 && (win->btn_style & 0x80)) {
         uint32_t cr = 0;
         if (win16_native_combo_proc(win, msg, wParam, lParam, &cr)) return cr;
+    }
+    // (win16dlgctl, #391 generalisation) Predefined STATIC/EDIT children, same
+    // "no app wndproc" gate as BUTTON above. This covers WM_SETTEXT/WM_GETTEXT/
+    // WM_PAINT sent DIRECTLY to the control's own hwnd (e.g. an app's
+    // SetDlgItemText -> SendMessage(GetDlgItem(id), WM_SETTEXT, ...), the
+    // common way a dialog populates its labels/fields after creation); the
+    // recursive per-child paint during the PARENT's WM_PAINT is handled
+    // separately by win16_paint_child_tree.
+    if (win->ctrl_kind == 2 && win->proc_seg == 0 && win->proc_off == 0) {
+        uint32_t cr = 0;
+        if (win16_native_static_proc(win, msg, wParam, lParam, &cr)) return cr;
+    }
+    if (win->ctrl_kind == 3 && win->proc_seg == 0 && win->proc_off == 0) {
+        uint32_t cr = 0;
+        if (win16_native_edit_proc(win, msg, wParam, lParam, &cr)) return cr;
     }
     if (msg == WM_PAINT)
         W6LOG("[W6] PAINT hwnd=%04x cx=%d cy=%d cw=%d ch=%d bgbr=%u child=%d soft=%d clip=%d,%d,%d,%d\n",
@@ -3459,14 +3939,17 @@ static int find_class(x86_16_cpu_t *c, uint16_t seg, uint16_t off) {
 //   nHeight, nWidth, y, x, dwStyle(hi,lo), lpWindowName(seg,off),
 //   lpClassName(seg,off).
 // Returns the new HWND in AX.
+// (#391) Persistent per-run scratch selector holding the WM_CREATE CREATESTRUCT
+// (see u_createwindow). Reset to 0 in win16_api_begin so each app run lazily
+// allocates a fresh block from that run's arena.
+static uint16_t g_win16_createstruct_sel = 0;
 static void u_createwindow(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
                            uint16_t *argbytes) {
     // Count words from top: lpParam=2, hInstance=1, hMenu=1, hWndParent=1,
     // nHeight=1, nWidth=1, y=1, x=1, dwStyle=2, lpWindowName=2, lpClassName=2.
     int i = 0;
     uint16_t param_off = arg16(c, i++); uint16_t param_seg = arg16(c, i++);
-    (void)param_off; (void)param_seg;
-    /* hInstance */ (void)arg16(c, i++);
+    uint16_t hInstance = arg16(c, i++);   // (#391) needed for the CREATESTRUCT
     uint16_t hMenu = arg16(c, i++);   // (#152) attached menu
     uint16_t hWndParent = arg16(c, i++);
     int16_t nHeight = (int16_t)arg16(c, i++);
@@ -3501,12 +3984,19 @@ static void u_createwindow(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
     // from hMenu; a predefined BUTTON also captures its BS_* low-nibble style.
     win->ctrl_kind = 0; win->btn_style = 0; win->btn_pressed = 0; win->btn_check = 0;
     win->ctrl_id = is_child ? hMenu : 0;
+    win->static_icon = 0;   // (win16dlgctl) reset; only SS_ICON below ever sets it
     if (ci < 0) {
         if (cls_seg == 0) {
             switch (cls_off) {   // standard control atom
                 case 0x0080: win->ctrl_kind = 1; win->btn_style = (uint8_t)(dwStyle & 0x0F); break;
-                case 0x0081: win->ctrl_kind = 3; break;
-                case 0x0082: win->ctrl_kind = 2; break;
+                // (win16dlgctl, #391 generalisation) EDIT's ES_LEFT/CENTER/RIGHT
+                // (dwStyle bits 0-1) drive win16_draw_edit's text alignment, the
+                // same low-bits-of-style convention BUTTON/COMBOBOX already use.
+                case 0x0081: win->ctrl_kind = 3; win->btn_style = (uint8_t)(dwStyle & 0x03); break;
+                // (win16dlgctl, #391 generalisation) STATIC's SS_* type (dwStyle
+                // bits 0-4, SS_TYPEMASK) selects text alignment vs. a rect/frame
+                // vs. SS_ICON in win16_draw_static below.
+                case 0x0082: win->ctrl_kind = 2; win->btn_style = (uint8_t)(dwStyle & 0x1F); break;
                 case 0x0083: win->ctrl_kind = 4; break;   // LISTBOX: full height is real content
                 // (#278 Word6 toolbar-layout FIX) COMBOBOX (atom 0x0085) is a
                 // distinct predefined class from LISTBOX (0x0083); both were
@@ -3525,11 +4015,28 @@ static void u_createwindow(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
         } else {
             char cn[32]; rd_far_cstr(c, cls_seg, cls_off, cn, sizeof(cn));
             if      (dlg_ci_eq(cn, "BUTTON")) { win->ctrl_kind = 1; win->btn_style = (uint8_t)(dwStyle & 0x0F); }
-            else if (dlg_ci_eq(cn, "STATIC")) { win->ctrl_kind = 2; }
-            else if (dlg_ci_eq(cn, "EDIT"))   { win->ctrl_kind = 3; }
+            else if (dlg_ci_eq(cn, "STATIC")) { win->ctrl_kind = 2; win->btn_style = (uint8_t)(dwStyle & 0x1F); }
+            else if (dlg_ci_eq(cn, "EDIT"))   { win->ctrl_kind = 3; win->btn_style = (uint8_t)(dwStyle & 0x03); }
             else if (dlg_ci_eq(cn, "LISTBOX")) { win->ctrl_kind = 4; }
             else if (dlg_ci_eq(cn, "COMBOBOX")) { win->ctrl_kind = 4; win->btn_style = (uint8_t)(0x80 | (dwStyle & 0x03)); }
         }
+    }
+    // (win16dlgctl, #391 generalisation) SS_ICON (type 3, either the standard
+    // control ATOM 0x0082 or the string class name "STATIC" above - both are
+    // legal ways a dialog's DLGITEMTEMPLATE/CreateWindow can name a predefined
+    // STATIC control, so this is checked once, after both forms have set
+    // ctrl_kind+btn_style, rather than duplicated per form): real USER.EXE's
+    // StaticWndProc loads the icon named by the control's OWN window text
+    // (lpWindowName, captured into win->title just below) via
+    // LoadIcon(hInstance, lpWindowName) at WM_CREATE and draws it on every
+    // WM_PAINT. We do the equivalent here, once, at create time (hInstance is
+    // this same CreateWindow call's own hInstance argument - the normal Win16
+    // idiom for an app's own icon resources). A failed/absent resource load
+    // leaves static_icon at 0 and win16_draw_static simply draws nothing for
+    // it (matches a real SS_ICON control given a bad icon name: no crash, no
+    // fabricated placeholder).
+    if (win->ctrl_kind == 2 && (win->btn_style & 0x1F) == 3) {
+        win->static_icon = win16_load_icon_cursor(c, name_off, name_seg, hInstance, 14, 3);
     }
     // (#278 Word6 combobox) Force a fresh item-list on this slot: a slot
     // recycled from a destroyed window must not leak a stale combo's items
@@ -3627,10 +4134,47 @@ static void u_createwindow(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
     }
     rd_far_cstr(c, name_seg, name_off, win->title, sizeof(win->title));
 
+    // (win16static, #391 generalisation) A predefined STATIC control created
+    // with cx==0 and/or cy==0 in the CreateWindow call is a REAL Win16 idiom,
+    // not a mistake to leave permanently blank. Real USER.EXE's StaticWndProc
+    // auto-sizes an SS_ICON/SS_BITMAP control to the icon/cursor's own pixel
+    // dimensions when cx/cy are zero (the documented contract behind an .RC
+    // ICON/BITMAP dialog-item statement that omits width/height: the resource
+    // compiler emits cx=cy=0 and relies on this at CreateWindow time). This
+    // interpreter's OWN template-based dialog renderer already has the matching
+    // generic convention for every OTHER static type: dlg_parse_template above
+    // auto-sizes a too-small width/height to the control's text extent
+    // (`dlg_text_w(txt) + 16`, minimum height 16) rather than leaving a
+    // template-declared item a zero-area rectangle. This is that SAME
+    // established convention, applied here so a dialog proc's own
+    // CreateWindow-created STATIC children (the win16_window_t path every
+    // real app's DialogProc uses, as opposed to a template-declared item) get
+    // identical treatment instead of staying a permanently zero-area,
+    // unpainted control - a generic control-sizing capability, not gated on
+    // any app/class/module. Only fires when the app supplied 0 (or negative)
+    // for a dimension; a real nonzero size from the app is never touched.
+    if (win->ctrl_kind == 2) {
+        int sstype = win->btn_style & 0x1F;   // SS_TYPEMASK (win16_draw_static's own bits)
+        if (sstype == 3) {                     // SS_ICON
+            if (win->static_icon && win->static_icon < WIN16_MAX_GDIOBJ &&
+                g_gdiobj[win->static_icon].used) {
+                if (win->w <= 0) win->w = g_gdiobj[win->static_icon].w;
+                if (win->h <= 0) win->h = g_gdiobj[win->static_icon].h;
+            }
+        } else if (sstype < 4) {               // SS_LEFT/SS_CENTER/SS_RIGHT (text)
+            if (win->w <= 0) win->w = dlg_text_w(win->title) + 16;
+            if (win->h <= 0) win->h = 16;
+        }
+        // sstype 4-9 (BLACKRECT/GRAYRECT/WHITERECT/*FRAME) and anything else
+        // (SS_SIMPLE, SS_LEFTNOWORDWRAP, SS_USERITEM, ...) are left untouched:
+        // a genuinely zero-area rect/frame control is not a bug to paper over,
+        // and win16_draw_static's own fallthrough default is already the safe
+        // "closest to real, never worse than blank" text case.
+    }
+
     kprintf("[win16api]   CreateWindow hwnd=%04x '%s' at %d,%d %dx%d cls=%d child=%d parent=%04x style=%08x shown=%d\n",
             win->hwnd, win->title, win->x, win->y, win->w, win->h, ci,
             is_child, win->parent, (unsigned)dwStyle, win->shown);
-
 
     // Compositor-integrated host window (#144/#145): the first top-level Win16
     // window gets a real kernel user-window backed by a content buffer (canvas)
@@ -3682,8 +4226,46 @@ static void u_createwindow(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
     // Compute client rect + paint background into the host canvas.
     win16_draw_frame(win);
 
+    // (#391) Build a faithful Win16 CREATESTRUCT and pass its far pointer as
+    // WM_CREATE's lParam, exactly as real USER.CreateWindow does. Photoshop 2.5.1
+    // (and any app using the classic "pass `this` via lpParam" C++ window idiom)
+    // reads its object pointer back from CREATESTRUCT.lpCreateParams (+0) inside
+    // WM_CREATE and stores it via SetWindowLong(hwnd,0,obj); every subsequent
+    // message that is not in its switch table then dispatches through that object's
+    // vtable via `call far [ [obj+2] + 0x30 ]`. With lParam=0 the app read guest
+    // [0000:0000] as the "object", stored that garbage, and later far-called a
+    // zero/garbage vtable slot -> jump to 0000:0000 -> the wild-CS crash guard
+    // halted it and the main window never painted (#391). Built ONLY when the app
+    // actually passed a non-null lpParam, so every app that passes NULL (all the
+    // games, Word 6, ...) keeps byte-identical behaviour (lParam stays 0).
+    uint32_t wm_create_lp = 0;
+    if (param_seg || param_off) {
+        if (!g_win16_createstruct_sel)
+            g_win16_createstruct_sel = heap_alloc(34);   // sizeof(Win16 CREATESTRUCT)
+        uint16_t cs = g_win16_createstruct_sel;
+        if (cs) {
+            x86_16_wr16(c, cs,  0, param_off);                     // lpCreateParams off
+            x86_16_wr16(c, cs,  2, param_seg);                     // lpCreateParams seg
+            x86_16_wr16(c, cs,  4, hInstance);                     // hInstance
+            x86_16_wr16(c, cs,  6, hMenu);                         // hMenu
+            x86_16_wr16(c, cs,  8, (uint16_t)win->parent);        // hwndParent
+            x86_16_wr16(c, cs, 10, (uint16_t)win->h);              // cy
+            x86_16_wr16(c, cs, 12, (uint16_t)win->w);              // cx
+            x86_16_wr16(c, cs, 14, (uint16_t)win->y);              // y
+            x86_16_wr16(c, cs, 16, (uint16_t)win->x);              // x
+            x86_16_wr16(c, cs, 18, (uint16_t)(dwStyle & 0xFFFF));  // style lo
+            x86_16_wr16(c, cs, 20, (uint16_t)(dwStyle >> 16));     // style hi
+            x86_16_wr16(c, cs, 22, name_off);                      // lpszName off
+            x86_16_wr16(c, cs, 24, name_seg);                      // lpszName seg
+            x86_16_wr16(c, cs, 26, cls_off);                       // lpszClass off
+            x86_16_wr16(c, cs, 28, cls_seg);                       // lpszClass seg
+            x86_16_wr16(c, cs, 30, 0);                             // dwExStyle lo
+            x86_16_wr16(c, cs, 32, 0);                             // dwExStyle hi
+            wm_create_lp = ((uint32_t)cs << 16);                   // far ptr cs:0000
+        }
+    }
     // Fire WM_CREATE through the wndproc immediately, as real CreateWindow does.
-    win16_call_wndproc(win->proc_seg, win->proc_off, win->hwnd, WM_CREATE, 0, 0);
+    win16_call_wndproc(win->proc_seg, win->proc_off, win->hwnd, WM_CREATE, 0, wm_create_lp);
 
     // (#278 P41) Real Win16 CreateWindow runs an internal SetWindowPos on the new
     // window; DefWindowProc's WM_WINDOWPOSCHANGED handling then SENDS WM_MOVE and
@@ -3750,6 +4332,33 @@ static void u_showwindow(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
         }
     }
     *ax = was; *dx = 0; *argbytes = 4;
+}
+
+// GetWindowTask (USER.224): GetWindowTask(HWND hwnd) = 1w = 2b. Real Windows
+// returns the htask (application instance) that owns a window. Previously
+// UNIMPL: the stub table (win16_stub_table, ordinal 224) already gave it the
+// correct argbytes=2 so calling it did not desync the Pascal stack, but its
+// hardcoded retval=0 is never a real task handle. This interpreter runs
+// exactly ONE Win16 guest at a time in a dedicated kernel process (#144: see
+// SYS_WIN16_RUN), so every window that exists belongs to the SAME task -
+// return the identical htask GetCurrentTask() (KERNEL.36, k_getcurrenttask)
+// returns, regardless of which hwnd is asked about.
+//
+// #288 VB1.0 (Rodent's Revenge/VBRUN100.DLL): a live trace (bounded
+// diagnostic instrumentation, not shipped) found VBRUN100 calls
+// GetWindowTask(hMainForm) once, immediately after ShowWindow enqueues the
+// main form's first WM_SIZE/WM_PAINT. Fixing this MISS to a real htask is
+// verified correct (removes a wrong-semantics stub) and is exercised on
+// every VB1.0 launch, but on its own does NOT unblock Rodent's Revenge's
+// rendering: a follow-up trace with the fix applied showed byte-identical
+// execution up to the point VBRUN then enters an unrelated infinite spin
+// loop a few instructions later (a far-pointer walk that never sees its
+// terminator). See docs/VB1_RUNTIME_SPIN_LOOP_PLAN.md for that diagnosis;
+// this fix stands on its own as a genuine correctness improvement.
+static void u_getwindowtask(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
+                            uint16_t *argbytes) {
+    (void)c;
+    *ax = g_info.module_handle; *dx = 0; *argbytes = 2;
 }
 
 // UpdateWindow (USER.124): UpdateWindow(hwnd) = 1 word. Force an immediate paint.
@@ -3832,7 +4441,7 @@ static void u_setwindowpos(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
         // fixed for, with its own comment explaining why (Tetris's GameGrid
         // derives its per-cell pixel size from WM_SIZE's lParam; without a
         // fresh WM_SIZE after a resize it keeps a stale 1x1 cell size). This
-        // handler never got the matching fix. MEASURED (VM <vmid>, #word6-scroll
+        // handler never got the matching fix. MEASURED (a test VM, #word6-scroll
         // pass): Word 6's document body (OpusWwd, hwnd 004f) is laid out via
         // SetWindowPos, not MoveWindow, as part of finalizing the MDI child's
         // geometry once the toolbar dock/ruler/status bar all have their final
@@ -4470,7 +5079,7 @@ void win16_host_rebind_canvas(int slot, uint32_t *new_buf, int new_w, int new_h)
             win16_draw_frame(mw);   // recompute cx/cy/cw/ch for the new canvas
             uint32_t lp = ((uint32_t)(uint16_t)mw->ch << 16) | (uint16_t)mw->cw;
             msgq_post(mw->hwnd, WM_SIZE, 0, lp);
-            // (#word6-maximize) MEASURED (VM <vmid>, FreeCell maximize): WM_SIZE
+            // (#word6-maximize) MEASURED (a test VM, FreeCell maximize): WM_SIZE
             // alone reflows anchored chrome (menu bar, a right-anchored "Cards
             // Left" label) but is NOT sufficient to bring back the play-field
             // content -- real Win16 apps that redraw only in WM_PAINT (rather
@@ -4624,7 +5233,7 @@ static uint16_t kernel_key_to_vk(int code, int *is_release, char *ch) {
         // as code=0x84 and this switch (correctly, for real F5) mapped it to
         // VK_F5, so holding Ctrl alone made Word 6 receive WM_KEYDOWN(VK_F5)
         // and open its real "Go To" dialog (RegisterClass/CreateWindow 'Go To'
-        // confirmed via a gated g_w6life trace on VM <vmid>), which our interpreter
+        // confirmed via a gated g_w6life trace on a test VM), which our interpreter
         // creates but never shows (shown=0) and which then loops creating child
         // controls forever: the wedge. isr.h now emits 0x99 for Ctrl press
         // (0x84 is unambiguously F5 again); map it here to the real VK_CONTROL
@@ -8390,6 +8999,68 @@ static void g_createpalette(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
     *dx = 0; *argbytes = 4;
 }
 
+// GetSystemPaletteEntries (GDI.375): UINT GetSystemPaletteEntries(HDC hdc,
+// UINT iStartIndex, UINT nEntries, LPPALETTEENTRY lppe). We present a 256-entry
+// palettized system palette (matches GetDeviceCaps SIZEPALETTE=256 / NUMCOLORS=256).
+// Win16 contract (WINE gdi.exe16 GetSystemPaletteEntries(word word word ptr),
+// argbytes 10):
+//   - lppe == NULL: return the number of entries in the system palette.
+//   - else: copy min(nEntries, 256-iStartIndex) PALETTEENTRY records (4 bytes:
+//     peRed, peGreen, peBlue, peFlags) starting at iStartIndex into lppe, and
+//     return the number of entries actually written.
+// (#391) Replaces a return-0-and-fill-nothing stub that violated the contract:
+// Adobe Photoshop 2.5.1 calls GetSystemPaletteEntries(hdc,0,20,buf) during its
+// window init and, on a 0 return, skips filling `buf` (seg100:0x1cf9 `jg`),
+// leaving the palette buffer uninitialised. NOTE: implementing this correctly
+// did NOT by itself clear Photoshop's separate window-init spin (its -7 colour
+// count is computed elsewhere, see docs/PHOTOSHOP_251_PAINT_PLAN.md); this is a
+// standalone GDI correctness fix.
+static void win16_syspalette_rgb(uint16_t i, uint8_t *r, uint8_t *g, uint8_t *b) {
+    // The 20 static Windows system colours (first 10 low, last 10 high); the
+    // middle 236 are a deterministic colour cube + grey ramp. Exact middle
+    // colours do not matter to callers; validity + count do.
+    static const uint8_t stat[20][3] = {
+        {0,0,0},{128,0,0},{0,128,0},{128,128,0},{0,0,128},
+        {128,0,128},{0,128,128},{192,192,192},{192,220,192},{166,202,240},
+        {255,251,240},{160,160,164},{128,128,128},{255,0,0},{0,255,0},
+        {255,255,0},{0,0,255},{255,0,255},{0,255,255},{255,255,255}
+    };
+    if (i < 10)   { *r=stat[i][0];      *g=stat[i][1];      *b=stat[i][2];      return; }
+    if (i >= 246) { int k=10+(int)(i-246); *r=stat[k][0]; *g=stat[k][1]; *b=stat[k][2]; return; }
+    uint16_t j = (uint16_t)(i - 10);
+    if (j < 216) {
+        uint8_t rr=(uint8_t)(j/36), gg=(uint8_t)((j/6)%6), bb=(uint8_t)(j%6);
+        *r=(uint8_t)(rr*51); *g=(uint8_t)(gg*51); *b=(uint8_t)(bb*51);
+    } else {
+        uint8_t v=(uint8_t)(((j-216)*255)/19);
+        *r=v; *g=v; *b=v;
+    }
+}
+static void g_getsystempaletteentries(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
+                                      uint16_t *argbytes) {
+    uint16_t lppe_off = arg16(c, 0);
+    uint16_t lppe_seg = arg16(c, 1);
+    uint16_t count    = arg16(c, 2);
+    uint16_t start    = arg16(c, 3);
+    /* hdc = arg16(c,4): one system palette for the framebuffer */
+    const uint16_t PALSIZE = 256;
+    *dx = 0; *argbytes = 10;
+    if (lppe_seg == 0 && lppe_off == 0) { *ax = PALSIZE; return; }  // count query
+    if (start >= PALSIZE) { *ax = 0; return; }
+    uint16_t avail = (uint16_t)(PALSIZE - start);
+    uint16_t n = (count < avail) ? count : avail;
+    for (uint16_t k = 0; k < n; k++) {
+        uint16_t idx = (uint16_t)(start + k);
+        uint8_t r, g, b; win16_syspalette_rgb(idx, &r, &g, &b);
+        uint16_t p = (uint16_t)(lppe_off + k * 4);
+        x86_16_wr8(c, lppe_seg, p,                 r);
+        x86_16_wr8(c, lppe_seg, (uint16_t)(p + 1), g);
+        x86_16_wr8(c, lppe_seg, (uint16_t)(p + 2), b);
+        x86_16_wr8(c, lppe_seg, (uint16_t)(p + 3), 0);  // peFlags
+    }
+    *ax = n;
+}
+
 // GetDeviceCaps (GDI.80): GetDeviceCaps(hdc, nIndex s_word) = 2 words.
 static void g_getdevicecaps(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
                             uint16_t *argbytes) {
@@ -8660,14 +9331,15 @@ static void k_lstrcmp(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *arg
     }
     *ax = (uint16_t)r; *dx = 0; *argbytes = 8;
 }
-// LoadLibrary (KERNEL.95): LoadLibrary(lpLibFileName far) = 2w = 4b. We have no
-// DLL loader -> return an error code < 32 (2 = file not found) so apps that call
-// it for an OPTIONAL helper DLL fall back gracefully.
 // LoadLibrary (KERNEL.95): LoadLibrary(lpLibFileName far) = 2w = 4b. Return a
 // module handle so a following GetProcAddress can resolve real exports (#148:
 // Chips loads a helper DLL and GetProcAddress's an entry in WM_CREATE; a 0 return
 // sent it into a long retry that blew the wndproc instruction budget -> WM_CREATE
-// returned -1 -> "no main procedure").
+// returned -1 -> "no main procedure"). (#391) win16_load_library() now does a
+// REAL runtime load (from disk) of a companion NE DLL the app never statically
+// imported, e.g. Photoshop 2.5.1's PHOTOS00/01/02.DLL; see ne.c for the why/how.
+// Only when the named module cannot be matched OR found on disk does it fall
+// back to the harmless non-error handle 0x0040 (GetProcAddress on that yields 0:0).
 // (#278 P55) Synthetic printer-driver handle. Word 6 is WYSIWYG: it reads
 // WIN.INI [windows] device= (e.g. "HP LaserJet III,HPPCL5A,LPT1:"), LoadLibrary's
 // the driver ("HPPCL5A.DRV"), then GetProcAddress's its DeviceMode/ExtDeviceMode/
@@ -8693,9 +9365,14 @@ static void k_loadlibrary(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t 
     { extern int g_w6life, g_w6seq; if (g_w6life) kprintf("[W6LOADLIB] SEQ %d: LoadLibrary(\"%s\") -> %04x\n", g_w6seq++, name, *ax); }
     *dx = 0; *argbytes = 4;
 }
-// FreeLibrary (KERNEL.96): FreeLibrary(hLibModule) = 1w = 2b.
+// FreeLibrary (KERNEL.96): FreeLibrary(hLibModule) = 1w = 2b. (#391) Route to
+// the real module registry so a runtime-loaded companion DLL's ref-count is
+// decremented; see win16_free_library() in ne.c for why we never actually
+// unload. Returns TRUE (1) on the real contract, not 0 as the old stub did.
 static void k_freelibrary(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *argbytes) {
-    (void)c; *ax = 0; *dx = 0; *argbytes = 2;
+    uint16_t hmod = arg16(c, 0);
+    *ax = (uint16_t)win16_free_library(hmod);
+    *dx = 0; *argbytes = 2;
 }
 // GetProcAddress (KERNEL.50): (hModule, lpProcName far) = 1+2 = 3w = 6b. None.
 // GetProcAddress (KERNEL.50): GetProcAddress(hModule word, lpProcName far) =
@@ -9424,26 +10101,29 @@ static void u_setwindowlong(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_
     *ax = w->wndwords[sl]; *dx = w->wndwords[sl + 1];
     w->wndwords[sl] = lo; w->wndwords[sl + 1] = hi;
 }
-// (#369) The Win16 API thunk segment (mirrors WIN16_THUNK_SEG in exec/ne.c). A
-// far pointer WIN16_THUNK_SEG:id is NOT guest code: `id` indexes g_imports[] and
-// a guest CALLF to it is serviced by the farcall trap -> win16_api_dispatch.
-#define WIN16_API_THUNK_SEG 0xF000
+// (#369) WIN16_API_THUNK_SEG is now #defined earlier in this file (next to
+// win16_call_wndproc's forward decls), since win16_call_wndproc itself needs it
+// too as of the jezzball follow-up below - see that #define's comment.
 // Forward decl: the import->handler resolver (defined later in this file).
 static win16_handler_fn find_handler(const win16_import_t *im);
 
-// (#369) Invoke a "previous window procedure" that is actually a BUILT-IN API
-// thunk (segment 0xF000), e.g. DefWindowProc or a superclassed control's original
-// proc that resolved to an imported thunk. Executing such a pointer as guest code
-// (via x86_16_call_far) fails, because the farcall trap only fires on a real
-// guest CALLF opcode, not on a directly-set cs:ip -> the interpreter runs garbage
-// out of the F000 guard region and returns rc=-1. That silently broke every
-// subclassing app that chains through CallWindowProc: JezzBall's field never
-// painted (its subclass proc chained the TurboWindow default paint via a thunk),
-// and WEP games "died" on the first click (their input chain hit the garbage).
-// Here we dispatch the thunk through the normal API layer instead. We build the
-// exact Pascal argument frame the handler reads via arg16() (arg16(0)=lParam lo
-// .. arg16(4)=hwnd), call it, then restore SP. Only fires for F000 prev-procs, so
-// apps that chain to real guest code are completely unaffected (byte-identical).
+// (#369, generalised by the jezzball follow-up at win16_call_wndproc above - see
+// that comment for the honest scope, including that this did NOT reproduce as
+// JezzBall's own root cause on a clean re-trace)
+// Invoke a "previous window procedure" (or, now, any wndproc) that is actually a
+// BUILT-IN API thunk (segment 0xF000), e.g. DefWindowProc or a superclassed
+// control's original proc that resolved to an imported thunk. Executing such a
+// pointer as guest code (via x86_16_call_far) fails, because the farcall trap
+// only fires on a real guest CALLF opcode, not on a directly-set cs:ip -> the
+// interpreter runs garbage out of the F000 guard region and returns rc=-1. That
+// silently broke every subclassing app that chains through CallWindowProc, AND
+// (per win16_call_wndproc's own comment) every OTHER path that can hand a wndproc
+// a thunk-segment proc directly, and WEP games "died" on the first click (their
+// input chain hit the garbage). Here we dispatch the thunk through the normal
+// API layer instead. We build the exact Pascal argument frame the handler reads
+// via arg16() (arg16(0)=lParam lo .. arg16(4)=hwnd), call it, then restore SP.
+// Only fires for F000 procs, so apps that chain to real guest code are
+// completely unaffected (byte-identical).
 static uint32_t win16_dispatch_thunk_proc(x86_16_cpu_t *c, uint16_t thunk_off,
                                           uint16_t hwnd, uint16_t msg,
                                           uint16_t wParam, uint32_t lParam) {
@@ -9513,10 +10193,14 @@ static void u_callwindowproc(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16
     *ax = (uint16_t)(r & 0xFFFF); *dx = (uint16_t)(r >> 16);
 }
 // DrawText (USER.85): DrawText(hdc, lpString far, nCount s_word, lpRect far,
-//   wFormat word) = 1+2+1+2+1 = 7w = 14b. Draw text at the rect's top-left using
-//   the bitmap font (DT_CENTER honoured loosely). Returns the text height.
+//   wFormat word) = 1+2+1+2+1 = 7w = 14b. Draw text using the bitmap font,
+//   honouring DT_LEFT (default)/DT_CENTER/DT_RIGHT horizontal alignment and
+//   DT_CALCRECT (measure only, no paint) - (tutstomb) DT_RIGHT and
+//   DT_CALCRECT were both previously ignored, which is why Tut's Tomb's
+//   right-justified status-bar score/time field always painted at the rect's
+//   left edge, on top of the label next to it. Returns the text height.
 static void u_drawtext(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *argbytes) {
-    uint16_t fmt    = arg16(c, 0);   (void)fmt;
+    uint16_t fmt    = arg16(c, 0);
     uint16_t r_off  = arg16(c, 1), r_seg = arg16(c, 2);
     int16_t  n      = (int16_t)arg16(c, 3);
     uint16_t s_off  = arg16(c, 4), s_seg = arg16(c, 5);
@@ -9531,19 +10215,39 @@ static void u_drawtext(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *ar
         if (n < 0) { len = 0; while (x86_16_rd8(c, s_seg, (uint16_t)(s_off + len))) len++; }
         int textw = len * FONT_WIDTH;
         int cx = l;
-        if (fmt & 0x0001) cx = l + ((rr - l) - textw) / 2;   // DT_CENTER
+        // (tutstomb, cosmetic) DT_RIGHT (0x0002) was never honoured, so a
+        // right-justified field fell through to the DT_LEFT default and drew
+        // at the rect's LEFT edge. Tut's Tomb's status bar calls DrawText 4x
+        // per repaint on the same HDC: DT_NOCLIP (0x0100) label draws anchored
+        // at rect left=0 (correct, left-aligned by design), then the live
+        // $Time/score value with DT_RIGHT|DT_NOCLIP (0x0102) meant to land
+        // right-justified near the status bar's right edge (rect right=638).
+        // With DT_RIGHT unimplemented it landed at x=0 too and stacked on top
+        // of the label every frame (the "$Time9828"-style garble). Confirmed
+        // with a /WIN16LOG.TXT DrawText trace before this fix: fmt=0102
+        // l=0 r=638 for the value vs fmt=0100 l=0 r=0 for the label, both
+        // resolving to the same on-screen x.
+        if (fmt & 0x0002) cx = rr - textw;                          // DT_RIGHT
+        else if (fmt & 0x0001) cx = l + ((rr - l) - textw) / 2;     // DT_CENTER
         if (cx < l) cx = l;
-        for (int i = 0; i < len; i++) {
-            char ch = (char)x86_16_rd8(c, s_seg, (uint16_t)(s_off + i));
-            const uint8_t *gph = font_get_glyph(ch);
-            if (gph) {
-                for (int row = 0; row < FONT_HEIGHT && row < 16; row++) {
-                    uint8_t bits = gph[row];
-                    for (int col = 0; col < 8; col++)
-                        if (bits & (0x80 >> col)) dc_plot(dc, cx + col, t + row, dc->text_color);
+        // (tutstomb, cosmetic) DT_CALCRECT (0x0400) asks for the bounding rect
+        // only and must NOT paint. Tut's Tomb calls DrawText with DT_CALCRECT
+        // first, to measure the score string before the real draw, and that
+        // call was painting an extra, wrongly-positioned copy of the text on
+        // every single repaint, compounding the DT_RIGHT overlap above.
+        if (!(fmt & 0x0400)) {
+            for (int i = 0; i < len; i++) {
+                char ch = (char)x86_16_rd8(c, s_seg, (uint16_t)(s_off + i));
+                const uint8_t *gph = font_get_glyph(ch);
+                if (gph) {
+                    for (int row = 0; row < FONT_HEIGHT && row < 16; row++) {
+                        uint8_t bits = gph[row];
+                        for (int col = 0; col < 8; col++)
+                            if (bits & (0x80 >> col)) dc_plot(dc, cx + col, t + row, dc->text_color);
+                    }
                 }
+                cx += FONT_WIDTH;
             }
-            cx += FONT_WIDTH;
         }
     }
     *ax = FONT_HEIGHT; *dx = 0; *argbytes = 14;
@@ -9651,11 +10355,31 @@ static void blt_copy_rop(win16_dc_t *dst, int dx, int dy, int w, int h,
     // overwhelming majority - dst->mbpp is 0 unless SelectObject just bound a
     // real 1bpp bitmap object) are completely unaffected.
     int dst_mono = (dst->mbpp == 1);
+    // (tvxtile) The #255 perf-B fast path below copies whole rows with memmove,
+    // bypassing dc_plot() entirely - and dc_plot() is where ExcludeClipRect/
+    // IntersectClipRect exclusion (dc_clip_visible(), see dc_plot above) is
+    // enforced. TetraVex draws its numbered 3x3 tile board (BitBlt from a
+    // pre-composed memory DC, SRCCOPY) THEN excludes that same screen rect from
+    // the window DC's clip region THEN flood-fills the whole client area with a
+    // background texture (also BitBlt, also SRCCOPY) expecting the excluded
+    // board+tray rects to be skipped, exactly the FillRect-vs-icon idiom the
+    // #278 Word6 toolbar-icon-erase pass already fixed for dc_plot callers
+    // (Rectangle/FillRect/TextOut). BitBlt/StretchBlt never got the same fix:
+    // the fast path's memmove has no clip check at all, so the flood blit
+    // silently overwrote every already-drawn digit on every single repaint
+    // (confirmed via win16_trace: the flood's own destination-pixel sample,
+    // dpx0, read back the exact TextOut colours - ffffff/808080/000000 - it
+    // was about to erase). A DC with no active clip (the overwhelming
+    // majority - clip_incl/clip_n are both 0 unless Exclude/IntersectClipRect
+    // was actually called) takes the fast path completely unchanged; only a
+    // clipped destination falls through to the slow per-pixel loop below,
+    // which already calls dc_plot() and has always honoured clipping.
+    int dst_clipped = (dst->clip_incl || dst->clip_n);
     // (#255 perf B) Fast path for SRCCOPY: clip the rectangle once, then copy
     // whole rows with memmove (overlap-safe for screen self-blit scrolls). This
     // replaces ~w*h per-pixel function calls + bounds checks with one memmove per
     // row and is identical in output for the common in-bounds sprite blit.
-    if (rop == 0x00CC0020UL && !dst_mono) {
+    if (rop == 0x00CC0020UL && !dst_mono && !dst_clipped) {
         uint32_t *sb, *db; int ss, ds, sox, soy, smw, smh, dox, doy, dmw, dmh;
         if (dc_surface(src, &sb, &ss, &sox, &soy, &smw, &smh) &&
             dc_surface(dst, &db, &ds, &dox, &doy, &dmw, &dmh)) {
@@ -10568,7 +11292,24 @@ typedef struct {
 #define BS_3STATE          5
 #define BS_AUTO3STATE      6
 #define BS_GROUPBOX        7
+#define BS_USERBUTTON      8
 #define BS_AUTORADIOBUTTON 9
+#define BS_OWNERDRAW       0x0B
+// (win16owndraw, #391 generalisation) Real Win16 USER.EXE's BUTTONWNDPROC, on
+// WM_PAINT/WM_LBUTTONDOWN/WM_LBUTTONUP for a button created with the
+// BS_OWNERDRAW style, does NOT draw any chrome itself - it builds a
+// DRAWITEMSTRUCT (packed Win16 layout: five WORDs, HWND, HDC, a 4-WORD RECT,
+// then a DWORD, 26 bytes total) and SENDs WM_DRAWITEM (WM_DRAWITEM/
+// WM_MEASUREITEM and the ODT_/ODA_/ODS_ field constants are defined up with
+// the other WM_* message constants near the top of the file, so
+// win16_paint_child_tree - defined well above this point - can use them too)
+// to the button's OWNER (its parent, or the active modal dialog's own
+// DialogProc when the parent is a synthetic hDlg - see
+// win16_resolve_owner_proc) so the app can paint whatever custom bitmap/logo
+// content it wants. Every Win16 app that ships a custom-look toolbar/splash
+// button (measured concretely on Tetris's own startup dialog, #391 pass 5)
+// relies on this; it is a GENERIC USER.EXE control contract, not specific to
+// any one app.
 typedef struct {
     uint8_t  cls;        // DLGC_* control class
     uint8_t  btype;      // BUTTON low-nibble style (BS_*) when cls==DLGC_BUTTON
@@ -10677,6 +11418,122 @@ static void win16_draw_button(win16_window_t *win) {
     }
 }
 
+// ===========================================================================
+// (win16owndraw, #391 generalisation) BS_OWNERDRAW / WM_DRAWITEM dispatch.
+//
+// Surfaced by Tetris's own startup ("Starting Level 1") dialog control
+// (hwnd 0044, ctrl_kind==1, btn_style==BS_OWNERDRAW - measured live, #391
+// pass 5) and flagged as a hypothesis by the same pass for Photoshop 2.5.1's
+// About dialog. A BS_OWNERDRAW button is a completely generic, standard
+// Win16/USER.EXE idiom (any app with a custom-bitmap toolbar/logo/splash
+// button uses it), not specific to either app: real BUTTONWNDPROC draws
+// NOTHING of its own for this style - it SENDs WM_DRAWITEM to the control's
+// owner (the window that would otherwise receive its WM_COMMAND, i.e. its
+// parent, or the active modal dialog's own DialogProc when the parent is our
+// synthetic hDlg) carrying a DRAWITEMSTRUCT, and the owner paints the control
+// itself. Before this change ctrl_kind==1 always drew the generic 3D chrome
+// (win16_draw_button) regardless of style, so BS_OWNERDRAW controls (which
+// have NO title/bitmap Windows itself knows how to render) came out as a
+// blank/mislabelled flat button at best.
+// ===========================================================================
+
+// (win16owndraw) Resolve the (proc_seg,proc_off,target_hwnd) a SEND to
+// `owner_hwnd` should actually reach. This is the SAME resolution
+// win16_native_ctrl_proc's WM_COMMAND delivery below needs and previously
+// open-coded (win_from_hwnd() only, silently dropping via msgq_post to a
+// hwnd nothing pumps whenever the "owner" is the active modal dialog's own
+// synthetic handle - g_dlg_hwnd is never a real win16_window_t, see the
+// win16dlgctl forward-decl comment above win16_draw_frame). Generalised into
+// one helper so WM_COMMAND and the new WM_DRAWITEM share one correct answer:
+// if the owner is a real window with its own wndproc, use it; otherwise, if
+// the owner IS the currently active modal dialog's synthetic handle, route to
+// that dialog's real DialogProc instead of dropping the message.
+static int win16_resolve_owner_proc(uint16_t owner_hwnd, uint16_t *out_seg,
+                                    uint16_t *out_off, uint16_t *out_target) {
+    win16_window_t *ow = win_from_hwnd(owner_hwnd);
+    if (ow && (ow->proc_seg || ow->proc_off)) {
+        *out_seg = ow->proc_seg; *out_off = ow->proc_off; *out_target = owner_hwnd;
+        return 1;
+    }
+    if (owner_hwnd == g_dlg_hwnd && g_dlg_active && (g_dlg_dp_seg || g_dlg_dp_off)) {
+        *out_seg = g_dlg_dp_seg; *out_off = g_dlg_dp_off; *out_target = g_dlg_hwnd;
+        return 1;
+    }
+    return 0;
+}
+
+// (win16owndraw) Persistent per-run guest scratch selector holding the
+// WM_DRAWITEM DRAWITEMSTRUCT, mirroring g_win16_createstruct_sel's pattern
+// (#391) exactly: one small block reused for every WM_DRAWITEM this run,
+// lazily allocated from the run's own arena so it needs no separate teardown.
+// Reset to 0 in win16_api_begin so a fresh run gets a fresh block.
+static uint16_t g_win16_drawitem_sel = 0;
+
+// (win16owndraw) Build a real Win16 DRAWITEMSTRUCT (packed layout: five
+// WORDs, HWND, HDC, a 4-WORD RECT, then a DWORD = 26 bytes) in guest memory
+// and SEND WM_DRAWITEM(wParam=CtlID, lParam=far ptr to the struct) to the
+// control's owner, exactly as real BUTTONWNDPROC does for a BS_OWNERDRAW
+// button. rcItem is (0,0,cw,ch) - the control's own client rect - because
+// hDC is a fresh DC bound to the CONTROL's own window (dc_alloc(wi)), the
+// same "GetDC(hwndItem)" real USER.EXE hands the owner, so (0,0) is already
+// the control's own top-left in that DC's coordinate system (dc_plot adds
+// the window's canvas origin for us - see dc_plot's win->cx/cy handling).
+// Returns 1 if WM_DRAWITEM was actually delivered to a real owner proc, 0 if
+// no owner could be resolved (canvas not ready, or a genuinely ownerless
+// control) so the caller can fall back to SOME visible default instead of
+// silently drawing nothing.
+static int win16_send_drawitem(win16_window_t *win, uint16_t itemAction, uint16_t itemState) {
+    if (!win || !g_win16_canvas || !g_cpu) return 0;
+    uint16_t oseg, ooff, otarget;
+    if (!win16_resolve_owner_proc(win->parent, &oseg, &ooff, &otarget)) return 0;
+    if (!g_win16_drawitem_sel)
+        g_win16_drawitem_sel = heap_alloc(26);   // sizeof(Win16 DRAWITEMSTRUCT)
+    uint16_t sel = g_win16_drawitem_sel;
+    if (!sel) return 0;
+    win16_paint_begin();
+    int wi = (int)(win - g_windows);
+    int hdc = dc_alloc(wi);
+    x86_16_wr16(g_cpu, sel,  0, ODT_BUTTON);        // CtlType
+    x86_16_wr16(g_cpu, sel,  2, win->ctrl_id);      // CtlID
+    x86_16_wr16(g_cpu, sel,  4, 0);                 // itemID (no listbox/combo index)
+    x86_16_wr16(g_cpu, sel,  6, itemAction);        // itemAction (ODA_*)
+    x86_16_wr16(g_cpu, sel,  8, itemState);         // itemState (ODS_*)
+    x86_16_wr16(g_cpu, sel, 10, win->hwnd);         // hwndItem
+    x86_16_wr16(g_cpu, sel, 12, (uint16_t)hdc);     // hDC
+    x86_16_wr16(g_cpu, sel, 14, 0);                 // rcItem.left
+    x86_16_wr16(g_cpu, sel, 16, 0);                 // rcItem.top
+    x86_16_wr16(g_cpu, sel, 18, (uint16_t)win->cw); // rcItem.right
+    x86_16_wr16(g_cpu, sel, 20, (uint16_t)win->ch); // rcItem.bottom
+    x86_16_wr16(g_cpu, sel, 22, 0);                 // itemData lo
+    x86_16_wr16(g_cpu, sel, 24, 0);                 // itemData hi
+    uint32_t lp = ((uint32_t)sel << 16);             // far ptr sel:0000
+    // (win16owndraw) Permanent low-volume trace, same "[bgdiag]" tag/style as
+    // u_createwindow's own CreateWindow trace: BS_OWNERDRAW controls are rare
+    // enough in any real app that this never floods /WIN16LOG.TXT, and it is
+    // the only visible proof a WM_DRAWITEM actually reached a real owner.
+    win16_trace("[bgdiag] WM_DRAWITEM hwnd=%04x id=%u owner=%04x:%04x target=%04x action=%04x state=%04x\n",
+                win->hwnd, win->ctrl_id, oseg, ooff, otarget, itemAction, itemState);
+    win16_call_wndproc(oseg, ooff, otarget, WM_DRAWITEM, win->ctrl_id, lp);
+    if (hdc > 0 && hdc < WIN16_MAX_DC) g_dcs[hdc].used = 0;   // ReleaseDC-equivalent
+    win16_paint_end();
+    return 1;
+}
+
+// (win16owndraw) A BUTTON child's paint, for ANY btn_style: BS_OWNERDRAW asks
+// the owner to draw via WM_DRAWITEM; every other style keeps the exact prior
+// behaviour (win16_draw_button's own 3D chrome). Falls back to
+// win16_draw_button when no owner can be resolved (e.g. the app has not yet
+// created a real owner window), so an ownerless owner-draw control is still
+// visible as a generic button rather than invisible - never worse than the
+// pre-fix blank/mislabelled state, matching the same safe-default philosophy
+// win16_draw_static's SS_ICON fallback already uses.
+static void win16_draw_button_ownerdraw_aware(win16_window_t *win, uint16_t itemAction, uint16_t itemState) {
+    if (win->btn_style == BS_OWNERDRAW) {
+        if (win16_send_drawitem(win, itemAction, itemState)) return;
+    }
+    win16_draw_button(win);
+}
+
 // (#393b) Native predefined-BUTTON class proc, emulating USER.EXE's BUTTONWNDPROC
 // for a child of class "BUTTON" that the app created with no wndproc of its own.
 // Returns 1 (message consumed) with *out set, or 0 to fall through to the generic
@@ -10691,13 +11548,20 @@ static int win16_native_ctrl_proc(win16_window_t *win, uint16_t msg,
     int autotoggle = (style==BS_AUTOCHECKBOX||style==BS_AUTORADIOBUTTON||style==BS_AUTO3STATE);
     switch (msg) {
         case WM_PAINT:
-            win16_draw_button(win);
+            // (win16owndraw) BS_OWNERDRAW: ask the owner to paint via WM_DRAWITEM
+            // instead of drawing our own generic chrome; every other style is
+            // byte-identical to before this change.
+            win16_draw_button_ownerdraw_aware(win, ODA_DRAWENTIRE, win->btn_check ? ODS_CHECKED : 0);
             return 1;
         case WM_LBUTTONDOWN:
         case WM_LBUTTONDBLCLK:
             win->btn_pressed = 1;
             g_win16_capture_hwnd = win->hwnd;   // SetCapture(hwnd)
-            win16_draw_button(win);
+            // (win16owndraw) Real BUTTONWNDPROC re-sends WM_DRAWITEM with
+            // ODA_SELECT|ODS_SELECTED on the highlight transition for an
+            // owner-draw button, instead of drawing a sunken bevel it has no
+            // label/bitmap to draw for.
+            win16_draw_button_ownerdraw_aware(win, ODA_SELECT, ODS_SELECTED);
             if (g_w16_mousepath)
                 kprintf("[BTN] hwnd=%04x id=%u DOWN pressed=1 capture set\n", win->hwnd, win->ctrl_id);
             return 1;
@@ -10707,22 +11571,31 @@ static int win16_native_ctrl_proc(win16_window_t *win, uint16_t msg,
             if (g_win16_capture_hwnd == win->hwnd) g_win16_capture_hwnd = 0;  // ReleaseCapture
             int clx = (int16_t)(lParam & 0xFFFF), cly = (int16_t)(lParam >> 16);
             int inside = (clx >= 0 && clx < win->cw && cly >= 0 && cly < win->ch);
-            win16_draw_button(win);
+            win16_draw_button_ownerdraw_aware(win, ODA_SELECT, 0);
             if (was && inside) {
                 if (autotoggle) {
                     if (style==BS_AUTORADIOBUTTON) win->btn_check = 1;   // (group logic omitted)
                     else win->btn_check = (uint8_t)(win->btn_check ? 0 : 1);
-                    win16_draw_button(win);
+                    win16_draw_button_ownerdraw_aware(win, ODA_DRAWENTIRE, win->btn_check ? ODS_CHECKED : 0);
                 }
-                // WM_COMMAND to the PARENT: wParam=id, lParam=MAKELONG(hwndCtl, BN_CLICKED=0)
+                // WM_COMMAND to the OWNER: wParam=id, lParam=MAKELONG(hwndCtl, BN_CLICKED=0).
+                // (win16owndraw) Resolve via win16_resolve_owner_proc, not a bare
+                // win_from_hwnd(parent): a real CreateWindow child of the active
+                // modal dialog (parent==g_dlg_hwnd, the synthetic handle - the
+                // exact shape of Photoshop's/Tetris's own dialog children, #391
+                // pass 5) previously fell through to msgq_post(parent, ...), which
+                // nothing ever pumps for that synthetic handle, so its BN_CLICKED
+                // silently vanished. Now it reaches the dialog's real DialogProc,
+                // same as WM_INITDIALOG/WM_COMMAND from a template item already do.
                 uint16_t parent = win->parent;
                 uint32_t clp = (uint32_t)win->hwnd;   // BN_CLICKED (0) in the hi word
-                win16_window_t *pw = win_from_hwnd(parent);
+                uint16_t oseg, ooff, otarget;
+                int resolved = win16_resolve_owner_proc(parent, &oseg, &ooff, &otarget);
                 if (g_w16_mousepath)
-                    kprintf("[BTN] hwnd=%04x id=%u UP inside=1 -> WM_COMMAND to parent=%04x proc=%04x:%04x\n",
-                            win->hwnd, win->ctrl_id, parent, pw?pw->proc_seg:0, pw?pw->proc_off:0);
-                if (pw && (pw->proc_seg || pw->proc_off))
-                    win16_call_wndproc(pw->proc_seg, pw->proc_off, parent, WM_COMMAND, win->ctrl_id, clp);
+                    kprintf("[BTN] hwnd=%04x id=%u UP inside=1 -> WM_COMMAND to parent=%04x resolved=%d proc=%04x:%04x\n",
+                            win->hwnd, win->ctrl_id, parent, resolved, oseg, ooff);
+                if (resolved)
+                    win16_call_wndproc(oseg, ooff, otarget, WM_COMMAND, win->ctrl_id, clp);
                 else
                     msgq_post(parent, WM_COMMAND, win->ctrl_id, clp);
             } else if (g_w16_mousepath) {
@@ -10732,6 +11605,187 @@ static int win16_native_ctrl_proc(win16_window_t *win, uint16_t msg,
         }
         default:
             return 0;   // let the generic path handle other messages
+    }
+}
+
+// ===========================================================================
+// (win16dlgctl, #391 generalisation) Native predefined STATIC and EDIT control
+// class procs. Surfaced by Adobe Photoshop 2.5.1's About dialog (#391): once
+// PHOTOS01.DLL's LibEntry returned cleanly, its dialog's icon-placeholder and
+// text-field children still rendered as blank grey rectangles, because
+// win16_dispatch_to_window/win16_paint_child_tree only ever gave BUTTON and
+// COMBOBOX (above) a native class proc - STATIC and EDIT children (ctrl_kind
+// 2 and 3, see u_createwindow) had NO paint routine at all: their proc_seg/off
+// are 0 (a predefined class registers no app wndproc), so win16_call_wndproc's
+// own no-op guard (`pseg==0 && poff==0` -> return 0) swallowed every message,
+// and nothing ever drew on top of the flat class-background fill
+// win16_draw_frame already paints for every child. This is a GENERIC gap in
+// the dialog manager, not specific to Photoshop or to any one window class:
+// EVERY Win16 app's dialogs use STATIC labels/icons and EDIT fields, so any
+// app whose dialog relies on the standard (non-owner-draw) STATIC/EDIT
+// classes was equally affected. Fixed the same way BUTTON/COMBOBOX already
+// are: a small native paint routine plus a native class-proc dispatcher that
+// intercepts WM_PAINT/WM_SETTEXT/WM_GETTEXT for a control with no real app
+// wndproc, wired into both win16_dispatch_to_window (message sent directly to
+// the control's own hwnd) and win16_paint_child_tree (the recursive per-child
+// repaint driven by the PARENT's WM_PAINT, which is how a dialog's children
+// actually get their first paint).
+// ===========================================================================
+
+// STATIC style bits (dwStyle bits 0-4, SS_TYPEMASK). Only the styles real
+// dialogs commonly use are given distinct rendering; anything else (SS_SIMPLE,
+// SS_LEFTNOWORDWRAP, SS_USERITEM, ...) falls through to the plain left-aligned
+// text case, which is the closest safe default and never worse than blank.
+#define SS_LEFT       0
+#define SS_CENTER     1
+#define SS_RIGHT      2
+#define SS_ICON       3
+#define SS_BLACKRECT  4
+#define SS_GRAYRECT   5
+#define SS_WHITERECT  6
+#define SS_BLACKFRAME 7
+#define SS_GRAYFRAME  8
+#define SS_WHITEFRAME 9
+#define SS_TYPEMASK   0x1F
+
+// Draw a predefined STATIC control child's content into the host canvas,
+// matching real USER.EXE's StaticWndProc WM_PAINT: a filled/framed rect for
+// the *RECT/*FRAME styles, the loaded icon (see u_createwindow's SS_ICON
+// handling) for SS_ICON, otherwise the control's text (win->title) aligned
+// per SS_LEFT/CENTER/RIGHT. The class/parent background fill has already run
+// (win16_draw_frame); STATIC never paints its own background, same as real
+// Windows (a label is transparent over its parent's face colour).
+static void win16_draw_static(win16_window_t *win) {
+    if (!g_win16_canvas || win->cw <= 0 || win->ch <= 0) return;
+    int bx = win->cx, by = win->cy, bw = win->cw, bh = win->ch;
+    uint32_t black = FB_COLOR(0,0,0), gray = FB_COLOR(128,128,128), white = FB_COLOR(255,255,255);
+    int type = win->btn_style & SS_TYPEMASK;
+    switch (type) {
+        case SS_BLACKRECT: canvas_fill(bx, by, bw, bh, black); return;
+        case SS_GRAYRECT:  canvas_fill(bx, by, bw, bh, gray);  return;
+        case SS_WHITERECT: canvas_fill(bx, by, bw, bh, white); return;
+        case SS_BLACKFRAME:
+        case SS_GRAYFRAME:
+        case SS_WHITEFRAME: {
+            uint32_t col = (type==SS_BLACKFRAME) ? black : (type==SS_GRAYFRAME) ? gray : white;
+            for (int x = 0; x < bw; x++) { canvas_plot(bx+x, by, col); canvas_plot(bx+x, by+bh-1, col); }
+            for (int y = 0; y < bh; y++) { canvas_plot(bx, by+y, col); canvas_plot(bx+bw-1, by+y, col); }
+            return;
+        }
+        case SS_ICON:
+            if (win->static_icon && win->static_icon < WIN16_MAX_GDIOBJ &&
+                g_gdiobj[win->static_icon].used && g_gdiobj[win->static_icon].type == 4 &&
+                g_gdiobj[win->static_icon].pix) {
+                win16_gdiobj_t *ic = &g_gdiobj[win->static_icon];
+                for (int yy = 0; yy < ic->h && yy < bh; yy++)
+                    for (int xx = 0; xx < ic->w && xx < bw; xx++)
+                        canvas_plot(bx + xx, by + yy, ic->pix[yy * ic->w + xx]);
+            }
+            // No icon resolved: draw nothing extra (the class background fill
+            // alone is what a real SS_ICON control with a bad icon name shows
+            // too - no border, no placeholder glyph).
+            return;
+        default:
+            break;   // SS_LEFT/CENTER/RIGHT and everything else: text below
+    }
+    if (!win->title[0]) return;
+    int tw = dlg_text_w(win->title);
+    int tx = bx + 2;
+    if (type == SS_CENTER)      tx = bx + (bw - tw) / 2;
+    else if (type == SS_RIGHT)  tx = bx + bw - tw - 2;
+    if (tx < bx) tx = bx;
+    int ty = by + (bh - FONT_HEIGHT) / 2; if (ty < by) ty = by;
+    dlg_text(tx, ty, win->title, black);
+}
+
+// Native predefined-STATIC class proc: WM_PAINT draws the control (as above);
+// WM_SETTEXT/WM_GETTEXT give it the same text-storage contract as every other
+// predefined control (BUTTON/COMBOBOX above), since SetDlgItemText/GetDlgItemText
+// route through SendMessage(hwndCtl, WM_SETTEXT/WM_GETTEXT, ...) for ANY
+// control class, not just editable ones - a dialog updating a STATIC label at
+// runtime (a common "status text" idiom) needs this to actually show.
+static int win16_native_static_proc(win16_window_t *win, uint16_t msg,
+                                    uint16_t wParam, uint32_t lParam, uint32_t *out) {
+    *out = 0;
+    switch (msg) {
+        case WM_PAINT:
+            win16_draw_static(win);
+            return 1;
+        case WM_SETTEXT:
+            if (g_cpu) rd_far_cstr(g_cpu, (uint16_t)(lParam >> 16), (uint16_t)lParam,
+                                   win->title, sizeof(win->title));
+            win16_draw_static(win);
+            return 1;
+        case WM_GETTEXT: {
+            uint16_t s_seg = (uint16_t)(lParam >> 16), s_off = (uint16_t)lParam, n = 0;
+            if (g_cpu && wParam > 0) {
+                for (; n < (uint16_t)(wParam - 1) && win->title[n]; n++)
+                    x86_16_wr8(g_cpu, s_seg, (uint16_t)(s_off + n), (uint8_t)win->title[n]);
+                x86_16_wr8(g_cpu, s_seg, (uint16_t)(s_off + n), 0);
+            }
+            *out = n;
+            return 1;
+        }
+        default:
+            return 0;
+    }
+}
+
+// Draw a predefined EDIT control child's content: real USER.EXE's EDIT class
+// paints a white (COLOR_WINDOW) background with a sunken 1px 3D border and the
+// current text left/center/right-aligned per ES_LEFT/CENTER/RIGHT (win->btn_style,
+// captured in u_createwindow the same way BUTTON's BS_* nibble already is).
+// This is single-line, non-scrolling, non-caret rendering - real keyboard text
+// EDITING of these fields is a separate, larger feature; the fix here is the
+// generic "does an EDIT control ever draw anything" gap the dialog manager had.
+static void win16_draw_edit(win16_window_t *win) {
+    if (!g_win16_canvas || win->cw <= 0 || win->ch <= 0) return;
+    int bx = win->cx, by = win->cy, bw = win->cw, bh = win->ch;
+    uint32_t white = FB_COLOR(255,255,255), sh = FB_COLOR(110,110,110), black = FB_COLOR(0,0,0);
+    canvas_fill(bx, by, bw, bh, white);
+    // Sunken frame: shadow on top/left, highlight (white, same as the fill, so
+    // only the top/left edge is visually distinct) on bottom/right - matches
+    // the same reference-measured sunken-field convention win16_draw_combo's
+    // banner documents for the Word6 combobox text field.
+    for (int x = 0; x < bw; x++) canvas_plot(bx+x, by, sh);
+    for (int y = 0; y < bh; y++) canvas_plot(bx, by+y, sh);
+    if (!win->title[0]) return;
+    int align = win->btn_style & 0x03;
+    int tw = dlg_text_w(win->title);
+    int tx = bx + 3;
+    if (align == 1)      tx = bx + (bw - tw) / 2;        // ES_CENTER
+    else if (align == 2) tx = bx + bw - tw - 3;          // ES_RIGHT
+    if (tx < bx + 2) tx = bx + 2;
+    int ty = by + (bh - FONT_HEIGHT) / 2; if (ty < by) ty = by;
+    dlg_text(tx, ty, win->title, black);
+}
+
+// Native predefined-EDIT class proc: same WM_PAINT/WM_SETTEXT/WM_GETTEXT
+// contract as STATIC above.
+static int win16_native_edit_proc(win16_window_t *win, uint16_t msg,
+                                  uint16_t wParam, uint32_t lParam, uint32_t *out) {
+    *out = 0;
+    switch (msg) {
+        case WM_PAINT:
+            win16_draw_edit(win);
+            return 1;
+        case WM_SETTEXT:
+            if (g_cpu) rd_far_cstr(g_cpu, (uint16_t)(lParam >> 16), (uint16_t)lParam,
+                                   win->title, sizeof(win->title));
+            win16_draw_edit(win);
+            return 1;
+        case WM_GETTEXT: {
+            uint16_t s_seg = (uint16_t)(lParam >> 16), s_off = (uint16_t)lParam, n = 0;
+            if (g_cpu && wParam > 0) {
+                for (; n < (uint16_t)(wParam - 1) && win->title[n]; n++)
+                    x86_16_wr8(g_cpu, s_seg, (uint16_t)(s_off + n), (uint8_t)win->title[n]);
+                x86_16_wr8(g_cpu, s_seg, (uint16_t)(s_off + n), 0);
+            }
+            *out = n;
+            return 1;
+        }
+        default:
+            return 0;
     }
 }
 
@@ -10748,7 +11802,7 @@ static int win16_native_ctrl_proc(win16_window_t *win, uint16_t msg,
 // This section gives it real per-window item-list storage (g_combos[], see
 // its declaration near g_windows[]) plus the standard collapsed paint. The
 // collapsed chrome was matched in STRUCTURE (not a hand-guessed modern style)
-// against a real Win 3.1 render: the build host:<workspace>,
+// against a real Win 3.1 render: the build host:/root/w6ref/bochs/render-final.png,
 // probed pixel-by-pixel with Python/PIL. MEASURED there: the text field is a
 // 1px sunken frame (top+left black, bottom+right white - the white matches
 // the field's own fill, so the far edge is genuinely invisible, exactly as in
@@ -10911,7 +11965,7 @@ static void win16_draw_combo(win16_window_t *win) {
 // (undocumented - this is not a public CB_* message) COMBOBOXCTLWNDPROC
 // extension, which our interpreter does not load or emulate as guest code.
 // Implementing it faithfully would mean disassembling that real binary (via
-// the Bochs reference rig, the build host:<workspace> or tools/word6/bochs) to learn
+// the Bochs reference rig, the build host:/root/w6ref or tools/word6/bochs) to learn
 // the real algorithm - genuinely deep, out of this pass's scope. Do NOT
 // hardcode the observed strings (not faithful emulation) and do NOT
 // resurrect the STRINGTABLE theory without new evidence; the gated
@@ -11073,12 +12127,18 @@ static int win16_native_combo_proc(win16_window_t *win, uint16_t msg,
                 win16_menu_restore_under();
                 win16_draw_combo(win);
                 if (changed) {
-                    // WM_COMMAND to the PARENT: wParam=id, lParam=MAKELONG(hwndCtl, CBN_SELCHANGE)
+                    // WM_COMMAND to the OWNER: wParam=id, lParam=MAKELONG(hwndCtl, CBN_SELCHANGE).
+                    // (win16owndraw, #391 generalisation) Same owner resolution as the
+                    // BUTTON BN_CLICKED path above: a combobox that is a real
+                    // CreateWindow child of the active modal dialog (parent ==
+                    // g_dlg_hwnd) needs its CBN_SELCHANGE routed to the dialog's
+                    // real DialogProc, not silently dropped via msgq_post to a
+                    // handle nothing pumps.
                     uint16_t parent = win->parent;
                     uint32_t clp = ((uint32_t)CBN_SELCHANGE << 16) | win->hwnd;
-                    win16_window_t *pw = win_from_hwnd(parent);
-                    if (pw && (pw->proc_seg || pw->proc_off))
-                        win16_call_wndproc(pw->proc_seg, pw->proc_off, parent, WM_COMMAND, win->ctrl_id, clp);
+                    uint16_t oseg, ooff, otarget;
+                    if (win16_resolve_owner_proc(parent, &oseg, &ooff, &otarget))
+                        win16_call_wndproc(oseg, ooff, otarget, WM_COMMAND, win->ctrl_id, clp);
                     else
                         msgq_post(parent, WM_COMMAND, win->ctrl_id, clp);
                 }
@@ -11297,6 +12357,17 @@ static int dlg_modal_core(x86_16_cpu_t *c) {
     dlg_draw(-1);
     // WM_INITDIALOG to the dialog proc (lParam = dwInitParam from *Param variants).
     win16_call_wndproc(dp_seg, dp_off, g_dlg_hwnd, WM_INITDIALOG, g_dlg_hwnd, g_dlg_init_param);
+    // (win16dlgctl, #391 generalisation) WM_INITDIALOG is exactly where a
+    // dialog proc commonly creates its OWN additional child controls on top
+    // of whatever the RT_DIALOG template already declared, via
+    // CreateWindow(..., hWndParent = hDlg, ...) - hDlg being g_dlg_hwnd, the
+    // very handle just passed above. Those are REAL win16_window_t children
+    // (ctrl_kind STATIC/EDIT/BUTTON/...), entirely separate from g_dlg_items
+    // (the resource-template overlay dlg_draw renders), so they need the
+    // SAME parent-child paint mechanism every other window's children get -
+    // dlg_draw alone never touches them. Paint them once now (they may have
+    // just been created) and again every redraw tick below.
+    win16_paint_child_tree(g_dlg_hwnd, 0);
 
     // Nested modal loop.
     uint8_t prevb = mouse_buttons;
@@ -11346,7 +12417,8 @@ static int dlg_modal_core(x86_16_cpu_t *c) {
                 if (!g_dlg_end && (id == IDOK || id == IDCANCEL)) { g_dlg_end = 1; g_dlg_result = id; }
             }
             prevb = b;
-            if (timer_ticks - lastdraw >= (hz/30?hz/30:1)) { lastdraw = timer_ticks; dlg_draw(hot); }
+            if (timer_ticks - lastdraw >= (hz/30?hz/30:1)) { lastdraw = timer_ticks; dlg_draw(hot);
+                win16_paint_child_tree(g_dlg_hwnd, 0); }   // (win16dlgctl) keep any real children live
         }
         // Keyboard: ESC -> cancel, Enter -> OK (route through the dialog proc).
         if (keyboard_has_char()) {
@@ -13045,6 +14117,7 @@ static const win16_api_entry_t g_api_table[] = {
     { "USER",  102, "ADJUSTWINDOWRECT",  u_adjustwindowrect },   // (#152)
     { "USER",  454, "ADJUSTWINDOWRECTEX",u_adjustwindowrectex }, // (#152)
     { "USER",   42, "SHOWWINDOW",        u_showwindow },
+    { "USER",  224, "GETWINDOWTASK",     u_getwindowtask },   // (#288 VB1)
     { "USER",   36, "GETWINDOWTEXT",     u_getwindowtext },
     { "USER",   53, "DESTROYWINDOW",     u_destroywindow },
     { "USER",   56, "MOVEWINDOW",        u_movewindow },
@@ -13207,6 +14280,7 @@ static const win16_api_entry_t g_api_table[] = {
     { "GDI",    66, "CREATESOLIDBRUSH",  g_createsolidbrush },
     { "GDI",    69, "DELETEOBJECT",      g_deleteobject },
     { "GDI",    80, "GETDEVICECAPS",     g_getdevicecaps },
+    { "GDI",   375, "GETSYSTEMPALETTEENTRIES", g_getsystempaletteentries },
     { "GDI",    82, "GETOBJECT",         g_getobject },
     { "GDI",    83, "GETPIXEL",          g_getpixel },   // (#394) was wrongly GetClipBox
     { "GDI",    77, "GETCLIPBOX",        g_getclipbox },  // GetClipBox is GDI.77
@@ -13567,7 +14641,7 @@ static const win16_stub_entry_t g_stub_table[] = {
     { "GDI", 372, 12, 1 },  // ExtFloodFill
     { "GDI", 373, 4, 1 },  // SetSystemPaletteUse
     { "GDI", 374, 2, 0 },  // GetSystemPaletteUse
-    { "GDI", 375, 10, 0 },  // GetSystemPaletteEntries
+    // GDI.375 GetSystemPaletteEntries now has a real handler (g_api_table); see g_getsystempaletteentries (#391)
     { "GDI", 376, 6, 1 },  // ResetDC
     { "GDI", 377, 6, 1 },  // StartDoc
     { "GDI", 378, 2, 1 },  // EndDoc
@@ -14437,6 +15511,8 @@ void win16_api_begin(const win16_loader_info_t *info,
     g_import_count = import_count;
     g_api_calls = 0;
     heap_reset();
+    g_win16_createstruct_sel = 0;   // (#391) fresh CREATESTRUCT block per run
+    g_win16_drawitem_sel = 0;       // (win16owndraw) fresh DRAWITEMSTRUCT block per run
     g_lheap_next = g_info.lheap_base;
     g_lheap_top  = g_info.lheap_top;
     // (#278 Word6 pass24) Give the MAIN APP's DGROUP its OWN local-heap window in
@@ -14560,6 +15636,48 @@ void win16_api_begin(const win16_loader_info_t *info,
     g_win16_scratch_h = 0;
 }
 
+// (#391) win16_api_begin() above is called EXACTLY ONCE per app launch, before
+// the interpreter starts, and takes a snapshot of ne.c's import table (pointer
+// + COUNT) so win16_api_dispatch()'s bounds check `off < g_import_count` knows
+// how many thunk ids are populated. That snapshot goes STALE the moment a
+// runtime LoadLibrary() (ne.c's load_companion_dll_runtime(), added for #391's
+// companion-DLL support) applies relocations for a newly loaded DLL: any
+// (module,ordinal)/(module,name) pair that DLL references for the FIRST time
+// anywhere in the run gets a brand-new id via win16_add_import(), which grows
+// ne.c's OWN g_import_count -- but this file's cached copy, and therefore this
+// dispatcher's bounds check, never hears about it. The result: a fully
+// resolved, fully populated g_imports[id] entry is reachable by pointer
+// arithmetic but invisible to the `off < g_import_count` guard, so a genuine
+// far call to it is misclassified as "unknown import id N". The dispatcher's
+// unknown-import fallback then pops ONLY the 4-byte far-return frame (argbytes
+// forced to 0) regardless of how many Pascal argument bytes the real callee
+// contract requires, desyncing the caller's stack by however many bytes
+// SHOULD have been popped -- the same "MISS import desyncs the interpreter
+// stack" class as an actually-unimplemented ordinal, except here the ordinal
+// is not actually unimplemented at all.
+//
+// MEASURED (throwaway VM 2694, PHOTOS01.DLL's LibEntry): a CALLF whose operand
+// had been correctly fixed up to WIN16_THUNK_SEG:0x0133 (id 307, a real,
+// fully-populated entry created by PHOTOS01's OWN relocations during its
+// runtime load) was rejected as "<unknown import id 307>" because win16api.c's
+// cached g_import_count was still the pre-LoadLibrary snapshot. The resulting
+// stack desync free-fell into a garbage pmode selector (cs:ip=0125:02bf) a few
+// instructions later, tripping the wild-CS crash guard -- exactly the halt
+// x86_16_call_far reported as "did not return cleanly (r=0)".
+//
+// Fix: ne.c calls this immediately after it finishes applying relocations for
+// every module a runtime LoadLibrary just added (load_companion_dll_runtime,
+// before patch_dll_entry_prologues/run_dll_init so the DLL's own LibEntry sees
+// an up-to-date count for calls it makes into its OWN newly-registered
+// imports). Only g_import_count needs updating: g_imports is a pointer into
+// ne.c's fixed-size static array, which does not move or get reallocated when
+// new entries are appended, so re-pointing it is unnecessary (harmless to redo
+// anyway; done for clarity, not correctness).
+void win16_api_resync_import_count(const win16_import_t *imports, int import_count) {
+    g_imports = imports;
+    g_import_count = import_count;
+}
+
 // Timer tick counter (250 Hz) used to hold the painted Win16 window on screen
 // briefly after the run so it is visible / screenshot-able before the desktop
 // or userland compositor repaints over the front buffer. (timer_ticks is
@@ -14659,6 +15777,23 @@ int win16_api_dispatch(x86_16_cpu_t *c, uint16_t off) {
 
     const win16_import_t *im = 0;
     if (off < (uint16_t)g_import_count) im = &g_imports[off];
+
+    // (#391 pslibentry pass) record the call site (caller's far-return cs:ip)
+    // and callee name for the dllhalt-trace diagnostic, so a halt inside a
+    // DLL LibEntry can be reported with the last API it called before
+    // halting. Inert unless g_ps391_dllhalt_trace is armed; correctness does
+    // not depend on it (display only).
+    if (g_ps391_dllhalt_trace) {
+        g_ps391_last_api_cs = ret_cs; g_ps391_last_api_ip = ret_ip;
+        if (im) {
+            if (im->by_ordinal)
+                snprintf(g_ps391_last_api_name, sizeof(g_ps391_last_api_name), "%s.#%u", im->module, im->ordinal);
+            else
+                snprintf(g_ps391_last_api_name, sizeof(g_ps391_last_api_name), "%s.%s", im->module, im->name);
+        } else {
+            snprintf(g_ps391_last_api_name, sizeof(g_ps391_last_api_name), "<unknown import id %u>", off);
+        }
+    }
 
     // (#278 DIAG typed-char-bail pass) while g_w6_charwin is armed (set by
     // win16_call_wndproc around a WM_CHAR delivery to Word's edit pane), log
@@ -14874,7 +16009,7 @@ static void win16_autolaunch_thread(void *arg) {
     kfree(d);
     if (!path[0]) return;
     // (#845) A trailing "pm" token FORCES protected mode (explicit override,
-    // wins over the derived default - what VM <vmid>'s WORD6/WINWORD.EXE pm has
+    // wins over the derived default - what a test VM's WORD6/WINWORD.EXE pm has
     // always relied on). No token means no override: the mode is left to
     // ne.c's win16_decide_pmode() to derive from the NE header, same as an
     // ordinary Start-menu launch of the same binary would get. This is one of

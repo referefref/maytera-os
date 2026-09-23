@@ -52,6 +52,7 @@ typedef struct {
     bt_hid_kind_t       kind;
     bt_hid_transport_t  transport;
     uint8_t             active;
+    uint8_t             initiator; // 1 = host-initiated (L2CAP client) classic link
     l2cap_chan_t       *ctrl;   // classic HIDP control channel (NULL for BLE)
     l2cap_chan_t       *intr;   // classic HIDP interrupt channel (NULL for BLE)
 } bt_hid_dev_t;

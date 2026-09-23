@@ -1,5 +1,7 @@
 # MayteraOS LLM Integration Contracts
 
+> **STATUS: aspirational / original concept, largely unbuilt (docs refresh, 2026-09-23).** This document describes the ORIGINAL per-app `manifest.json` LLM-contract concept. The per-app `manifest.json` files it implies were removed as fabricated (#235); the real, implemented capability/consent/audit system is `docs/CONTRACT_API.md` (#233), with `docs/SYSTEM_CAPABILITY_API.md` for the syscall-level design. Treat the `manifest.json` contract format and the lowercase `/apps/<name>/manifest.json` paths below as the initial concept, not the current interface. Kept for design context.
+
 ## Overview
 
 This document defines how LLM agents can interact with MayteraOS applications through the capability-based permission system. All LLM interactions are governed by temporal capability tokens that provide fine-grained access control with mandatory audit trails.

@@ -531,8 +531,10 @@ window_t *window_create(const char *title, int32_t x, int32_t y, int32_t width, 
 
     win->resize_edge = 0;
     win->opacity = g_default_window_opacity;
+    win->opacity_override = 0;   // #osglass: fresh windows inherit the OS-wide default
     win->locked = 0;
     win->theme_override = 0;     // follow system theme by default
+    win->chrome_style = WIN_CHROME_DEFAULT;
     win->scale_pct = 100;       // 100% content scale by default
     win->scale_base_w = 0;
     win->scale_base_h = 0;
@@ -564,6 +566,17 @@ window_t *window_create(const char *title, int32_t x, int32_t y, int32_t width, 
         process_t *creator = proc_current();
         win->owner_pid = (creator && creator->privilege == PRIV_USER)
                              ? creator->pid : 0;
+        // #titlebar-chrome: resolve a general per-window chrome variant from
+        // the SAME identity check above, at the SAME call site - not a new
+        // lookup, not a title-text special case. gbemu is the only entry
+        // today; adding another "utility panel" style app (e.g. a future
+        // calculator-shaped applet) is one more strcmp here, not a new
+        // mechanism.
+        if (win->owner_pid != 0 &&
+            (strcmp(creator->name, "gbemu") == 0 ||
+             strcmp(creator->name, "GBEMU") == 0)) {
+            win->chrome_style = WIN_CHROME_LIGHT_UTILITY;
+        }
     }
 
     // Add to window list (sorted by z-order, highest first)
@@ -705,12 +718,64 @@ void window_minimize(window_t *win) {
     kprintf("Minimized window '%s'\n", win->title);
 }
 
+// (#dosfsmax) Identify a window hosting a DOS guest, so the MAXIMIZE gesture
+// can route it into #158 native fullscreen (see below) instead of the
+// ordinary work-area maximize. SAME owner-name identity check
+// window_title_icon() already established for the DOS titlebar icon
+// (#dosowner): "dos"/"dosrun" name the in-kernel Ring-0 path (legacy),
+// "DOSUSER" names the Ring-3 host (/APPS/DOSUSER, DOSROUTE.CFG default=ring3
+// - the one that actually ships). Reusing this identity check rather than a
+// new flag threaded through window_create() keeps the change to the two
+// places that need it (this file's maximize routing, and window_title_icon's
+// existing icon lookup), instead of a third copy of the same three strcmps.
+static bool window_is_dos_host(window_t *win) {
+    if (!win || win->owner_pid == 0) return false;
+    process_t *owner = proc_get(win->owner_pid);
+    if (!owner) return false;
+    return strcmp(owner->name, "dos") == 0 ||
+           strcmp(owner->name, "dosrun") == 0 ||
+           strcmp(owner->name, "DOSUSER") == 0;
+}
+
 // Maximize a window
 void window_maximize(window_t *win) {
     if (!win) return;
 
     // If already maximized, do nothing
     if (win->flags & WINDOW_FLAG_MAXIMIZED) return;
+
+    // (#dosfsmax) Already native-fullscreen (whether entered through this
+    // same maximize gesture below, the dedicated #158 fullscreen titlebar
+    // button, or Alt+Enter): a maximize call on top of that is a no-op, not
+    // a second resize. Without this guard a MAXIMIZED+FULLSCREEN double-flag
+    // was reachable (chrome hides the maximize button while fullscreen, but
+    // SYS_WM_MAXIMIZE_WINDOW/wm_toggle_maximize_focused reach this function
+    // by pid, not by hit-test) and would have left sys_wm_fullscreen_render's
+    // g_fullscreen_win pointed at a window whose bounds a work-area maximize
+    // had just silently overwritten underneath it. Getting back out is via
+    // F11 / Alt+Enter / the other documented #158 ways back (window.c's
+    // native-fullscreen block comment above window_fullscreen_enter), or the
+    // wm_toggle_maximize_focused() fullscreen-exit check below - not by
+    // calling this function again.
+    if (win->flags & WINDOW_FLAG_FULLSCREEN) return;
+
+    // (#dosfsmax, DOS_FULLSCREEN_BYPASS_PLAN.md item 3) Route the DOS
+    // window's MAXIMIZE gesture (titlebar button, titlebar double-click, F11,
+    // SYS_WM_MAXIMIZE_WINDOW) into the SAME native-fullscreen compositor
+    // bypass Alt+Enter already uses, instead of the ordinary work-area
+    // maximize a screen-covering DOS window otherwise pays a full per-frame
+    // layer-stack composite for (the exact regression that made a maximised
+    // DOS game ~1fps - see the plan doc). WINDOW_FLAG_MAXIMIZED is
+    // deliberately never set on this path: window_fullscreen_enter() snapshots
+    // the CURRENT (pre-maximize, windowed) bounds into fs_stored_bounds and
+    // fs_was_maximized stays 0, so exiting fullscreen (F11, or a second
+    // maximize-gesture routed through wm_toggle_maximize_focused's fullscreen
+    // check below) returns the window to its original windowed size, not back
+    // into a maximized state - no maximize<->fullscreen oscillation.
+    if (window_is_dos_host(win)) {
+        window_fullscreen_enter(win);
+        return;
+    }
 
     // Store current bounds for restore
     win->stored_bounds.x = win->bounds.x;
@@ -746,9 +811,29 @@ void window_maximize(window_t *win) {
 // Restore a window from minimized or maximized state
 // Toggle maximize/restore of the currently focused window. Used by the
 // F11 hotkey (kernel desktop mode) and SYS_WM_MAXIMIZE_WINDOW (compositor).
+//
+// (#dosfsmax) FULLSCREEN checked FIRST, same order wm_handle_key_down()'s F11
+// case already uses. A DOS window's maximize gesture enters native fullscreen
+// (window_maximize() above) without ever setting WINDOW_FLAG_MAXIMIZED, so
+// the plain "is it maximized" check below would never see it and this
+// toggle's second call would fall into window_maximize() again - which now
+// no-ops on an already-fullscreen window (see the guard added there) rather
+// than corrupting state, but that left no working "put it back" for THIS
+// exact gesture (SYS_WM_MAXIMIZE_WINDOW, the taskbar/context-menu Maximize/
+// Restore item). Exiting fullscreen here makes the toggle symmetric again:
+// call once to enter, call again to exit back to the pre-maximize windowed
+// bounds (fs_was_maximized is 0 on this path, so window_fullscreen_exit()
+// does not re-enter WINDOW_FLAG_MAXIMIZED - no oscillation). Harmless for any
+// non-DOS window that happens to hold native fullscreen too (e.g. via the
+// dedicated #158 fullscreen button): this call was previously unreachable
+// through the UI while fullscreen (chrome, including the taskbar, is
+// suppressed for the whole desktop during native fullscreen - see the block
+// comment above window_fullscreen_enter), so making it "exit fullscreen"
+// only replaces a latent double-flag corruption with a clean exit.
 void wm_toggle_maximize_focused(void) {
     window_t *w = wm_state.focused_window;
     if (!w) return;
+    if (w->flags & WINDOW_FLAG_FULLSCREEN) { window_fullscreen_exit(w); return; }
     if (w->flags & WINDOW_FLAG_MAXIMIZED) window_restore(w);
     else window_maximize(w);
 }
@@ -833,6 +918,23 @@ void window_restore(window_t *win) {
 // ============================================================================
 window_t *g_fullscreen_win = NULL;
 
+// #dosfspacing (deferred-follow-up 2 of DOS_FULLSCREEN_BYPASS_PLAN.md): forces
+// ONE whole-screen present the next time SYS_WM_FULLSCREEN_RENDER runs
+// (kernel/proc/syscall.c), instead of the damage-clipped picture-only rect it
+// uses thereafter. Needed because the picture rect is a safe re-copy target
+// ONLY while whatever sits outside it on the real display is already known
+// to be exactly what this session last put there - true on every present
+// after the first, false on the very FIRST present of a session even if a
+// PRIOR session left the same window at the same content size: between the
+// two, window_fullscreen_exit() handed the screen back to the normal desktop
+// composite, which paints over the margin band (and, via chrome/toasts, can
+// paint over parts of the picture rect too). Tracking "did the content
+// dimensions change" alone would miss exactly that exit-then-reenter case, so
+// this is set on every real ENTRY (this function), which is the one event
+// that actually means "the screen might now hold something other than our
+// last frame". Starts true so the first-ever render after boot is also safe.
+volatile bool g_fs_force_full_present = true;
+
 void window_fullscreen_enter(window_t *win) {
     if (!win) return;
     if (win->flags & WINDOW_FLAG_FULLSCREEN) return;   // already fullscreen: no-op
@@ -855,6 +957,7 @@ void window_fullscreen_enter(window_t *win) {
     win->flags |= WINDOW_FLAG_FULLSCREEN;
     win->flags &= ~WINDOW_FLAG_MAXIMIZED;   // fullscreen supersedes; exit restores it
     g_fullscreen_win = win;
+    g_fs_force_full_present = true;   // #dosfspacing: see comment above
 
     // The app must reflow to the new (screen-filling) size, exactly like
     // maximize does - a fullscreen game needs to know its real render target.
@@ -1091,7 +1194,22 @@ void window_send_to_back(window_t *win) {
 // elsewhere in this file.
 // ============================================================================
 
-#define WIN_BEVEL_MAX   6    /* clamp: sanity, and bounds the snapshot/restore box */
+// #titlebar-chrome: raised from 6. The owner asked for MORE pronounced
+// rounding on a window's bottom corners generally, and WIN_CHROME_LIGHT_
+// UTILITY (gbemu) needs headroom to look "rounded to match the rest of the
+// app" at a titlebar height of 20px - 6px was too subtle to read as rounded
+// at that scale. Bounds the snapshot/restore box (px[4][WIN_BEVEL_MAX]
+// [WIN_BEVEL_MAX] below), so this also has to stay a sane fixed upper bound,
+// not a per-theme unbounded value.
+#define WIN_BEVEL_MAX   10
+
+// #titlebar-chrome: fixed corner radius for WIN_CHROME_LIGHT_UTILITY windows,
+// applied regardless of the active theme's radius.window (retro_unix, the
+// shipped default, sets radius.window=0 - a deliberate square Motif look for
+// ordinary windows - which would otherwise leave a utility-style window
+// looking exactly like every other square-cornered window instead of "like
+// the rest of the app").
+#define WIN_CHROME_LIGHT_RADIUS  8
 
 int32_t window_corner_bevel(const window_t *win) {
     if (!win) return 0;
@@ -1101,7 +1219,9 @@ int32_t window_corner_bevel(const window_t *win) {
     /* Maximized windows square off, as they do on every desktop that rounds
      * corners: the cut would otherwise expose wallpaper at the screen edge. */
     if (win->flags & WINDOW_FLAG_MAXIMIZED) return 0;
-    int32_t b = theme_metric_i(TM_RADIUS_WINDOW);
+    int32_t b = (win->chrome_style == WIN_CHROME_LIGHT_UTILITY)
+                    ? WIN_CHROME_LIGHT_RADIUS
+                    : theme_metric_i(TM_RADIUS_WINDOW);
     if (b <= 0) return 0;
     if (b > WIN_BEVEL_MAX) b = WIN_BEVEL_MAX;
     /* Never chew into a window too small to spare the pixels. */
@@ -1331,6 +1451,14 @@ static bool is_on_close_button(window_t *win, int32_t x, int32_t y) {
 }
 // Global default window opacity (new windows inherit this).
 uint8_t g_default_window_opacity = 255;
+// #emfield-fix (owner 2026-09-22): 1 once the user has set an EXPLICIT global
+// window opacity (the Settings/tray "Window Opacity" slider, or a persisted
+// UIPROFIL winopacity, both arriving via SYS_SET_WIN_OPACITY -> the user entry
+// point below). While set, a theme apply no longer stomps the user's choice;
+// the theme's window_opacity is only the DEFAULT for a user who has not chosen
+// their own. Per-window opacity_override is a separate, finer layer and is
+// unaffected by this flag.
+static int g_user_opacity_pinned = 0;
 
 // Settings cog button: 4th button, left of [minimize][maximize][close].
 static bool is_on_cog_button(window_t *win, int32_t x, int32_t y) {
@@ -1352,12 +1480,43 @@ static bool is_on_fullscreen_button(window_t *win, int32_t x, int32_t y) {
             y >= btn_y && y < btn_y + CLOSE_BUTTON_SIZE);
 }
 
-void wm_set_default_opacity(int opacity) {
+// Shared apply: clamp, set the OS-wide default, and push it onto every window
+// that has not taken a per-window opacity_override. (Unchanged behaviour; only
+// factored out so the user path and the theme path can share it.)
+static void wm_apply_default_opacity(int opacity) {
     if (opacity < 40) opacity = 40;        // never fully invisible
     if (opacity > 255) opacity = 255;
     g_default_window_opacity = (uint8_t)opacity;
-    for (window_t *w = wm_state.window_list; w; w = w->next) w->opacity = (uint8_t)opacity;
+    // #osglass (2026-09-16): skip any window with an explicit PER-WINDOW
+    // override (opacity_override, set via the titlebar decorator popup's
+    // Opacity stepper below). Before this guard, ANY caller of this function
+    // - the theme switch hook in themes.c theme_set(), the Settings/tray
+    // "Window Opacity" slider, a per-app control like MusicPlayer's cycle_
+    // opacity() - unconditionally stomped every window's opacity, silently
+    // erasing a user's deliberate per-window choice. This is what makes the
+    // OS-wide default and the per-window override coexist instead of the
+    // second one always losing to whichever call happens next.
+    for (window_t *w = wm_state.window_list; w; w = w->next)
+        if (!w->opacity_override) w->opacity = (uint8_t)opacity;
     wm_invalidate_all();
+}
+
+// USER path (SYS_SET_WIN_OPACITY): the user explicitly chose a global opacity.
+// Pin it so a later theme apply/switch (wm_set_theme_default_opacity below)
+// does not stomp it. This is the entry point the Settings/tray slider and the
+// compositor's persisted winopacity both reach.
+void wm_set_default_opacity(int opacity) {
+    g_user_opacity_pinned = 1;
+    wm_apply_default_opacity(opacity);
+}
+
+// THEME path (themes.c theme_set): the theme's window_opacity becomes the
+// OS-wide default ONLY for a user who has not pinned their own value. Once the
+// user has set an explicit global opacity, their choice wins across every theme
+// apply and reboot (the compositor re-sends it through the user path at boot).
+void wm_set_theme_default_opacity(int opacity) {
+    if (g_user_opacity_pinned) return;   // user's explicit choice wins
+    wm_apply_default_opacity(opacity);
 }
 
 int wm_get_default_opacity(void) {
@@ -1377,7 +1536,7 @@ int wm_get_default_opacity(void) {
 
 // #resizelag: how often the EXPENSIVE per-window content realloc+notify
 // (user_window_handle_resize(), called from window_resize()) is allowed to
-// run during a live resize drag. MEASURED (blame.md #resizelag, VM <vmid>,
+// run during a live resize drag. MEASURED (blame.md #resizelag, VM 2921,
 // build 2320): kmalloc + O(cw*ch) background fill + memcpy costs
 // ~2.2-3.5 ns/pixel, so roughly 4.5-13ms per call at the composite
 // resolutions this OS actually ships at (1920x1080 / 2560x1600) - large
@@ -1649,6 +1808,39 @@ void wm_handle_mouse_move(int32_t x, int32_t y) {
     }
 }
 
+// #tbclose (appqa Finding 1, SYS_WM_CLOSE_WINDOW): the graceful close request
+// a real click on the titlebar close (X) button runs - posts EVENT_WINDOW_-
+// CLOSE to the window's owner (target_id = win->id) and then either lets the
+// window's own on_close handler run (for a user window that is
+// user_window_close_handler: queues the SAME event into the app's per-window
+// queue and hides it) or, when no handler is set, hides the window directly.
+// Factored out of wm_handle_mouse_down()'s close-button branch below so a
+// caller with no titlebar to click - SYS_WM_CLOSE_WINDOW, for a
+// WINDOW_FLAG_NOCHROME window - runs the EXACT same code, not a second copy
+// that could drift out of sync with it. mouse_x/mouse_y/mouse_buttons are
+// carried through into the event only for a real click (0/0/0 for a
+// synthetic id-based request, matching how no other synthetic WM action in
+// this file fabricates a click position). Does not block; runs on the WM/
+// compositor thread like every other wm_handle_mouse_down branch (#426).
+static void window_request_close(window_t *win, int32_t mouse_x, int32_t mouse_y,
+                                  uint32_t mouse_buttons) {
+    gui_event_t close_event = {0};
+    close_event.type = EVENT_WINDOW_CLOSE;
+    close_event.target_id = win->id;
+    close_event.mouse_x = mouse_x;
+    close_event.mouse_y = mouse_y;
+    close_event.mouse_buttons = mouse_buttons;
+    wm_queue_event(&close_event);
+
+    if (win->on_close) {
+        win->on_close(win, &close_event);
+    } else {
+        // Default behavior: hide the window
+        window_hide(win);
+        wm_invalidate_all();
+    }
+}
+
 // Handle mouse button down
 void wm_handle_mouse_down(int32_t x, int32_t y, uint32_t button) {
     wm_state.mouse_buttons |= button;
@@ -1721,22 +1913,7 @@ void wm_handle_mouse_down(int32_t x, int32_t y, uint32_t button) {
 
         // Check close button
         if ((win->flags & WINDOW_FLAG_CLOSABLE) && is_on_close_button(win, x, y)) {
-            // Queue close event for app
-            gui_event_t close_event = {0};
-            close_event.type = EVENT_WINDOW_CLOSE;
-            close_event.target_id = win->id;
-            close_event.mouse_x = x;
-            close_event.mouse_y = y;
-            close_event.mouse_buttons = button;
-            wm_queue_event(&close_event);
-
-            if (win->on_close) {
-                win->on_close(win, &close_event);
-            } else {
-                // Default behavior: hide the window
-                window_hide(win);
-                wm_invalidate_all();
-            }
+            window_request_close(win, x, y, button);
             return;
         }
     }
@@ -2086,6 +2263,96 @@ static int win_modern_style(void) {
 //
 // Nothing here caught either problem, because a strcmp against a name nobody
 // ever printed looks exactly like a strcmp that works.
+// #titlebar-icon (general, all apps): owning-process IDENTITY table, keyed
+// on owner->name - the launched binary's basename (kernel/gui/desktop.c
+// launch_userspace_app() sets a process's name to exactly this, e.g.
+// "/APPS/gbemu" -> "gbemu"; window_create() reads it off proc_current()) -
+// not on the window's own (arbitrary, app-chosen) TITLE. This is the exact
+// fix already proven for the userland taskbar's tb_icon_for_window()
+// (#41/#208/#223): a title-keyword guess only ever finds an app whose title
+// happens to contain one of a fixed set of English words. MEASURED misses
+// under the OLD keyword-only version of this function: Browser ("Browser"),
+// Planetarium ("Maytera Planetarium"), App Repo ("App Repo"), Music Player
+// ("Maytera HiFi") and gbemu (whose title is the loaded ROM's OWN cartridge
+// name - "TETRIS", "POKEMON RED", whatever the cartridge header says - so no
+// fixed keyword list could ever match it) all fell through to ICON_WINDOW,
+// the plain box. Checked BEFORE the keyword fallback below, so an app in
+// this table always wins even if its title happens to also contain a
+// keyword that would have guessed wrong (see the taskbar's own "Network
+// Settings" example in tb_icon_for_window()'s header comment).
+//
+// Table entries are the exec basenames from build/assets/startmenu/system.d/
+// *.MENU (case exactly as shipped there - some are upper-case, some are
+// not; owner->name preserves whatever case the launching path used, so
+// entries are NOT case-folded). Extending this list is the correct way to
+// fix the next app that shows a box - do not add another keyword instead.
+typedef struct { const char *name; icon_id_t icon; } win_titlebar_icon_t;
+static const win_titlebar_icon_t s_win_titlebar_icons[] = {
+    { "BROWSER",      ICON_BROWSER },
+    { "stellarium",   ICON_PLANETARIUM },
+    { "APPSTORE",     ICON_APPSTORE },
+    { "gbemu",        ICON_GAME },
+    { "GBEMU",        ICON_GAME },
+    { "MUSICPLR",     ICON_MUSIC },
+    { "MIDIPLAY",     ICON_MUSIC },
+    { "MEDIAPLAYER",  ICON_MUSIC },
+    { "GALLERY",      ICON_IMAGE },
+    { "IMAGEVIEWER",  ICON_IMAGE },
+    { "SNAPSHOT",     ICON_IMAGE },
+    { "PAINT",        ICON_PAINT },
+    { "TERMINAL",     ICON_TERMINAL },
+    { "PYTHON.ELF",   ICON_TERMINAL },
+    { "FILES",        ICON_FOLDER },
+    { "EDITOR",       ICON_HIGHLIGHT },
+    { "IDE",          ICON_HIGHLIGHT },
+    { "FONTBOOK",     ICON_HIGHLIGHT },
+    { "NOTES",        ICON_FILE_TEXT },
+    { "CALC",         ICON_CALCULATOR },
+    { "CONVERT",      ICON_CALCULATOR },
+    { "SETTINGS",     ICON_COG },
+    { "SVCMGR",       ICON_COG },
+    { "mfa",          ICON_COG },
+    { "clock",        ICON_CLOCK },
+    { "TIMERS",       ICON_CLOCK },
+    { "taskmgr",      ICON_TASK_MANAGER },
+    { "WINSWTCH",     ICON_TASK_MANAGER },
+    { "SYSMON",       ICON_TASK_MANAGER },
+    { "SYSLOG",       ICON_LOG_VIEWER },
+    { "network",      ICON_NETWORK },
+    { "IRC",          ICON_IRC },
+    { "LAUNCHER",     ICON_CATEGORIES },
+    { "DEVMGR",       ICON_HARD_DRIVE },
+    { "DISKIMG",      ICON_HARD_DRIVE },
+    { "INSTALL",      ICON_HARD_DRIVE },
+    { "SOLITAIRE",    ICON_GAME_SOLITAIRE },
+    { "lemmings",     ICON_GAME_LEMMINGS },
+    { "pong",         ICON_GAME_PONG },
+    { "ASSAULTCUBE",  ICON_GAME },
+    { "CLASSICUBE",   ICON_GAME },
+    { "GLCUBE",       ICON_GAME },
+    { "GLMATRIX",     ICON_GAME },
+    { "LAVALAMP",     ICON_GAME },
+    { "rogue",        ICON_GAME },
+    { "ARENA",        ICON_GAME },
+    { "CHESS",        ICON_GAME },
+    { "SQUADRON",     ICON_GAME },
+    { "DOOM.ELF",     ICON_GAME_DOOM },
+    { "RSS",          ICON_INFO_CIRCLE },
+    { "WEATHER",      ICON_INFO_CIRCLE },
+    { "AICHAT",       ICON_INFO_CIRCLE },
+    { "help",         ICON_INFO_CIRCLE },
+    { "PRINT3D",      ICON_COG },
+};
+
+static icon_id_t win_icon_by_owner_name(const char *name) {
+    if (!name || !name[0]) return ICON_COUNT;   // sentinel: no identity match
+    for (size_t i = 0; i < sizeof(s_win_titlebar_icons) / sizeof(s_win_titlebar_icons[0]); i++) {
+        if (strcmp(name, s_win_titlebar_icons[i].name) == 0)
+            return s_win_titlebar_icons[i].icon;
+    }
+    return ICON_COUNT;
+}
+
 static icon_id_t window_title_icon(window_t *win) {
     const char *t = win->title;
     if (win->owner_pid != 0) {
@@ -2094,6 +2361,10 @@ static icon_id_t window_title_icon(window_t *win) {
                       strcmp(owner->name, "dosrun") == 0 ||
                       strcmp(owner->name, "DOSUSER") == 0)) {
             return ICON_GAME;
+        }
+        if (owner) {
+            icon_id_t by_name = win_icon_by_owner_name(owner->name);
+            if (by_name != ICON_COUNT) return by_name;
         }
     }
     if (win_ci_has(t, "setting"))  return ICON_COG;
@@ -2408,6 +2679,11 @@ static int winmenu_handle_click(int32_t x, int32_t y) {
                 if (o < 40) o = 40;
                 if (o > 255) o = 255;
                 w->opacity = (uint8_t)o;
+                // #osglass: this is the PER-WINDOW override winning over the
+                // OS-wide/theme default from now on - wm_set_default_opacity()
+                // (a theme switch or the Settings/tray slider) must not stomp
+                // it back. See window_t::opacity_override in window.h.
+                w->opacity_override = 1;
             }
         }
         wm_invalidate_all();
@@ -2640,6 +2916,18 @@ void window_draw(window_t *win) {
         ov_titlebar = 0x002A3038; ov_bg = 0x001E2228;
     } else if (win->theme_override == 2) {   // force Light
         ov_titlebar = 0x00DDE3EA; ov_bg = 0x00F4F6F9;
+    } else if (win->chrome_style == WIN_CHROME_LIGHT_UTILITY) {
+        // #titlebar-chrome: light-grey utility titlebar, independent of the
+        // active theme (retro_unix's default beveled/square look would
+        // otherwise make this window indistinguishable from any other). The
+        // user's own Dark/Light override (theme_override cycles via the
+        // titlebar button, checked above) always wins over this default -
+        // this is a fallback look for the window, not a lock on it. 0xC0C0C0
+        // is the classic "light grey" - also comfortably below the #140
+        // near-white-recolour threshold a few lines down, so it is not
+        // silently rerouted to the taskbar colour the way a near-white
+        // titlebar would be.
+        ov_titlebar = 0x00C0C0C0;
     }
 
     // #185: borderless panel. Skip all chrome (border/titlebar/buttons/grips)
@@ -2682,7 +2970,61 @@ void window_draw(window_t *win) {
     }
 
     // Draw border
-    fb_draw_rect(x, y, w, h, ov_border);
+    //
+    // [no-ticket, 2026-09-16] stray-white-corner-pixel fix (owner, real iMac).
+    // fb_draw_rect() ALWAYS draws a single-pixel-wide outline (see its own
+    // implementation, framebuffer.c: one fb_put_pixel() per edge cell, no
+    // thickness parameter) regardless of BORDER_WIDTH. BORDER_WIDTH is a
+    // THEME METRIC (metric.border_w, 2px on every shipped non-retro theme)
+    // that every OTHER consumer in this file treats as the frame's real
+    // thickness: window_get_content_bounds() insets the content rect by
+    // BORDER_WIDTH on every side, and window_punch_corners()'s own ring math
+    // (border_w/inner_b/inner_b_sq a few hundred lines below) paints a full
+    // BORDER_WIDTH-thick ring in the ROUNDED corner box. So on a straight
+    // edge, the 1px outline above left a (BORDER_WIDTH-1)-pixel-wide band
+    // completely unpainted by anything in this function, between the outline
+    // and the interior fill - invisible on almost every window, because nine
+    // times out of ten nothing else ever draws into that band and it just
+    // shows a sliver of whatever was already there (nothing, mid-composite).
+    // The bottom-right resize grip's diagonal glyph (below, "Draw resize
+    // grips") is drawn INSIDE window bounds along the right edge and reaches
+    // one column shy of the outline - exactly into this gap - so its white
+    // highlight pixel sat there completely unmasked: not cut by
+    // window_punch_corners() (its box only reaches the last few pixels
+    // nearest the literal corner tip; this point is several rows up the
+    // flat vertical edge, correctly outside that box) and not covered by
+    // this border draw either. It read as "a stray white pixel in the
+    // rounded corner" because the resize grip only exists in that one
+    // corner, not because the corner ARC itself was wrong.
+    //
+    // Fix: draw a REAL border_w-thick frame (four filled strips, same
+    // pattern as every other rect this function fills before the corner
+    // punch squares them back off) instead of a 1px outline, so the frame
+    // is solid all the way from the outline to the interior fill on every
+    // edge, not just in the four corner boxes. Matches window_punch_-
+    // corners()'s own border_w clamp (never wider than half the window) so
+    // the two can never disagree about how thick the frame is.
+    // #osglass (2026-09-16): fb_fill_rect_alpha() at win->opacity instead of
+    // the plain fb_fill_rect() the cornerpix fix landed with - same four
+    // strips, same geometry, same BORDER_WIDTH clamp (untouched, so the
+    // corner-pixel fix stands exactly as before); the only change is that a
+    // translucent window's frame now blends against whatever the compositor
+    // already painted underneath it this frame, instead of always painting
+    // solid. fb_fill_rect_alpha(...,255) is byte-identical to fb_fill_rect
+    // (its own fast path), so an opaque window (the default for retro-style
+    // themes, and any window with no glass applied) renders pixel-identically
+    // to before this change.
+    {
+        int32_t bw = BORDER_WIDTH;
+        if (bw > w / 2) bw = w / 2;
+        if (bw > h / 2) bw = h / 2;
+        if (bw > 0) {
+            fb_fill_rect_alpha(x,             y,             w,  bw, ov_border, win->opacity);  // top
+            fb_fill_rect_alpha(x,             y + h - bw,    w,  bw, ov_border, win->opacity);  // bottom
+            fb_fill_rect_alpha(x,             y,             bw, h,  ov_border, win->opacity);  // left
+            fb_fill_rect_alpha(x + w - bw,    y,             bw, h,  ov_border, win->opacity);  // right
+        }
+    }
 
     // #140: recolour a near-white active titlebar to the taskbar colour so the
     // window heading matches the taskbar rather than glaring white.
@@ -2696,8 +3038,17 @@ void window_draw(window_t *win) {
 
     // Phase 4: modern themes get a subtle vertical gradient titlebar (lighter at
     // the top for a raised feel); Classic keeps the flat fill it always had.
-    // Opaque fill within the (always-redrawn) titlebar region, so it cannot
-    // accumulate or trail like an alpha effect would under partial redraws.
+    // #osglass (2026-09-16): this region is filled at win->opacity via
+    // fb_fill_rect_alpha() below, same as the border above - the owner
+    // architecture requires glass to cover the HEADING/TITLEBAR, not only
+    // the body, and before this change the titlebar was always painted
+    // fully opaque regardless of the window's opacity (the OLD gap this
+    // task closes: a translucent window's body let the desktop show through
+    // but its titlebar stayed a solid block). The region is still redrawn in
+    // full every composite (fb_fill_rect_alpha reads the CURRENT backdrop at
+    // draw time, same pattern the corner-AA blend a few hundred lines below
+    // already uses mid-frame), so it cannot accumulate or trail like a
+    // stateful alpha effect would.
     int32_t tbx = x + BORDER_WIDTH, tby = y + BORDER_WIDTH;
     int32_t tbw = w - 2 * BORDER_WIDTH;
     if (win_modern_style()) {
@@ -2710,7 +3061,11 @@ void window_draw(window_t *win) {
         int active = (win->flags & WINDOW_FLAG_FOCUSED) != 0;
         uint32_t g_top = active ? th->c_titlebar_top : th->c_titlebar_inactive_top;
         uint32_t g_bot = active ? th->c_titlebar_bottom : th->c_titlebar_inactive_bottom;
-        if (win->theme_override != 0 || tb_col != ov_titlebar) { g_top = 0; g_bot = 0; }
+        // #titlebar-chrome: WIN_CHROME_LIGHT_UTILITY added to the same guard
+        // as theme_override, for the same reason - it is a runtime property
+        // of THIS window, not of the active theme's gradient stops.
+        if (win->theme_override != 0 || tb_col != ov_titlebar ||
+            win->chrome_style == WIN_CHROME_LIGHT_UTILITY) { g_top = 0; g_bot = 0; }
         uint8_t r, g, b, tr8, tg8, tb8;
         if (g_top != g_bot) {
             tr8 = (g_top >> 16) & 0xFF; tg8 = (g_top >> 8) & 0xFF; tb8 = g_top & 0xFF;
@@ -2728,12 +3083,13 @@ void window_draw(window_t *win) {
             int rr = tr + (r - tr) * j / span;
             int gg = tg + (g - tg) * j / span;
             int bb = tb2 + (b - tb2) * j / span;
-            fb_fill_rect(tbx, tby + j, tbw, 1,
-                         ((uint32_t)rr << 16) | ((uint32_t)gg << 8) | (uint32_t)bb);
+            fb_fill_rect_alpha(tbx, tby + j, tbw, 1,
+                         ((uint32_t)rr << 16) | ((uint32_t)gg << 8) | (uint32_t)bb,
+                         win->opacity);
         }
     } else {
-        // Classic: flat titlebar (unchanged).
-        fb_fill_rect(tbx, tby, tbw, TITLEBAR_HEIGHT, tb_col);
+        // Classic: flat titlebar, now glass-aware (see #osglass comment above).
+        fb_fill_rect_alpha(tbx, tby, tbw, TITLEBAR_HEIGHT, tb_col, win->opacity);
     }
 
     // #711 loop 2 (designer 1, window decorations): wire two previously-dead
@@ -3063,6 +3419,33 @@ void wm_queue_event(gui_event_t *event) {
     q->events[q->tail] = *event;
     q->tail = (q->tail + 1) % EVENT_QUEUE_SIZE;
     q->count++;
+}
+
+// #resizegrow: whether the WM has currently claimed the pointer for its OWN
+// chrome gesture (a window resize via its grip, or a title-bar move drag).
+// sys_inject_mouse() (fb_syscall.c) must check this BEFORE forwarding a
+// content mouse event to the app under the cursor: without it, EVERY sample
+// of a resize or window-drag was ALSO delivered to the app underneath as a
+// genuine EVENT_MOUSE_DOWN/MOVE/UP, unconditionally, because
+// wm_inject_app_mouse() below has no knowledge of what wm_handle_mouse_down/
+// move/up() decided. For an app with its own drag gesture on mouse-down-and-
+// move in its content area (Terminal/Files/the browser: text selection),
+// resizing a window by its bottom-right grip ALSO starts (and continues, and
+// ends) a text selection in whatever the grip happens to sit over, because
+// the grip's hit zone is the last few pixels of the content rect, not
+// outside it. MEASURED (golden b2363, VM 2958, resizegrow): a scripted
+// MDOWN/MOVE-x80/MUP resize drag left Terminal showing a large stuck
+// selection-highlight rectangle over blank virtual rows, pixel-identical 90s
+// after mouse-up - not a kernel resize-commit lag at all, but a real second
+// mouse-down/move/up stream the app was never supposed to see. This has been
+// present since the repo's initial commit (cc0176c8, #535) - it predates
+// #resizelag/#resizescale, whose short synthetic drags never opened an app
+// with a live drag gesture of its own, so neither investigation could see it.
+// Scoped to resizing_window/dragging_window ONLY (not titlebar buttons/menus,
+// which already  before setting any state and are a separate,
+// lower-risk gap left for a later pass - see blame.md).
+bool wm_chrome_drag_active(void) {
+    return wm_state.resizing_window != NULL || wm_state.dragging_window != NULL;
 }
 
 // Build a content mouse event from primitive args and dispatch it to the
@@ -3473,6 +3856,106 @@ int64_t sys_wm_minimize_window(int id) {
     return -1;
 }
 
+// #tbclose (appqa Finding 1, SYS_WM_CLOSE_WINDOW): close an ARBITRARY window
+// by id via the SAME window_request_close() a real titlebar close-button
+// click runs (see the function above wm_handle_mouse_down). This exists
+// because a synthetic click at the close button's SCREEN COORDINATES - what
+// taskbar_close_window() used before this - can never reach that code path
+// for a WINDOW_FLAG_NOCHROME window: wm_handle_mouse_down() skips the whole
+// titlebar-button block (fullscreen/cog/minimize/maximize/close) for NOCHROME
+// windows, because they have no titlebar to click. An id-based call sidesteps
+// the coordinate hit-test entirely, so it works identically whether or not
+// the window has chrome. Ungated, like its SYS_WM_FOCUS_WINDOW/SYS_WM_-
+// MINIMIZE_WINDOW neighbors just above (same severity - any caller can
+// already focus/minimize any window by id; closing is not a stronger
+// capability than either).
+int64_t sys_wm_close_window(int id) {
+    window_t *win = wm_state.window_list;
+    while (win) {
+        if ((int)win->id == id) {
+            if (!(win->flags & WINDOW_FLAG_CLOSABLE)) return -1;
+            window_request_close(win, win->bounds.x, win->bounds.y, 0);
+            return 0;
+        }
+        win = win->next;
+    }
+    return -1;
+}
+
+// ===========================================================================
+// #404 (cfhost): SYS_WM_SET_BOUNDS - Cardfile window hosting.
+//
+// Set an ARBITRARY window's bounds by its wm_window_info_t.id, plus a
+// managed/hide bit, so the Cardfile deck can place / resize / show / hide the
+// real app windows its cards host (docs/CARDFILE_ARCHITECTURE.md sections 4/6).
+// No existing call could do this for a FOREIGN window: SYS_WIN_MOVE/_BY act on
+// the caller's OWN handle, and sys_wm_maximize_focused fills ONE work-area rect
+// (so it cannot tile N group panes / N columns).
+//
+// RUST-FIRST SPLIT (2026-07-16 rule). The DECISION - which flag word to store
+// (NOCHROME/VISIBLE/MINIMIZED), whether to move the window, and dimension
+// validation - is pure and lives in rustkern/wm_bounds.rs (wm_bounds_plan_rs).
+// What stays C, and why: the caller-is-compositor gate + dispatch (privilege
+// plumbing), and THIS window-list lookup + apply, because wm_state.window_list
+// is a C-static intrusive list of window_t with no FFI surface. Same split
+// winbuf.rs / winstate_bits_rs use.
+//
+// The _Static_asserts pin the WINDOW_FLAG_* bit positions the Rust side
+// hardcodes and the plan struct's size, so a reshuffle of window.h or the
+// struct fails the build here rather than silently corrupting a flag word.
+// ===========================================================================
+typedef struct {
+    int32_t  accept;      // 1 = apply, 0 = reject
+    uint32_t new_flags;   // WINDOW_FLAG_* word to store (NOCHROME/VISIBLE/MIN resolved)
+    int32_t  hide;        // 1 = window should be hidden (stowed)
+    int32_t  set_geom;    // 1 = apply x/y/w/h below (resize if w/h changed)
+    int32_t  x, y, w, h;
+} wm_bounds_plan_t;
+_Static_assert(sizeof(wm_bounds_plan_t) == 32,
+               "#404 cfhost: wm_bounds_plan_t layout is mirrored in rustkern/wm_bounds.rs WmBoundsPlan");
+_Static_assert(WINDOW_FLAG_VISIBLE   == (1u << 0), "#404 cfhost: wm_bounds.rs WF_VISIBLE");
+_Static_assert(WINDOW_FLAG_MINIMIZED == (1u << 7), "#404 cfhost: wm_bounds.rs WF_MINIMIZED");
+_Static_assert(WINDOW_FLAG_NOCHROME  == (1u << 9), "#404 cfhost: wm_bounds.rs WF_NOCHROME");
+extern int wm_bounds_plan_rs(uint32_t cur_flags, int32_t x, int32_t y, int32_t w,
+                             int32_t h, uint32_t req_flags, wm_bounds_plan_t *out);
+
+// Compositor-privileged: the CALLER check is done in proc/syscall.c's dispatch
+// (uw_caller_is_compositor()) before this is ever reached, exactly like the
+// input-inject / screen-capture syscalls. Returns 0 on success, -1 if the id is
+// not a live window or (when shown) the requested size is out of range.
+int64_t sys_wm_set_bounds(int id, int x, int y, int w, int h, uint32_t flags) {
+    window_t *win = wm_state.window_list;
+    while (win && (int)win->id != id) win = win->next;
+    if (!win) return -1;
+
+    wm_bounds_plan_t plan;
+    if (!wm_bounds_plan_rs((uint32_t)win->flags, x, y, w, h, flags, &plan) || !plan.accept)
+        return -1;
+
+    int changed = 0;
+    if ((uint32_t)win->flags != plan.new_flags) {
+        win->flags = plan.new_flags;
+        changed = 1;
+    }
+    if (plan.set_geom) {
+        if (win->bounds.x != plan.x || win->bounds.y != plan.y) {
+            win->bounds.x = plan.x;
+            win->bounds.y = plan.y;
+            changed = 1;
+        }
+        if (win->bounds.width != plan.w || win->bounds.height != plan.h) {
+            // window_resize() sets w/h AND calls user_window_handle_resize() so
+            // the owning app reflows its content buffer. Only when the size
+            // actually changed - a reflow every frame at a steady size is the
+            // #resizelag cost for nothing.
+            window_resize(win, plan.w, plan.h);
+            changed = 1;
+        }
+    }
+    if (changed) wm_invalidate_all();
+    return 0;
+}
+
 int64_t sys_wm_get_windows(wm_window_info_t *buf, int max_count) {
     if (!buf || max_count <= 0) return -1;
     int n = 0;
@@ -3497,6 +3980,11 @@ int64_t sys_wm_get_windows(wm_window_info_t *buf, int max_count) {
         // userland so the dock right-click menu can label "Maximize" vs
         // "Restore" correctly instead of guessing.
         buf[n].maximized = (win->flags & WINDOW_FLAG_MAXIMIZED) ? 1 : 0;
+        // #opacityglass: this window's actual opacity (global default or a
+        // per-window titlebar override, see window.h wm_window_info_t.opacity
+        // for the full rationale) - lets the compositor detect translucency
+        // it did not itself set.
+        buf[n].opacity   = (int)(win->opacity ? win->opacity : 255);
         // #745: the compositor cannot see kernel window flags any other way,
         // and it is the only layer that can paint outside a window rect.
         buf[n].shadow    = window_wants_shadow(win)             ? 1 : 0;

@@ -1,0 +1,34 @@
+0002-highscore-advisory-lock-best-effort.patch
+
+highscore.c do_open() takes a POSIX advisory record lock (fcntl F_SETLKW with
+a struct flock) on the score file, and treats a lock failure as fatal():
+   if (res == -1) fatal ("Cannot lock score file ...");
+
+MayteraOS's libc carries the fcntl lock constants and struct flock for source
+compatibility only: the kernel has no multi-process advisory record locking and
+returns -1/ENOSYS (see libc fcntl.h, added for the angband port, whose callers
+already ignore the return). moon-buggy is the odd one out in that it checks the
+return and aborts, so the game would fatal the first time it writes a score.
+
+MayteraOS runs a single writer, so the lock is unnecessary. This patch makes
+the lock best-effort: attempt it (harmless), but do not abort on failure,
+matching the advisory-locking-is-best-effort contract every other caller in the
+tree relies on. Score reading/writing is otherwise unchanged.
+
+--- a/highscore.c	2026-09-08 14:53:44.656381642 +0000
++++ b/highscore.c	2026-09-08 14:53:44.657324135 +0000
+@@ -381,9 +381,11 @@
+     do {
+       res = fcntl (fd, F_SETLKW, &l);
+     } while (res == -1 && errno == EINTR);
+-    if (res == -1) {
+-      fatal ("Cannot lock score file \"%s\": %s", name, strerror (errno));
+-    }
++    /* MayteraOS port: advisory record locking is source-compatible only (the
++     * kernel returns -1/ENOSYS, see libc fcntl.h) and MayteraOS runs a single
++     * writer, so a failed lock is not fatal here, matching the best-effort
++     * contract every other caller in the tree already relies on.  */
++    (void) res;
+   }
+   
+   return  fd;

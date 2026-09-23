@@ -93,6 +93,15 @@ struct window;
 // Default window flags
 #define WINDOW_FLAGS_DEFAULT (WINDOW_FLAG_VISIBLE | WINDOW_FLAG_MOVABLE | WINDOW_FLAG_CLOSABLE)
 
+// #titlebar-chrome: window_t.chrome_style values. General per-window chrome
+// variants, not a per-app hack - see the field comment above. 0 is the only
+// value every window has always had; 1 is new.
+#define WIN_CHROME_DEFAULT        0   // theme decides titlebar colour + corner radius
+#define WIN_CHROME_LIGHT_UTILITY  1   // light-grey titlebar, forced rounded corners
+                                      // regardless of theme (retro_unix ships
+                                      // radius.window=0, which would otherwise
+                                      // leave a utility-style app square)
+
 // ===========================================================================
 // Title bar / chrome dimensions (#711: DATA, not compiled-in constants)
 //
@@ -364,9 +373,29 @@ typedef struct window {
 
     // Transparency (0-255, 255=opaque) + lock-in-place
     uint8_t opacity;
+    // #osglass (2026-09-16): 0 = opacity is INHERITED from the OS-wide
+    // default (g_default_window_opacity, theme-driven via theme_set() ->
+    // wm_set_default_opacity() - see themes.c) and is overwritten every time
+    // that default changes; 1 = the user set THIS window's opacity
+    // explicitly via the titlebar decorator popup's Opacity stepper
+    // (winmenu_handle_click() row 3, window.c), and wm_set_default_opacity()
+    // must skip it. Without this flag a later theme switch or Settings
+    // "Window Opacity" slider move silently overwrote every per-window
+    // override - the exact footgun userland/apps/terminal/term_prefs.c
+    // documented and declined to build a control around.
+    uint8_t opacity_override;
     uint8_t locked;
     // Per-window decorator state (Task A redesign).
     uint8_t theme_override;   // 0 = follow system, 1 = force dark, 2 = force light
+    // #titlebar-chrome: general per-window chrome variant, resolved once at
+    // window_create() from the OWNING PROCESS'S BINARY IDENTITY (owner->name,
+    // the same stable signal window_title_icon()'s DOS check and the
+    // titlebar icon table use), never from a title-text special case. Any
+    // app can be added to the identity table in window_create(); gbemu is
+    // the first because its window title is the loaded ROM's own cartridge
+    // name, unrelated to "gbemu" or "Game Boy". See WIN_CHROME_* below and
+    // window_corner_bevel()/window_draw() for what each style changes.
+    uint8_t chrome_style;
     // #711 loop 2 (designer 1): which titlebar button the cursor is currently
     // over. 0 none, 1 filter/cog, 2 minimize, 3 maximize, 4 close. Set by
     // wm_handle_mouse_move, read by window_draw's button hover fills.
@@ -396,7 +425,8 @@ void wm_init(void);
 
 // Create a new window
 window_t *window_create(const char *title, int32_t x, int32_t y, int32_t width, int32_t height);
-void wm_set_default_opacity(int opacity);  // global default + apply to all windows
+void wm_set_default_opacity(int opacity);  // USER global default (pins; survives theme apply)
+void wm_set_theme_default_opacity(int opacity);  // THEME default (applies only if user has not pinned)
 extern uint8_t g_default_window_opacity;
 
 // Destroy a window
@@ -630,9 +660,22 @@ typedef struct {
     // is what lets userland pick the correct label and skip the call when
     // it would already be a no-op/wrong-way toggle.
     int     maximized;
+    // #opacityglass (2026-09-06): this window's OWN opacity byte (0-255),
+    // widened to int for struct-field consistency with the rest of this
+    // table. win->opacity is normally seeded from the global default
+    // (wm_set_default_opacity/SYS_SET_WIN_OPACITY) but can be overridden
+    // PER WINDOW via the titlebar decorator popup's Opacity stepper
+    // (winmenu_handle_click() row 3, this file), entirely kernel-side with
+    // no syscall of its own - so the compositor cannot infer "is any window
+    // translucent" from the global g_win_opacity alone. Exposed here so the
+    // compositor's existing per-tick wm_get_windows() enumeration (already
+    // used for z-order/taskbar) can also detect real per-window glass, with
+    // no new syscall and no poll loop. APPENDED, never reordered, same
+    // discipline as app_id/maximized above.
+    int     opacity;
 } wm_window_info_t;
-_Static_assert(sizeof(wm_window_info_t) == 136,
-               "#745/#41/#44: wm_window_info_t layout is duplicated in userland/libc/syscall.h; "
+_Static_assert(sizeof(wm_window_info_t) == 140,
+               "#745/#41/#44/#opacityglass: wm_window_info_t layout is duplicated in userland/libc/syscall.h; "
                "change both or neither");
 
 // Syscall: fill buf with info about up to max_count windows
@@ -671,6 +714,20 @@ int64_t sys_win_set_shadow(int handle);
 // nothing to validate).
 int64_t sys_wm_apps_dirty(void);
 int64_t sys_wm_minimize_window(int id);
+// #tbclose (SYS_WM_CLOSE_WINDOW, proc/syscall.h): close an arbitrary window by
+// id, running the exact same window_request_close() the titlebar X button
+// does. See window.c for the shared implementation.
+int64_t sys_wm_close_window(int id);
+// #404 (cfhost): set an arbitrary window's bounds by id + managed/hide flags,
+// for the Cardfile deck's window hosting. Compositor-privileged (the caller
+// check is in proc/syscall.c dispatch). See gui/window.c.
+int64_t sys_wm_set_bounds(int id, int x, int y, int w, int h, uint32_t flags);
+// #resizegrow: true while the WM has claimed the pointer for a resize-grip
+// or title-bar move drag. sys_inject_mouse() (fb_syscall.c) must check this
+// before ALSO forwarding the same sample to the app under the cursor as a
+// content mouse event - see the definition in window.c for the bug this
+// closes.
+bool wm_chrome_drag_active(void);
 void wm_inject_app_mouse(int32_t x, int32_t y, int32_t type, uint32_t button);
 void wm_inject_app_scroll(int32_t x, int32_t y, int32_t delta);
 

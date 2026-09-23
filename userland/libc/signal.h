@@ -43,6 +43,7 @@
 #define SA_RESTART   0x10000000
 #define SA_NODEFER   0x40000000
 #define SA_RESETHAND 0x80000000
+#define SA_ONSTACK   0x08000000  // deliver on alternate stack; added for libedit (#745). No sigaltstack support yet, so the kernel treats it as a no-op, which is safe: handlers run on the normal stack.
 
 // how for sigprocmask
 #define SIG_BLOCK     0

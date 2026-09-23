@@ -10,6 +10,10 @@
 #include "../proc/process.h"
 #include "../fs/fat.h"
 #include "../sync/spinlock.h"   // #114: the SHARED irqsave spinlock
+#include "../cpu/cpumax.h"      // #dosmem: MAYTERA_MAX_CPUS for the per-CPU reason slot
+#include "../cpu/smp.h"         // #dosmem: smp_this_cpu()
+#include "../fs/bootlog.h"      // #dosmem: bootlog_fault_write (owning header)
+#include "mmlog.h"   // #dosmem: mm anomalies must reach a serial-less machine
 
 #ifndef USER_STACK_SIZE
 #define USER_STACK_SIZE (2 * 1024 * 1024)  // 2MB default
@@ -72,6 +76,51 @@ static uint64_t stat_lazy_allocs = 0;
 //
 // LOCK ORDER is unchanged and still mm->vma_lock -> cow_lock (see below).
 static spinlock_t cow_lock = SPINLOCK_INIT;
+
+#define MMF_R_NONE          0
+#define MMF_R_NO_PROC       1
+#define MMF_R_NO_MM         2
+#define MMF_R_NO_VMA        3
+#define MMF_R_VMA_NOWRITE   4
+#define MMF_R_VMA_NOACCESS  5
+#define MMF_R_VMA_FILE      6
+#define MMF_R_LAZY_OOM      7
+#define MMF_R_LAZY_MAPFAIL  8
+#define MMF_R_COW_DENY      9
+#define MMF_R_PRESENT_PROT  10
+#define MMF_R_PRESENT_NOUSER_NOVMA 11
+#define MMF_R_COW_FAIL      12
+#define MMF_R_SPURIOUS      13
+#define MMF_R_SPURIOUS_LOOP 14
+
+static const char *mmf_reason_name(uint32_t r) {
+    switch (r) {
+    case MMF_R_NO_PROC:      return "NO_PROC(no current process or cr3==0)";
+    case MMF_R_NO_MM:        return "NO_MM(process has no mm_struct: nothing ever mmap'd)";
+    case MMF_R_NO_VMA:       return "NO_VMA(not present and NO VMA covers this address)";
+    case MMF_R_VMA_NOWRITE:  return "VMA_NOWRITE(write to a VMA without VMA_WRITE)";
+    case MMF_R_VMA_NOACCESS: return "VMA_NOACCESS(user access to a VMA with no R/W/X)";
+    case MMF_R_VMA_FILE:     return "VMA_FILE(file-backed mapping is not implemented)";
+    case MMF_R_LAZY_OOM:     return "LAZY_OOM(pmm_alloc_page returned 0: OUT OF PHYSICAL MEMORY)";
+    case MMF_R_LAZY_MAPFAIL: return "LAZY_MAPFAIL(vmm_map_page_in failed: page-table alloc failed)";
+    case MMF_R_COW_DENY:     return "COW_DENY(COW write refused by a read-only VMA)";
+    case MMF_R_PRESENT_PROT: return "PRESENT_PROT(page present: NX exec fault or protection violation)";
+    case MMF_R_PRESENT_NOUSER_NOVMA:
+                             return "PRESENT_NOUSER_NOVMA(present kernel-identity leaf, no demand VMA)";
+    case MMF_R_COW_FAIL:     return "COW_FAIL(demand_cow_write failed)";
+    case MMF_R_SPURIOUS:     return "SPURIOUS(CPU reported not-present on a PRESENT, permitting PTE: swallowed)";
+    case MMF_R_SPURIOUS_LOOP:
+                             return "SPURIOUS_LOOP(the same address kept faulting spuriously: NOT swallowed)";
+    default:                 return "NONE(mm_fault was never asked, or it succeeded)";
+    }
+}
+
+static uint32_t g_mmf_reason[MAYTERA_MAX_CPUS];
+
+static inline void mmf_set(uint32_t r) {
+    uint32_t c = smp_this_cpu();
+    if (c < MAYTERA_MAX_CPUS) g_mmf_reason[c] = r;
+}
 
 static uint64_t cow_acquire_lock(void) {
     return spinlock_acquire_irqsave(&cow_lock);
@@ -217,6 +266,8 @@ static void mm_require_lock(mm_struct_t *mm, const char *what, void *ret) {
     if (spinlock_is_locked(&mm->vma_lock)) return;
     if (mm_lock_audit_count >= MM_LOCK_AUDIT_MAX) return;
     mm_lock_audit_count++;
+    MM_ANOMALY("[VMALOCK] %s() on mm %p with vma_lock UNHELD, caller %p "
+               "(addr2line this against kernel.elf)", what, (void *)mm, ret);
     kprintf("[VMALOCK] %s() on mm %p with vma_lock UNHELD, caller %p "
             "(addr2line this against kernel.elf)\n", what, (void *)mm, ret);
     if (mm_lock_audit_count == MM_LOCK_AUDIT_MAX) {
@@ -266,11 +317,17 @@ static int vma_add_nolock(mm_struct_t *mm, vma_t *vma) {
 
     // Check for overlap
     if (prev && prev->end > vma->start) {
+        MM_ANOMALY("[VMA] insert REFUSED: [0x%lx,0x%lx) overlaps the PREVIOUS vma "
+                   "[0x%lx,0x%lx). The caller's mmap/brk returns failure.",
+                   vma->start, vma->end, prev->start, prev->end);
         kprintf("[VMA] Overlap with previous VMA: 0x%lx-0x%lx vs 0x%lx-0x%lx\n",
                 prev->start, prev->end, vma->start, vma->end);
         return -1;
     }
     if (curr && vma->end > curr->start) {
+        MM_ANOMALY("[VMA] insert REFUSED: [0x%lx,0x%lx) overlaps the NEXT vma "
+                   "[0x%lx,0x%lx). The caller's mmap/brk returns failure.",
+                   vma->start, vma->end, curr->start, curr->end);
         kprintf("[VMA] Overlap with next VMA: 0x%lx-0x%lx vs 0x%lx-0x%lx\n",
                 vma->start, vma->end, curr->start, curr->end);
         return -1;
@@ -548,10 +605,44 @@ int handle_lazy_fault(mm_struct_t *mm, vma_t *vma, uint64_t fault_addr) {
     process_t *me = proc_current();
     uint64_t pml4 = me->cr3;
 
+    // #dosmem: DID SOMEBODY ELSE ALREADY DO THIS?
+    //
+    // mm_fault() reads the PTE BEFORE taking mm->vma_lock, so two threads of
+    // one process (CLONE_VM siblings share this exact mm and cr3, which is what
+    // DOSUSER is) can both read "not present" for the same page, and the loser
+    // of the lock then arrives here with the page ALREADY MAPPED AND WRITTEN by
+    // the winner. Without this check it allocates a second frame, zeroes it, and
+    // maps it OVER the winner's - silently discarding whatever the winner wrote
+    // and leaking the winner's frame, because vmm_map_page_in() overwrites the
+    // PTE unconditionally. That is a data-corruption path, not just a leak, and
+    // it leaves no trace at all.
+    //
+    // Cheap: one page-table walk on a path that is about to do an allocation and
+    // a 4 KB memset anyway. The USER bit is what distinguishes a real
+    // demand-allocated user page from leftover kernel identity backing, which
+    // must still be replaced (see mm_fault()'s case 2).
+    {
+        uint64_t page_addr_now = fault_addr & ~(VMM_PAGE_SIZE_4K - 1);
+        uint64_t cur = vmm_get_pte_in(pml4, page_addr_now);
+        if ((cur & VMM_FLAG_PRESENT) && (cur & VMM_FLAG_USER)) {
+            vmm_invlpg(page_addr_now);
+            stat_minor_faults++;
+            return 0;
+        }
+    }
+
     // Allocate physical page
     uint64_t phys_page = pmm_alloc_page();
     if (phys_page == 0) {
-        kprintf("[DEMAND] Out of memory for lazy allocation at 0x%lx\n", fault_addr);
+        // #dosmem: this line has existed for a long time and has NEVER reached
+        // the owner's disk, because kprintf is serial-only and neither of his
+        // machines has a serial port. It alone distinguishes "out of memory"
+        // from "the mapping was never made", which are the two leading
+        // explanations for every large-allocation fault on his hardware.
+        mmf_set(MMF_R_LAZY_OOM);
+        bootlog_fault_write("[DEMAND] OUT OF PHYSICAL MEMORY for a lazy page at 0x%lx "
+                            "(pmm free=%lu/%lu pages)", fault_addr,
+                            pmm_get_free_pages(), pmm_get_total_pages());
         // TODO: Try to swap out pages
         return -1;
     }
@@ -572,7 +663,10 @@ int handle_lazy_fault(mm_struct_t *mm, vma_t *vma, uint64_t fault_addr) {
     uint64_t page_addr = fault_addr & ~(VMM_PAGE_SIZE_4K - 1);
     if (vmm_map_page_in(pml4, page_addr, phys_page, flags) != 0) {
         pmm_free_page(phys_page);
-        kprintf("[DEMAND] Failed to map lazy page at 0x%lx\n", page_addr);
+        mmf_set(MMF_R_LAZY_MAPFAIL);
+        bootlog_fault_write("[DEMAND] failed to MAP a lazy page at 0x%lx (a page-table "
+                            "level could not be allocated; pmm free=%lu/%lu pages)",
+                            page_addr, pmm_get_free_pages(), pmm_get_total_pages());
         return -1;
     }
 
@@ -1855,14 +1949,287 @@ int demand_cow_write(struct process *p, uint64_t page_addr) {
 }
 
 // Per-process page-fault resolver (see demand.h). Called by the #PF handler.
+// ===========================================================================
+// #dosmem: SAY WHY A PAGE FAULT COULD NOT BE RESOLVED, ON A MACHINE WITH NO
+// SERIAL PORT.
+//
+// THE PROBLEM THIS EXISTS FOR. Every DOS guest on the owner's iMac14,4 dies at
+// the same instruction, and the whole report is:
+//
+//   [EXCEPTION] Page Fault (INT 14) USER err=0x6 RIP=0x80296a8acc CR2=0x8040dee000
+//   [FAULT] pid=44 'DOSUSER' image=[0x8029600000,0x802c98b000) RIP = image+0xa8acc
+//   [PROC] 'DOSUSER' (PID 44) exiting, code -1
+//
+// err=0x6 is write / user / NOT PRESENT, and CR2 is 14.6 MB into the libc heap
+// (HEAP_START 0x8040000000). mm_fault() refuses that fault for one of NINE
+// different reasons, and the report names none of them. The three that matter
+// are mutually exclusive and demand opposite fixes:
+//
+//   * no VMA covers the address        -> the mapping was never made, or the
+//                                         list is wrong. Look at do_mmap.
+//   * a VMA covers it but forbids the  -> a permission bug. Look at the flags.
+//     access
+//   * a VMA covers it and permits it,  -> the machine is out of physical memory
+//     and the allocation FAILED           or the page-table write failed.
+//
+// Reconstructing which one it was has cost several sessions of guessing, and
+// on the owner's hardware it CANNOT be reconstructed at all: `kprintf` goes to
+// serial and neither of his machines has a serial port. The `[DEMAND] Out of
+// memory for lazy allocation` line, which alone would settle two of the three,
+// has been in this file the whole time and has never reached his disk.
+//
+// So mm_fault() now records WHY it gave up, in a per-CPU slot, and the fatal
+// path prints that reason plus the state a reader would otherwise have to
+// infer: the raw PTE, the covering VMA (or the hole it fell in, named by its
+// neighbours), the mm's VMA/resident/lazy counters and the PMM free count.
+// One boot log, one answer.
+//
+// WHY C, and this is the Rust-first rule's stated-justification requirement,
+// not a shrug. This runs inside the #PF handler with IF=0, must not allocate,
+// must not itself fault, and must not put an FFI hop between a fault and the
+// report of it. It samples a C linked list under a C spinlock with
+// spinlock_try_acquire(), reads raw page-table entries, and formats through
+// the C varargs bootlog_fault_write(). That is the entanglement-with-paging
+// exemption, the same one f6865391 used for the CR2 capture two days ago.
+//
+// PER-CPU, not global: two cores can fault at the same instant, and a global
+// would let one core's report quote the other's reason. The slot is written
+// with IF=0 on the faulting core and read by that same core a few calls later
+// in the same handler invocation, so no lock is needed and none is taken.
+// ===========================================================================
+
+
+// #dosmem: emit the one line that says why. Called from page_fault_handler()
+// on the unresolved path only, so it costs nothing on a healthy machine.
+// Everything here is best-effort by construction: a lock it cannot take is
+// reported as not-sampled rather than waited for, and every page-table read
+// goes through vmm_get_pte_in(), which walks and returns 0 instead of faulting.
+void mm_fault_report(struct process *p, uint64_t cr2, uint64_t err) {
+    uint32_t c = smp_this_cpu();
+    uint32_t r = (c < MAYTERA_MAX_CPUS) ? g_mmf_reason[c] : MMF_R_NONE;
+
+    uint64_t pte = (p && p->cr3) ? vmm_get_pte_in(p->cr3, cr2 & ~(VMM_PAGE_SIZE_4K - 1)) : 0;
+
+    bootlog_fault_write("[VMFAULT] pid=%u cr2=0x%lx err=0x%lx[%s%s%s%s%s] pte=0x%lx WHY=%s",
+                        p ? p->pid : 0, cr2, err,
+                        (err & PF_PRESENT)     ? "P"  : "p",
+                        (err & PF_WRITE)       ? "W"  : "R",
+                        (err & PF_USER)        ? "U"  : "K",
+                        (err & PF_RESERVED)    ? "|RSVD" : "",
+                        (err & PF_INSTRUCTION) ? "|IFETCH" : "",
+                        pte, mmf_reason_name(r));
+
+    mm_struct_t *mm = p ? (mm_struct_t *)p->mm : NULL;
+    if (!mm) {
+        bootlog_fault_write("[VMFAULT] pid=%u no mm_struct; pmm free=%lu/%lu pages (%lu MB free)",
+                            p ? p->pid : 0, pmm_get_free_pages(), pmm_get_total_pages(),
+                            (pmm_get_free_pages() * VMM_PAGE_SIZE_4K) >> 20);
+        return;
+    }
+
+    // TRYLOCK, never acquire. This runs in fault context: a plain acquire
+    // would deadlock outright if THIS core faulted while holding the lock,
+    // and an unbounded wait in a fault handler is the banned pattern anyway.
+    if (!spinlock_try_acquire(&mm->vma_lock)) {
+        bootlog_fault_write("[VMFAULT] pid=%u vma_lock is HELD, VMA state not sampled "
+                            "(count=%u resident=%lu lazy=%lu); pmm free=%lu/%lu pages",
+                            p->pid, mm->vma_count, mm->resident_pages, mm->lazy_pages,
+                            pmm_get_free_pages(), pmm_get_total_pages());
+        return;
+    }
+
+    // Covering VMA, or the hole, named by the neighbours on either side. A
+    // NO_VMA report that also shows "the previous VMA ends 4 KB below you" is
+    // a different bug from one that shows a 300 MB gap, and the difference is
+    // the whole diagnosis.
+    vma_t *hit = NULL, *below = NULL, *above = NULL;
+    uint32_t walked = 0;
+    for (vma_t *v = mm->vma_list; v && walked < 100000; v = v->next, walked++) {
+        if (cr2 >= v->start && cr2 < v->end) { hit = v; break; }
+        if (v->end <= cr2) below = v;
+        else { above = v; break; }
+    }
+
+    if (hit) {
+        bootlog_fault_write("[VMFAULT] pid=%u COVERED by vma [0x%lx,0x%lx) flags=0x%x prot=0x%x "
+                            "(%s%s%s%s%s%s) | vmas=%u resident=%lu lazy=%lu | pmm free=%lu/%lu "
+                            "pages (%lu MB)",
+                            p->pid, hit->start, hit->end, hit->flags, hit->prot,
+                            (hit->flags & VMA_READ)      ? "R" : "-",
+                            (hit->flags & VMA_WRITE)     ? "W" : "-",
+                            (hit->flags & VMA_EXEC)      ? "X" : "-",
+                            (hit->flags & VMA_LAZY)      ? " LAZY" : "",
+                            (hit->flags & VMA_ANONYMOUS) ? " ANON" : "",
+                            (hit->flags & VMA_FILE)      ? " FILE" : "",
+                            mm->vma_count, mm->resident_pages, mm->lazy_pages,
+                            pmm_get_free_pages(), pmm_get_total_pages(),
+                            (pmm_get_free_pages() * VMM_PAGE_SIZE_4K) >> 20);
+    } else {
+        bootlog_fault_write("[VMFAULT] pid=%u IN A HOLE: nearest vma below=[0x%lx,0x%lx) "
+                            "above=[0x%lx,0x%lx) gap_below=0x%lx gap_above=0x%lx | vmas=%u "
+                            "walked=%u resident=%lu lazy=%lu | pmm free=%lu/%lu pages (%lu MB)",
+                            p->pid,
+                            below ? below->start : 0, below ? below->end : 0,
+                            above ? above->start : 0, above ? above->end : 0,
+                            below ? (cr2 - below->end) : 0,
+                            above ? (above->start - cr2) : 0,
+                            mm->vma_count, walked, mm->resident_pages, mm->lazy_pages,
+                            pmm_get_free_pages(), pmm_get_total_pages(),
+                            (pmm_get_free_pages() * VMM_PAGE_SIZE_4K) >> 20);
+    }
+
+    spinlock_release(&mm->vma_lock);
+}
+
+// ===========================================================================
+// #dosmem: THE SPURIOUS PAGE FAULT, WHICH THIS KERNEL TREATED AS FATAL.
+//
+// REPRODUCED, on a 4 vCPU / 4 GB VM, with the [VMFAULT] instrument this ticket
+// added. /APPS/MEMHOG had written 32 MB of a 64 MB anonymous buffer when:
+//
+//   [VMFAULT] pid=37 cr2=0x8045052000 err=0x6[pWU] pte=0x800000004a851067
+//             WHY=PRESENT_PROT
+//   [VMFAULT] pid=37 COVERED by vma [0x8043f01000,0x8047f01000) flags=0x433
+//             (RW- LAZY ANON) | vmas=8 resident=25195 lazy=7318
+//             | pmm free=197219/506860 pages (770 MB)
+//   [EXCEPTION] Page Fault (INT 14) USER err=0x6 RIP=0x801d205d16 CS=0x23
+//   [PROC] 'MEMHOG' (PID 37) exiting, code -1
+//
+// Read the two numbers together. `err=0x6` is the CPU saying write / user /
+// NOT PRESENT. `pte=0x800000004a851067` is that page's live PTE: bit 0
+// PRESENT, bit 1 WRITABLE, bit 2 USER, bit 5 ACCESSED, bit 6 DIRTY, bit 63 NX.
+// The page is present, writable from Ring 3, and the DIRTY bit says a write to
+// it has ALREADY COMPLETED. There were 770 MB of physical memory free and the
+// VMA permits the write. Nothing was wrong with the mapping at all.
+//
+// This is a SPURIOUS PAGE FAULT and it is architecturally permitted. Both
+// vendors document it: a not-present-to-present transition needs no
+// invalidation for correctness, but the processor MAY still deliver a fault
+// from stale paging information (Intel SDM Vol 3 "Propagation of Paging-
+// Structure Changes to Multiple Processors"; AMD APM Vol 2 likewise). Every
+// mature kernel handles it - Linux has had spurious_kernel_fault() for this
+// exact case for twenty years. MayteraOS had no such path: mm_fault() saw a
+// PRESENT PTE, fell through its two recoverable branches, and returned -1,
+// which is a SIGSEGV and a dead process.
+//
+// WHY IT SHOWS UP NOW AND WHY IT LOOKS LIKE A MEMORY BUG. It needs a thread to
+// be running where the stale information is, so it is a function of SMP and of
+// migration, not of allocation size: three earlier MEMHOG runs on the same VM
+// wrote and byte-verified the same 64 MB with zero faults, and the run that
+// failed was the one with a DOS guest running beside it. From Ring 3 the
+// symptom is indistinguishable from running out of memory - malloc returns a
+// good pointer, the app's own NULL check passes, and it dies PART OF THE WAY
+// THROUGH the buffer - which is character for character the two standing
+// reports this ticket was opened for (DOSUSER's memset of DOS_MEM_SIZE on the
+// owner's iMac, and COMPCEIL 11.67 MB into a 27.82 MB buffer).
+//
+// THE RULE, and it is deliberately narrow:
+//
+//   Swallow ONLY when the CPU said NOT-PRESENT (err bit 0 clear) and the live
+//   PTE both is present AND already permits the exact access that faulted.
+//
+// err bit 0 SET is a genuine protection violation and must never be swallowed;
+// that is the branch mprotect, W^X and COW all express themselves through. A
+// PTE that does not permit the access is a real fault too. So the only thing
+// this can hide is a fault that would have succeeded on re-execution anyway.
+//
+// AND IT IS BOUNDED, because swallowing a fault that keeps recurring would turn
+// a crash into a hang, which is worse. If the same address faults spuriously
+// more than SPURIOUS_MAX times in a row on one core, we stop swallowing, report
+// SPURIOUS_LOOP, and fall through to the old behaviour. A hang is the one
+// failure mode this kernel has paid for most often; it is not being introduced
+// to fix a crash.
+// ===========================================================================
+#define SPURIOUS_MAX 16u
+
+static uint64_t g_spur_addr[MAYTERA_MAX_CPUS];
+static uint32_t g_spur_run[MAYTERA_MAX_CPUS];
+static uint64_t g_spur_total;          // swallowed, since boot, all cores
+
+// Returns 1 if this core may swallow a spurious fault at `page_addr`.
+// Per-CPU, no lock: written with IF=0 in the fault handler by the only core
+// that reads it.
+static int mmf_spurious_allow(uint64_t page_addr) {
+    uint32_t c = smp_this_cpu();
+    if (c >= MAYTERA_MAX_CPUS) return 0;
+    if (g_spur_addr[c] == page_addr) {
+        if (g_spur_run[c] >= SPURIOUS_MAX) return 0;
+        g_spur_run[c]++;
+    } else {
+        g_spur_addr[c] = page_addr;
+        g_spur_run[c]  = 1;
+    }
+    return 1;
+}
+
+uint64_t mm_spurious_faults(void) { return g_spur_total; }
+
 int mm_fault(struct process *p, uint64_t fault_addr, uint64_t error_code) {
-    if (!p || p->cr3 == 0) return -1;
+    // #dosmem: clear the slot first, so a stale reason from an EARLIER fault on
+    // this core can never be reported against this one. That is exactly the
+    // shape of the CR2 defect f6865391 fixed two days ago (a per-CPU
+    // architectural value read later and attributed to the wrong event), and
+    // an instrument built to explain faults must not repeat it.
+    mmf_set(MMF_R_NONE);
+    if (!p || p->cr3 == 0) { mmf_set(MMF_R_NO_PROC); return -1; }
 
     uint64_t page_addr = fault_addr & ~(VMM_PAGE_SIZE_4K - 1);
     uint64_t pml4 = p->cr3;
     uint64_t pte = vmm_get_pte_in(pml4, page_addr);
 
     if (pte & VMM_FLAG_PRESENT) {
+        // #dosmem: SPURIOUS FAULT. The CPU said NOT-PRESENT (err bit 0 clear)
+        // but the PTE is present and already permits this exact access, so
+        // re-executing the instruction will succeed. See the block comment
+        // above mmf_spurious_allow(). Deliberately FIRST: it is the cheapest
+        // test, it cannot mask a protection violation (those arrive with err
+        // bit 0 SET and are excluded here), and putting it after the COW and
+        // USER-bit branches would let those two re-do work for a fault that
+        // does not exist.
+        if (!(error_code & PF_PRESENT)) {
+            int permits = 1;
+            if ((error_code & PF_USER)        && !(pte & VMM_FLAG_USER))     permits = 0;
+            if ((error_code & PF_WRITE)       && !(pte & VMM_FLAG_WRITABLE)) permits = 0;
+            if ((error_code & PF_INSTRUCTION) &&  (pte & VMM_FLAG_NX))       permits = 0;
+            if (permits) {
+                if (mmf_spurious_allow(page_addr)) {
+                    // Drop whatever stale translation this core is holding, so
+                    // the re-execution walks the tables afresh. Local only: the
+                    // page-table content is already correct and every other
+                    // core will walk it correctly too.
+                    vmm_invlpg(page_addr);
+                    g_spur_total++;
+                    mmf_set(MMF_R_SPURIOUS);
+                    // Say it ONCE per boot. A spurious fault is invisible by
+                    // construction after this fix, and a mechanism nobody can
+                    // see fire is one the next person will delete as dead code
+                    // (this tree has shipped several of those).
+                    {
+                        static int said = 0;
+                        if (!said) {
+                            said = 1;
+                            MM_ANOMALY("[VMFAULT] SPURIOUS fault SWALLOWED at 0x%lx "
+                                       "(err=0x%lx said not-present; pte=0x%lx is "
+                                       "present and permits it). Before this existed "
+                                       "the process was killed with SIGSEGV. Reported "
+                                       "once per boot; running total is in mm stats.",
+                                       page_addr, error_code, pte);
+                        }
+                    }
+                    return 0;
+                }
+                // Same address, over and over. Something really is wrong, and a
+                // swallowed fault would now be an infinite loop, which is worse
+                // than the crash. Hand it back to the old path, loudly.
+                mmf_set(MMF_R_SPURIOUS_LOOP);
+                MM_ANOMALY("[VMFAULT] the SAME address 0x%lx has faulted spuriously "
+                           "%u times in a row on cpu %u. NOT swallowing it again: a "
+                           "repeating swallowed fault is a hang, not a fix.",
+                           page_addr, SPURIOUS_MAX, smp_this_cpu());
+                return -1;
+            }
+        }
+
         // Recoverable case 1: a write to a read-only COW page (works for user-
         // AND kernel-mode writes so copy_to_user into a fork-shared buffer is
         // handled too).
@@ -1888,8 +2255,10 @@ int mm_fault(struct process *p, uint64_t fault_addr, uint64_t error_code) {
                 deny = (cv && !(cv->flags & VMA_WRITE));
                 mm_unlock(cmm, cirq);
             }
-            if (deny) return -1;
-            return demand_cow_write(p, page_addr);
+            if (deny) { mmf_set(MMF_R_COW_DENY); return -1; }
+            { int rc = demand_cow_write(p, page_addr);
+              if (rc != 0) mmf_set(MMF_R_COW_FAIL);
+              return rc; }
         }
         // Recoverable case 2: a USER access faulted on a page that is present
         // but lacks the USER bit. This happens inside a demand region when an
@@ -1934,21 +2303,27 @@ int mm_fault(struct process *p, uint64_t fault_addr, uint64_t error_code) {
                 vma_t *v2 = vma_find(mm2, fault_addr);
                 if (v2 && !(v2->flags & VMA_FILE)) {
                     int r2;
-                    if ((error_code & PF_WRITE) && !(v2->flags & VMA_WRITE)) r2 = -1;
-                    else r2 = handle_lazy_fault(mm2, v2, fault_addr);
+                    if ((error_code & PF_WRITE) && !(v2->flags & VMA_WRITE)) {
+                        mmf_set(MMF_R_VMA_NOWRITE); r2 = -1;
+                    } else {
+                        r2 = handle_lazy_fault(mm2, v2, fault_addr);
+                    }
                     mm_unlock(mm2, irq2);
                     return r2;
                 }
                 mm_unlock(mm2, irq2);
             }
+            mmf_set(MMF_R_PRESENT_NOUSER_NOVMA);
+            return -1;
         }
+        mmf_set(MMF_R_PRESENT_PROT);
         return -1;  // NX exec fault, or a genuine protection violation
     }
 
     // Not present: satisfy from the process's VMA list (demand-zero / lazy
     // mmap or file-backed). Requires a per-process mm.
     mm_struct_t *mm = (mm_struct_t *)p->mm;
-    if (!mm) return -1;
+    if (!mm) { mmf_set(MMF_R_NO_MM); return -1; }
 
     // #522 step 2: the lookup AND the handler run under the mm lock. Splitting
     // this into "find under the lock, then drop it and use the pointer" would
@@ -1960,12 +2335,16 @@ int mm_fault(struct process *p, uint64_t fault_addr, uint64_t error_code) {
     uint64_t irq = mm_lock(mm);
 
     vma_t *vma = vma_find(mm, fault_addr);
-    if (!vma) { mm_unlock(mm, irq); return -1; }
+    if (!vma) { mmf_set(MMF_R_NO_VMA); mm_unlock(mm, irq); return -1; }
 
     // A user access must be to a page the VMA actually permits.
-    if ((error_code & PF_WRITE) && !(vma->flags & VMA_WRITE)) { mm_unlock(mm, irq); return -1; }
+    if ((error_code & PF_WRITE) && !(vma->flags & VMA_WRITE)) {
+        mmf_set(MMF_R_VMA_NOWRITE); mm_unlock(mm, irq); return -1;
+    }
     if ((error_code & PF_USER) &&
-        !(vma->flags & (VMA_READ | VMA_WRITE | VMA_EXEC))) { mm_unlock(mm, irq); return -1; }
+        !(vma->flags & (VMA_READ | VMA_WRITE | VMA_EXEC))) {
+        mmf_set(MMF_R_VMA_NOACCESS); mm_unlock(mm, irq); return -1;
+    }
 
     // #630: file-backed mapping is NOT implemented. VMA_FILE can only be set by
     // a caller that supplies a file handle, and #522 rejects that at the mmap
@@ -1973,7 +2352,7 @@ int mm_fault(struct process *p, uint64_t fault_addr, uint64_t error_code) {
     // than a silent demand-zero, so a future file-mmap cannot quietly hand an
     // app a page of zeros where it asked for file contents. See the deletion
     // note above handle_lazy_fault() for why the old handler had to go.
-    if (vma->flags & VMA_FILE) { mm_unlock(mm, irq); return -1; }
+    if (vma->flags & VMA_FILE) { mmf_set(MMF_R_VMA_FILE); mm_unlock(mm, irq); return -1; }
 
     // Anonymous / lazy: demand-zero a fresh page.
     int r = handle_lazy_fault(mm, vma, fault_addr);

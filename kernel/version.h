@@ -69,7 +69,7 @@
 // MED - 4Kn logical sector size read IDENTIFY words 118/119 instead of the
 // correct 117/118. Added ahci_selftest_ncq() (drives ahci_read_ncq/
 // ahci_write_ncq directly, separate scratch LBA from ahci_selftest()),
-// called from ata_init(). VERIFIED on VM <vmid> (q35, two virtio SATA/AHCI
+// called from ata_init(). VERIFIED on VM 2500 (q35, two virtio SATA/AHCI
 // disks): both selftests PASS on real write+readback round-trips -
 // "[AHCI] selftest: write+readback of LBA 2047992 -> PASS" (non-NCQ, no
 // regression) and "[AHCI] selftest_ncq: NCQ write+readback of LBA 2047984
@@ -101,7 +101,7 @@
 // LIVE-VERIFIED TLS certificate-validation kernel. Valid public HTTPS sites
 // (coingecko/yahoo/wttr.in/musicbrainz/archive.org) verify OK + fetch 200;
 // a self-signed and a wrong-host cert are both REJECTED with a certificate
-// error (proven on VM <vmid> against an openssl s_server bad-cert endpoint).
+// error (proven on a test VM against an openssl s_server bad-cert endpoint).
 // #433 xHCI HID enumeration race fix: mark-port-enumerated-on-success +
 // bounded retry, warm-reboot per-port PP off->on power-cycle, CONFIG_EP return
 // check + retry for HID interrupt-IN, and a periodic port re-scan worker.
@@ -365,7 +365,7 @@
 // client instead of replaying plaintext at port 443, and the #333 net
 // self-test is actually CALLED at boot for the first time (it was dead code).
 // b863 (Win16 #278-toolbar): Word 6 toolbar-icon BLACK SQUARES, root-caused
-// and fixed. legacy-app-re method on VM <vmid>: u_peekmessage (win16api.c) had
+// and fixed. legacy-app-re method on a test VM: u_peekmessage (win16api.c) had
 // no win16_trace flush (Word's WinMain loop is PeekMessage-based, per the
 // pre-existing gated [W6PMSG] trace; only u_getmessage flushed, #205), so
 // /WIN16LOG.TXT stayed stale for an entire Word 6 run - fixed that first
@@ -397,7 +397,7 @@
 // the toolbar (measured zero calls even with the real handler in place), but
 // correct and worth keeping for any app that does use it.
 //
-// MEASURED result (VM <vmid>, two screendumps + advancing clock each stage):
+// MEASURED result (a test VM, two screendumps + advancing clock each stage):
 // toolbar buttons no longer render as solid black squares; real bitmap pixel
 // data (including the source DIB's own magenta/0xFF00FF colour-key marker)
 // now reaches the screen. Regression-clean: FreeCell and Golf (MS
@@ -453,7 +453,7 @@
 // I/O, inode/bitmap allocation and i_size stay in C. Live under
 // -DRUST_EXT2_DIRADD, C kept as ext2_dirblock_insert_c for one-line rollback.
 // Build numbers 944..951 were burned by the #446 FPU differential builds.
-#define MAYTERA_BUILD_NUMBER 2285
+#define MAYTERA_BUILD_NUMBER 2400   // #404 disk-mgr Stage 4b: VFS resolver + ext2 write-mount (aux mounts under /MNT). Golden number set by build-golden.sh.
 
 // Version string helper macros
 #define STRINGIFY(x) STRINGIFY_HELPER(x)

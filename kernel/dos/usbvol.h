@@ -47,7 +47,7 @@
 // ---------------------------------------------------------------
 // The probe runs only when the root block device is a USB MSC disk. Two honest
 // reasons: it is the configuration the feature is for (and the one real
-// hardware and VM <vmid> both use), and it is the only one where the device
+// hardware and a test VM both use), and it is the only one where the device
 // CAPACITY can be read (usb_msc_device_t.num_blocks). drivers/ata.h exposes no
 // capacity accessor at all, so on an ATA root there is no bound to check a
 // volume's declared length against and no reliable channel/drive identity to

@@ -347,3 +347,67 @@ void *memccpy(void *dest, const void *src, int c, size_t n) {
     }
     return (void *)0;
 }
+
+// strcasestr - case-insensitive substring search (#745 darkhttpd port, used by
+// its HTTP header field parser). Returns a pointer into haystack, or NULL.
+// Case folding is done inline for ASCII (A=65..Z=90 -> +32) so this has no
+// <ctype.h> dependency.
+static char mt_lc(char c) {
+    if (c >= 65 && c <= 90) return (char)(c + 32);
+    return c;
+}
+char *strcasestr(const char *haystack, const char *needle) {
+    if (!haystack || !needle) return (void *)0;
+    if (!*needle) return (char *)haystack;
+    for (; *haystack; haystack++) {
+        const char *h = haystack;
+        const char *n = needle;
+        while (*h && *n && mt_lc(*h) == mt_lc(*n)) { h++; n++; }
+        if (!*n) return (char *)haystack;
+    }
+    return (void *)0;
+}
+
+// ---------------------------------------------------------------------------
+// <strings.h> (BSD/POSIX) helpers, added for the libedit port (#745). tty.c
+// needs ffs(); the rest are the classic <strings.h> set, implemented as thin
+// wrappers over the <string.h> primitives already in this file so any future
+// consumer that reaches for them finds one honest copy rather than forking it.
+// ---------------------------------------------------------------------------
+int ffs(int i)
+{
+	if (i == 0)
+		return 0;
+	unsigned u = (unsigned)i;
+	int pos = 1;
+	while ((u & 1u) == 0u) {
+		u >>= 1;
+		pos++;
+	}
+	return pos;
+}
+
+void bzero(void *s, size_t n)
+{
+	memset(s, 0, n);
+}
+
+void bcopy(const void *src, void *dst, size_t n)
+{
+	memmove(dst, src, n);
+}
+
+int bcmp(const void *a, const void *b, size_t n)
+{
+	return memcmp(a, b, n);
+}
+
+char *index(const char *s, int c)
+{
+	return strchr(s, c);
+}
+
+char *rindex(const char *s, int c)
+{
+	return strrchr(s, c);
+}
