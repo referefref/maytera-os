@@ -6,7 +6,12 @@
 // hard-wedged the OS; never use it from an app). We do not link the aiclient
 // ReAct tool loop itself because the Studio planner must NOT expose OS tools:
 // it speaks a closed op vocabulary and the model output is parsed as DATA
-// against a fixed JSON schema (prompt-injection hygiene per #449 Nova).
+// against a fixed JSON schema. That closed vocabulary is now the ONLY thing
+// standing between this client and a prompt injection: the kernel keyword
+// screen this line used to cite was removed at #469m aititleinject after it
+// was measured to pass 18 of 18 hostile strings. Keeping the vocabulary
+// closed, and parsing the reply as data, is therefore load-bearing here and
+// must not be relaxed. See docs/AI_PROMPT_INJECTION.md.
 #include "studio.h"
 #include "../../libc/syscall.h"
 #include "../../libc/fcntl.h"
@@ -28,13 +33,15 @@
 #define PLAN_MAX   16
 #define POST_TIMEOUT_MS 90000u
 
-// #745: kimi_chat() returns 0 on success and -1 on any failure. This third
-// value distinguishes "the kernel's prompt-injection screen refused this
-// request" from a network or API error, so ai_command() can say so instead of
-// blaming the network. Studio is a SECOND, independent LLM client: it does not
-// link the shared aiclient, so the kernel chokepoint is the only thing
-// screening it, and this is how that refusal becomes visible to the user.
-#define AI_BLOCKED_BY_GUARD (-3)
+// #469m aititleinject: AI_BLOCKED_BY_GUARD is RETIRED along with the kernel
+// keyword screen that produced it. Studio is a SECOND, independent LLM
+// client (it does not link the shared aiclient), and the kernel POST screen
+// was the only thing looking at its traffic. That screen is gone because it
+// did not work: MEASURED, 18 of 18 hostile strings passed it. What protects
+// Studio is that it drives paint's own document, not the OS tool surface,
+// and that any OS action still needs the #293 capability + consent gate.
+// Stated plainly because this client now has NO prompt screen at all.
+
 
 static char g_key[256];
 static int  g_key_state = -1;         // -1 unknown, 0 missing, 1 present
@@ -245,7 +252,7 @@ static int           g_job_status = 0;
 static char          g_headers[512];
 
 // Start the POST of the body already built in g_body. Returns 0 (started),
-// AI_BLOCKED_BY_GUARD, or -1 (no key / no buffers / start failed).
+// or -1 (no key / no buffers / start failed).
 static int kimi_start(void) {
     if (!ai_available() || !buffers_ok()) return -1;
     if (g_job >= 0) return -1;                // one request at a time
@@ -255,12 +262,6 @@ static int kimi_start(void) {
     g_resp[0] = 0;
     g_job_status = 0;
     int job = http_post_start(API_URL, g_headers, g_body);
-    // #745: the kernel's prompt-injection screen refuses an LLM request
-    // carrying a HIGH-severity match, with its own code. Retrying is
-    // pointless (the body will not change) and reporting it as a network
-    // failure would be a lie that also hides a security event, so bail
-    // immediately and distinctly. A silent block is its own bug.
-    if (job == NET_ERR_AIGUARD) return AI_BLOCKED_BY_GUARD;
     if (job < 0) return -1;
     g_job = job;
     g_job_t0 = uptime_ms();
@@ -300,7 +301,7 @@ static int kimi_poll(void) {
 
 // Blocking single-turn chat: builds system + one user message, runs the
 // transport to completion. Returns 0 ok (content in g_content), -1 on any
-// net/HTTP/parse failure, AI_BLOCKED_BY_GUARD if the kernel screen refused.
+// net/HTTP/parse failure.
 static int kimi_chat(const char *system_prompt, const char *user_msg) {
     if (!ai_available() || !buffers_ok()) return -1;
     int n = body_open(system_prompt);
@@ -308,7 +309,6 @@ static int kimi_chat(const char *system_prompt, const char *user_msg) {
     body_close(n);
     for (int attempt = 0; attempt < 2; attempt++) {
         int rc = kimi_start();
-        if (rc == AI_BLOCKED_BY_GUARD) return AI_BLOCKED_BY_GUARD;
         if (rc < 0) { sys_sleep(500); continue; }
         int r;
         while ((r = kimi_poll()) == 0) sys_sleep(20);
@@ -443,14 +443,6 @@ int ai_command(const char *prompt, char *reply, int cap) {
              g_doc.sel_active ? "active" : "none", prompt);
 
     int chat_rc = kimi_chat(k_system_planner, user);
-    if (chat_rc == AI_BLOCKED_BY_GUARD) {
-        // #745: refused by the kernel's prompt-injection screen before anything
-        // reached the wire. Not retryable and not a network fault; say which.
-        if (reply) strlcpy(reply,
-            "Blocked by the prompt-injection screen. Nothing was sent to the AI.",
-            (size_t)cap);
-        return -1;
-    }
     if (chat_rc != 0) {
         if (reply) strlcpy(reply, "AI request failed (network or API error).", (size_t)cap);
         return -1;
@@ -684,10 +676,6 @@ int ai_assist_send(const char *msg) {
     }
     body_close(n);
     int rc = kimi_start();
-    if (rc == AI_BLOCKED_BY_GUARD) {
-        turn_add(2, "Blocked by the prompt-injection screen. Nothing was sent to the AI.");
-        return -1;
-    }
     if (rc < 0) {
         turn_add(2, "AI request failed to start (network or API error).");
         return -1;

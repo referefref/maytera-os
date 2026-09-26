@@ -51,7 +51,6 @@ extern size_t dos_fm_event_size(void);
 extern int64_t dos_fm_host_call(uint32_t op, uint64_t a1, uint64_t a2,
                                 uint64_t a3, uint32_t pid);
 #include "../security/validate.h" // #500: spawn_impl argv two-level deref + SYS_IOCTL boundary
-#include "../security/aiguard.h"  // #745: LLM prompt-injection screen (nova.c + aiguard.rs)
 #include "../version.h"
 #include "../serial.h"
 #include "../string.h"
@@ -2097,8 +2096,6 @@ static int64_t syscall_dispatch_inner(uint64_t num, uint64_t arg1, uint64_t arg2
             return sys_http_fetch_progress((int)arg1, (int *)arg2, (uint32_t *)arg3, (uint32_t *)arg4);
         case SYS_HTTP_POST_START:
             return sys_http_post_start((const char *)arg1, (const char *)arg2, (const char *)arg3);
-        case SYS_AI_SCAN:   // #745
-            return sys_ai_scan((const char *)arg1, (void *)arg2);
         case SYS_HTTP_POST_POLL:
             return sys_http_post_poll((int)arg1, (int *)arg2, (uint32_t *)arg3);
         case SYS_HTTP_POST_READ:
@@ -2677,6 +2674,10 @@ static int64_t syscall_dispatch_inner(uint64_t num, uint64_t arg1, uint64_t arg2
         // args only, so no argtab descriptor is required.
         case SYS_CAP_INJECT_KEY:
             return sys_cap_inject_key((int)arg1, (int)arg2);
+        // #469 AI-VISION: the RELEASE half. Same gate, same guard, same
+        // synthetic provenance; only the event type differs.
+        case SYS_CAP_INJECT_KEY_UP:
+            return sys_cap_inject_key_up((int)arg1, (int)arg2);
         case SYS_CAP_INJECT_MOUSE:
             return sys_cap_inject_mouse((int)arg1, (int)arg2, (int)arg3,
                                         (int)arg4, (uint32_t)arg5);
@@ -5949,13 +5950,28 @@ static void async_post_worker(void *arg) {
             if (j->state != 0 || !j->url) continue;
             did = 1;
             uint8_t *body = 0; uint32_t len = 0; int status = 0;
+            // #postfix: remember what was attempted. Userland only ever saw
+            // pstate==2 and printed "Network error (POST returned -1)", so the
+            // one number that identified the >16 KB TLS-record defect (the size
+            // of the request) was never recorded anywhere and diagnosing it
+            // needed a VM bisect.
+            uint32_t reqlen = j->reqbody ? (uint32_t)strlen(j->reqbody) : 0;
             int r = https_post(j->url, j->headers ? j->headers : "",
                                j->reqbody ? j->reqbody : "",
                                &body, &len, &status);
             net_fetch_report_owner(j->url, r, status, j->owner);   // #549 breaker; #netfix2 owner
             j->status = status;
             if (r >= 0 && body) { j->body = body; j->len = len; }
-            else { if (body) kfree(body); j->len = 0; }
+            else {
+                if (body) kfree(body);
+                j->len = 0;
+                // #postfix: give the poller something it can name. HTTP status
+                // codes are positive, so a NEGATIVE status is unambiguously a
+                // transport error and can never be mistaken for a real reply.
+                if (status == 0) j->status = r;
+                kprintf("[HTTPPOST] job %d FAILED rc=%d http=%d reqbody=%u bytes url=%s\n",
+                        i, r, status, (unsigned)reqlen, j->url ? j->url : "(null)");
+            }
             async_post_free_req(j);
             // Publish terminal state LAST so a poller never reads done/error
             // before body/len/status are settled.
@@ -6030,52 +6046,21 @@ int64_t sys_http_post_start(const char *uurl, const char *uheaders, const char *
         return -1;
     }
 
-    // =======================================================================
-    // #745 THE PROMPT-INJECTION CHOKEPOINT.
+    // #469m aititleinject: THE #745 PROMPT-INJECTION SCREEN WAS HERE AND IT
+    // HAS BEEN REMOVED. It ran the vendored Nova keyword ruleset over the
+    // assembled body and refused a HIGH match. MEASURED 2026-09-26: 18 of 18
+    // hostile 48-byte strings written in one sitting passed it clean, while
+    // an ordinary window title ("Contract as signed.pdf") tripped it at HIGH
+    // on the literal "act as". A keyword layer on adversarial text is a race
+    // the defender loses, and this one was also costing false positives.
     //
-    // This is the ONE funnel every LLM client in the tree already passes
-    // through (userland/libc/aiclient.c and the separate userland/apps/paint/
-    // ai.c both call http_post_start), and the request body is sitting in
-    // KERNEL memory here, fully assembled, before anything is queued. Screening
-    // at this single point covers every existing route AND every route that
-    // does not exist yet, which a per-client guard cannot: paint/ai.c is a
-    // second, independent LLM client that would never have known about one.
-    //
-    // aiguard_screen_post_rs() returns ALLOW immediately for any POST that is
-    // not an LLM request, so the App Store, the #294 build service and
-    // ClassiCube pay one substring scan and nothing else.
-    //
-    // POLICY: HIGH severity BLOCKS. Lower severities are allowed and AUDITED.
-    // Nothing here is silent in either direction: a block returns a DISTINCT
-    // code (NET_ERR_AIGUARD, not the generic -1) so the client can say what
-    // happened, and both outcomes write a record naming the actor pid, the
-    // rule, the severity and the literal that matched.
-    // =======================================================================
-    {
-        int blen = 0;
-        while (kb[blen]) blen++;
-        aiguard_verdict_t v;
-        int verdict = aiguard_screen_post_rs(kb, (uint64_t)blen, &v);
-        if (v.llm && verdict != AIGUARD_ALLOW) {
-            process_t *ap = proc_current();
-            unsigned int apid = ap ? (unsigned int)ap->pid : 0u;
-            char det[160];
-            snprintf(det, sizeof(det),
-                     "%s llm-post rule=%s sev=%d matched=%s%s",
-                     verdict == AIGUARD_BLOCK ? "BLOCKED" : "flagged",
-                     v.rule, v.severity, v.matched,
-                     v.truncated ? " (scan truncated)" : "");
-            seclog_report_ai_injection(apid, det);
-            kprintf("[AIGUARD] %s pid=%u rule=%s cat=%s sev=%d matched='%s'\n",
-                    verdict == AIGUARD_BLOCK ? "BLOCK" : "annotate",
-                    apid, v.rule, v.category, v.severity, v.matched);
-            if (verdict == AIGUARD_BLOCK) {
-                fetchown_abandon_rs(FETCHOWN_TAB_POST, (uint32_t)slot);   // task #36
-                kfree(ku); kfree(kh); kfree(kb);
-                return NET_ERR_AIGUARD;
-            }
-        }
-    }
+    // Nothing replaces it HERE, deliberately. Text semantics are not a thing
+    // Ring 0 can decide. The controls that bind are the ones that already
+    // did all the work: the #293 capability tokens and the consent the
+    // trusted compositor draws, which no amount of persuading the model can
+    // forge. The client-side change is structural: untrusted bytes are kept
+    // out of instruction positions rather than screened once they are in
+    // one. See docs/AI_PROMPT_INJECTION.md.
 
     kprintf("[HTTPPOST] queued slot=%d %s\n", slot, ku);
     j->headers = kh; j->reqbody = kb;
@@ -6089,39 +6074,6 @@ int64_t sys_http_post_start(const char *uurl, const char *uheaders, const char *
     // is a lock and a NULL check, and its first action is a full table scan.
     wake_up_all(&g_post_job_wq);
     return slot;
-}
-
-// #745 SYS_AI_SCAN: screen ONE untrusted string against the kernel-owned
-// ruleset and hand the caller the rule that fired.
-//
-// This is deliberately INFORMATIONAL. It cannot be used to turn screening off
-// and it is not what makes the guard binding: a client that never calls it is
-// still blocked at sys_http_post_start(). It exists because a silent block is
-// its own bug, and a client can only tell the user "a tool observation from
-// files.read matched DirectPromptInjection (HIGH) on 'ignore all previous
-// instructions'" if something gives it those words.
-int64_t sys_ai_scan(const char *utext, void *uout) {
-    if (!utext || !uout) return -1;
-    char *kt = kstrdup_opt(utext);
-    if (!kt) return -14;
-    int len = 0;
-    while (kt[len]) len++;
-
-    aiguard_verdict_t v;
-    int verdict = aiguard_screen_rs(kt, (uint64_t)len, &v);
-    kfree(kt);
-
-    if (verdict != AIGUARD_ALLOW) {
-        process_t *ap = proc_current();
-        unsigned int apid = ap ? (unsigned int)ap->pid : 0u;
-        char det[160];
-        snprintf(det, sizeof(det), "scan %s rule=%s sev=%d matched=%s",
-                 verdict == AIGUARD_BLOCK ? "HIGH" : "low", v.rule,
-                 v.severity, v.matched);
-        seclog_report_ai_injection(apid, det);
-    }
-    if (copy_to_user(uout, &v, sizeof(v)) != 0) return -14;
-    return verdict;
 }
 
 int64_t sys_http_post_poll(int id, int *ustatus, uint32_t *ulen) {
@@ -6303,36 +6255,6 @@ int64_t sys_http_post(const char *uurl, const char *uheaders, const char *ubody,
         if (kbody) kfree(kbody);
         return -1;
     }
-    // #745: the same screen as the async path, and it is LOAD-BEARING, not
-    // defensive. A first sweep concluded SYS_HTTP_POST had no live userland
-    // caller because the async trio replaced it at #264. That was WRONG:
-    // userland/apps/settings/main.c ai_test() posts
-    // {"model":...,"messages":[{"role":"user","content":"ping"}]} to whichever
-    // provider the user configured, through THIS entry point. Screening only
-    // the async path would have left a real LLM route open while the comment
-    // above it claimed a chokepoint. Same policy, same audit, same code.
-    {
-        int blen = 0;
-        while (kbody[blen]) blen++;
-        aiguard_verdict_t v;
-        int verdict = aiguard_screen_post_rs(kbody, (uint64_t)blen, &v);
-        if (v.llm && verdict != AIGUARD_ALLOW) {
-            unsigned int apid = (unsigned int)cur->pid;
-            char det[160];
-            snprintf(det, sizeof(det), "%s llm-post(sync) rule=%s sev=%d matched=%s",
-                     verdict == AIGUARD_BLOCK ? "BLOCKED" : "flagged",
-                     v.rule, v.severity, v.matched);
-            seclog_report_ai_injection(apid, det);
-            kprintf("[AIGUARD] %s pid=%u rule=%s cat=%s sev=%d matched='%s'\n",
-                    verdict == AIGUARD_BLOCK ? "BLOCK" : "annotate",
-                    apid, v.rule, v.category, v.severity, v.matched);
-            if (verdict == AIGUARD_BLOCK) {
-                kfree(kurl); kfree(khdr); kfree(kbody);
-                return NET_ERR_AIGUARD;
-            }
-        }
-    }
-
     // Scheme check on the kernel copy (was a raw url[0..4] read).
     int https = (kurl[0]=='h'&&kurl[1]=='t'&&kurl[2]=='t'&&kurl[3]=='p'&&kurl[4]=='s');
 
@@ -7804,6 +7726,31 @@ int64_t sys_cap_inject_key(int win, int keycode) {
     return 0;
 }
 
+// #469 AI-VISION: the RELEASE half of sys_cap_inject_key. Byte-for-byte the
+// same authorization path (cap_inject_guard enforces the grant, the window
+// scope, the consent-surface/lock guard and consumes one use) and the same
+// INPUT_SRC_SYNTHETIC provenance, so it can no more manufacture input credit
+// than the press can. Without it an injected button went down and never came
+// up, so an edge-detecting app (an emulator, a menu) could be driven exactly
+// once per key and never again.
+int64_t sys_cap_inject_key_up(int win, int keycode) {
+    process_t *p = NULL;
+    int64_t g = cap_inject_guard(&p, win);
+    if (g != 0) return g;
+    gui_event_t ev; memset(&ev, 0, sizeof(ev));
+    ev.type = EVENT_KEY_UP;
+    ev.keycode = keycode;
+    // Mirror the press: a printable ASCII keycode carries key_char, so an app
+    // that matches on the character (rather than the keycode) sees the release
+    // of the SAME key it saw pressed.
+    if (keycode >= 0x20 && keycode <= 0x7E)
+        ev.key_char = (char)keycode;
+    user_window_queue_event(win, &ev, INPUT_SRC_SYNTHETIC);
+    (void)bootlog_write("[CAP] input.inject key-up: pid=%u win=%d keycode=%d (synthetic)",
+                        (unsigned)p->pid, win, keycode);
+    return 0;
+}
+
 int64_t sys_cap_inject_mouse(int win, int x, int y, int type, uint32_t button) {
     process_t *p = NULL;
     int64_t g = cap_inject_guard(&p, win);
@@ -8154,6 +8101,11 @@ static int uw_slot_for_window(window_t *w) {
     }
     return -1;
 }
+
+// #469 (ai-vision): the one PUBLIC accessor for the same lookup, so
+// sys_wm_get_windows() in gui/window.c can report each window's owning-app
+// handle without a second copy of the table walk. Declared in gui/window.h.
+int userwin_slot_for_window(window_t *w) { return uw_slot_for_window(w); }
 
 // ============================================================================
 // CROSS-WINDOW DRAG ("docking"): SYS_DRAG_* 401-406.
@@ -9315,21 +9267,63 @@ static int64_t sys_win_create_impl(const char *utitle, int x, int y,
         x = px; y = py;
     }
 
-    if (!winbuf_geom_ok_rs(width, height)) return -1;
+    // (#sqearlyexit) EVERY FAILURE PATH BELOW SAYS WHY, ON SERIAL AND IN THE
+    // BOOT LOG. This syscall had five ways to return -1 and not one of them
+    // logged anything, so an app that got -1 from win_create() vanished with
+    // no window, no message and nothing on the console to say what had
+    // happened. That is exactly the report this was found chasing: "Maytera
+    // Squadron silently exits early, no error, no window, nothing on screen".
+    // The app cannot diagnose this for itself - -1 is all it is told, and the
+    // reasons are all kernel-side resource limits it cannot see. Reproduced
+    // deliberately: with all MAX_USER_WINDOWS slots occupied, win_create()
+    // returns -1 and the app exits before its first frame, which is the
+    // reported symptom exactly.
+    if (!winbuf_geom_ok_rs(width, height)) {
+        bootlog_write("[WINCREATE] REFUSED pid=%u title='%s': geometry %dx%d "
+                      "outside policy (winbuf_geom_ok_rs)",
+                      proc_current() ? proc_current()->pid : 0,
+                      title ? title : "?", width, height);
+        return -1;
+    }
 
     // Find free window slot
     int slot = -1;
+    int inuse = 0;
     for (int i = 0; i < MAX_USER_WINDOWS; i++) {
         if (!user_windows[i].window) {
-            slot = i;
-            break;
+            if (slot < 0) slot = i;
+        } else {
+            inuse++;
         }
     }
-    if (slot < 0) return -1;
+    if (slot < 0) {
+        // The table is SYSTEM-WIDE, not per process: one app that opens many
+        // windows, or one that leaks them, starves every other app. Name the
+        // owners, because "no free slot" on its own does not say who took
+        // them.
+        bootlog_write("[WINCREATE] REFUSED pid=%u title='%s': no free "
+                      "user_windows[] slot, all %d in use",
+                      proc_current() ? proc_current()->pid : 0,
+                      title ? title : "?", MAX_USER_WINDOWS);
+        for (int i = 0; i < MAX_USER_WINDOWS; i++) {
+            if (!user_windows[i].window) continue;
+            bootlog_write("[WINCREATE]   slot %d held by pid=%u '%s'",
+                          i, user_windows[i].owner_pid,
+                          user_windows[i].window->title);
+        }
+        return -1;
+    }
 
     // Create the window
     window_t *win = window_create(title, x, y, width, height);
-    if (!win) return -1;
+    if (!win) {
+        bootlog_write("[WINCREATE] REFUSED pid=%u title='%s': window_create() "
+                      "returned NULL (kernel heap or MAX_WINDOWS)",
+                      proc_current() ? proc_current()->pid : 0,
+                      title ? title : "?");
+        return -1;
+    }
+    (void)inuse;
 
     // Get content area dimensions
     int32_t wx, wy, ww, wh;
@@ -9342,6 +9336,10 @@ static int64_t sys_win_create_impl(const char *utitle, int x, int y,
     extern void *kmalloc(size_t size);
     uint32_t *content_buffer = kmalloc((size_t)cb_bytes);
     if (!content_buffer) {
+        bootlog_write("[WINCREATE] REFUSED pid=%u title='%s': kmalloc(%llu) for "
+                      "the %dx%d content buffer failed",
+                      proc_current() ? proc_current()->pid : 0,
+                      title ? title : "?", (unsigned long long)cb_bytes, ww, wh);
         window_destroy(win);
         return -1;
     }
@@ -9384,6 +9382,10 @@ static int64_t sys_win_create_impl(const char *utitle, int x, int y,
                                   user_window_draw_handler,
                                   NULL);
     if (app_id < 0) {
+        bootlog_write("[WINCREATE] REFUSED pid=%u title='%s': wm_register_app() "
+                      "failed, no free app registration slot",
+                      proc_current() ? proc_current()->pid : 0,
+                      title ? title : "?");
         window_destroy(win);
         user_windows[slot].window = NULL;
         return -1;

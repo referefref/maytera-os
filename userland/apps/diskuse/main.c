@@ -974,7 +974,7 @@ static void draw_partitions(void) {
         char hint[128];
         blk_dev_t *dd = cur_disk();
         char tot[32]; fmt_bytes((dd ? dd->sectors : 0) * SECTOR_BYTES, tot, sizeof tot);
-        snprintf(hint, sizeof hint, "Disk %s  |  -/+ resize selected by 4 MiB  |  double-click a row to change type", tot);
+        snprintf(hint, sizeof hint, "Disk %s  |  arrows: Left/Right disk, Up/Down layout  |  -/+ resize 4 MiB  |  dbl-click row to change type", tot);
         win_draw_text_ttf(win, px + 12, ly + lh - 20, hint, 11, cdim);
     }
     if (g_dirty && !boot)
@@ -1359,8 +1359,17 @@ static void handle_key(gui_event_t *ev) {
             else if (c == 8 || kc == GUI_KEY_LEFT) u_go_up();
             break;
         case TAB_PART:
+            // Up/Down move within the selected disk's layout; Left/Right (or
+            // PageUp/PageDown) switch which disk is selected. Disk selection was
+            // mouse-only, and headless/VM mouse clicks do not land (#334), so
+            // keyboard disk selection is required to drive this tab (2026-09-23).
             if (kc == GUI_KEY_UP && g_lay_sel > 0) g_lay_sel--;
             else if (kc == GUI_KEY_DOWN && g_lay_sel < g_nlayout - 1) g_lay_sel++;
+            else if ((kc == GUI_KEY_LEFT || kc == GUI_KEY_PGUP) && g_disk_sel > 0) {
+                g_disk_sel--; parse_parts(); layout_from_disk();
+            } else if ((kc == GUI_KEY_RIGHT || kc == GUI_KEY_PGDN) && g_disk_sel < g_ndisks - 1) {
+                g_disk_sel++; parse_parts(); layout_from_disk();
+            }
             break;
         case TAB_FORMAT:
             if (g_fmt_focus == 1) {

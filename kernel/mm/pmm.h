@@ -56,6 +56,12 @@ const char *pmm_mmap_type_name(uint32_t type);
 // One past the highest physical address in the boot memory map.
 uint64_t pmm_phys_limit(void);
 
+// #procspawn: the [lo, hi) PHYSICAL range the allocator will ever consider,
+// in bytes. Needed by mm/vmm.c to ask the page tables whether every page in
+// that window is actually writable from Ring 0 (it was not: see
+// vmm_reserve_unwritable_identity_pages()).
+void pmm_managed_range(uint64_t *lo, uint64_t *hi);
+
 // Diagnostic: dump the boot memory map (see the note in pmm.c on why descriptor
 // ADJACENCY is the only raw-UEFI-type signal that survives the bootloader).
 void pmm_dump_mmap(void);

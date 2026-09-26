@@ -49,6 +49,7 @@
 #include "unistd.h"
 #include "string.h"
 #include "syscall.h"
+#include "stdio.h"   // #appwrite: snprintf for the refusal line
 
 // THE ONE HOME JOIN. Builds "<home>/<sub>/<name>" into out; `sub` may be NULL
 // or "" for "<home>/<name>". Returns 0 on success, -1 if it will not fit. FAILS
@@ -137,6 +138,46 @@ int userconf_open_read(const char *name, const char *legacy) {
 
 // Open a per-user preference for WRITING. Always the per-user path, never the
 // legacy one: writing back to /CONFIG is the thing being eliminated.
+// ---------------------------------------------------------------------------
+// #appwrite: A FAILED PREFERENCE WRITE MUST LEAVE A TRACE SOMEWHERE THE OWNER
+// CAN READ, AND UNTIL NOW IT DID NOT.
+//
+// MEASURED on golden 2480 (build a1a344eb, VM 2498): a Ring-3 process at
+// uid 1000 gets -13 from sys_open(O_WRONLY|O_CREAT) for every destination
+// outside its own home, and on a machine with no account yet (which is every
+// freshly built golden, because #226 ships no /CONFIG/PASSWD on purpose) that
+// includes its home too, because userhome_root() resolves to "/".
+//
+// The two mechanisms this userland uses to TELL somebody a save failed are
+// themselves writes to those same places: notify_post() spools through this
+// very function, and Settings' save_failed() writes /SETLOG.TXT at the ext2
+// root. So a careful caller that checks every return value still produces
+// nothing a person can see. That is why a facility that has never worked
+// looked like an assortment of unrelated app bugs.
+//
+// sys_bootlog() is the one reporting channel MEASURED to work from a uid-1000
+// app on this image: every line appears on serial as
+// "[BOOTLOG] [USERSPACE uid=1000] ..." and is replayed into /BOOTLOG.TXT,
+// which the kernel writes, so it does not depend on the permission that just
+// failed. It is not a user-visible toast and this does not pretend to be one;
+// it is the difference between a diagnosable failure and an invisible one.
+//
+// BOUNDED, for the same reason perms.c bounds [PERMS-DENY]: a preference save
+// inside an app's event loop could otherwise flood the boot log and push the
+// earlier, more informative lines out of it.
+#define UC_REFUSAL_LOG_MAX 32
+void uc_report_write_refusal(const char *what, const char *path, int rc) {
+    static int logged = 0;
+    if (logged >= UC_REFUSAL_LOG_MAX) return;
+    logged++;
+    char msg[224];
+    snprintf(msg, sizeof(msg),
+             "[FSDENY-U] %s REFUSED path=%s rc=%d uid=%d%s",
+             what ? what : "?", path ? path : "?", rc, getuid(),
+             logged == UC_REFUSAL_LOG_MAX ? " (log cap reached)" : "");
+    (void)sys_bootlog(msg);
+}
+
 int userconf_open_write(const char *name) {
     char p[256];
     if (userconf_path(name, p, sizeof(p)) != 0) return -1;
@@ -156,7 +197,9 @@ int userconf_open_write(const char *name) {
         dir[cut] = '\0';
         sys_mkdir(dir, 0755);
     }
-    return sys_open(p, 0x41 | 0x200 /*O_WRONLY|O_CREAT|O_TRUNC*/);
+    int fd = sys_open(p, 0x41 | 0x200 /*O_WRONLY|O_CREAT|O_TRUNC*/);
+    if (fd < 0) uc_report_write_refusal("userconf_open_write", p, fd);
+    return fd;
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +305,17 @@ int userconf_finish_write(int fd, const void *buf, unsigned long len) {
 int userconf_write_all(const char *path, const void *buf, unsigned long len) {
     if (!path) return -1;
     int fd = sys_open(path, 0x41 | 0x200 /*O_WRONLY|O_CREAT|O_TRUNC*/);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        // #appwrite: the OTHER entry point, and the one that matters most for
+        // diagnosability. Settings' save_failed() reports into setlog(), which
+        // lands here with "/SETLOG.TXT" at the ext2 root, root-owned 0755, and
+        // deliberately discards the result because "there is no fallback for a
+        // breadcrumb". Correct as far as it goes, and it means the app's ENTIRE
+        // failure-reporting channel is a write to a path a non-root session
+        // cannot create. Every panel that dutifully checks its save and calls
+        // save_failed() has been writing into a void.
+        uc_report_write_refusal("userconf_write_all", path, fd);
+        return -1;
+    }
     return userconf_finish_write(fd, buf, len);
 }

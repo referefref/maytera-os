@@ -89,17 +89,17 @@
 # dataflow, which this tool states plainly that it does not do. That is the
 # textbook case for this section: safe for a documented reason the regex cannot
 # model.
-proc/fdlayer.c:877: if (path && path[0]
-proc/fdlayer.c:1095: { int z = 0; while (path[z] && z < 259)
-proc/fdlayer.c:1131: { int z = 0; while (path[z] && z < 259)
-proc/fdlayer.c:1175: if (g_root_ext2 && path && path[0]
-proc/fdlayer.c:1178: while (path[z] && z < 258)
-proc/fdlayer.c:1190: { int z = 0; while (rel[z] && z < 255)
-proc/syscall.c:6244: if (net_fetch_blocked()) { if (status_out)
-proc/syscall.c:6245: int https = (url[0]
-proc/syscall.c:6250: if (r < 0) { if (rbody) kfree(rbody);
-proc/syscall.c:6252: if (rbody && n) memcpy(kbuf, rbody, n);
-proc/syscall.c:6243: if (status_out) *status_out = status;
+proc/fdlayer.c:916: if (path && path[0]
+proc/fdlayer.c:1148: { int z = 0; while (path[z] && z < 259)
+proc/fdlayer.c:1184: { int z = 0; while (path[z] && z < 259)
+proc/fdlayer.c:1228: if (g_root_ext2 && path && path[0]
+proc/fdlayer.c:1231: while (path[z] && z < 258)
+proc/fdlayer.c:1243: { int z = 0; while (rel[z] && z < 255)
+proc/syscall.c:6196: if (net_fetch_blocked()) { if (status_out)
+proc/syscall.c:6197: int https = (url[0]
+proc/syscall.c:6202: if (r < 0) { if (rbody) kfree(rbody);
+proc/syscall.c:6204: if (rbody && n) memcpy(kbuf, rbody, n);
+proc/syscall.c:6195: if (status_out) *status_out = status;
 
 # --- proc/procinfo.c : c_cstr_into() is the tail of the ROW BUILDERS, and the
 # AC window for those is opened by the CALLER, around the whole builder call
@@ -139,8 +139,8 @@ proc/syscall.c:652: ke.gid = t[i].gid;
 # are flagged. The two genuine Ring-3 reads in this function (the argv pointer
 # array, and each argument string) are a copy_from_user() and a
 # strncpy_from_user() respectively.
-proc/syscall.c:4256: char *kargp[64];
-proc/syscall.c:4261: if (!kargp[i]) break;
+proc/syscall.c:4260: char *kargp[64];
+proc/syscall.c:4265: if (!kargp[i]) break;
 
 # --- #112 proc/syscall.c sys_spawn_env : the same B3 attribution artefact as
 # `kargp` directly above, in the same function's new sibling.
@@ -151,11 +151,11 @@ proc/syscall.c:4261: if (!kargp[i]) break;
 # function are all wrapped: copy_from_user() for the request struct,
 # copy_from_user() for the envp pointer array, and validate_user_string() +
 # strncpy_from_user() for each entry string.
-proc/syscall.c:4575: char *kenvp[SC_ENV_MAX_ENTRIES + 1];
-proc/syscall.c:4586: char *uenv[SC_ENV_MAX_ENTRIES];
-proc/syscall.c:4594: if (!uenv[i]) break;
-proc/syscall.c:4606: kenvp[kenvc] = ebuf[kenvc];
-proc/syscall.c:4610: kenvp[kenvc] = NULL;
+proc/syscall.c:4579: char *kenvp[SC_ENV_MAX_ENTRIES + 1];
+proc/syscall.c:4590: char *uenv[SC_ENV_MAX_ENTRIES];
+proc/syscall.c:4598: if (!uenv[i]) break;
+proc/syscall.c:4610: kenvp[kenvc] = ebuf[kenvc];
+proc/syscall.c:4614: kenvp[kenvc] = NULL;
 
 # --- #112 proc/syscall.c spawn_impl / open_redir_file : `path`, `infile` and
 # `outfile` became VISIBLE to B3 for the first time at #112, and the reason is
@@ -177,32 +177,32 @@ proc/syscall.c:4610: kenvp[kenvc] = NULL;
 # This is EXEMPT rather than KNOWN_GAP because the safety is a property of the
 # code, not an outstanding fault: the reassignment is what the lint cannot see,
 # which is the documented limit of a tool that states it does no dataflow.
-proc/syscall.c:4385: if (outfile && outfile[0]) {
-proc/syscall.c:4390: if (infile && infile[0]) {
-proc/syscall.c:4107: if (!path || !path[0]) return NULL;
+proc/syscall.c:4389: if (outfile && outfile[0]) {
+proc/syscall.c:4394: if (infile && infile[0]) {
+proc/syscall.c:4111: if (!path || !path[0]) return NULL;
 
 # --- proc/syscall.c sys_brk / sys_mmap / sys_munmap : `p` is proc_current(),
 # a KERNEL process_t. Same B3 attribution artefact: these take a user ADDRESS as
 # a scalar and never dereference it, they only hand it to the VMM. Nothing here
 # reads or writes user memory.
-proc/syscall.c:6602: process_t *p = proc_current();
-proc/syscall.c:6635: if (!p || p->privilege != PRIV_USER) {
-proc/syscall.c:6639: if (p->brk == 0) {
-proc/syscall.c:6640: p->brk = DEFAULT_BRK_START;
-proc/syscall.c:6644: return (int64_t)p->brk;
-proc/syscall.c:6648: uint64_t old_brk = p->brk;
-proc/syscall.c:6654: if (vmm_alloc_user_pages(p->cr3, old_brk, pages, VMM_USER_RW) != 0) {
-proc/syscall.c:6660: vmm_free_user_pages(p->cr3, new_brk, pages);
-proc/syscall.c:6663: p->brk = new_brk;
-proc/syscall.c:6602: process_t *p = proc_current();
-proc/syscall.c:6687: if (!p || p->privilege != PRIV_USER) return -1;
-proc/syscall.c:6690: if (!p->mm) p->mm = mm_create();
-proc/syscall.c:6691: if (!p->mm) return -1;
-proc/syscall.c:6717: uint64_t r = do_mmap((mm_struct_t *)p->mm, addr, len,
-proc/syscall.c:6634: process_t *p = proc_current();
-proc/syscall.c:6724: if (!p || p->privilege != PRIV_USER) {
-proc/syscall.c:6749: if (p->mm) return do_munmap((mm_struct_t *)p->mm, addr, len);
-proc/syscall.c:6752: vmm_free_user_pages(p->cr3, addr, pages);
+proc/syscall.c:6524: process_t *p = proc_current();
+proc/syscall.c:6557: if (!p || p->privilege != PRIV_USER) {
+proc/syscall.c:6561: if (p->brk == 0) {
+proc/syscall.c:6562: p->brk = DEFAULT_BRK_START;
+proc/syscall.c:6566: return (int64_t)p->brk;
+proc/syscall.c:6570: uint64_t old_brk = p->brk;
+proc/syscall.c:6576: if (vmm_alloc_user_pages(p->cr3, old_brk, pages, VMM_USER_RW) != 0) {
+proc/syscall.c:6679: vmm_free_user_pages(p->cr3, new_brk, pages);
+proc/syscall.c:6585: p->brk = new_brk;
+proc/syscall.c:6524: process_t *p = proc_current();
+proc/syscall.c:6609: if (!p || p->privilege != PRIV_USER) return -1;
+proc/syscall.c:6612: if (!p->mm) p->mm = mm_create();
+proc/syscall.c:6613: if (!p->mm) return -1;
+proc/syscall.c:6639: uint64_t r = do_mmap((mm_struct_t *)p->mm, addr, len,
+proc/syscall.c:6556: process_t *p = proc_current();
+proc/syscall.c:6646: if (!p || p->privilege != PRIV_USER) {
+proc/syscall.c:6671: if (p->mm) return do_munmap((mm_struct_t *)p->mm, addr, len);
+proc/syscall.c:6674: vmm_free_user_pages(p->cr3, addr, pages);
 
 [KNOWN_GAP]
 # ONE entry, and it is a CLASS, not a site. Do not add anything else here to

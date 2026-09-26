@@ -10,6 +10,8 @@
 #include "../serial.h"
 #include "../string.h"
 #include "../fs/bootlog.h"
+#include "../fs/fat.h"      // #capalways: /CONFIG/CAPALLOW.CFG persistence
+#include "../mm/heap.h"     // #capalways: kfree for the fat_read_file buffer
 #include "../fs/graphfs/journal.h"   // GFSJ_OP_EDGE_ADD / EDGE_REVOKE / ACTOR_PID
 
 extern uint64_t sched_now_ms(void);
@@ -240,6 +242,86 @@ int64_t sys_cap_query(uint32_t cap, cap_state_t *u_out)
 // are distinct and named (design section 8.1). Order matters: cheapest and
 // least informative first.
 // ---------------------------------------------------------------------------
+
+// ===========================================================================
+// #capalways: STANDING CONSENT ("Always allow")
+// ---------------------------------------------------------------------------
+// See rustkern/caps.rs for the rules and the identity argument. Here: only the
+// file. /CONFIG/CAPALLOW.CFG is written with fat_write_file, the same call
+// cron.c uses for /CONFIG/CRON.CFG (it routes to the ext2 root; vfs_write_file
+// is NETFS-only, which is a trap this tree has hit before).
+// g_fat_fs is DEFINED in main.c; every user declares its own extern (the
+// convention in fs/netfs.c, fs/devlog.c, fs/fat_vfs.c...). fat.h does not
+// declare it, which the syntax check caught.
+extern fat_fs_t g_fat_fs;
+
+// Defined below, next to sys_cap_resolve; sys_cap_request (above it) calls it.
+static int64_t cap_issue_approved(const cap_approve_info_t *pinfo);
+
+#define CAPALLOW_PATH "/CONFIG/CAPALLOW.CFG"
+#define CAPALLOW_BUF  4096
+
+static int g_always_loaded = 0;
+
+void cap_always_load(void)
+{
+    // Mirrors cron_load(): fat_read_file ALLOCATES and returns the buffer, so
+    // the caller owns it and must kfree it on every path.
+    g_always_loaded = 1;
+    cap_always_reset_rs();
+    if (!g_fat_fs.mounted) {
+        g_always_loaded = 0;   // retry once the root is actually mounted
+        return;
+    }
+    uint32_t sz = 0;
+    char *data = (char *)fat_read_file(&g_fat_fs, CAPALLOW_PATH, &sz);
+    if (!data || sz == 0) {
+        if (data) kfree(data);
+        return;
+    }
+    int n = cap_always_parse_rs(data, sz);
+    kfree(data);
+    if (n > 0)
+        (void)bootlog_write("[CAP] standing consents loaded: %d from " CAPALLOW_PATH, n);
+}
+
+static void cap_always_save(void)
+{
+    static char out[CAPALLOW_BUF];
+    int n = cap_always_serialize_rs(out, sizeof(out));
+    if (n <= 0) {
+        (void)bootlog_write("[CAP] standing consent NOT saved: serialize failed (%d)", n);
+        return;
+    }
+    int rc = fat_write_file(&g_fat_fs, CAPALLOW_PATH, out, (uint32_t)n);
+    if (rc != 0)
+        (void)bootlog_write("[CAP] FAILED to write " CAPALLOW_PATH " (rc=%d): the consent "
+                            "holds for this boot only", rc);
+}
+
+// Record an approved request as standing. Never fatal: if it cannot be stored
+// the user still got the one-off grant they approved.
+static void cap_always_remember(const cap_approve_info_t *info)
+{
+    process_t *rp = proc_get(info->req_pid);
+    const char *app = rp ? rp->name : "";
+    int64_t r = cap_always_add_rs(info->req_uid, info->cap, info->scope_kind,
+                                  app, info->scope);
+    if (r < 0) {
+        (void)bootlog_write("[CAP] standing consent REFUSED (rc=%lld) app=%s %s scope=%s",
+                            (long long)r, app, cap_name(info->cap), info->scope);
+        return;
+    }
+    if (r == 1) {
+        char d[160];
+        snprintf(d, sizeof(d), "ALWAYS-ALLOW stored: %s scope=%s app=%s uid=%u",
+                 cap_name(info->cap), info->scope, app, (unsigned)info->req_uid);
+        seclog_report_capability((unsigned)info->req_pid, d);
+        (void)bootlog_write("[CAP] %s", d);
+        cap_always_save();
+    }
+}
+
 int64_t sys_cap_request(const cap_req_t *u_req)
 {
     process_t *p = proc_current();
@@ -320,6 +402,38 @@ int64_t sys_cap_request(const cap_req_t *u_req)
     // here because Stage 0 gated SYS_INJECT_KEY, so an ordinary app can no
     // longer manufacture the input credit.
     uint64_t now = sched_now_ms();
+
+    // #capalways: a STANDING consent the user previously chose "Always allow"
+    // for. Checked before the input-credit requirement, because that credit
+    // exists only to stop an app raising a prompt nobody asked for, and here no
+    // prompt is raised. Deliberately placed AFTER the compositor-latch check
+    // above so this does not quietly become a before-login grant path (that is
+    // Stage 5 and stays absent). The issued grant is still time-bounded.
+    if (!g_always_loaded) cap_always_load();
+    if (cap_always_match_rs(p->euid, req.cap, req.scope_kind, p->name, req.scope) == 1) {
+        uint32_t elev_open_a = elev_owner_pid_rs() ? 1u : 0u;
+        int64_t aseq = cap_req_autogrant_rs(p->pid, p->euid, now, req.cap, req.duration_ms,
+                                            req.scope_kind, req.reason, req.scope,
+                                            p->name, elev_open_a);
+        if (aseq > 0) {
+            cap_approve_info_t ai;
+            memset(&ai, 0, sizeof(ai));
+            ai.req_pid = p->pid;
+            ai.req_uid = p->euid;
+            ai.cap = req.cap;
+            ai.duration_ms = req.duration_ms;
+            ai.scope_kind = req.scope_kind;
+            strncpy(ai.scope, req.scope, sizeof(ai.scope) - 1);
+            if (cap_issue_approved(&ai) == 0) {
+                (void)bootlog_write("[CAP] AUTO-GRANT (always-allow): pid=%u uid=%u %s scope=%s",
+                                    (unsigned)p->pid, (unsigned)p->euid,
+                                    cap_name(req.cap), req.scope);
+                return aseq;
+            }
+        }
+        // fall through to the normal prompt if the auto-grant could not be made
+    }
+
     if (p->elev_last_input_ms == 0 ||
         now - p->elev_last_input_ms > CAP_INPUT_WINDOW_MS) {
         cap_ledger_note(CAP_LEDGER_DENIED);
@@ -377,32 +491,12 @@ int64_t sys_cap_view(cap_view_t *u_out)
 // COMPOSITOR ONLY. Approve or deny. On approve the grant is issued on the
 // REQUESTER'S process_t (never the compositor's) and recorded as a
 // GFSJ_OP_EDGE_ADD edge whose seq becomes the grant's granted_seq.
-int64_t sys_cap_resolve(uint64_t seq, int action)
+// #capalways: the grant-issuing tail, shared by the compositor's resolve and
+// by the standing-consent auto-grant, so there is exactly ONE place that turns
+// an approved request into a grant + journal edge + audit line.
+static int64_t cap_issue_approved(const cap_approve_info_t *pinfo)
 {
-    if (!caller_is_compositor()) return CAP_EPERM;
-    cap_watchdog();
-
-    uint32_t rpid = cap_req_owner_pid_rs();
-    if (!rpid) return CAP_ESTALE;
-
-    if (action == CAP_ACT_DENY) {
-        int r = cap_req_resolve_rs(seq, 0);
-        if (r == 0) {
-            cap_ledger_note(CAP_LEDGER_DENIED);
-            (void)bootlog_write("[CAP] DENIED by user: pid=%u", (unsigned)rpid);
-            seclog_report_capability((unsigned)rpid, "DENIED by user");
-        }
-        return r;
-    }
-    if (action != CAP_ACT_APPROVE) return CAP_EARG;
-
-    cap_approve_info_t info;
-    memset(&info, 0, sizeof(info));
-    if (!cap_req_approve_info_rs(&info)) return CAP_ESTALE;
-
-    // Mark the request granted (closes it, so a second approve is stale).
-    if (cap_req_resolve_rs(seq, 1) != 0) return CAP_ESTALE;
-
+    cap_approve_info_t info = *pinfo;
     process_t *rp = proc_get(info.req_pid);
     if (!rp) return CAP_ESTALE;
 
@@ -452,6 +546,39 @@ int64_t sys_cap_resolve(uint64_t seq, int action)
                         cap_name(info.cap), info.scope,
                         (unsigned long long)expires, (unsigned long long)jseq);
     return 0;
+}
+
+int64_t sys_cap_resolve(uint64_t seq, int action)
+{
+    if (!caller_is_compositor()) return CAP_EPERM;
+    cap_watchdog();
+
+    uint32_t rpid = cap_req_owner_pid_rs();
+    if (!rpid) return CAP_ESTALE;
+
+    if (action == CAP_ACT_DENY) {
+        int r = cap_req_resolve_rs(seq, 0);
+        if (r == 0) {
+            cap_ledger_note(CAP_LEDGER_DENIED);
+            (void)bootlog_write("[CAP] DENIED by user: pid=%u", (unsigned)rpid);
+            seclog_report_capability((unsigned)rpid, "DENIED by user");
+        }
+        return r;
+    }
+    if (action != CAP_ACT_APPROVE && action != CAP_ACT_APPROVE_ALWAYS)
+        return CAP_EARG;
+
+    cap_approve_info_t info;
+    memset(&info, 0, sizeof(info));
+    if (!cap_req_approve_info_rs(&info)) return CAP_ESTALE;
+
+    // Mark the request granted (closes it, so a second approve is stale).
+    if (cap_req_resolve_rs(seq, 1) != 0) return CAP_ESTALE;
+
+    int64_t rc = cap_issue_approved(&info);
+    if (rc == 0 && action == CAP_ACT_APPROVE_ALWAYS)
+        cap_always_remember(&info);
+    return rc;
 }
 
 // SYS_CAP_REVOKE. A process drops its own grant of `cap`. The Settings manager

@@ -459,31 +459,35 @@ static void isr_handler_impl(interrupt_frame_t *frame) {
 // add an FFI hop between a fault and the report of it. That is the
 // "entanglement with paging/asm" exemption, not "the surrounding code is C".
 // ===========================================================================
-static volatile uint64_t g_fault_cr2[MAYTERA_MAX_CPUS];
-static volatile uint8_t  g_fault_cr2_live[MAYTERA_MAX_CPUS];
-
-void exception_note_cr2(uint64_t cr2) {
-    uint32_t c = smp_get_cpu_id();
-    if (c < MAYTERA_MAX_CPUS) { g_fault_cr2[c] = cr2; g_fault_cr2_live[c] = 1; }
-}
-
-// The address to REPORT for this exception. Non-#PF exceptions have no fault
-// address at all, which is why every existing site already tested for vector
-// 14. The read_cr2() fallback covers a vector 14 that somehow did not come
-// through mm/fault.c, which would be no worse than the old behaviour.
-static uint64_t exception_cr2(uint64_t int_no) {
-    if (int_no != EXCEPTION_PF) return 0;
-    uint32_t c = smp_get_cpu_id();
-    if (c < MAYTERA_MAX_CPUS && g_fault_cr2_live[c]) return g_fault_cr2[c];
-    return read_cr2();
+// #CR2FRAME (2026-09-26): THE CAPTURE MOVED AGAIN, INTO THE ENTRY STUB, AND
+// THE PER-CPU SLOT IS GONE.
+//
+// The per-CPU array below this comment used to be the capture. It fixed the
+// SECOND read (in exception_fatal) but not the FIRST: the capture itself lived
+// in mm/fault.c page_fault_handler(), which runs AFTER isr_handler()'s
+// bkl_acquire(). That wait runs with interrupts enabled and the waiter can be
+// resumed on a different core, so CR2 could already belong to another fault by
+// the time it was "captured at the fault". A per-CPU slot cannot survive that
+// either, for the same reason and for a second one: it is overwritten by any
+// nested vector on the same core. The frame is the only home that is both
+// per-fault and carried across a migration, so cpu/idt.asm pushes it there.
+//
+// This accessor therefore just reads the frame. It stays a function, and every
+// caller keeps going through it, so there is still exactly ONE definition of
+// "the address to report for this exception".
+static uint64_t exception_cr2(const interrupt_frame_t *frame) {
+    if (!frame || frame->int_no != EXCEPTION_PF) return 0;
+    return frame->cr2;
 }
 
 // 0 when a fresh read agrees with the captured value, otherwise the fresh
-// value: the witness described above.
-static uint64_t exception_cr2_drift(uint64_t int_no) {
-    if (int_no != EXCEPTION_PF) return 0;
+// value: the witness described above. It now witnesses the WHOLE window (stub
+// entry -> here), which is the window that was actually losing the address,
+// rather than the tail of it.
+static uint64_t exception_cr2_drift(const interrupt_frame_t *frame) {
+    if (!frame || frame->int_no != EXCEPTION_PF) return 0;
     uint64_t now = read_cr2();
-    return (now == exception_cr2(int_no)) ? 0 : now;
+    return (now == exception_cr2(frame)) ? 0 : now;
 }
 
 // #429: shared fatal-exception tail (declared in idt.h). Extracted from
@@ -537,14 +541,14 @@ void exception_fatal(interrupt_frame_t *frame) {
                             ((frame->cs & 0x3) != 0) ? "USER" : "KERNEL",
                             frame->error_code, frame->rip, frame->cs,
                             frame->rsp, frame->rflags,
-                            exception_cr2(int_no));
+                            exception_cr2(frame));
         // The witness. Silent unless the two disagree, which is exactly the
         // case the capture above exists for.
-        { uint64_t _drift = exception_cr2_drift(int_no);
+        { uint64_t _drift = exception_cr2_drift(frame);
           if (_drift) bootlog_fault_write("[EXCEPTION] CR2 CAPTURED-AT-FAULT=0x%lx "
                                           "but a read NOW gives 0x%lx: another fault "
                                           "overwrote CR2 between the fault and this report",
-                                          exception_cr2(int_no), _drift); }
+                                          exception_cr2(frame), _drift); }
         // ==================================================================
         // #COMPRESPAWN: A FAULTING RIP IS USELESS UNDER PIE+ASLR ON ITS OWN.
         //
@@ -650,7 +654,7 @@ void exception_fatal(interrupt_frame_t *frame) {
 
         // Page fault has special handling
         if (int_no == EXCEPTION_PF) {
-            uint64_t cr2 = exception_cr2(int_no);
+            uint64_t cr2 = exception_cr2(frame);
             kprintf_nolock("  CR2 (fault address): 0x%lx\n", cr2);
             kprintf_nolock("  Error bits: %s%s%s%s\n",
                     (frame->error_code & 1) ? "P " : "",
@@ -671,7 +675,7 @@ void exception_fatal(interrupt_frame_t *frame) {
         
         // Get CR2 for page faults
         if (int_no == EXCEPTION_PF) {
-            regs.cr2 = exception_cr2(int_no);
+            regs.cr2 = exception_cr2(frame);
         }
         
         // Map exception to crash type
@@ -692,7 +696,7 @@ void exception_fatal(interrupt_frame_t *frame) {
             kprintf_nolock("[KERNEL PANIC] %s at RIP=0x%lx\n", name, frame->rip);
             uint64_t cr2_val = 0;
             if (int_no == 14) {
-                cr2_val = exception_cr2(int_no);
+                cr2_val = exception_cr2(frame);
                 kprintf_nolock("[KERNEL PANIC] CR2=0x%lx err=0x%lx\n", cr2_val, frame->error_code);
             }
             kprintf_nolock("[KERNEL PANIC] RSP=0x%lx  Halting CPU.\n", frame->rsp);
@@ -766,7 +770,7 @@ void exception_fatal(interrupt_frame_t *frame) {
         // worst-case double/triple fault inside the dialog still leaves a
         // readable, correctly-sized /PANIC.TXT from the ORIGINAL fault.
         panic_log_write(frame->rip,
-                         exception_cr2(int_no),
+                         exception_cr2(frame),
                          frame->error_code, read_cr3(), name, 1);
         // User-mode fault: show crash dialog, then kill the process
         crashhandler_report(crash_type, &regs, -1);

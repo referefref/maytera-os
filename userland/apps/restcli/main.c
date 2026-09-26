@@ -339,8 +339,7 @@ static void send_request(void) {
         if (strcmp(method, "POST") == 0) {
             g_kjob = http_post_start(url, hdrs, g_bodybuf);
             if (g_kjob < 0) {
-                finish_err(g_kjob == NET_ERR_AIGUARD ? "POST refused by the kernel prompt-injection guard (SYS_AI_SCAN names the rule)"
-                         : g_kjob == NET_ERR_FAULTY ? "Network marked faulty by the kernel breaker; retry shortly"
+                finish_err(g_kjob == NET_ERR_FAULTY ? "Network marked faulty by the kernel breaker; retry shortly"
                          : "Could not start the HTTPS POST");
                 return;
             }

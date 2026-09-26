@@ -102,6 +102,21 @@ static uint64_t s_th_lock_at_ms = 0;
 // would always land inside that window and prove nothing.
 static uint64_t s_th_pcclick_at_ms = 0;
 static int32_t  s_th_pcclick_x = 0, s_th_pcclick_y = 0;
+// (#sqearlyexit) SPAWNLOOP: relaunch one app N times on a wall-clock cadence,
+// killing the previous instance first. Exists because the defect being chased
+// is an INTERMITTENT failure during app STARTUP, so the only useful harness is
+// one that performs many independent startups per boot and labels each one on
+// serial. Non-blocking by construction (#426): one uptime_ms() compare per
+// frame, no wait, no sleep, no poll loop.
+static int      s_sl_left = 0;
+static int      s_sl_iter = 0;
+static int      s_sl_prev_pid = 0;
+static int      s_sl_period = 3000;
+static uint64_t s_sl_next_ms = 0;
+static char     s_sl_path[96];
+static char     s_sl_arg[64];
+static int      s_sl_kill = 0;
+static int      s_sl_armed = 0;   // one-shot: an offline-baked /TESTHOOK.CMD cannot always be consumed (PERMS-DENY on truncate), so it re-fires every poll
 #define TH_OUT_PATH "/TESTHOOK.OUT"
 #define TH_O_APPEND (0x1 | 0x40 | 0x400)   // O_WRONLY | O_CREAT | O_APPEND
 
@@ -710,6 +725,33 @@ static void emfdemo_tick(void) {
     g_needs_redraw = true;
 }
 
+// (#sqearlyexit) Close the first window whose title contains `want` (case
+// insensitive), through the same taskbar_close_window() a real taskbar click
+// runs. Used by SPAWNLOOP mode 2, whose whole point is that the win_destroy()
+// then happens IN THE APP'S OWN PROCESS on its own next event-loop turn, i.e.
+// asynchronously to whatever the compositor is doing - which is exactly the
+// condition the window-lifetime bug needs, and the condition a SIGKILL from
+// this same poll can never create.
+static int th_close_by_title(const char *want) {
+    wm_window_info_t wins[16];
+    int n = wm_get_windows(wins, 16);
+    if (n < 0) n = 0;
+    for (int i = 0; i < n; i++) {
+        for (const char *h = wins[i].title; *h; h++) {
+            const char *hh = h, *nn = want;
+            while (*hh && *nn) {
+                char a = *hh, b = *nn;
+                if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+                if (a != b) break;
+                hh++; nn++;
+            }
+            if (!*nn) { taskbar_close_window(wins[i].id); return wins[i].id; }
+        }
+    }
+    return -1;
+}
+
 void testhook_poll(void) {
     if (s_th_lock_at_ms != 0 && uptime_ms() >= s_th_lock_at_ms) {
         s_th_lock_at_ms = 0;
@@ -732,6 +774,23 @@ void testhook_poll(void) {
         if (m != th_cf_mode) { th_cf_mode = m; th_cf_build(m); }
         cf_geom_t g = th_cf_geom(th_cf_deck.nslots);
         cf_host_apply(&th_cf_deck, &g);
+    }
+    if (s_sl_left > 0 && uptime_ms() >= s_sl_next_ms) {
+        int closed = -1;
+        if (s_sl_kill == 2) {
+            if (s_sl_iter > 0) closed = th_close_by_title(s_sl_arg);
+        } else if (s_sl_kill == 1 && s_sl_prev_pid > 0) {
+            syscall2(SYS_KILL, s_sl_prev_pid, 9);
+        }
+        s_sl_iter++;
+        char *av[2]; av[0] = s_sl_path; av[1] = s_sl_arg;
+        int argn = (s_sl_kill == 2 || !s_sl_arg[0]) ? 1 : 2;
+        int pid = sys_spawn_args(s_sl_path, av, argn);
+        (void)closed;
+        s_sl_prev_pid = pid;
+        s_sl_left--;
+        s_sl_next_ms = uptime_ms() + (uint64_t)s_sl_period;
+        th_logf("SPAWNLOOP iter=%d left=%d pid=%d path=%s", s_sl_iter, s_sl_left, pid, s_sl_path);
     }
     if (s_rd_armed) removdemo_tick();   // #removdev self-driving removable monitor
     if (s_emf_armed) emfdemo_tick();     // #emfield self-driving EMFIELD swirl proof
@@ -970,6 +1029,35 @@ void testhook_poll(void) {
     if (strcmp(verb, "GLASSSTAT") == 0) {
         th_glass_stat("manual");
         th_log("OK GLASSSTAT");
+        return;
+    }
+
+    if (strcmp(verb, "SPAWNLOOP") == 0) {
+        // SPAWNLOOP <count> <periodms> <path> [arg]
+        char *t = arg, *f[5]; int nf = 0;
+        while (*t && nf < 5) {
+            while (*t == ' ') t++;
+            if (!*t) break;
+            f[nf++] = t;
+            while (*t && *t != ' ') t++;
+            if (*t) *t++ = '\0';
+        }
+        if (nf < 4) { th_log("ERR SPAWNLOOP needs <count> <periodms> <kill01> <path> [arg]"); return; }
+        if (s_sl_armed) return;   // silent: a re-fire must not restart the run
+        s_sl_armed = 1;
+        s_sl_left = th_atoi(f[0]);
+        s_sl_period = th_atoi(f[1]);
+        if (s_sl_period < 250) s_sl_period = 250;
+        s_sl_kill = th_atoi(f[2]);
+        { int i = 0; for (; f[3][i] && i < 95; i++) s_sl_path[i] = f[3][i]; s_sl_path[i] = 0; }
+        { int i = 0; if (nf == 5) for (; f[4][i] && i < 63; i++) s_sl_arg[i] = f[4][i]; s_sl_arg[i] = 0; }
+        s_sl_iter = 0; s_sl_prev_pid = 0;
+        // Do NOT start spawning the instant the desktop appears: boot is still
+        // bringing up audio, DHCP and cron for tens of seconds afterwards, and a
+        // launch inside that window measures a boot race rather than the steady
+        // state a real user launches in.
+        s_sl_next_ms = uptime_ms() + 30000;
+        th_logf("OK SPAWNLOOP n=%d period=%d kill=%d path=%s arg=%s", s_sl_left, s_sl_period, s_sl_kill, s_sl_path, s_sl_arg);
         return;
     }
 

@@ -69,11 +69,59 @@ int  aiclient_ask(const char *prompt, char *out, int outcap, int verbose);
 // the same consent + audit path the AI uses.
 int  aiclient_run_action(const char *id, const char *args, char *obs, int ocap);
 
-// #745 prompt-injection screen. 1 while a HIGH-severity match is pending, i.e.
-// the next send WILL be refused. aiclient_guard_note() is the last message the
-// screen produced (block or annotate), for a host app that wants to show it in
-// its own chrome rather than as a chat turn. Empty string if nothing has fired.
-int         aiclient_guard_blocked(void);
-const char *aiclient_guard_note(void);
+// #469m aititleinject. Refresh and return the one-line running-app state
+// exactly as it is sent to the model. Exposed so `aichat --statetest` can
+// PROVE on the running OS that the line carries app ids and no app-chosen
+// bytes, rather than that being a claim in a comment. The returned pointer
+// is a static buffer, valid until the next call.
+const char *aiclient_running_state(void);
+
+
+
+// ===========================================================================
+// #469 AI-VISION: one-shot MULTIMODAL completion (an image plus a prompt).
+// ===========================================================================
+// The largest JPEG aiclient_ask_image() will send. The request body buffer is
+// BODY_MAX (64 KiB) and base64 costs 4/3, so this is the size above which the
+// body could not be built; the call REFUSES an oversized image rather than
+// truncating one (a truncated base64 payload is a corrupt body that the server
+// rejects with an error a long way from the cause). Callers should crop and
+// downscale to the region of interest: a 160x144 Game Boy LCD is a few KB.
+#define AICLIENT_IMAGE_MAX  44000
+
+// Ask the model about an image. `system` may be NULL/empty. `jpeg`/`jpeg_len`
+// are a complete JPEG (the shared encoder in libc/jpegenc.h produces one).
+// The reply text is written into out[].
+//
+// This is a ONE-SHOT: it does NOT touch or use the multi-turn conversation in
+// g_msgs, and it does NOT run the ReAct tool loop. It is the perception half of
+// an agent loop, not a chat turn.
+//
+// Returns 0 on success, < 0 on a network error, > 0 on an HTTP status error or
+// a local refusal (no key, image too large, body would overflow); on any
+// failure out[] holds the human-readable reason. It never reports success for a
+// request it did not make.
+int aiclient_ask_image(const char *system, const char *prompt,
+                       const unsigned char *jpeg, long jpeg_len,
+                       char *out, int outcap);
+
+// ===========================================================================
+// #469m LOOP INSTRUMENTATION read-back.
+// ===========================================================================
+// Per-call phase timings, payload sizes and API-reported token counts are
+// written to /CONFIG/AIMETRIC.LOG (the record layout and the redaction
+// argument are in aicap.h). These are the process-lifetime COUNTERS, so a
+// harness or a UI can print a run summary without re-parsing the log.
+//
+//   retries       - transport attempts beyond the first, counted SEPARATELY
+//                   from the attempt that eventually succeeded
+//   act_ok        - model ACTIONs that parsed, named a real tool, and ran
+//   act_badverb   - parsed, but named a tool that does not exist
+//   act_badargs   - named a real tool that rejected the arguments
+//   act_malformed - the reply meant an ACTION but did not parse as one
+//                   (heuristic; see the comment at the counting site)
+// Any pointer may be NULL.
+void aiclient_metrics_summary(long *retries, long *act_ok, long *act_badverb,
+                              long *act_badargs, long *act_malformed);
 
 #endif // AICLIENT_H

@@ -3,8 +3,6 @@
 #include "seclog.h"
 #include "uaccess_smap.h"
 #include "../mm/vmm.h"
-#include "nova.h"
-#include "aiguard.h"   /* #745: the policy layer that gives nova.c a caller */
 #include "../serial.h"
 #include "../fs/bootlog.h"   /* #ASUSDIAG: the pre-flight verdict must survive to /BOOTLOG.TXT */
 #include "../string.h"
@@ -411,35 +409,17 @@ void security_init(void) {
     kprintf("[SECURITY] ASLR: user PIE image base RANDOMISED by exec/elf.c "
             "(<=9 bits, 2MB grain); stack/heap/mmap/kernel NOT randomised\n");
 
-    // #646: run the Nova prompt-injection ruleset self-test. It had zero
-    // callers, i.e. it proved nothing on any shipped build. It is pure string
-    // matching over static data with no allocation and no I/O, so it is safe at
-    // this point in boot. Note what this does and does NOT prove: it proves the
-    // KEYWORD matcher still fires on 7 known-malicious and stays silent on 4
-    // known-benign prompts. It does NOT mean anything is being screened, see
-    // the NOT-WIRED banner in nova.h.
-    {
-        /* NULL report buffer on purpose: the return value is the verdict, and a
-         * local we write and never read is the small version of the same defect
-         * this pass exists to remove. */
-        int nfail = nova_selftest(0, 0);
-        kprintf("[NOVA] ruleset self-test: %s (%d rules, %d failures)\n",
-                nfail == 0 ? "PASS" : "FAIL", nova_rule_count(), nfail);
-    }
-
-    /* #745: the POLICY self-test, which is a different claim from the one
-     * above. nova_selftest() proves the MATCHER still fires; this proves the
-     * screen that CONSUMES it makes the right decision, in BOTH directions and
-     * on the right scope. A guard that blocks everything passes any "did it
-     * block" test, so the cases include benign LLM bodies that MUST pass and a
-     * non-LLM body carrying injection text that MUST NOT be screened at all. */
-    {
-        static char rep[768];
-        int gfail = aiguard_selftest_rs(rep, sizeof(rep));
-        kprintf("[AIGUARD] policy self-test: %s (%d failure%s)\n",
-                gfail == 0 ? "PASS" : "FAIL", gfail, gfail == 1 ? "" : "s");
-        kprintf("%s", rep);
-    }
+    // #469m aititleinject: the [NOVA] ruleset self-test and the [AIGUARD]
+    // policy self-test that used to run here are GONE with the thing they
+    // tested. Both were honest about their own scope, and the scope was the
+    // problem: they proved a keyword matcher still fired on seven textbook
+    // strings, which says nothing about a string an attacker chooses. 18 of
+    // 18 hostile strings written in one sitting passed the ruleset clean
+    // (MEASURED 2026-09-26), while the ordinary window title "Contract as
+    // signed.pdf" tripped it at HIGH. The AI prompt-injection posture is now
+    // structural and lives in the client; the enforcement that was always
+    // doing the work is the #293 capability + consent layer, which is
+    // untouched. See docs/AI_PROMPT_INJECTION.md.
     kprintf("[SECURITY] init complete, LIVE features mask=0x%x (rust=0x%x)\n",
             g_security_features, sec_features_rs());
 }

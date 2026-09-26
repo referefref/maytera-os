@@ -1,0 +1,183 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
+// aitools.def - THE ONE DECLARATION OF THE MODEL-FACING OS TOOL SURFACE (#469m).
+//
+// WHY THIS FILE EXISTS, measured rather than asserted. Before it, the tool
+// surface was declared in THREE places that could and did disagree:
+//
+//   1. dispatch_tool() in aiclient.c, which is what actually runs: 29 tools.
+//   2. /AITOOLS/INDEX.yaml on the image, which is what the model is TOLD:
+//      18 tools (MEASURED by extracting it from the asset base, #469m
+//      section 3). Eleven tools - app.action, screen.capture, the whole
+//      input.* family, device.list, device.block.eject, photos.organize,
+//      fs.mkdir, fs.move - reached the model only through hand-written prose.
+//   3. the prose paragraphs in system_prompt(), maintained by hand.
+//
+// That is the same defect class the last pass found in the CONTRACT index,
+// where emit_index() read only main.c and so omitted `paint`, the one app the
+// live-action wire had been proven on. A derived file that quietly drops a row
+// teaches every reader to distrust it, which defeats the point of deriving it.
+//
+// So the table moved HERE, and every consumer is generated from it:
+//   - aitools.c        -> the prose "id: summary" block in the system prompt
+//   - aitools.c        -> the native tool-calling `tools` JSON schema array
+//   - tools/aitools-index/aitools-index.c -> /AITOOLS/INDEX.yaml itself
+//   - the same generator's --check mode cross-reads dispatch_tool() out of
+//     aiclient.c and FAILS if the two lists disagree in either direction.
+//
+// X-macros, so the C compiler is the parser. A regex over C source was the
+// mechanism that failed last time; this cannot drift because there is nothing
+// to parse.
+//
+// SHAPE:
+//   AI_TOOL(id, summary)          begins a tool; summary is what the model reads
+//     AI_ARG(name, type, required)   zero or more, in declaration order
+//
+// ALIASES ARE DELIBERATELY ABSENT. dispatch_tool() also accepts files.write,
+// files.delete, files.mkdir, files.move, system.storage.info, windows.list and
+// input.mouse, which route to the SAME executors as their canonical spellings.
+// They stay accepted on input (an older conversation, or a model that learned
+// the other name, must keep working) and stay out of the advertised surface,
+// because advertising two names for one executor spends tokens teaching the
+// model a choice that does not matter. aitools-index.c --check knows about
+// them by name and does not count them as drift.
+//
+// NO DOUBLE QUOTES IN A SUMMARY. The same string is emitted into JSON (where
+// it would need escaping) and into YAML (where a leading quote changes the
+// scalar type). Single quotes read the same and are safe in both.
+
+// --- filesystem -------------------------------------------------------------
+AI_TOOL("files.list",
+        "List the contents of a directory. args {path:string}. cap fs.read, low risk.")
+  AI_ARG("path", AI_T_STR, 1)
+
+AI_TOOL("files.read",
+        "Read a text file and return its contents. args {path:string}. cap fs.read, low risk.")
+  AI_ARG("path", AI_T_STR, 1)
+
+AI_TOOL("files.open",
+        "Open the Files app so the user can browse. no args. cap app.files.navigate, low risk.")
+
+AI_TOOL("fs.write",
+        "Create, overwrite or append to a file. args {path:string, content:string, mode:'overwrite'|'append'}. cap fs.write, HIGH risk (asks consent).")
+  AI_ARG("path", AI_T_STR, 1)
+  AI_ARG("content", AI_T_STR, 1)
+  AI_ARG("mode", AI_T_STR, 0)
+
+AI_TOOL("fs.delete",
+        "Delete a file. args {path:string}. cap fs.delete, HIGH risk (asks consent).")
+  AI_ARG("path", AI_T_STR, 1)
+
+AI_TOOL("fs.mkdir",
+        "Create a folder. args {path:string}. cap fs.write, HIGH risk (asks consent).")
+  AI_ARG("path", AI_T_STR, 1)
+
+AI_TOOL("fs.move",
+        "RELOCATE a file or folder without deleting it. args {src:string, dst:string}. cap fs.write, HIGH risk (asks consent).")
+  AI_ARG("src", AI_T_STR, 1)
+  AI_ARG("dst", AI_T_STR, 1)
+
+AI_TOOL("photos.organize",
+        "Sort every photo on a removable drive into date folders under an escrow contract that MOVES and never deletes. args {path:string, group_by:'YYYY'|'YYYY-MM'|'YYYY-MM-DD'}. cap fs.write, HIGH risk (asks consent). Use this ONE tool instead of scripting many fs.mkdir/fs.move calls.")
+  AI_ARG("path", AI_T_STR, 1)
+  AI_ARG("group_by", AI_T_STR, 0)
+
+// --- web, weather, storage --------------------------------------------------
+AI_TOOL("web.open",
+        "Open a URL in the Browser. args {url:string}. cap app.browser.open, low risk.")
+  AI_ARG("url", AI_T_STR, 1)
+
+AI_TOOL("weather.current",
+        "Get the current local weather (location, condition, temperatures, humidity, rain). no args. cap system.info, low risk.")
+
+AI_TOOL("storage.free",
+        "Report disk storage usage and free space. no args. cap system.info, low risk.")
+
+// --- settings ---------------------------------------------------------------
+AI_TOOL("settings.get",
+        "Read one system setting. args {key:string} using the Settings app's own contract names (clock.use_24hour, display.brightness, sound.master_volume, appearance.theme); an unambiguous leaf such as brightness also works. Pass {category:'network'} to read the live network state (ip, gateway, netmask, dns, mac) from the stack instead. cap system.settings.read, low risk.")
+  AI_ARG("key", AI_T_STR, 1)
+  AI_ARG("category", AI_T_STR, 0)
+
+AI_TOOL("settings.set",
+        "Change one system setting. args {key:string, value:string}. cap system.settings.write, HIGH risk (asks consent).")
+  AI_ARG("key", AI_T_STR, 1)
+  AI_ARG("value", AI_T_STR, 1)
+
+AI_TOOL("settings.get_theme",
+        "Get the active desktop theme id and name. no args. cap system.settings.read, low risk.")
+
+AI_TOOL("settings.open",
+        "Launch the Settings app. no args. cap process.launch, low risk.")
+
+// --- apps -------------------------------------------------------------------
+AI_TOOL("app.launch",
+        "Launch an app or game by id from the INSTALLED APPS list. args {app_id:string, rom:string (Game Boy title), arg:string (one argument)}. cap process.launch, low risk.")
+  AI_ARG("app_id", AI_T_STR, 1)
+  AI_ARG("rom", AI_T_STR, 0)
+  AI_ARG("arg", AI_T_STR, 0)
+
+AI_TOOL("app.action",
+        "Run a NAMED contract action against an ALREADY RUNNING app, on its live document. Prefer this over synthetic input when the app has the action you need. args {app:string, name:string, args:string, verb:'get'|'set', value:string}. Gated by the app, low risk.")
+  AI_ARG("app", AI_T_STR, 1)
+  AI_ARG("name", AI_T_STR, 1)
+  AI_ARG("args", AI_T_STR, 0)
+  AI_ARG("verb", AI_T_STR, 0)
+  AI_ARG("value", AI_T_STR, 0)
+
+AI_TOOL("terminal.open",
+        "Launch the Terminal app. no args. cap process.launch, low risk.")
+
+AI_TOOL("calc.open",
+        "Launch the Calculator app. no args. cap process.launch, low risk.")
+
+AI_TOOL("calc.eval",
+        "Evaluate an arithmetic expression and return the result. args {expr:string}. cap app.calc.compute, low risk.")
+  AI_ARG("expr", AI_T_STR, 1)
+
+// --- see and control the screen ---------------------------------------------
+AI_TOOL("input.windows",
+        "List the open windows with their WINDOW HANDLE, title and app id. no args. Read-only and NOT gated; call it before any input.* injection to get the handle. cap system.info, low risk.")
+
+AI_TOOL("screen.capture",
+        "Save a screenshot of the whole screen to a BMP file and return its path and pixel size. args {path:string}. cap screen.capture, HIGH risk (asks consent). You cannot look at the image unless the user runs a vision-capable model; the observation says whether it was attached.")
+  AI_ARG("path", AI_T_STR, 0)
+
+AI_TOOL("input.type",
+        "Type a string into a target window. args {win:integer (handle from input.windows), text:string}. cap input.inject, HIGH risk (asks consent).")
+  AI_ARG("win", AI_T_INT, 1)
+  AI_ARG("text", AI_T_STR, 1)
+
+AI_TOOL("input.key",
+        "Press one key in a target window. args {win:integer, key:string} (enter, tab, esc, space, backspace, up, down, left, right, home, end, pgup, pgdn, delete, f1..f12, or a single character). cap input.inject, HIGH risk (asks consent).")
+  AI_ARG("win", AI_T_INT, 1)
+  AI_ARG("key", AI_T_STR, 1)
+
+AI_TOOL("input.click",
+        "Click a content-relative point in a target window. args {win:integer, x:integer, y:integer, button:'left'|'right', type:'down'|'up'|'move'}. cap input.inject, HIGH risk (asks consent).")
+  AI_ARG("win", AI_T_INT, 1)
+  AI_ARG("x", AI_T_INT, 1)
+  AI_ARG("y", AI_T_INT, 1)
+  AI_ARG("button", AI_T_STR, 0)
+  AI_ARG("type", AI_T_STR, 0)
+
+// --- removable devices ------------------------------------------------------
+AI_TOOL("device.list",
+        "List the removable devices with each one's mount path, name and whether it is busy. no args. Read-only and NOT gated; call it BEFORE device.block.eject. cap system.info, low risk.")
+
+AI_TOOL("device.block.eject",
+        "Safely eject a removable drive: flush cached writes, unmount and tell the device it is safe to remove. args {mount:string} or {name:string}. Gated by the per-device manifest, HIGH risk (asks consent). Refuses cleanly if the device is BUSY; never targets the system or boot disk.")
+  AI_ARG("mount", AI_T_STR, 0)
+  AI_ARG("name", AI_T_STR, 0)
+
+// --- build a new app from a chat description --------------------------------
+AI_TOOL("build.compile_app",
+        "Compile a new or updated userland app from C source on the build service. args {app_id:string, source:string (the FULL main.c)}. cap app.build.compile, HIGH risk (asks consent).")
+  AI_ARG("app_id", AI_T_STR, 1)
+  AI_ARG("source", AI_T_STR, 1)
+
+AI_TOOL("build.deploy_app",
+        "Deploy and launch the freshly built app. args {app_id:string}. cap app.build.deploy, HIGH risk (asks consent).")
+  AI_ARG("app_id", AI_T_STR, 1)

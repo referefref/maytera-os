@@ -167,8 +167,6 @@ size_t ad_strlcpy(char *d, const char *s, size_t n) {
 
 // ---- ad_ stubs for aiclient.c symbols NOT on the device path -----------------
 // (aidev_authorize_tool is REAL here - linked from aidev.c - so it is NOT stubbed.)
-int  ad_aiguard_check(const char *a, int b, char *c, int d) { (void)a;(void)b;(void)c;(void)d; return 0; }
-const char *ad_aiguard_sev_name(int s) { (void)s; return "none"; }
 int  ad_contract_invoke(const char *a, const char *b, char *c, int d) { (void)a;(void)b;(void)c;(void)d; return -1; }
 int  ad_contract_invoke_live(const char *a, const char *b, const char *c, char *d, int e) { (void)a;(void)b;(void)c;(void)d;(void)e; return -1; }
 int  ad___spawn_with_env(const char *a, char *const b[], char *const c[]) { (void)a;(void)b;(void)c; return -1; }

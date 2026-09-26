@@ -140,7 +140,7 @@ void capconsent_render(void)
                  (unsigned)(g_capc.duration_ms / 60000u > 0 ? g_capc.duration_ms / 60000u : 1u));
     draw_text_ttf(px + 24, py + 124, dline, 14, 0xFFAAAAAA);
 
-    draw_text_ttf(px + 24, py + ph - 34, "[Enter] Allow        [Esc] Deny", 15, 0xFFCFCFE0);
+    draw_text_ttf(px + 24, py + ph - 34, "[Enter] Allow     [A] Always     [Esc] Deny", 15, 0xFFCFCFE0);
 }
 
 // Modal-group key handler. Enter approves, Esc denies. Everything in the first
@@ -158,6 +158,12 @@ int capconsent_handle_key(int key)
     }
     if (key == '\n' || key == '\r') {
         sys_cap_resolve(g_capc.seq, CAP_ACT_APPROVE);
+        g_capc_open = 0;
+        g_needs_redraw = true;
+        return 1;
+    }
+    if (key == 'a' || key == 'A') {   // #capalways: approve AND remember
+        sys_cap_resolve(g_capc.seq, CAP_ACT_APPROVE_ALWAYS);
         g_capc_open = 0;
         g_needs_redraw = true;
         return 1;

@@ -5,6 +5,7 @@
 // aicap.c - MayteraOS AI capability tokens + consent + audit (#293).
 // See aicap.h for the model. Pure userland; enforced at the aiclient dispatch
 // boundary. #305 will relocate this logic into a protected immutable core.
+#include "unistd.h"   // #appwrite: getuid() for the lost-audit-record line
 #include "syscall.h"
 #include "stdio.h"
 #include "stdlib.h"
@@ -17,6 +18,10 @@
 #define AIAUDIT_LOG   "/CONFIG/AIAUDIT.LOG"     // append-only audit trail
 #define MAX_TOKENS    32
 #define AUDIT_CAP     32768                     // keep at most this much log tail
+// #469m: the metrics tail is its own budget, so a chatty measurement run can
+// never evict an authorization record from AIAUDIT.LOG. ~112 bytes/record, so
+// 96 KB is roughly the last 850 records: several full baseline runs.
+#define AIMETRIC_CAP  98304
 
 // ---------------------------------------------------------------------------
 // Risk table: tool-id -> capability + risk. LOW-risk tools run freely (still
@@ -500,6 +505,66 @@ static void ts_now(char *out, int ocap) {
     snprintf(out, ocap, "%04d-%02d-%02d %02d:%02d:%02d", y, mo, d, h, m, s);
 }
 
+// THE ONE APPEND. Read-modify-write with a bounded tail (portable across FAT
+// and ext2, neither of which this code may assume supports O_APPEND). Factored
+// out of aicap_audit() at #469m so the audit trail and the loop-instrumentation
+// record share ONE implementation of the cap-and-rotate logic instead of a
+// second copy that would drift. `logbuf`/`bufcap` are the caller's scratch, so
+// each sink keeps its own retention without a second static buffer here.
+static void log_append(const char *path, const char *line, int l,
+                       char *logbuf, int bufcap) {
+    if (l <= 0 || l >= bufcap) return;
+    int have = 0;
+    int rfd = sys_open(path, O_RDONLY);
+    if (rfd >= 0) {
+        long rn = sys_read(rfd, logbuf, bufcap - 1);
+        sys_close(rfd);
+        if (rn > 0) have = (int)rn;
+    }
+    // if we would overflow, keep only the tail
+    if (have + l > bufcap - 1) {
+        int drop = have + l - bufcap + 1;
+        if (drop < have) { memmove(logbuf, logbuf + drop, have - drop); have -= drop; }
+        else have = 0;
+    }
+    int wfd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC);
+    if (wfd < 0) {
+        // #appwrite: AN AUDIT RECORD THAT VANISHES WITHOUT A TRACE IS NOT AN
+        // AUDIT CONTROL.
+        //
+        // This is THE ONE APPEND for both the AI audit trail and the loop
+        // instrumentation, and it discarded the write refusal. MEASURED on
+        // golden 2480: AICAPS_CFG and this log are hardcoded under /CONFIG,
+        // which is root:root 0711, so a uid-1000 session is refused -13 on
+        // every append, on every machine, before and after the setup wizard.
+        // Every AI action a normal user takes has therefore been unrecorded,
+        // and nothing said so.
+        //
+        // This does not make the append succeed; the right fix for that is to
+        // move the sink under the session user's own home (userconf_path()),
+        // which is a behaviour change with a policy question attached and is
+        // written up rather than taken here. It makes the LOSS visible, which
+        // is the part that must never be silent. The line lands in
+        // /BOOTLOG.TXT, which is written by Ring 0 and seeded root:root 0600
+        // in perms_system_seed[], so as an interim sink it is strictly harder
+        // for a Ring-3 actor to tamper with than the file that failed.
+        //
+        // Deliberately NOT bounded by a counter here, unlike the userconf
+        // reporter: dropping an audit record is not routine noise, and a flood
+        // of these lines is itself the finding.
+        char m[224];
+        snprintf(m, sizeof(m),
+                 "[FSDENY-U] AUDIT RECORD LOST: append to %s refused (rc=%d, uid=%d); "
+                 "the record follows and exists nowhere else: %.96s",
+                 path ? path : "?", wfd, getuid(), line);
+        (void)sys_bootlog(m);
+        return;
+    }
+    if (have > 0) sys_write(wfd, logbuf, have);
+    sys_write(wfd, line, l);
+    sys_close(wfd);
+}
+
 void aicap_audit(const char *tool_id, const char *cap, const char *args,
                  const char *result, const char *how) {
     char ts[32]; ts_now(ts, sizeof(ts));
@@ -514,27 +579,58 @@ void aicap_audit(const char *tool_id, const char *cap, const char *args,
     int l = snprintf(line, sizeof(line), "%s|%s|%s|%s|%s|%s\n",
                      ts, tool_id ? tool_id : "?", cap ? cap : "?",
                      a, result ? result : "?", how ? how : "?");
-    if (l <= 0) return;
-    // Read-modify-write append (portable across FAT/ext2; bounded tail).
     static char buf[AUDIT_CAP];
-    int have = 0;
-    int rfd = sys_open(AIAUDIT_LOG, O_RDONLY);
-    if (rfd >= 0) {
-        long rn = sys_read(rfd, buf, sizeof(buf) - 1);
-        sys_close(rfd);
-        if (rn > 0) have = (int)rn;
+    log_append(AIAUDIT_LOG, line, l, buf, (int)sizeof(buf));
+}
+
+// ---------------------------------------------------------------------------
+// #469m loop instrumentation. See the contract and the redaction argument in
+// aicap.h. One line per record, pipe-delimited to match the audit log's shape
+// so the same splitting works on both.
+// ---------------------------------------------------------------------------
+
+// Enumerated-ish caller strings still reach a log file, so every one of them is
+// clamped to a safe alphabet. This is belt and braces for `tool`, which is the
+// only field whose value can originate from the MODEL rather than from our own
+// string constants.
+static void met_word(const char *src, char *dst, int cap) {
+    int o = 0;
+    for (const char *p = src ? src : ""; *p && o < cap - 1; p++) {
+        char c = *p;
+        int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        dst[o++] = ok ? c : '_';
     }
-    // if we would overflow, keep only the tail
-    if (have + l > (int)sizeof(buf) - 1) {
-        int drop = have + l - (int)sizeof(buf) + 1;
-        if (drop < have) { memmove(buf, buf + drop, have - drop); have -= drop; }
-        else have = 0;
-    }
-    int wfd = sys_open(AIAUDIT_LOG, O_WRONLY | O_CREAT | O_TRUNC);
-    if (wfd < 0) return;
-    if (have > 0) sys_write(wfd, buf, have);
-    sys_write(wfd, line, l);
-    sys_close(wfd);
+    dst[o] = 0;
+    if (!o) { dst[0] = '-'; dst[1] = 0; }
+}
+
+void aicap_metric(const aicap_metric_t *m) {
+    if (!m) return;
+    char ts[32]; ts_now(ts, sizeof(ts));
+    char op[16], model[48], style[16], outcome[32], tool[40];
+    met_word(m->op,      op,      sizeof(op));
+    met_word(m->model,   model,   sizeof(model));
+    met_word(m->style,   style,   sizeof(style));
+    met_word(m->outcome, outcome, sizeof(outcome));
+    met_word(m->tool,    tool,    sizeof(tool));
+    char line[512];
+    int l = snprintf(line, sizeof(line),
+        // #469m aim2 adds ONE trailing column, us_state. The version tag is
+        // bumped rather than left alone because a reader that splits on | and
+        // indexes by position would silently mis-read a future insertion; the
+        // tag is the contract that says how many columns to expect.
+        "%s|aim2|%s|%d|%d|%d|%s|%s|%s|%s|"
+        "%ld|%ld|%ld|%ld|%ld|%ld|"
+        "%lu|%lu|%lu|%lu|%lu|%lu|%lu|%lu|%lu|%lu|%lu|%lu\n",
+        ts, op, m->turn, m->step, m->attempt, model, style, outcome, tool,
+        m->req_bytes, m->resp_bytes, m->img_bytes, m->b64_bytes,
+        m->tok_in, m->tok_out,
+        m->us_build, m->us_encode, m->us_poststart, m->us_ttfb, m->us_total,
+        m->us_parse, m->us_dispatch, m->us_capture, m->us_decode, m->us_scale,
+        m->us_io, m->us_state);
+    static char buf[AIMETRIC_CAP];
+    log_append(AIMETRIC_LOG, line, l, buf, (int)sizeof(buf));
 }
 
 // ---------------------------------------------------------------------------

@@ -1428,10 +1428,21 @@ int https_post(const char *url, const char *headers, const char *body,
         "\r\n",
         path, host, headers ? headers : "", (int)body_len);
     // Append the body (https_snprintf may not handle very large %s safely).
+    // #postfix: this silently DROPPED the body when it did not fit, then sent a
+    // request whose Content-Length promised bytes that were never written, so
+    // the server waited for a body that never came and the call died as a
+    // timeout far from its cause. req_cap is sized to fit, so the else branch
+    // should be unreachable; say so loudly rather than lie on the wire.
     if (body_len) {
         if ((uint32_t)req_len + body_len < req_cap) {
             memcpy(request + req_len, body, body_len);
             req_len += (int)body_len;
+        } else {
+            kprintf("[HTTPS] POST: request buffer too small: hdr=%d body=%u cap=%u\n",
+                    req_len, (unsigned)body_len, (unsigned)req_cap);
+            kfree(request);
+            https_close(conn);
+            return HTTPS_ERR_NO_MEMORY;
         }
     }
 
@@ -1440,7 +1451,16 @@ int https_post(const char *url, const char *headers, const char *body,
     if (g_tls_dbg) kprintf("[POSTDBG] https_send ret=%d (req_len=%d)\n", ret, req_len);
     _pt_req = sched_now_ms();
     kfree(request);
-    if (ret < 0) { kprintf("[HTTPPROF] POST send FAILED ret=%d\n", ret); https_close(conn); return ret; }
+    if (ret < 0) {
+        // #postfix: name the sizes. The "HTTPS POST fails over ~16 KB" defect
+        // was invisible for months because this line printed only `ret=-2`, and
+        // the one number that identified it (the whole-request byte count, which
+        // had crossed the TLS 2^14 plaintext limit) was never logged anywhere.
+        kprintf("[HTTPPROF] POST send FAILED ret=%d req_len=%d body_len=%u host=%s\n",
+                ret, req_len, (unsigned)body_len, host);
+        https_close(conn);
+        return ret;
+    }
 
     uint32_t buffer_size = 131072;   // 128KB for chat responses
     uint8_t *buffer = kmalloc(buffer_size);
@@ -1500,6 +1520,14 @@ int https_post(const char *url, const char *headers, const char *body,
         }
     }
 
+    // #postfix: the receive side has a real ceiling too (128 KB). Say so when
+    // it is hit, naming the limit, rather than handing back a short body and
+    // letting the JSON parse fail somewhere unrelated. The truncated-body check
+    // below still turns it into an error whenever Content-Length proves it.
+    if (buffer_len >= buffer_size) {
+        kprintf("[HTTPS] POST: response filled the %u-byte receive buffer; "
+                "anything past it was not read\n", (unsigned)buffer_size);
+    }
     https_close(conn);
     if (g_https_prof) {
         kprintf("[HTTPPROF] POST tot=%u conn=%u(dns=%u tcp=%u tls=%u) ttfb=%u len=%u st=%d hdrend=%d\n",

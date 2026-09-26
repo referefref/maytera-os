@@ -56,8 +56,8 @@ _Static_assert(sizeof(drag_info_t) == 104,
                "#503 argtab: SZ_DRAG_INFO in rustkern/argtab.rs is stale. "
                "drag_info_t is duplicated in userland/libc/syscall.h and "
                "mirrored by DragInfo in rustkern/dragsess.rs; update all four.");
-_Static_assert(sizeof(wm_window_info_t) == 140,   /* #opacityglass: + int opacity (#44: + int maximized; #41: + char app_id[32]) */
-               "#503 argtab: SZ_WM_WINDOW_INFO in rustkern.rs is stale");
+_Static_assert(sizeof(wm_window_info_t) == 144,   /* #469: + int uwin (#opacityglass: + int opacity; #44: + int maximized; #41: + char app_id[32]) */
+               "#503 argtab: SZ_WM_WINDOW_INFO in rustkern/argtab.rs is stale");
 _Static_assert(sizeof(cron_job_t) == 128,
                "#503 argtab: SZ_CRON_JOB in rustkern.rs is stale");
 _Static_assert(sizeof(ext2_fsck_report_t) == 200,

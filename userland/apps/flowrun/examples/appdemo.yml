@@ -1,0 +1,35 @@
+# Maytera Flow M2 example: APP-node dispatch through the tool-contract API.
+#
+# The `app` node conv drives the Convert app's real contract action
+# convert.value (a CT_SAFE compute action: it types the given decimal through
+# the app's own input primitives and returns the converted result the window
+# would show). The node's inputs are marshalled into the contract call's argv
+# (verb "call", item "value", arg = the amount); the app's reply line is parsed
+# back and the extracted result is placed on the node's "out" port, which the
+# file node writes.
+#
+# convert.value converts using the app's currently-configured category and unit
+# pair (a fresh install defaults to Length, metre -> foot), so for amount 100 the
+# reply is e.g. "100 m = 328.084 ft". This dispatch needs the real OS (it spawns
+# the Convert binary); it is not exercised by the network-independent host test.
+name: appdemo
+nodes:
+  - id: t1
+    type: trigger
+    params: { kind: manual }
+  - id: amount
+    type: transform
+    params: { op: constant, text: "100" }
+  - id: conv
+    type: app
+    params: { app: convert, feature: value, verb: call }
+  - id: sink
+    type: file
+    params: { op: write, path: /HOME/APPOUT.TXT }
+edges:
+  - from: [t1, out]
+    to:   [conv, in]
+  - from: [amount, out]
+    to:   [conv, arg]                    # the decimal amount -> contract call arg
+  - from: [conv, out]
+    to:   [sink, text]                   # the parsed conversion result -> file

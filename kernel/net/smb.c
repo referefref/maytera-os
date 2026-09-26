@@ -1268,6 +1268,27 @@ int smb_mount(const char *url, const char *mount_point) {
 }
 
 // Mount with explicit credentials
+// --- SMB connect resilience (#297/#317) ------------------------------------
+// Rapid same-IP reboots and cold ARP make a flat 4-try connect fragile: the
+// shared NIC/TCP/neighbour state can drop the SYN-ACK before ARP resolves.
+// We retry more times with an ESCALATING settle (widening the settle for later
+// attempts to ride out a slow neighbour-table/ARP warmup), re-arm ARP fresh
+// each attempt, and use a fresh socket per attempt. Kept BOUNDED by both an
+// attempt cap and an overall wall-clock deadline so a dead server still fails
+// in reasonable time. No busy-spin: all waiting goes through smb_net_pump.
+#define SMB_CONNECT_ATTEMPTS   10
+#define SMB_CONNECT_TOTAL_MS   30000
+#define SMB_CONNECT_TIMEOUT_MS 6000
+#define SMB_ARP_REWARM_MS      2000
+
+// Pump-count settle between connect attempts; widens with each attempt (each
+// pump is about 1ms via smb_net_pump -> proc_sleep(1)). Capped so total time
+// stays reasonable.
+static inline int smb_connect_settle(int attempt) {
+    int s = 40 + attempt * 60;   // 40, 100, 160, ... pumps (about ms)
+    return s > 400 ? 400 : s;
+}
+
 int smb_mount_auth(uint32_t server_ip, const char *share,
                    const char *domain, const char *username,
                    const char *password, const char *mount_point) {
@@ -1305,12 +1326,39 @@ int smb_mount_auth(uint32_t server_ip, const char *share,
         }
     }
 
-    // Connect to server, with retries. The compositor calls net_poll() every
-    // frame; when our worker also pumps net_poll concurrently they can race the
-    // shared NIC/TCP state and drop our SYN-ACK (#297). A fresh socket on retry
-    // rides out a raced window, making connect reliable in practice.
+    // Connect to server, with retries and an ESCALATING backoff (#297/#317).
+    // The compositor calls net_poll() every frame; when our worker also pumps
+    // net_poll concurrently they can race the shared NIC/TCP state and drop our
+    // SYN-ACK. Under rapid same-IP reboots the peer's neighbour/TCP state churns
+    // and ARP may need to re-resolve. Each attempt therefore: (1) re-checks and
+    // re-arms ARP if the entry is not cached, (2) opens a FRESH socket and closes
+    // any failed one (no fd leak), (3) waits out a settle that widens for later
+    // attempts. Bounded by SMB_CONNECT_ATTEMPTS and an overall deadline so a
+    // genuinely dead server still fails in reasonable time.
     int connected = 0;
-    for (int attempt = 0; attempt < 4 && !connected; attempt++) {
+    uint64_t connect_deadline = sched_now_ms() + smb_ms_span(SMB_CONNECT_TOTAL_MS);
+    for (int attempt = 0; attempt < SMB_CONNECT_ATTEMPTS && !connected; attempt++) {
+        if (sched_now_ms() >= connect_deadline) break;   // overall hard bound
+
+        // Re-arm ARP fresh if the neighbour entry is not (or no longer) cached.
+        // arp_resolve() returns the cached MAC or fires a fresh who-has request
+        // (a normal request, NOT a gratuitous announce, so it is safe on real
+        // LAN hardware, #380) and returns 0. A failed prior attempt or a same-IP
+        // reboot may have left no usable entry; warm it again before we open a
+        // socket so the first SYN of this attempt goes out with a known MAC.
+        {
+            extern int arp_lookup_cached(uint32_t ip, uint8_t *mac);
+            extern int arp_resolve(uint32_t ip, uint8_t *mac);
+            uint8_t pmac[6];
+            if (!arp_lookup_cached(server_ip, pmac)) {
+                uint64_t astart = sched_now_ms();
+                while (!arp_resolve(server_ip, pmac)) {
+                    smb_net_pump();
+                    if (sched_now_ms() - astart > smb_ms_span(SMB_ARP_REWARM_MS)) break;
+                }
+            }
+        }
+
         conn->tcp_socket = tcp_socket();
         if (conn->tcp_socket < 0) {
             kprintf("[SMB] Failed to create TCP socket\n");
@@ -1318,17 +1366,19 @@ int smb_mount_auth(uint32_t server_ip, const char *share,
         }
         kprintf("[SMB] Connecting to ");
         ip_print(server_ip);
-        kprintf(":%d (attempt %d)\n", SMB_PORT, attempt + 1);
+        kprintf(":%d (attempt %d/%d)\n", SMB_PORT, attempt + 1, SMB_CONNECT_ATTEMPTS);
 
         int cr = tcp_connect(conn->tcp_socket, server_ip, SMB_PORT);
         if (cr < 0 && cr != TCP_ERR_IN_PROGRESS) {
             tcp_close(conn->tcp_socket);
-            for (int k = 0; k < 50; k++) smb_net_pump();
+            conn->tcp_socket = -1;
+            int settle = smb_connect_settle(attempt);
+            for (int k = 0; k < settle; k++) smb_net_pump();
             continue;
         }
 
         uint64_t cstart = sched_now_ms();
-        uint64_t ctimeout = smb_ms_span(6000);
+        uint64_t ctimeout = smb_ms_span(SMB_CONNECT_TIMEOUT_MS);
         while (!tcp_is_connected(conn->tcp_socket)) {
             smb_net_pump();
             if (tcp_get_state(conn->tcp_socket) == TCP_STATE_CLOSED) break;
@@ -1340,7 +1390,9 @@ int smb_mount_auth(uint32_t server_ip, const char *share,
             break;
         }
         tcp_close(conn->tcp_socket);
-        for (int k = 0; k < 50; k++) smb_net_pump();  // settle before retry
+        conn->tcp_socket = -1;
+        int settle = smb_connect_settle(attempt);   // escalating settle
+        for (int k = 0; k < settle; k++) smb_net_pump();
     }
 
     if (!connected) {

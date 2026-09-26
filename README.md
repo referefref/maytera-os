@@ -49,8 +49,8 @@ fix. See Releases below.
   built-in LLM reads them to drive the desktop and, on your consent, generate,
   compile and run new apps/widgets/drivers on the live system. Every action is
   scoped by a **capability token**, gated on consent, and written to an audit
-  trail. A prompt-injection keyword guard (the Nova ruleset) ships in the
-  kernel. See the honest description of its limits under Security below.
+  trail. There is deliberately **no prompt-injection detector**; see Security
+  below for what is actually enforced and why.
 - **Kernel** - long-mode paging with demand paging and copy-on-write, a
   preemptive scheduler, ELF and PE loaders, signals, futexes, and a
   wait-queue-based blocking layer.
@@ -192,11 +192,21 @@ both in this tree.
 - **A non-root desktop.** Work is in progress; this release still runs the
   desktop as the administrator account, which is uid 0.
 
-**About the Nova prompt-injection guard:** it is a **keyword and pattern
-ruleset**, not a semantic model. It raises the cost of the obvious injection
-strings. It does not understand intent and must not be treated as a boundary
-you can rely on. The capability token, the consent prompt and the audit trail
-are the real controls.
+**About prompt injection: there is no detector, on purpose.** Earlier releases
+shipped a keyword ruleset in the kernel and described it here as raising the
+cost of the obvious injection strings. It was then measured: **18 of 18
+hostile strings written in one sitting passed it**, while an ordinary window
+title ("Contract as signed.pdf") tripped its highest severity. It has been
+removed rather than tuned, because detecting adversarial text is a race
+decided by whoever iterates last, and a control that is believed to work is
+worse than none.
+
+What replaces it is structural: untrusted bytes are kept out of positions the
+model reads as instruction. Window titles, for example, are no longer sent to
+the model as ambient state; only kernel-resolved app ids are. **The controls
+you can actually rely on are the capability token, the consent prompt the
+trusted compositor draws, and the audit trail.** A successful injection
+reaches an unexpected consent prompt, not an unexpected action.
 
 Please report security issues as described in `SECURITY.md`.
 

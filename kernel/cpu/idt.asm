@@ -333,11 +333,50 @@ isr_common:
     push r14
     push r15
 
+    ; ==================================================================
+    ; #CR2FRAME: CR2 IS FAULT STATE AND IT MUST LIVE IN THE FRAME.
+    ;
+    ; CR2 is a single per-CORE register that EVERY page fault overwrites.
+    ; It was being read in C, at the top of mm/fault.c page_fault_handler().
+    ; That is not the top of the fault: isr_handler() runs bkl_acquire()
+    ; FIRST, the contended wait deliberately runs with interrupts ENABLED
+    ; (cpu/smp.c bkl_take_locked), and sched_rq_pop() steals across cores.
+    ; So between the fault and that read this frame can be preempted, can
+    ; watch another thread on this core take and resolve its own faults,
+    ; and can be resumed ON A DIFFERENT CORE entirely. Every one of those
+    ; replaces CR2. The handler then resolves, reports and kills against
+    ; SOMEONE ELSE FAULT ADDRESS.
+    ;
+    ; MEASURED (procspawn C1, 702 SQUADRON launches, golden 2480): five
+    ; user page faults, five different faulting effective addresses
+    ; reconstructed from the saved registers (R11 + RCX*4, all in-bounds
+    ; inside a live 4 MB buffer), and CR2 reported as the SAME constant
+    ; 0x8040c48000 all five times. Five innocent processes were SIGSEGVd.
+    ; cpu/idt.c #smpreval2 had already caught one hop of this (a second
+    ; read in exception_fatal) and moved the capture earlier; this is the
+    ; rest of it, and no C location can fix it, because the first C
+    ; instruction already runs too late.
+    ;
+    ; Here there is nothing between the CPU raising the fault and this
+    ; read but pushes onto a kernel stack, which cannot fault. Reading it
+    ; for every vector rather than only 14 keeps ONE frame shape for the
+    ; one stub every vector shares; a non-#PF frame simply carries a value
+    ; nothing consults. Cost is one control-register read per interrupt.
+    ; The pad keeps the push count even so the stack alignment at the
+    ; CALL below is exactly what it was.
+    ; ==================================================================
+    push qword 0        ; frame->cr2_pad
+    mov  rax, cr2
+    push rax            ; frame->cr2  (rax itself is already saved above)
+
     ; Pass stack pointer as argument (points to interrupt_frame_t)
     mov rdi, rsp
 
     ; Call C handler
     call isr_handler
+
+    ; Drop the #CR2FRAME capture (cr2 + pad) before the GPR pops
+    add rsp, 16
 
     ; Restore all registers
     pop r15

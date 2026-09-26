@@ -258,7 +258,7 @@ const SZ_DISKIMG_INFO: u32 = 288;
 // _Static_assert in proc/syscall_argtab_lock.c AND in both copies of the
 // struct (kernel + userland), because it is duplicated three ways.
 const SZ_DRAG_INFO: u32 = 104;
-const SZ_WM_WINDOW_INFO: u16 = 140;   // #opacityglass: + int opacity; #44: + int maximized; #41: + char app_id[32] (locked by syscall_argtab_lock.c)
+const SZ_WM_WINDOW_INFO: u16 = 144;   // #469: + int uwin; #opacityglass: + int opacity; #44: + int maximized; #41: + char app_id[32] (locked by syscall_argtab_lock.c)
 const SZ_CRON_JOB: u16 = 128;
 const SZ_SC_USER_INFO: u16 = 140;
 const SZ_FB_INFO_USER: u32 = 24;
@@ -325,9 +325,6 @@ const CAP_PRINTERS: u16 = 8;
 // SYS_FONT_GLYPH arg3 is int meta[5]: the handler writes meta[0..4] (width,
 // height, xoff, yoff, advance) and nothing more.
 const SZ_FONT_GLYPH_META: u32 = 20;
-// #745 aiguard_verdict_t: 5 x i32 + 48 + 64 + 64. Locked by _Static_assert in
-// kernel/security/aiguard.h and a const assert in rustkern/aiguard.rs.
-const SZ_AIGUARD_VERDICT: u32 = 196;
 /// (#182) sizeof(dos_fm_event_t). _Static_assert-locked in dos/dosexec.c AND in
 /// proc/syscall.c, so this number cannot drift away from the struct it sizes.
 const SZ_DOS_FM_EVENT: u16 = 16;
@@ -544,15 +541,11 @@ static TAB: &[Desc] = &[
     Desc { num: 257, args: [NONE, wa(3), NONE, NONE, NONE, NONE] },
     // sys_http_post_start((const char *)arg1, (const char *)arg2, (const char *)arg3)
     Desc { num: 265, args: [s(PATH_MAX), s(TEXT_MAX), s(TEXT_MAX), NONE, NONE, NONE] },
-    // (#745) sys_ai_scan((const char *)arg1 text, (aiguard_verdict_t *)arg2 out).
-    // arg1 is an arbitrary-length untrusted string, so TEXT_MAX; arg2 is a
-    // fixed 196-byte write the handler always performs on a non-negative return.
     // (#182) sys_dos_fm_events(dos_fm_event_t *buf, uint32_t max_events).
     // arg2 is a COUNT of 16-byte events, clamped to the queue's own capacity so
     // a caller cannot make the validated length enormous. wec, not we: the
     // handler clamps to 1024 as well, and the two clamps agreeing is the point.
     Desc { num: 377, args: [wec(2, SZ_DOS_FM_EVENT, 1024), NONE, NONE, NONE, NONE, NONE] },
-    Desc { num: 383, args: [s(TEXT_MAX), wf(SZ_AIGUARD_VERDICT), NONE, NONE, NONE, NONE] },
     // sys_http_post_poll((int)arg1, (int *)arg2, (uint32_t *)arg3) - both optional.
     Desc { num: 266, args: [NONE, wf(4), wf(4), NONE, NONE, NONE] },
     // sys_http_post_read((int)arg1, (char *)arg2, (uint32_t)arg3)

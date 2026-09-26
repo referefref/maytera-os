@@ -638,6 +638,7 @@ static inline long sys_elev_may(void) {
 #define SYS_CAP_INJECT_KEY       439   // Stage 3 input.inject: post a synthetic key to an OWNED window (gated)
 #define SYS_CAP_INJECT_MOUSE     440   // Stage 3 input.inject: post a synthetic pointer event to an OWNED window (gated)
 #define SYS_FLOCK                441   // #404 Stage 6: flock(fd,op) BSD advisory whole-file lock
+#define SYS_CAP_INJECT_KEY_UP    460   // #469 AI-VISION: the RELEASE half of input.inject (gated identically)
 
 // Capability classes (mirror proc/caps.h / rustkern/caps.rs).
 #define CAP_NONE            0u
@@ -674,6 +675,14 @@ static inline long sys_elev_may(void) {
 
 #define CAP_ACT_DENY     0
 #define CAP_ACT_APPROVE  1
+// #capalways: approve AND remember. The kernel records a standing consent
+// for (uid, app, cap, scope_kind, exact scope), so a later identical request
+// skips both the prompt and the input-credit test and is issued a normal,
+// still-time-bounded grant. Only the compositor may send it, and only while
+// its own prompt is open. MUST match CAP_ACT_APPROVE_ALWAYS in
+// kernel/proc/caps.h; the compositor cannot include the kernel header, which
+// is exactly how this constant was missed and broke the golden build.
+#define CAP_ACT_APPROVE_ALWAYS  2
 
 // SYS_CAP_REQUEST in. reason is display text (sanitised in the kernel); scope
 // is the noun (validated against the kernel's terms). Nothing here decides
@@ -764,6 +773,13 @@ static inline long sys_cap_inject_key(int win, int keycode) {
     return syscall2(SYS_CAP_INJECT_KEY, (long)win, (long)keycode); }
 static inline long sys_cap_inject_mouse(int win, int x, int y, int type, unsigned int button) {
     return syscall5(SYS_CAP_INJECT_MOUSE, (long)win, (long)x, (long)y, (long)type, (long)button); }
+// #469 AI-VISION: the RELEASE half. SYS_CAP_INJECT_KEY posts EVENT_KEY_DOWN
+// only, so a driven app saw every button go down and never come up: it could
+// be driven exactly ONCE per key. This is the same privilege (same grant, same
+// scope, same guard, same INPUT_SRC_SYNTHETIC provenance), not a new one.
+// A caller that wants a press should send key then key_up.
+static inline long sys_cap_inject_key_up(int win, int keycode) {
+    return syscall2(SYS_CAP_INJECT_KEY_UP, (long)win, (long)keycode); }
 // Mode encoding, mirrored from kernel/proc/syscall.h (locked there by
 // _Static_assert) and from rustkern/loginmode.rs (locked there by the boot
 // self-test). ANY error is treated as TYPED by every caller: showing every
@@ -1655,9 +1671,20 @@ typedef struct {
     // titlebar decorator popup's per-window override. APPENDED, never
     // reordered.
     int  opacity;
+    // #469 (ai-vision): the user_windows[] SLOT HANDLE win_create() returned to
+    // this window's owning app, or -1 for a window with no Ring-3 owner.
+    // APPENDED, never reordered - mirrors kernel/gui/window.h.
+    //
+    // This is the id space SYS_CAP_INJECT_KEY/_MOUSE and a
+    // CAP_SCOPE_WINDOW_TARGET consent request use; `id` above is the window
+    // manager's, and the note on SYS_WIN_GET_STATE further up this file records
+    // that nothing used to map one to the other. It is INERT on its own: using
+    // it still requires a consented, time-bounded grant naming that exact
+    // window, which the user approves with a real keypress.
+    int  uwin;
 } wm_window_info_t;
-_Static_assert(sizeof(wm_window_info_t) == 140,
-               "#745/#41/#44/#opacityglass: wm_window_info_t layout is duplicated in kernel/gui/window.h; "
+_Static_assert(sizeof(wm_window_info_t) == 144,
+               "#745/#41/#44/#opacityglass/#469: wm_window_info_t layout is duplicated in kernel/gui/window.h; "
                "change both or neither");
 
 static inline int wm_get_windows(wm_window_info_t *buf, int n) {
@@ -2930,12 +2957,6 @@ static inline int sys_http_fetch(const char *url, char *buf, unsigned int max_le
 #define NET_ERR_FAULTY (-3)
 
 // #745: a POST REFUSED by the kernel's prompt-injection screen. MIRRORS
-// NET_ERR_AIGUARD in kernel/proc/syscall.h. Distinct from -1 (request failed)
-// and -3 (circuit breaker) on purpose: this one is NOT a network problem and
-// NOT retryable, and reporting it as "network error" would both lie to the user
-// and hide a security event. Call SYS_AI_SCAN (libc/aiguard.h) on the text you
-// were about to send to find out WHICH rule refused it.
-#define NET_ERR_AIGUARD (-4)
 
 // Async (non-blocking) HTTP fetch (#277): start -> poll each frame -> read body.
 static inline int http_fetch_start(const char *url) {
@@ -2973,11 +2994,6 @@ static inline int sys_http_post(const char *url, const char *headers, const char
 // START copies url/headers/body into the kernel and spawns the worker, returning
 // a job id (>=0) or -1. POLL returns 0=running/1=done/2=error (and fills status,
 // len). READ copies the response body out and frees the job. CANCEL aborts.
-// #745 SYS_AI_SCAN. Kept beside the POST numbers on purpose: the enforcement
-// that matters happens inside SYS_HTTP_POST_START, and this is the read-only
-// companion that lets a client NAME what was refused. MIRRORS the kernel
-// header; syscall-number-lint rule 3 checks the two agree.
-#define SYS_AI_SCAN          383
 
 #define SYS_HTTP_POST_START  265
 #define SYS_HTTP_POST_POLL   266

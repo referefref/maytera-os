@@ -43,6 +43,7 @@
 #include "../fs/fat.h"
 #include "../fs/ext2.h"
 #include "../fs/perms.h"
+#include "../fs/bootlog.h"   // #appwrite: a refused create must survive a reboot
 #include "../fs/vfs.h"
 #include "../fs/escrow_guard.h"   // #246/#305 AI escrow kernel enforcement
 #include "../net/smb.h"
@@ -826,6 +827,31 @@ int64_t sys_open_k(const char *path, int flags) {
                 char parent[SC_PATH_MAX];
                 sc_parent_of(path, parent, sizeof(parent));
                 if (perms_check(parent, p->euid, p->egid, W_OK | X_OK) != 0) {
+                    // #appwrite: SAY WHAT THE CALLER WAS TRYING TO DO.
+                    //
+                    // perms_check() has already logged its own [PERMS-DENY],
+                    // but that line names the PARENT, because the parent is
+                    // what POSIX makes this decision about. So the only record
+                    // of a refused create read "want=-wx path=/DOS/DOOM", and
+                    // nothing anywhere said which FILE the application wanted
+                    // or that a create was what failed. MEASURED on golden
+                    // 2480: sixteen refused creates produced sixteen parent
+                    // paths and not one target name.
+                    //
+                    // This is the [WINCREATE] REFUSED pattern from
+                    // sys_win_create_impl(), applied to the other half of the
+                    // same problem. One line, at the chokepoint every create
+                    // in the system reaches, naming the operation, the target,
+                    // the directory that was consulted and the identity that
+                    // was refused. The [PERMS-DENY] cap above already bounds
+                    // the volume of the companion line; this one is bounded by
+                    // the same thing that bounds any create, namely an
+                    // application actually asking.
+                    bootlog_write("[FSDENY] REFUSED op=create pid=%u proc=%s uid=%u gid=%u "
+                                  "target=%s consulted=%s (parent needs w+x)",
+                                  (unsigned)p->pid, p->name,
+                                  (unsigned)p->euid, (unsigned)p->egid,
+                                  path, parent);
                     return -MOS_EACCES;
                 }
             } else {
@@ -860,8 +886,21 @@ int64_t sys_open_k(const char *path, int flags) {
                 // about who ends up allowed to write here - it only extends
                 // WHEN that decision applies, to a name that happens to
                 // already exist rather than one being created this instant.
-                if (rc != 0 && (flags & 0x40) && (access & W_OK) &&
-                    !perms_has_entry(path)) {
+                //
+                // #permcreate: THE `rc != 0` PRECONDITION HAD TO GO, and not
+                // as a tidy-up. rustkern/permpath.rs now answers a W_OK on a
+                // row-less name from the PARENT directory, so this exact case
+                // returns rc == 0 before reaching here. Left as it was, the
+                // stamp below would simply stop happening: the write would be
+                // allowed (correctly) and the file would stay with NO row
+                // forever, so nothing would ever record who owns it and
+                // chmod/chown/Files would keep showing it as root's. The
+                // ACCESS answer is identical either way - that is the point of
+                // the parent rule - but the OWNERSHIP RECORD is not, and it is
+                // the ownership record this branch exists for. The guard is now
+                // the condition that was always the real one: an O_CREAT write
+                // open of a name with no policy of its own.
+                if ((flags & 0x40) && (access & W_OK) && !perms_has_entry(path)) {
                     char parent[SC_PATH_MAX];
                     sc_parent_of(path, parent, sizeof(parent));
                     if (perms_check(parent, p->euid, p->egid, W_OK | X_OK) == 0) {
@@ -878,6 +917,20 @@ int64_t sys_open_k(const char *path, int flags) {
                         path[3]=='v' && path[4]=='/') {
                         capgate_note_refusal_rs(CAPGATE_K_DEV_PERM);
                     }
+                    // #appwrite: the OTHER half, and it is a genuinely
+                    // different failure from the create above. This one is a
+                    // refusal to open an object that ALREADY EXISTS, so the
+                    // remedy is a mode or an owner on the object itself, not a
+                    // writable parent. A single "EACCES" told the two apart
+                    // for nobody. Name which it was.
+                    bootlog_write("[FSDENY] REFUSED op=%s pid=%u proc=%s uid=%u gid=%u "
+                                  "target=%s (object exists; its own mode/owner refuse %c%c%c)",
+                                  (access & W_OK) ? "write" : "read",
+                                  (unsigned)p->pid, p->name,
+                                  (unsigned)p->euid, (unsigned)p->egid, path,
+                                  (access & R_OK) ? 'r' : '-',
+                                  (access & W_OK) ? 'w' : '-',
+                                  (access & X_OK) ? 'x' : '-');
                     return -MOS_EACCES;
                 }
             }

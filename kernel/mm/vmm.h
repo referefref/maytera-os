@@ -363,6 +363,18 @@ uint64_t vmm_protect_user_range(uint64_t pml4_phys, uint64_t virt_addr,
 // ---------------------------------------------------------------------------
 void vmm_reserve_boot_page_tables(void);
 
+// #procspawn: take every physical page the PMM could hand out but that Ring 0
+// cannot WRITE through its identity address out of the free list. The kernel
+// runs on the firmware's page tables forever, so the identity map carries the
+// firmware's protections; zeroing such a page in vmm_alloc_user_pages() is a
+// supervisor write to a present read-only page and panics the kernel. Must run
+// after vmm_reserve_boot_page_tables() and before anything else allocates.
+void vmm_reserve_unwritable_identity_pages(void);
+
+// Is `pa` inside one of the ranges that sweep found unwritable? Used by the
+// page-fault reporter so a fault there is named instead of guessed at.
+int vmm_identity_write_refused(uint64_t pa);
+
 // Is this physical address one of the live boot page tables? (1/0)
 int vmm_is_boot_page_table(uint64_t phys);
 uint32_t vmm_boot_page_table_count(void);

@@ -863,6 +863,31 @@ static void st_home_vectors(const st_home_t *h, const char *ctx) {
              "#676: create in OWN HOME permitted (this is what #679 unblocks)");
     st_check(h->path, ou, og, W_OK | X_OK, -1,
              "#676: create in ANOTHER user's home refused");
+
+    // =====================================================================
+    // #permcreate: THE SAME QUESTION, ASKED THE WAY MOST CALLERS ASK IT.
+    // =====================================================================
+    // The two vectors above ask about the DIRECTORY, because sys_open_k()
+    // knows to. Most callers do not: gui/shotq.c sys_screenshot_request()
+    // asks perms_check(<output file>, W_OK) on a name that does not exist
+    // yet, and until #permcreate that was answered from the root-owned 0755
+    // no-entry default and REFUSED for every non-root uid. Measured on
+    // golden 2472: `visiongame: FAIL screenshot request refused (-13 ...)`
+    // for uid 1000 writing into its OWN home.
+    //
+    // `child` is a probe name chosen above precisely because it has NO
+    // PERMS.DB row, which is exactly the shape the rule turns on. These two
+    // vectors are the allow and deny directions of the fix itself.
+    st_check(child, h->uid, h->gid, W_OK, 0,
+             "#permcreate: create a NEW name in the OWNER'S OWN home is PERMITTED "
+             "(this is the -13 that made screen.capture impossible for a user)");
+    st_check(child, ou, og, W_OK, -1,
+             "#permcreate: create a new name in ANOTHER user's home is REFUSED "
+             "(the parent's 0750 decides, and it grants nothing to other)");
+    // The rule is scoped to W_OK. R_OK/X_OK on the same row-less child must be
+    // answered exactly as they were before it existed.
+    st_check(child, h->uid, h->gid, R_OK, 0,
+             "#permcreate: R_OK on a row-less child is unchanged (parent traversal only)");
 }
 
 static void st_summary(const char *ctx) {
@@ -1102,6 +1127,78 @@ void perms_selftest(void) {
              "#676: create in / refused (root-owned 0755)");
     selftest_ran("perms/create");
 
+    // =====================================================================
+    // #permcreate: THE DENY DIRECTIONS OF THE PARENT RULE.
+    // =====================================================================
+    // The allow direction lives in st_home_vectors() above, against whatever
+    // home this machine actually has. These are the ones that must NOT have
+    // moved, and they are the whole security argument for the change: a rule
+    // that lets a user create in their own home is worth nothing if it also
+    // lets them create next to SHADOW.
+    //
+    // Every path below is deliberately a name with NO PERMS.DB row, because a
+    // name that HAS one never reaches the new rule at all. Asserting on a name
+    // that has a row would look like a test and prove nothing.
+    st_check("/CONFIG/NOSUCH.STV", 1000, 1000, W_OK, -1,
+             "#permcreate: create INSIDE /CONFIG refused (0711 grants other no w)");
+    st_check("/NOSUCH.STV", 1000, 1000, W_OK, -1,
+             "#permcreate: create at the filesystem root refused (root-owned 0755)");
+    st_check("/APPS/NOSUCH.STV", 1000, 1000, W_OK, -1,
+             "#permcreate: create in /APPS refused (root-owned 0755)");
+    // A PARENT THAT HAS NO ROW EITHER MUST NOT BECOME PERMISSIVE. This is the
+    // one that would silently undo the whole model if the rule recursed or
+    // defaulted open: /NOSUCHDIR.STV has no row, so it keeps the root-owned
+    // 0755 default and refuses a non-root creator, exactly as today.
+    st_check("/NOSUCHDIR.STV/NOSUCH.STV", 1000, 1000, W_OK, -1,
+             "#permcreate: a parent with NO entry keeps the root-owned default");
+    // ROOT IS UNTOUCHED: perms_check() still returns 0 on its first line.
+    st_check("/CONFIG/NOSUCH.STV", 0, 0, W_OK, 0,
+             "#permcreate: the uid-0 early-out is exactly as it was");
+    selftest_ran("perms/permcreate-deny");
+
+    // AN EXPLICIT ROW STILL DECIDES, AND THE PARENT IS NOT CONSULTED.
+    // /DEV/PTS/0 is seeded 0666 inside /DEV/PTS, which is seeded 0755 and
+    // therefore grants uid 1000 NO write. If the parent were consulted for a
+    // path that has its own row, this would be REFUSED. It must be ALLOWED.
+    // Guarded on the seeds actually being what this reasons about, so an
+    // operator-edited PERMS.DB produces a clear not-run instead of a FAIL.
+    {
+        uint32_t pu = 0, pg = 0; uint16_t pm = 0;
+        uint32_t du = 0, dg = 0; uint16_t dm = 0;
+        if (perms_get("/DEV/PTS",   &pu, &pg, &pm) == 0 && pu == 0 && (pm & 0777) == 0755 &&
+            perms_get("/DEV/PTS/0", &du, &dg, &dm) == 0 && du == 0 && (dm & 0777) == 0666) {
+            st_check("/DEV/PTS/0", 1000, 1000, W_OK, 0,
+                     "#permcreate: an explicit 0666 row decides; its 0755 parent is NOT consulted");
+            selftest_ran("perms/permcreate-entrywins");
+        } else {
+            selftest_notrun("perms/permcreate-entrywins",
+                            "/DEV/PTS and /DEV/PTS/0 are not the seeded root-owned 0755 and 0666 "
+                            "rows this vector reasons about, so 'an explicit entry decides and the "
+                            "parent rule does not override it' was NOT verified this boot");
+            st_notrun++;
+        }
+    }
+
+    // A SHARED-STATE DIRECTORY THAT IS SEEDED 0777 NOW PERMITS ITS CONTENTS TO
+    // BE CREATED, which is what seeding it 0777 was always FOR: NetHack writes
+    // lock and bones files beside its record. Before #permcreate the directory
+    // said 0777 and the kernel refused every create in it anyway, which is a
+    // policy that reads as granted and behaves as denied.
+    {
+        uint32_t nu = 0, ng = 0; uint16_t nm = 0;
+        if (perms_get("/GAMES/NETHACK", &nu, &ng, &nm) == 0 && (nm & 0777) == 0777) {
+            st_check("/GAMES/NETHACK/NOSUCH.STV", 1000, 1000, W_OK, 0,
+                     "#permcreate: a 0777 shared-state directory can have names created in it");
+            selftest_ran("perms/permcreate-shared");
+        } else {
+            selftest_notrun("perms/permcreate-shared",
+                            "/GAMES/NETHACK is not the seeded 0777 shared-state directory this "
+                            "vector reasons about, so the allow direction on a world-writable "
+                            "directory was NOT verified this boot");
+            st_notrun++;
+        }
+    }
+
     st_summary("boot");
 }
 
@@ -1121,6 +1218,98 @@ void perms_selftest(void) {
 // opposite of the model. Stating that here rather than leaving a third silent
 // skip: for a root session the vectors run against every non-root home the
 // database holds, and if there are none, that is a LOUD not-run.
+// ===========================================================================
+// #appwrite: WHERE CAN THIS SESSION ACTUALLY CREATE A FILE?
+// ===========================================================================
+// THE DEFECT THIS EXISTS TO MAKE UNMISSABLE. On golden 2480 a Ring-3 process
+// at uid 1000 was MEASURED to be refused a create at SIXTEEN destinations out
+// of sixteen, including the ext2 root, /HOME, /NOTES, /SQUADRON, /CONFIG,
+// /RECYCLE, /IMAGES, /GAMES and both of the directories whose write
+// exemptions (#dosperm, #word6blank) exist precisely so a guest can keep
+// state beside its executable. Nothing in the system said so. The individual
+// refusals were logged one at a time, to a serial port that the two machines
+// that matter do not have, each one naming a PARENT directory rather than the
+// file somebody wanted, and the features built on top of them presented as an
+// unrelated assortment of buttons that do nothing.
+//
+// The self-test above is the RULE check and it passes on such a machine,
+// correctly: every vector it asks is about a home, and on a machine with no
+// account there is no home, so the group declines and says so. What was
+// missing is the OPERATIONAL statement, which is a different question with a
+// different answer: given THIS session's identity, right now, is there
+// anywhere on this filesystem it can put a file? "No" is a legitimate answer
+// for a pre-account bootstrap session and an alarming one for a real login,
+// and until this ran nothing distinguished them or even asked.
+//
+// NON-WIDENING BY CONSTRUCTION: it decides nothing and changes no mode. It
+// asks the same walker the real gate asks and prints the answer.
+//
+// It calls perms_path_check_rs() rather than perms_check() ON PURPOSE. A
+// diagnostic sweep through perms_check() would emit one [PERMS-DENY] per
+// probe and burn the bounded deny-log budget that real refusals need; the
+// walker is the same decision without the logging. Root is short-circuited
+// because perms_check() returns 0 on its first line for uid 0, so sweeping as
+// root would report "all writable" and mean nothing.
+static const char *const perms_write_probe_dirs[] = {
+    "/", "/HOME", "/CONFIG", "/APPS", "/NOTES", "/IMAGES", "/GAMES",
+    "/RECYCLE", "/DOS", "/WIN16", "/SQUADRON", "/THEMES",
+};
+
+void perms_report_session_writability(const char *home, uint32_t uid, uint32_t gid) {
+    // The walker itself. Declared locally because the file-scope extern for it
+    // sits below, next to perms_check(), which is where it belongs.
+    extern int perms_path_check_rs(const char *path, uint32_t uid, uint32_t gid,
+                                   int access);
+    if (uid == 0) {
+        bootlog_write("[PERMS-WRITEMAP] session uid 0: perms_check() bypasses on its "
+                      "first line, so every path is writable and a sweep would prove "
+                      "nothing. Not run.");
+        return;
+    }
+
+    unsigned n = sizeof(perms_write_probe_dirs) / sizeof(perms_write_probe_dirs[0]);
+    int allowed = 0;
+    char line[240];
+    int w = 0;
+    for (unsigned i = 0; i < n; i++) {
+        int ok = (perms_path_check_rs(perms_write_probe_dirs[i], uid, gid,
+                                      W_OK | X_OK) == 0);
+        if (ok) allowed++;
+        const char *nm = perms_write_probe_dirs[i];
+        int need = 0; while (nm[need]) need++;
+        if (w + need + 4 < (int)sizeof(line)) {
+            if (w) line[w++] = ' ';
+            line[w++] = ok ? '+' : '-';
+            for (int k = 0; nm[k]; k++) line[w++] = nm[k];
+        }
+    }
+    line[w] = '\0';
+    bootlog_write("[PERMS-WRITEMAP] uid=%u gid=%u create-in-dir: %s",
+                  (unsigned)uid, (unsigned)gid, line);
+
+    int home_ok = 0;
+    int real_home = (home && home[0] == '/' && home[1] != '\0');
+    if (real_home)
+        home_ok = (perms_path_check_rs(home, uid, gid, W_OK | X_OK) == 0);
+    bootlog_write("[PERMS-WRITEMAP] session home: %s -> %s",
+                  real_home ? home : "(none: no account, home resolves to \"/\")",
+                  real_home ? (home_ok ? "WRITABLE" : "NOT WRITABLE")
+                            : "NOT WRITABLE");
+
+    if (allowed == 0 && !home_ok) {
+        // The loud case. Every feature that saves a document, a preference, a
+        // download, a high score or a log is dead on this machine, and each
+        // one will present as its own unrelated bug.
+        bootlog_write("[PERMS-WRITEMAP] *** THIS SESSION (uid=%u) CANNOT CREATE A FILE "
+                      "ANYWHERE. Every save, download, log and preference will fail "
+                      "with -13 (EACCES). Expected ONLY before the setup wizard has "
+                      "created an account; on a machine with a real login this is a "
+                      "defect, and /CONFIG/PERMS.DB plus the login-time home claim "
+                      "(#745, kernel/main.c) are where to look. ***",
+                      (unsigned)uid);
+    }
+}
+
 void perms_selftest_session(const char *home, uint32_t uid, uint32_t gid) {
     st_fail = 0;
     st_ran = 0;
@@ -1190,6 +1379,11 @@ void perms_selftest_session(const char *home, uint32_t uid, uint32_t gid) {
     }
 
     st_summary("session");
+
+    // #appwrite: the OPERATIONAL companion to the rule check above. Separate
+    // call, separate verdict, deliberately after st_summary() so a PASS on the
+    // rules can never be mistaken for "and therefore this session can work".
+    perms_report_session_writability(home, uid, gid);
 }
 
 static void perms_seed_system(void) {
@@ -1567,14 +1761,26 @@ int perms_check(const char *path, uint32_t proc_uid, uint32_t proc_gid, int acce
         if (deny_logged < PERMS_DENY_LOG_MAX) {
             deny_logged++;
             extern const char *proc_current_name(void);
-            kprintf("[PERMS-DENY] proc=%s uid=%u gid=%u want=%c%c%c path=%s\n",
+            // #appwrite: bootlog_write(), NOT kprintf(). This is the same
+            // argument this file already makes for perms_selftest() a few
+            // hundred lines up, applied to the line that matters more. A
+            // REFUSAL is worth exactly as much as the number of machines it
+            // can be read on, and kprintf() reaches a serial port only. The
+            // two targets whose evidence actually matters (the owner's laptop
+            // and the iMac14,4) have no serial port, so on those machines a
+            // permission refusal has always left NO trace at all, which is
+            // exactly how "the app's Save button does nothing" stayed
+            // unexplained for months. bootlog_write() mirrors to serial anyway
+            // and replays into /BOOTLOG.TXT once the root volume is writable,
+            // so choosing it costs nothing and loses nothing.
+            bootlog_write("[PERMS-DENY] proc=%s uid=%u gid=%u want=%c%c%c path=%s",
                     proc_current_name(), proc_uid, proc_gid,
                     (access & R_OK) ? 'r' : '-',
                     (access & W_OK) ? 'w' : '-',
                     (access & X_OK) ? 'x' : '-',
                     path);
             if (deny_logged == PERMS_DENY_LOG_MAX) {
-                kprintf("[PERMS-DENY] log cap (%u) reached; further denials silent\n",
+                bootlog_write("[PERMS-DENY] log cap (%u) reached; further denials silent",
                         (unsigned)PERMS_DENY_LOG_MAX);
             }
         }

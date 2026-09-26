@@ -474,12 +474,12 @@ mechanically; see "How this table is kept honest" below.
 | dr_flac | `kernel/media/dr_flac` | public domain / MIT-0 | `COPYING` |
 | stb_truetype (Sean Barrett / RAD Game Tools) | `kernel/gui/stb_truetype.h` | public domain, or MIT at your option (dual, per the file's own tail) | in-file header |
 | Ed25519 verification, derived from TweetNaCl | `kernel/crypto/ed25519.c` | public domain (TweetNaCl) | in-file note naming the TweetNaCl authors |
-| Nova prompt-injection ruleset | `kernel/security/nova.c` | MIT | in-file note |
 | Mozilla CA bundle | `kernel/fs/CERTS/ca-bundle.crt` | MPL 2.0 (claimed; see the note below) | **none: the promised in-file note does not exist** |
 | Realtek 88x2bu register tables | `kernel/drivers/net/wifi` | GPL (register facts) | in-file note |
 | MayteraOS libc (first party, listed so the table is a complete inventory) | `userland/libc` | MIT | `LICENSE` + per-file SPDX headers |
 | TinyGL | `userland/libgl` | zlib-style, **mandatory in-product acknowledgment** (see note below) | `src/LICENSE` |
 | CPython 3.11.9 (the shipping Python interpreter, `/APPS/PYTHON.ELF`) | `userland/apps/python/port` holds MayteraOS port glue only (MIT); CPython 3.11.9 itself is fetched at build time, not vendored in this repo | Python Software Foundation License (PSF), upstream python.org | upstream (python.org); the port-glue files carry MIT SPDX headers |
+| MicroPython MayteraOS port glue (legacy tree, not the shipping interpreter) | `userland/python/micropython/ports/maytera` | MIT (port glue only; upstream MicroPython is MIT) | per-file SPDX headers |
 | Duktape (JS engine core) | `userland/apps/browser/port/duktape` holds MayteraOS glue only; the engine is fetched, not tracked (see note below) | MIT (upstream) | not tracked |
 | NetSurf core libs (libwapcaplet, libparserutils, libhubbub, libcss, libdom) | `userland/apps/browser/port/netsurf` holds MayteraOS glue only; the libraries are fetched at pinned revisions, not tracked (see note below) | MIT (upstream NetSurf core libs) | not tracked |
 | DOOM (id Software) | `userland/apps/doom` | id Software DOOM Source Code License (NOT the GPL) | per-file headers only; **no licence document is in the tree, see the DOOM note below** |
@@ -2244,11 +2244,16 @@ header at all is invisible to it. It verifies that a path is NAMED here; it
 cannot verify that what this file SAYS about that path is true. It is a
 bookkeeping gate, not legal advice.
 
-The AI layer's LLM prompt-injection protection uses the **Nova** open ruleset by
-**Thomas Roccia** ([@fr0gger_](https://github.com/fr0gger/nova-framework)),
-(c) 2025, MIT License. The keyword layer is adapted from Nova's
-`llm01_promptinject`, `jailbreak` and `injection` rules; retain this credit if
-you redistribute `kernel/security/nova.c`.
+**REMOVED 2026-09-26 (#469m aititleinject).** This file previously credited the
+**Nova** open ruleset by **Thomas Roccia** (@fr0gger_), (c) 2025, MIT, whose
+keyword layer was vendored as `kernel/security/nova.c`. That file and every
+line that ran it are gone from the tree, so the attribution obligation no
+longer applies and the row has been removed from the table above. Recorded
+here rather than deleted silently, because an attribution that disappears
+without explanation reads like an attribution that was dropped. Nothing about
+the removal reflects on the upstream project: the rules did what keyword rules
+do, and this OS was asking them to do something else. See
+`docs/AI_PROMPT_INJECTION.md`.
 
 Because the kernel statically links GPLv2 components (libmad, faad2), the
 combined MayteraOS KERNEL binary is distributed under **GPLv2-or-later**. The

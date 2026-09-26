@@ -341,6 +341,35 @@ int  contract_invoke(const char *app, int argc, char **argv, char *out, int ocap
 // rather than recomputing the convention.
 void contract_app_path(const char *app, char *out, int ocap);
 
+// ---------------------------------------------------------------------------
+// #469m IS THIS APP ACTUALLY DECLARED? The guard between a model-supplied name
+// and an unbounded wait.
+//
+// contract_app_path() deliberately falls back to the /APPS/<UPPERCASE> naming
+// convention when the generated index does not list an app, which is right for
+// a HUMAN typing `ctl <name>`. It is dangerous for a name the MODEL chose,
+// because contract_invoke() spawns that path with --contract and then does an
+// UNBOUNDED sys_waitpid() (the kernel ignores WNOHANG, see libc/sys/wait.c:33).
+// An app that is not contract-aware ignores the flag, opens its window, and
+// never exits, so the whole AI tool loop hangs with no timeout and no recovery.
+//
+// MEASURED, on the first turn of the first baseline run (#469m): asked to
+// invert the image in Maytera Studio, the model emitted
+// app.action {"app":"sprite", ...}; the convention resolved that to
+// /APPS/SPRITE, a real GUI binary; it launched and never returned. One
+// hallucinated argument wedged the loop indefinitely.
+//
+// Returns 1 if `app` appears in the generated index. Returns 1 ALSO when the
+// index file is ABSENT, because an image without the index must keep working
+// exactly as before; the guard is for a PRESENT index that does not name the
+// app. Returns 0 only for "the index exists and this app is not in it".
+int contract_declared(const char *app);
+
+// Comma-separated list of the apps the generated index declares, for an error
+// message that tells the caller what it COULD have asked for. Writes "" and
+// returns 0 if the index is missing or empty.
+int contract_declared_list(char *out, int ocap);
+
 // ---- the LIVE-INSTANCE call path (tier 2 wire, #<config-ref>) -------------
 //
 // docs/AI_ACTION_CAPABILITY_BINDING.md section 4.2. contract_invoke() above

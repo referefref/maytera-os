@@ -611,6 +611,16 @@ int pmm_reserve_page(uint64_t phys_addr) {
     return 1;
 }
 
+// #procspawn: the window the allocator scans, in BYTES. memory_start /
+// memory_end are page numbers and are file-static, and mm/vmm.c needs the
+// exact same bounds pmm_alloc_page_inner() uses or its "every free page is
+// writable" sweep would check a different set of pages than the allocator
+// hands out.
+void pmm_managed_range(uint64_t *lo, uint64_t *hi) {
+    if (lo) *lo = memory_start * PMM_PAGE_SIZE;
+    if (hi) *hi = memory_end * PMM_PAGE_SIZE;
+}
+
 // Is this page currently allocatable? 1 = free (would be handed out), 0 = not.
 // Pages outside [memory_start, memory_end) report 0: the allocator's scan never
 // reaches them.

@@ -15,8 +15,9 @@ SRCS = string.c userconf.c stdio.c stdio_file.c stdlib.c gui.c gui_scroll.c gui_
        pwd.c grp.c assoc.c aiclient.c aicap.c aidev.c escrow.c photorg.c exifdate.c notify.c math.c pthread.c \
        ctype.c scanf.c time.c tz.c settingscfg.c assert.c posixextra.c wallpapers.c sha256.c pkgsig.c gui_theme.c gui_palette.c uiscale.c \
        gui_dock.c gui_confirm.c gui_mods.c \
-       startmenu_reg.c pkgdest.c aiguard.c poll.c spawn.c \
-       contract.c ctinvoke.c ctlive.c getopt.c libgen.c ftw.c utime.c locale.c tmpfile.c system.c wctype.c pipeline.c mtool.c proccpu.c langinfo.c
+       startmenu_reg.c pkgdest.c poll.c spawn.c \
+       contract.c ctinvoke.c ctlive.c getopt.c libgen.c ftw.c utime.c locale.c tmpfile.c system.c wctype.c pipeline.c mtool.c proccpu.c langinfo.c \
+       jpegenc.c b64.c aitools.c
 OBJS = $(SRCS:.c=.o)
 
 # sys/ sources

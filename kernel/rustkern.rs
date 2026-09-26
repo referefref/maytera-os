@@ -179,7 +179,6 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/imgra.rs"] mod imgra;   // [no-ticket]: sequential readahead policy for the disk-image block cache
 #[path = "rustkern/isomemo.rs"] mod isomemo;   // [no-ticket]: 4-way memo over the last ISO path resolved
 #[path = "rustkern/blkhist.rs"] mod blkhist;   // [no-ticket]: block-layer transfer-size accounting (round trips per MB)
-#[path = "rustkern/aiguard.rs"] mod aiguard;   // #745: LLM prompt-injection screen
 #[path = "rustkern/jpeg.rs"] mod jpeg;
 #[path = "rustkern/le.rs"] mod le;   // #740: LE (Linear Executable) parse + load for DOS/4GW
 #[path = "rustkern/go32.rs"] mod go32;   // #211: go32/DJGPP v2 i386 COFF parse + load + stubinfo
@@ -213,6 +212,7 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/permhome.rs"] mod permhome;   // #PERMSKIP: "is this PERMS.DB key a user home?"
 #[path = "rustkern/selftestreg.rs"] mod selftestreg; // #PERMSKIP: the register of self-tests that DID NOT RUN
 #[path = "rustkern/ptwalk.rs"] mod ptwalk;   // #647: live page-table hierarchy walk
+#[path = "rustkern/ptro.rs"] mod ptro;      // #procspawn: which identity pages Ring 0 can actually write
 #[path = "rustkern/proc_mem.rs"] mod proc_mem;
 #[path = "rustkern/procinfo.rs"] mod procinfo;
 #[path = "rustkern/procreap.rs"] mod procreap;   // #745 (task 37): which zombie process slots may be reclaimed
@@ -244,6 +244,7 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/tls12.rs"] mod tls12;
 #[path = "rustkern/tlspool.rs"] mod tlspool;
 #[path = "rustkern/tls_parse.rs"] mod tls_parse;
+#[path = "rustkern/tlsfrag.rs"] mod tlsfrag;   // #postfix: the OUTGOING TLS record fragmentation plan (2^14 plaintext cap)
 #[path = "rustkern/tls_suite.rs"] mod tls_suite;   // #tls-suitefix: the offered cipher suite list, shared by ClientHello and ServerHello
 #[path = "rustkern/userconf.rs"] mod userconf;   // #683: per-user config paths
 #[path = "rustkern/usbvol.rs"] mod usbvol;   // #740: data volumes in the boot device tail

@@ -15,10 +15,11 @@ LDFLAGS = -pie --no-dynamic-linker -z notext -nostdlib -z max-page-size=0x1000 -
 # new app (build/golden-new-apps.list), ext2 is case-sensitive, and the
 # Start-menu entry launches /APPS/IMGCONV.
 TARGET = IMGCONV
-# jpegenc.o is apps/paint/jpegenc.c compiled BY PATH: a pure function over an
+# (#469) jpegenc is no longer compiled by path out of another app's directory:
+# it MOVED to userland/libc and comes in with libc.a. Kept note: a pure function over an
 # ARGB buffer with no Studio state, so both apps share one JPEG encoder and
 # cannot drift apart on output. It is not copied here and paint is not edited.
-OBJS = main.o imgenc.o jpegenc.o
+OBJS = main.o imgenc.o
 
 CRT0 = $(LIBC_DIR)/crt0.o
 LIBC = $(LIBC_DIR)/libc.a
@@ -34,9 +35,6 @@ main.o: main.c imgenc.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 imgenc.o: imgenc.c imgenc.h
-	$(CC) $(CFLAGS) -c $< -o $@
-
-jpegenc.o: ../paint/jpegenc.c ../paint/studio.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:

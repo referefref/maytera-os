@@ -738,6 +738,60 @@ ifeq ($(PTWALKNORESERVE),1)
 CFLAGS += -DPTWALK_NO_RESERVE
 endif
 
+#   make PTRONORESERVE=1   - the NEGATIVE CONTROL for the #procspawn sweep in
+#                            vmm_reserve_unwritable_identity_pages(): identical
+#                            build with the reservation REMOVED, so the
+#                            [PTRO] INVARIANT line can be WATCHED TO FAIL and
+#                            the original panic (supervisor write to a present
+#                            read-only identity page, memset_fast, CR2 in a
+#                            firmware write-protected 2MB block) can be
+#                            reproduced on demand. Same argument as
+#                            PTWALKNORESERVE above. NEVER in a golden.
+ifeq ($(PTRONORESERVE),1)
+CFLAGS += -DPTRO_NO_RESERVE
+endif
+
+#   make PTROFAULTTEST=1   - the DETERMINISTIC half: memset one page of the
+#                            first range the sweep called unwritable, at boot.
+#                            Combined with PTRONORESERVE=1 the kernel MUST die
+#                            with err=0x3 at that exact address; without
+#                            PTRONORESERVE=1 the page is reserved but the
+#                            mapping is unchanged, so it MUST still die (the
+#                            fix withholds the page from the ALLOCATOR, it does
+#                            not make it writable). Never in a golden: it is a
+#                            deliberate kernel panic.
+ifeq ($(PTROFAULTTEST),1)
+CFLAGS += -DPTRO_FAULT_TEST
+endif
+
+# #CR2FRAME: THE FAULT ADDRESS RACE, CONSTRUCTED INSTEAD OF WAITED FOR.
+#
+#   make CR2RACETEST=1   - poison CR2 on EVERY Ring-3 page fault, just before
+#                          mm/fault.c reads it. That is exactly what a
+#                          preemption or a core migration inside
+#                          isr_handler()'s bkl_acquire() does to a #PF frame,
+#                          minus the luck. With the #CR2FRAME capture in place
+#                          the kernel uses frame->cr2, every fault still
+#                          resolves, the machine boots to the desktop, and
+#                          [CR2RACE] fires because the witness sees the poison.
+#
+#   make CR2RACETEST=1 CR2RACELEGACY=1
+#                        - the RED half: also write the poison INTO the frame,
+#                          which is precisely what the pre-#CR2FRAME
+#                          read_cr2() returned. The first userland demand fault
+#                          then kills its own process at the poison address,
+#                          reproducing the reported symptom on the first boot
+#                          instead of once in 140 app launches.
+#
+# Same argument and same placement as NOBLOCKTEST / SMAPTEST / PTROFAULTTEST
+# above. Never in a golden: CR2RACELEGACY deliberately kills user processes.
+ifeq ($(CR2RACETEST),1)
+CFLAGS += -DCR2RACETEST
+endif
+ifeq ($(CR2RACELEGACY),1)
+CFLAGS += -DCR2RACELEGACY
+endif
+
 # #75 (enqrace75b): `make ENQTEST=1` compiles in proc/process.c's enqueue-probe
 # SELF-TEST, which CONSTRUCTS the state each #75 enqueue probe claims to detect,
 # prints whether it fired, and leaves the rest of the boot as the neighbouring-

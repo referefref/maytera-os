@@ -65,6 +65,12 @@
 // --- SYS_CAP_RESOLVE actions (compositor only) -----------------------------
 #define CAP_ACT_DENY     0
 #define CAP_ACT_APPROVE  1
+// #capalways: approve AND remember, so a later identical request from the
+// same (uid, app, cap, scope) skips both the prompt and the input-credit
+// requirement. Only the compositor can send it, only while its own prompt
+// is open, so a standing consent can still only be born from a real human
+// decision at the trusted surface.
+#define CAP_ACT_APPROVE_ALWAYS  2
 
 #define CAP_USES_UNLIMITED 0xFFFFFFFFu
 
@@ -187,6 +193,8 @@ int64_t sys_cap_revoke(uint32_t cap);
 // cross-app WINDOW_TARGET), the consent-surface / lock-screen guard, one use
 // consume, and posts a synthetic (credit-free) event to the authorized window.
 int64_t sys_cap_inject_key(int win, int keycode);
+// #469 AI-VISION: the RELEASE half (same gate, same guard, EVENT_KEY_UP).
+int64_t sys_cap_inject_key_up(int win, int keycode);
 int64_t sys_cap_inject_mouse(int win, int x, int y, int type, uint32_t button);
 
 // Does the CURRENT process hold a live grant of `cap` covering `path`, and
@@ -214,5 +222,23 @@ int64_t caps_inject_authorize(int owns_target, uint64_t target_id);
 // Boot self-test driver + observability ledger printer (mirrors capgate).
 void caps_selftest(void);
 void caps_report(void);
+
+
+// --- standing consent ("Always allow"), rustkern/caps.rs -------------------
+// Policy + table live in Rust; only the /CONFIG file I/O is C (the same split
+// the rest of this file uses).
+void     cap_always_reset_rs(void);
+uint32_t cap_always_count_rs(void);
+int      cap_always_match_rs(uint32_t uid, uint32_t cap, uint32_t scope_kind,
+                             const char *app, const char *scope);
+int64_t  cap_always_add_rs(uint32_t uid, uint32_t cap, uint32_t scope_kind,
+                           const char *app, const char *scope);
+int      cap_always_parse_rs(const void *buf, uint32_t len);
+int      cap_always_serialize_rs(void *out, uint32_t cap_len);
+int64_t  cap_req_autogrant_rs(uint32_t pid, uint32_t uid, uint64_t now_ms, uint32_t cap,
+                              uint32_t duration_ms, uint32_t scope_kind, const char *reason,
+                              const char *scope, const char *app, uint32_t elev_open);
+// Load /CONFIG/CAPALLOW.CFG into the table. Safe to call before the FS is up.
+void     cap_always_load(void);
 
 #endif // PROC_CAPS_H

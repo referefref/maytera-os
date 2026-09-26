@@ -74,6 +74,13 @@ typedef struct {
 
 // Interrupt frame pushed by CPU
 typedef struct {
+    // #CR2FRAME: pushed by isr_common BEFORE anything that can fault or
+    // block, so it is this fault's CR2 and not some later one's. Only
+    // meaningful for int_no == EXCEPTION_PF; read it through
+    // exception_cr2(frame), never with read_cr2(). See cpu/idt.asm.
+    uint64_t cr2;
+    uint64_t cr2_pad;           // keeps the stub's push count even
+
     // Pushed by our interrupt stub
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rdi, rsi, rbp, rbx, rdx, rcx, rax;
@@ -89,6 +96,26 @@ typedef struct {
     uint64_t rsp;
     uint64_t ss;
 } __attribute__((packed)) interrupt_frame_t;
+
+// #CR2FRAME: THE STRUCT AND THE STUB ARE ONE DATA FORMAT WITH TWO AUTHORS, AND
+// NOTHING USED TO CHECK THEM AGAINST EACH OTHER. cpu/idt.asm's isr_common
+// decides the layout by its push order; this struct decides how C reads it. A
+// push added, removed or reordered in the asm silently shifts every field here
+// and turns a fault report, a signal frame and the uaccess fixup's frame->rip
+// write into garbage - the kind of defect that presents as an unrelated crash
+// somewhere else entirely. These are the four offsets the two sides must agree
+// on, so a desynchronising edit fails the BUILD instead of the machine.
+_Static_assert(__builtin_offsetof(interrupt_frame_t, cr2) == 0,
+               "#CR2FRAME: cr2 must be the LAST thing isr_common pushes");
+_Static_assert(__builtin_offsetof(interrupt_frame_t, r15) == 2 * 8,
+               "#CR2FRAME: cr2 + cr2_pad sit below r15");
+_Static_assert(__builtin_offsetof(interrupt_frame_t, int_no) == 17 * 8,
+               "interrupt_frame_t: 2 capture words + 15 GPRs precede int_no");
+_Static_assert(__builtin_offsetof(interrupt_frame_t, rip) == 19 * 8,
+               "interrupt_frame_t: int_no + error_code precede the CPU frame");
+_Static_assert(sizeof(interrupt_frame_t) == 24 * 8,
+               "interrupt_frame_t: isr_common's epilogue drops exactly 16 "
+               "bytes of capture and 16 of int_no/error_code");
 
 // Interrupt handler type
 typedef void (*interrupt_handler_t)(interrupt_frame_t *frame);
@@ -119,7 +146,6 @@ void exception_fatal(interrupt_frame_t *frame);
 // mm/fault.c's page_fault_handler(), which is the only place that sees CR2
 // while it still belongs to this fault. Every later print of a fault address
 // uses the recorded value. See the long comment at the definition in idt.c.
-void exception_note_cr2(uint64_t cr2);
 
 // External assembly functions
 extern void idt_load(idt_ptr_t *idt_ptr);

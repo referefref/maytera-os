@@ -59,6 +59,13 @@ void perms_selftest(void);
 // [PERMS-SELFTEST], durably.
 void perms_selftest_session(const char *home, uint32_t uid, uint32_t gid);
 
+// #appwrite: the OPERATIONAL question the rule self-test does not ask: given
+// this session's identity, is there ANY directory on this filesystem it can
+// create a file in? Decides nothing and changes no mode; it asks the same
+// walker the real gate asks and writes the answer to the boot log. Called from
+// perms_selftest_session(). Logs [PERMS-WRITEMAP], durably.
+void perms_report_session_writability(const char *home, uint32_t uid, uint32_t gid);
+
 // Set permissions for a file
 void perms_set(const char *path, uint32_t uid, uint32_t gid, uint16_t mode);
 

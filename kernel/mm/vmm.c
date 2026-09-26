@@ -78,6 +78,13 @@ void vmm_init(void) {
     // does and the first allocation-relevant thing after pmm_init().
     vmm_reserve_boot_page_tables();
 
+    // #procspawn: #647 above reserved the live page TABLES. The firmware
+    // write-protects whole 2MB blocks, so ~950 NON-table pages sharing those
+    // blocks were still free and still read-only, and zeroing one of them in
+    // vmm_alloc_user_pages() is a kernel panic. Same ordering requirement:
+    // after pmm_init(), before anything else allocates.
+    vmm_reserve_unwritable_identity_pages();
+
     kprintf("[VMM] Virtual memory manager initialized\n");
 }
 
@@ -595,6 +602,197 @@ int vmm_user_window_selftest(void) {
             ok ? "PASS" : "***FAIL***", free_before, free_after);
     bootlog_write("[UWIN] selftest %s leaked=%ld", ok ? "PASS" : "FAIL", (long)leaked);
     return ok;
+}
+
+// ===========================================================================
+// #procspawn: A FREE PHYSICAL PAGE WHOSE KERNEL IDENTITY MAPPING IS READ-ONLY
+// IS A KERNEL PANIC WAITING FOR THE ALLOCATOR CURSOR TO REACH IT.
+//
+// THE BUG, end to end, MEASURED on golden 2480 (QEMU q35 / OVMF, 4 GB):
+//
+//   [EXCEPTION] Page Fault (INT 14) KERNEL err=0x3 RIP=0x630a98 CS=0x8
+//               CR2=0x7aa00000     Error bits: P W S
+//   RDI=0x7aa00000 RSI=0x0 RCX=0x1000 RDX=0x1000   (memset(dest,0,4096))
+//
+//   RIP 0x630a98 disassembles to the `rep stosb` of memset_fast
+//   (memcpy_fast.asm:63); the return address 0x45f05f is inside
+//   vmm_alloc_user_pages() below, at `memset((void*)page, 0, 4096)` on the
+//   page pmm_alloc_page() had just returned. It took 254 serialised app
+//   launches in one boot.
+//
+//   The error code is the whole story: P=1 W=1 U=0 is a SUPERVISOR WRITE TO A
+//   PAGE THAT IS PRESENT AND READ-ONLY. Not demand paging, not a race, not a
+//   stale TLB. Reading the firmware's own PD entry for that address out of
+//   guest memory confirms it: PD[469] of the 1-2GB table = 0x7aa000e1, i.e.
+//   PRESENT | HUGE | ACCESSED | DIRTY and R/W CLEAR. CR0.WP is set
+//   (CR0=0x80010033), so the write faults instead of silently succeeding.
+//
+// WHY THERE ARE READ-ONLY PAGES IN THE FREE LIST AT ALL. vmm_init() adopts
+// the firmware's page tables and runs on them forever, so what the kernel
+// calls "the identity map" carries the FIRMWARE's protection attributes, not
+// ours. OVMF write-protects the 2MB blocks that contain its own paging
+// structures. Meanwhile bootloader.c maps EfiBootServicesCode/Data onto
+// MEMORY_TYPE_USABLE and pmm_init() frees that, so those pages enter the
+// allocator's free list still mapped read-only. MEASURED here, two 2MB
+// blocks: 0x7aa00000-0x7ac00000 and 0x7bc00000-0x7be00000.
+//
+// WHY IT LOOKS LIKE A SPAWN-COUNT THRESHOLD AND IS NOT ONE. pmm_alloc_page()
+// is next-fit with a rotating cursor (`alloc_hint`, mm/pmm.c), so it sweeps
+// physical memory monotonically upward and wraps. The trigger is CUMULATIVE
+// PAGE ALLOCATION, i.e. how far that cursor has travelled, AND whether the
+// read-only page happens to be free when the cursor arrives. That is why one
+// observer measured "roughly 45 to 60 spawns" and this one measured 254: the
+// number is a property of allocation rate and of a coin flip per lap, not of
+// spawning. The FIRST lap of this run swept past 0x7aa00000 without dying.
+//
+// #647 IS THE SAME CLASS AND FIXED ONE INSTANCE OF IT. It enumerated the live
+// page TABLES from CR3 and reserved them (74 pages here, all inside those two
+// blocks). It could only ever see table pages; the firmware write-protects
+// whole 2MB blocks, and the ~950 NON-table pages sharing them stayed free.
+// So the general question is not "which pages are page tables" but "which
+// pages can Ring 0 actually write", and only the page tables can answer it.
+//
+// THE FIX: ask them, once, at boot, and take the unwritable pages out of the
+// allocator. RESERVE rather than force-writable, deliberately: a page that is
+// unwritable because it is a live firmware table we failed to enumerate must
+// keep faulting loudly. Making it writable would convert this loud panic into
+// silent corruption of a live translation, which is the trade #647's own
+// notes warn about. The cost measured here is 4 MB of 1979 MB, 0.2%.
+//
+// The walk is in Rust (rustkern/ptro.rs) per the Rust-first policy: it is
+// pure pointer chasing over identity-mapped memory, the same argument
+// ptwalk.rs makes. The C below keeps the PMM bitmap calls and the reporting.
+// ===========================================================================
+
+// rustkern/ptro.rs. Symbols locked by kernel/rust-symbols.manifest.
+extern uint32_t ptro_collect_rs(uint64_t cr3, uint64_t lo, uint64_t hi,
+                                uint64_t phys_limit, uint64_t *out,
+                                uint32_t max, uint32_t *overflow);
+
+// Two 2MB blocks on this firmware. 32 ranges is an order of magnitude of
+// headroom, and an overflow is DETECTED and reported rather than truncating
+// silently (the ptwalk.rs rule: a truncated list means "not listed" stops
+// meaning "writable").
+#define VMM_RO_MAX 32
+static uint64_t g_ro_rng[VMM_RO_MAX * 2];
+static uint32_t g_ro_n = 0;
+static uint64_t g_ro_reserved = 0;
+
+// Exposed so the #PF reporter can say "that address is one of the pages the
+// firmware write-protects" instead of guessing.
+int vmm_identity_write_refused(uint64_t pa) {
+    for (uint32_t i = 0; i < g_ro_n; i++) {
+        if (pa >= g_ro_rng[i * 2] && pa < g_ro_rng[i * 2 + 1]) return 1;
+    }
+    return 0;
+}
+
+void vmm_reserve_unwritable_identity_pages(void) {
+    uint64_t lo = 0, hi = 0;
+    pmm_managed_range(&lo, &hi);
+    if (hi <= lo) {
+        kprintf("[PTRO] PMM has no managed range; nothing to check\n");
+        return;
+    }
+
+    uint64_t cr3  = g_kernel_cr3 ? g_kernel_cr3 : read_cr3();
+    uint64_t plim = pmm_phys_limit();
+    uint32_t ovf  = 0;
+
+    g_ro_n = ptro_collect_rs(cr3, lo, hi, plim, g_ro_rng, VMM_RO_MAX, &ovf);
+
+    uint64_t total_pages = 0, was_free = 0;
+    g_ro_reserved = 0;
+
+    for (uint32_t i = 0; i < g_ro_n; i++) {
+        uint64_t a = g_ro_rng[i * 2], b = g_ro_rng[i * 2 + 1];
+        uint64_t n = (b - a) / VMM_PAGE_SIZE_4K;
+        uint64_t freehere = 0;
+        for (uint64_t pa = a; pa < b; pa += VMM_PAGE_SIZE_4K) {
+            if (pmm_page_is_free(pa)) freehere++;
+#ifndef PTRO_NO_RESERVE
+            if (pmm_reserve_page(pa) == 1) g_ro_reserved++;
+#endif
+        }
+        total_pages += n;
+        was_free += freehere;
+        uint32_t midx = 0; uint64_t mbase = 0, mlen = 0;
+        uint32_t type = pmm_mmap_type_of(a, &midx, &mbase, &mlen);
+        (void)midx; (void)mbase; (void)mlen;
+        kprintf("[PTRO] 0x%lx..0x%lx (%lu pages) NOT writable from Ring 0; "
+                "%lu were FREE; mmap type=%u %s\n",
+                a, b, n, freehere, type, pmm_mmap_type_name(type));
+    }
+
+    if (ovf) {
+        kprintf("[PTRO] ERROR: range list OVERFLOWED at %u entries. Some "
+                "unwritable pages remain allocatable. Raise VMM_RO_MAX.\n",
+                VMM_RO_MAX);
+    }
+
+#ifndef PTRO_NO_RESERVE
+    kprintf("[PTRO] %u range(s), %lu pages unwritable, %lu were free, "
+            "%lu newly reserved (%lu KB withheld)\n",
+            g_ro_n, total_pages, was_free, g_ro_reserved,
+            (g_ro_reserved * VMM_PAGE_SIZE_4K) >> 10);
+#else
+    // #procspawn NEGATIVE CONTROL (`make PTRONORESERVE=1`): identical build,
+    // identical instrumentation, reservation REMOVED. This is the bug, kept
+    // buildable, so the invariant below can be WATCHED to fail. An invariant
+    // that has only ever been seen to pass proves nothing.
+    kprintf("[PTRO] NEGATIVE CONTROL: reservation DISABLED. %lu unwritable "
+            "pages left FREE.\n", was_free);
+#endif
+
+    // INVARIANT, checked in every build, by a DIFFERENT implementation from
+    // the one that did the reserving: every page the allocator can hand out
+    // must be writable from Ring 0 through its identity address. The walk
+    // above is Rust and range-based; this is the C per-address walk written
+    // for #500, so an off-by-one in either is visible.
+    uint64_t bad = 0, first_bad = 0, checked = 0;
+    for (uint64_t pa = lo; pa < hi; pa += VMM_PAGE_SIZE_4K) {
+        if (!pmm_page_is_free(pa)) continue;
+        checked++;
+        uint64_t eff = vmm_get_effective_flags_in(cr3, pa);
+        if (eff & VMM_FLAG_WRITABLE) continue;
+        if (!bad) first_bad = pa;
+        bad++;
+    }
+    kprintf("[PTRO] INVARIANT: %lu of %lu free pages are NOT writable from "
+            "Ring 0 (first 0x%lx) -> %s\n",
+            bad, checked, first_bad, bad == 0 ? "PASS" : "FAIL");
+
+#ifdef PTRO_FAULT_TEST
+    // #procspawn THE DETERMINISTIC HALF OF THE PROOF, and it must never ship:
+    // `make PTROFAULTTEST=1` does here, on purpose and at a known address,
+    // exactly what vmm_alloc_user_pages() does by accident at a random one.
+    //
+    // Organic reproduction takes hundreds of app launches and is a coin flip
+    // per lap of the allocator cursor, which makes it useless as a check that
+    // the MECHANISM is what this code claims. This makes it a boot-time
+    // certainty: pick the first address the sweep called unwritable and
+    // memset one page of it. With PTRONORESERVE=1 that page is still in the
+    // free list and this is precisely the panic being fixed; the kernel MUST
+    // die here with err=0x3 (P W S), CR2 equal to the address printed just
+    // below, RIP inside memset_fast, and the new [#PF-RO] line naming it.
+    // If the kernel sails past this, the whole diagnosis is wrong.
+    //
+    // Same discipline as SMAPTEST=1 in exec/elf.c and NOBLOCKTEST=1 in
+    // sync/noblock.c, for the same reason: an assertion nobody has watched
+    // fire is not an assertion.
+    if (g_ro_n > 0) {
+        uint64_t victim = g_ro_rng[0];
+        kprintf("[PTROFAULT] about to memset 4096 bytes at identity 0x%lx, "
+                "which this sweep just reported as NOT writable from Ring 0. "
+                "The kernel MUST take a #PF with err=0x3 here.\n", victim);
+        memset((void *)victim, 0, VMM_PAGE_SIZE_4K);
+        kprintf("[PTROFAULT] FAILED: the write SUCCEEDED, so the page is "
+                "writable after all and the sweep is reporting nonsense.\n");
+    } else {
+        kprintf("[PTROFAULT] no unwritable range on this firmware; nothing "
+                "to fault on (this is not a pass, it is a no-op).\n");
+    }
+#endif
 }
 
 uint64_t vmm_create_user_space(void) {

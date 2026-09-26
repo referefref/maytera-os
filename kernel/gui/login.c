@@ -1336,7 +1336,7 @@ void login_init(void) {
     // WITHOUT EVER DRAWING A FRAME. With the release done here, nothing ever
     // repainted the screen again: the last thing the machine had painted was
     // main.c's "[BOOT] Starting desktop services...", and that text stayed on
-    // the glass for the whole of provision_ai_key(), svc_init(), desktop_run(),
+    // the glass for the whole of ai_provision_key_for(), svc_init(), desktop_run(),
     // the /APPS/COMPOSIT spawn, and the compositor's entire startup, right up
     // until the compositor's first present.
     //

@@ -198,17 +198,95 @@ static uint64_t uaccess_fixup_lookup(uint64_t rip) {
 }
 
 // ---------------------------------------------------------------------------
+// #CR2FRAME witness + deterministic self-test
+// ---------------------------------------------------------------------------
+//
+// THE WITNESS IS ALWAYS ON, INCLUDING IN THE GOLDEN, AND IT COSTS ONE CR2 READ
+// ON THE FAULT PATH. The failure it watches for is a scheduling race: it
+// appeared 5 times in 702 app launches and each occurrence killed a healthy
+// process with a fault address belonging to somebody else. A defect at that
+// rate is invisible to any A/B you can afford to run, so the binary has to
+// count it for you. When the frame's captured CR2 and a read taken here
+// disagree, this frame WAS preempted or migrated between the fault and the
+// handler, and before the capture moved into the stub that disagreement was
+// silently the value the kernel acted on.
+//
+// Rate-limited to one line, then a running count, because a busy machine can
+// produce these in bursts and this runs before the fault is resolved.
+static volatile uint64_t g_cr2race_n;
+
+static void cr2race_witness(const interrupt_frame_t *frame, uint64_t captured) {
+    uint64_t now = read_cr2();
+    if (now == captured) return;
+    uint64_t n = __atomic_add_fetch(&g_cr2race_n, 1, __ATOMIC_RELAXED);
+    // First one in full, then one line per 64 so a burst cannot flood the
+    // console from inside an unresolved fault, but the TOTAL is always visible.
+    if (n != 1 && (n & 63)) return;
+    kprintf("[CR2RACE] n=%lu: the #PF frame was preempted or migrated before "
+            "the handler ran. CR2 captured at entry = 0x%lx, CR2 read now = "
+            "0x%lx, rip=0x%lx cs=0x%lx err=0x%lx. The captured value is the one "
+            "this fault belongs to; before #CR2FRAME the kernel acted on the "
+            "other one and killed the wrong process.\n",
+            n, captured, now, frame->rip, frame->cs, frame->error_code);
+}
+
+#ifdef CR2RACETEST
+// make CR2RACETEST=1 - NOT IN THE GOLDEN.
+//
+// DO NOT WAIT FOR A 1-IN-140 RACE; CONSTRUCT IT. CR2 is writable in Ring 0, so
+// the exact damage the race does (CR2 no longer belongs to this fault) is one
+// instruction, with no scheduler, no second core and no luck involved. Armed
+// here, EVERY Ring-3 page fault on the machine gets a poisoned CR2.
+//
+//   make CR2RACETEST=1                  -> GREEN. The kernel uses frame->cr2,
+//                                          every fault still resolves, the box
+//                                          boots to the desktop and prints
+//                                          [CR2RACE] because the witness sees
+//                                          the poison.
+//   make CR2RACETEST=1 CR2RACELEGACY=1  -> RED. The kernel reads CR2 here, as
+//                                          it did before this change, and the
+//                                          first userland demand fault kills
+//                                          its process at CR2=0x7ffc2ace0000.
+//                                          That is the reported symptom, on
+//                                          demand, on the first boot.
+//
+// Same shape as PTROFAULTTEST / NOBLOCKTEST / SMAPTEST: one flag, two builds,
+// a failure you can watch happening and watch not happening.
+#define CR2RACE_POISON 0x00007FFC2ACE0000ULL
+static void cr2race_poison(interrupt_frame_t *frame) {
+    if ((frame->cs & 0x3) == 0) return;          // Ring 0 only would deadlock boot
+    __asm__ volatile("mov %0, %%cr2" :: "r"(CR2RACE_POISON) : "memory");
+#ifdef CR2RACELEGACY
+    frame->cr2 = CR2RACE_POISON;                 // == the pre-#CR2FRAME read_cr2()
+#endif
+}
+#endif
+
+// ---------------------------------------------------------------------------
 // The #PF handler proper (registered on IDT vector 14 by isr_init)
 // ---------------------------------------------------------------------------
 
 void page_fault_handler(interrupt_frame_t *frame) {
-    uint64_t cr2 = read_cr2();
-    // #smpreval2: THIS is the only point at which CR2 still belongs to this
-    // fault. Everything below can fault again on this CPU - mm_fault() walks
-    // page tables, deliver_segv_handler() writes a signal frame to the USER
-    // stack - and each such fault overwrites CR2. Record it before any of that
-    // runs, so the crash report quotes the address that was actually faulted on.
-    exception_note_cr2(cr2);
+#ifdef CR2RACETEST
+    cr2race_poison(frame);
+#endif
+    // #CR2FRAME: THE FAULT ADDRESS COMES FROM THE FRAME, NOT FROM CR2.
+    //
+    // #smpreval2 put a read_cr2() here and called it "the only point at which
+    // CR2 still belongs to this fault". It is not, and that sentence is the
+    // whole bug. This function is reached from isr_handler(), which calls
+    // bkl_acquire() BEFORE dispatching; the contended wait runs with
+    // interrupts ENABLED on purpose (cpu/smp.c bkl_take_locked) and
+    // sched_rq_pop() steals across cores, so by the time this line runs the
+    // frame may have been preempted, may have watched other threads on this
+    // core take and RESOLVE their own faults, and may be executing on a
+    // different core entirely. Each of those replaces CR2. Reading it here
+    // resolves, reports and kills against another fault's address.
+    //
+    // cpu/idt.asm now pushes CR2 into the frame at entry, where nothing but
+    // kernel-stack pushes has happened yet. See the comment there.
+    uint64_t cr2 = frame->cr2;
+    cr2race_witness(frame, cr2);
     uint64_t err = frame->error_code;
     process_t *p = proc_current();
 
@@ -247,6 +325,24 @@ void page_fault_handler(interrupt_frame_t *frame) {
     // Only for a fault the kernel has already decided it cannot fix, so a
     // healthy machine pays nothing: every resolvable fault returned at step 1.
     if (p) mm_fault_report(p, cr2, err);
+
+    // #procspawn: SAY WHAT THE ERROR CODE ALREADY SAYS, because the generic
+    // reporter does not. A kernel-mode fault with P=1 and W=1 is a SUPERVISOR
+    // WRITE TO A PRESENT, READ-ONLY PAGE. mm_fault_report() reached that exact
+    // fault and printed "WHY=NO_VMA(not present and NO VMA covers this
+    // address)", which is the opposite of what err=0x3 means and sends the
+    // next reader after demand paging. This costs nothing on a healthy boot:
+    // every resolvable fault returned at step 1 above.
+    if (!from_user && (err & 0x1) && (err & 0x2)) {
+        extern uint64_t g_kernel_cr3;   // mm/vmm.c, set once from the UEFI CR3
+        kprintf("[#PF-RO] SUPERVISOR WRITE to a PRESENT page: the mapping is "
+                "READ-ONLY, this is NOT a missing page. cr2=0x%lx rip=0x%lx "
+                "identity-eff-flags=0x%lx firmware-write-protected=%d\n",
+                cr2, frame->rip,
+                vmm_get_effective_flags_in(g_kernel_cr3 ? g_kernel_cr3
+                                                        : read_cr3(), cr2),
+                vmm_identity_write_refused(cr2));
+    }
 
     if (from_user && p) {
         if (deliver_segv_handler(p, frame, cr2) == 0) {

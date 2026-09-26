@@ -1,0 +1,37 @@
+# Maytera Flow - Milestone 1 LLM example (REQUIRES network + /CONFIG/KIMI.KEY).
+#
+# trigger(manual) -> transform(constant, subject) -> llm -> file(write)
+#
+# The llm node substitutes {subject} in its prompt from the inbound edge and
+# calls the shared aiclient one-shot. This is NOT part of the deterministic
+# golden test: a throwaway VM may have no network or API key, in which case the
+# llm node fails cleanly with  FLOWRUN-FAIL AI unavailable...  and a non-zero
+# exit (never a fake success).
+name: llmdemo
+nodes:
+  - id: t1
+    type: trigger
+    params:
+      kind: manual
+  - id: subj
+    type: transform
+    params:
+      op: constant
+      text: "the Maytera operating system"
+  - id: ask
+    type: llm
+    params:
+      system: "You are concise. Answer in a single sentence."
+      prompt: "Write one sentence describing {subject}."
+  - id: save
+    type: file
+    params:
+      op: write
+      path: /HOME/FLOWLLM.TXT
+edges:
+  - from: [t1, out]
+    to: [subj, in]
+  - from: [subj, out]
+    to: [ask, subject]
+  - from: [ask, out]
+    to: [save, text]

@@ -116,6 +116,20 @@ development, bump `MAYTERA_BUILD_NUMBER` yourself when it matters to you; a
 manual `make` will not do it, and `build-golden.sh`'s own bump does not depend on
 whatever you left in your working tree.
 
+**A build number is allocated ONCE and never reissued, even to a build that
+fails.** `build-golden.sh` computes the next number and **persists it before it
+builds anything**, so a build that stamps an image and then fails at a gate
+BURNS its number rather than leaving it for the next build. That is deliberate:
+gaps in the sequence are harmless, while two images sharing a number destroy the
+number's usefulness as an identifier, and several procedures use it as one
+(notably "check the version string on the desktop to confirm the new kernel
+loaded"). The persist happens under a lock, via a temp file and an atomic
+rename, before the kernel build and before the output image is touched, so a
+failure there costs seconds and destroys nothing. Every allocation is also
+appended to a `build-numbers.tsv` ledger beside the state file (number, time,
+commit, queue agent, queue job) purely so a later post-mortem can say who spent
+which number.
+
 ### 3.0a Fast iteration: build and boot the kernel ALONE, not a golden
 
 If you are iterating on kernel code, do NOT go round the golden pipeline for
@@ -281,8 +295,9 @@ in silently under cover of the existing known ones.
    provenance). Untracked files are ignored for this check; only tracked
    modifications block.
 2. Computes the next build number as `max(last recorded build, kernel/version.h's
-   current value) + 1` and patches it into a disposable checkout it builds from
-   (never the working tree you are editing).
+   current value) + 1`, **persists it immediately** (see "A build number is
+   allocated ONCE" above), and patches it into a disposable checkout it builds
+   from (never the working tree you are editing).
 3. Pins `MAYTERA_BUILD_DATE`/`MAYTERA_BUILD_TIME` (via `REPRO_DATE`/`REPRO_TIME`
    passed to `make`) instead of letting `__DATE__`/`__TIME__` embed the real wall
    clock, and stamps those same pinned values into the image's `BUILDINFO.TXT`.
@@ -361,7 +376,13 @@ build/invariant-gate.sh --self-test-fresh    # prove the app-freshness check goe
 build/invariant-gate.sh --self-test-ext2     # prove the ext2 fsck check goes RED on a corrupt root
 build/invariant-gate.sh --self-test-fat      # prove the FAT fsck check goes RED on a corrupt ESP
 build/invariant-gate.sh --self-test-kernel   # prove the kernel-rebuild check goes RED on a stale kernel
+build/invariant-gate.sh --self-test-buildnum # prove the build-number uniqueness check goes RED on a duplicate
 ```
+
+`--archive <dir>` names the golden archive the uniqueness check reads (default
+is the host's archive directory). Passed explicitly it must exist, so a typo
+cannot silently turn the check off. `--allow-build-collision` accepts a
+duplicate deliberately; nothing in `build/` passes it.
 
 Exit 0 = every invariant holds. Exit 1 = an invariant failed. Exit 2 = the gate
 could not do its job at all (a missing tool, not running as root) and fails
@@ -389,6 +410,17 @@ Checks performed (each independently provable red/green, not merely asserted):
 - `/BUILDINFO.TXT` is present on the ESP, its stamped commit matches the
   commit passed via `--commit`, and its stamped build number is **strictly
   greater** than the number passed via `--prev`.
+- **The stamped build number has never been used before.** "Greater than the
+  last number I remember" is a weaker claim than "not used before", and the
+  difference is not academic: two images once shipped stamped with the same
+  number and passed the `--prev` check, because each was compared against the
+  same stale counter. This check reads the golden archive instead, where every
+  superseded image is filed as `b<build>-<commit12>.img`, so the evidence needs
+  no new state. It reads filenames rather than mounting every image, so a
+  hand-renamed image is invisible to it; the image under test is excluded by
+  real path, so re-gating an archived image does not report it colliding with
+  itself. `build/buildnum-alloc-selftest.sh` proves the other half by extracting
+  the allocator verbatim from `build-golden.sh` and executing it.
 - p2 is ext2.
 - **p2 passes `e2fsck -fn`.** Like the FAT check, this validates the filesystem
   itself, not just its type label; a filesystem that only looks right (correct

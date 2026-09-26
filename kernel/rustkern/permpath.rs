@@ -53,6 +53,7 @@
 // #included because there is no bindgen in this build; the values are POSIX and
 // fixed, and perms_selftest() (fs/perms.c) would fail loudly if they drifted.
 const X_OK: i32 = 1;
+const W_OK: i32 = 2;
 
 const PATH_MAX: usize = 256; // matches perm_entry_t.path[256] in fs/perms.h
 // Bound on how far a caller-supplied string is scanned for its NUL. A path
@@ -66,6 +67,15 @@ extern "C" {
     // does NOT apply the uid-0 / !perms_initialized early-outs: perms_check()
     // owns those, so this module can never be a way around them.
     fn perms_check_leaf(path: *const u8, uid: u32, gid: u32, access: i32) -> i32;
+
+    // fs/perms.c: does a PERMS.DB row exist for this path AT ALL? This is the
+    // question perms_check_leaf() cannot answer, because it folds "no entry"
+    // into a decision. The create rule below needs to tell "no policy exists
+    // for this name" apart from "a policy exists and it says no", and getting
+    // that distinction wrong in either direction is a security bug: treating a
+    // real 0444 row as absent would hand the parent's write bit to a file its
+    // owner deliberately locked.
+    fn perms_has_entry(path: *const u8) -> i32;
 }
 
 /// Return code for "the path could not be canonicalized into PATH_MAX bytes".
@@ -223,8 +233,135 @@ pub extern "C" fn perms_path_check_rs(path: *const u8, uid: u32, gid: u32, acces
         i += 1;
     }
 
-    // The object itself.
-    unsafe { perms_check_leaf(canon.as_ptr(), uid, gid, access) }
+    // The object itself, decided by its own PERMS.DB row if it has one.
+    let r = unsafe { perms_check_leaf(canon.as_ptr(), uid, gid, access) };
+    if r == 0 {
+        return 0;
+    }
+    if (access & W_OK) == 0 {
+        return r; // R_OK / X_OK behaviour is untouched by everything below
+    }
+
+    // =======================================================================
+    // #permcreate: CREATING A NAME IS A WRITE TO THE PARENT DIRECTORY, NOT TO A FILE
+    // THAT DOES NOT EXIST YET.
+    // =======================================================================
+    // THE DEFECT. perms_check_leaf() answers "no PERMS.DB row" with the
+    // root-owned 0755 default, which denies W_OK to every non-root uid. For a
+    // path that ALREADY EXISTS that is a deliberate conservative default. For a
+    // path that is ABOUT TO BE CREATED it is nonsense: asking what permissions
+    // a file has before it exists has no answer, and answering "root owns it"
+    // means a normal user can never create anything anywhere, INCLUDING IN
+    // THEIR OWN HOME, through any caller that asks perms_check(path, W_OK).
+    //
+    // MEASURED, on golden 2472, as a Maytera Flow running uid 1000 (`gbtest`,
+    // home /HOME/GBTEST 1000:1000 0750):
+    //
+    //     visiongame: FAIL screenshot request refused (-13 ...)
+    //
+    // gui/shotq.c sys_screenshot_request() asks perms_check(path, W_OK) on an
+    // output path that does not exist yet, so `screen.capture` could NEVER
+    // produce a file for a non-root user, whatever capability the person
+    // granted. The identical -13 is recorded against `captest` in
+    // kernel/SECURITY_ADVISORIES.md and was read there as "the gate opened"
+    // rather than "the write is impossible".
+    //
+    // TWO CALLERS ALREADY KNEW THE RIGHT QUESTION AND ASKED IT THEMSELVES:
+    // proc/fdlayer.c's O_CREAT branch and proc/syscall.c's mkdir/rmdir/unlink
+    // all ask perms_check(parent, W_OK | X_OK) instead (#676). That is POSIX:
+    // creating a name needs write + search on the DIRECTORY. This moves that
+    // rule into the one place every caller meets, so a caller that asks the
+    // naive question gets the POSIX answer instead of a permanent refusal.
+    //
+    // WHAT THIS CAN AND CANNOT DO, because a permission change is only worth
+    // what its blast radius is:
+    //   * It is reached ONLY after perms_check_leaf() has already DENIED, so it
+    //     can turn a deny into an allow and can never turn an allow into a
+    //     deny. Nothing that works today stops working.
+    //   * It is reached ONLY when W_OK was asked for. R_OK and X_OK return
+    //     above, byte for byte as before.
+    //   * It is reached ONLY when the leaf has NO row of its own. A seed, an
+    //     operator chmod or a perms_on_create() stamp is an explicit policy and
+    //     it still decides, alone. /CONFIG/SHADOW does not become writable
+    //     because somebody can write /CONFIG (they cannot, but the point is it
+    //     would not matter).
+    //   * The parent is then judged by THE ORDINARY RULES, via the same
+    //     perms_check_leaf(). A parent with no row of its own keeps the
+    //     root-owned 0755 default and therefore still REFUSES a non-root
+    //     caller, so a missing parent entry cannot become permissive: creating
+    //     /NOSUCHDIR/X is refused exactly as it is today.
+    //   * Search (x) on every ancestor was already required by the walk above,
+    //     so this cannot be reached through a directory the caller may not
+    //     traverse.
+    //
+    // WHAT IS GENUINELY NEW, stated plainly rather than buried: a uid that has
+    // w+x on a directory may now write a name in it that has no PERMS.DB row,
+    // whether or not that name already exists on the medium. perms_check() sees
+    // a NAME, never an inode, so "no row" cannot be narrowed to "does not
+    // exist" here without doing filesystem I/O from inside the permission
+    // check, which would be a layering inversion and a deadlock risk. The
+    // widening is bounded by what POSIX already grants that uid anyway: with
+    // w+x on a directory you may unlink any name in it and create it again, so
+    // "may overwrite an unowned name there" adds no authority you did not
+    // already have. proc/fdlayer.c reached the same conclusion, in the same
+    // words, for its O_CREAT self-heal branch.
+    //
+    // KNOWN GAP, do not assume otherwise: the sticky bit (S_ISVTX, 01000) is
+    // NOT consulted. On a 1777 directory POSIX restricts delete/rename to the
+    // file's owner, and this rule would ignore that. No directory in the tree
+    // sets it today (the whole seed table is 0600/0644/0666/0700/0711/0750/
+    // 0755/0777), so implementing it here would add a branch nobody has ever
+    // watched fire, which this file's own history says is worth less than a
+    // recorded gap. Add it WITH a vector the day something ships a 1777.
+    if unsafe { perms_has_entry(canon.as_ptr()) } != 0 {
+        return r; // an explicit row governs this object: it decides, full stop
+    }
+    let mut parent = [0u8; PATH_MAX];
+    canon_parent(&canon[..n], &mut parent);
+    if unsafe { perms_check_leaf(parent.as_ptr(), uid, gid, W_OK | X_OK) } != 0 {
+        return r; // cannot create in the directory either: the deny stands
+    }
+    // W_OK is satisfied by the directory. Any OTHER bit the caller asked for is
+    // still the leaf's own question, and is answered by the leaf exactly as it
+    // was before this change.
+    let rest = access & !W_OK;
+    if rest == 0 {
+        return 0;
+    }
+    unsafe { perms_check_leaf(canon.as_ptr(), uid, gid, rest) }
+}
+
+/// Parent directory of an ALREADY-CANONICAL absolute path, NUL-terminated in
+/// `out`; returns its length. "/A/B" -> "/A", "/A" -> "/", "/" -> "/".
+///
+/// It only ever SHORTENS the canonical string at one of its own separators, so
+/// the result is canonical by construction and cannot name anything outside the
+/// tree: there is no string surgery here that ".." could ride out on, because
+/// canonicalize() popped every ".." before this function is ever reached.
+fn canon_parent(canon: &[u8], out: &mut [u8]) -> usize {
+    let mut cut = 0usize;
+    let mut i = 1usize; // index 0 is the leading '/', never the cut point
+    while i < canon.len() {
+        if canon[i] == b'/' {
+            cut = i;
+        }
+        i += 1;
+    }
+    // No separator past the root, or no room: the parent is the root itself.
+    // Failing to "/" is FAIL CLOSED, because the root is root-owned 0755 and
+    // therefore refuses W_OK to every non-root caller.
+    if cut == 0 || cut + 1 > out.len() {
+        out[0] = b'/';
+        out[1] = 0;
+        return 1;
+    }
+    let mut k = 0usize;
+    while k < cut {
+        out[k] = canon[k];
+        k += 1;
+    }
+    out[cut] = 0;
+    cut
 }
 
 /// Canonicalization self-test, callable from C (fs/perms.c perms_selftest()).

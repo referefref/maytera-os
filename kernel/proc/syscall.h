@@ -630,13 +630,6 @@ _Static_assert(sizeof(net_status_t) == 52,
 // caller that would rather poll the state than decode a return code.
 #define NET_ERR_FAULTY                 (-3)
 
-// #745: a POST REFUSED by the prompt-injection screen, as distinct from a
-// request that failed (-1) and from one refused by the circuit breaker (-3).
-// The client needs the difference: this one is NOT retryable and NOT a network
-// problem, and telling the user "network error" for it would be a lie that also
-// hides a security event. A silent block is its own bug, so this code exists
-// specifically so the refusal can be reported honestly.
-#define NET_ERR_AIGUARD                (-4)
 
 // (#745) Publish the desktop WORK AREA to the kernel window manager: the four
 // px insets the active dock style reserves at the left/top/right/bottom screen
@@ -701,16 +694,12 @@ _Static_assert(sizeof(net_status_t) == 52,
 #define SYS_ELEV_RESOLVE               381  // COMPOSITOR ONLY (seq, action, const char *pw)
 #define SYS_ELEV_MAY                   382  // () -> 1 if the CALLER may elevate, else 0
 
-// ===========================================================================
-// #745 AI PROMPT-INJECTION SCREEN (security/aiguard.h + security/nova.c).
-//
-// Informational, NOT the enforcement point. The enforcement is unconditional
-// and lives in sys_http_post_start(); this exists so a Ring-3 client can name
-// the rule that fired when it tells the user why a turn was refused.
-//   SYS_AI_SCAN(const char *text, aiguard_verdict_t *out)
-//     -> AIGUARD_ALLOW / _ANNOTATE / _BLOCK, or -1 bad args / -14 EFAULT
-// ===========================================================================
-#define SYS_AI_SCAN                    383
+// 383 IS RETIRED, DO NOT REUSE. It carried the Ring-3 view of the #745
+// Nova prompt-injection keyword screen, removed at #469m aititleinject
+// (see docs/AI_PROMPT_INJECTION.md for what replaced it and what did not).
+// A recycled syscall number silently hands an old binary a new syscall, so
+// it stays burned.
+
 
 // ===========================================================================
 // #745 (local 102): display rotation (video/framebuffer.h fb_rotation_t).
@@ -1495,7 +1484,26 @@ typedef struct {
 #define SYS_MOUNT_LIST                 455  // (mount_ent_t *buf, int max, int elem_size) -> count | neg
 #define SYS_MOUNT                      456  // (int kind,int index,int part_index,const char *path) -> 0 | neg  root-only
 #define SYS_UMOUNT                     457  // (const char *path) -> 0 | neg  root-only, /MNT/ only (boot mounts refused)
-#define SYS_MAX                        460  // top is SYS_NFS_MOUNT=459 (#317 nfsbrowse)
+// AI-VISION (#469): the RELEASE half of the app-facing synthetic-input
+// contract. SYS_CAP_INJECT_KEY posts EVENT_KEY_DOWN and nothing else, so an
+// app that edge-detects input (every emulator, every game, every menu that
+// advances on a press) saw a button go down and NEVER come up: the button was
+// dead for the rest of the session and a second press of the same key was
+// unobservable. Stage 4 could therefore drive a window exactly once per key,
+// which is not "drive another app" in any useful sense. This is the missing
+// half, NOT a new privilege: identical arguments, identical cap_inject_guard()
+// (same grant, same scope check, same consent-surface/lock guard, same
+// INPUT_SRC_SYNTHETIC provenance so it still cannot stamp input credit), the
+// only difference being ev.type = EVENT_KEY_UP.
+//
+// NUMBER CHOICE: 460, which WAS the SYS_MAX sentinel value and is therefore
+// the first genuinely unallocated number; SYS_MAX is bumped to 461 in the
+// same edit (the #216/#448 precedent).
+//   SYS_CAP_INJECT_KEY_UP(int win, int keycode) -> 0 | CAP_E*  [gated: input.inject]
+#define SYS_CAP_INJECT_KEY_UP          460  // (int win, int keycode) -> 0 | CAP_E*  [gated: input.inject]
+
+#define SYS_MAX                        461  // top is SYS_CAP_INJECT_KEY_UP=460 (#469 ai-vision)
+
 
 // ============================================================================
 // Syscall Register Convention (AMD64 System V ABI)
@@ -1584,9 +1592,6 @@ int64_t sys_http_fetch_cancel(int id);
 int64_t sys_http_fetch_progress(int id, int *uphase, uint32_t *ubytes, uint32_t *ucontent_len);   // #25
 int64_t sys_http_post_start(const char *url, const char *headers, const char *body);
 
-// #745 SYS_AI_SCAN. `uout` is an aiguard_verdict_t* (security/aiguard.h); it is
-// declared void* here so syscall.h does not have to pull that header in.
-int64_t sys_ai_scan(const char *utext, void *uout);
 int64_t sys_http_fetch_hdr(const char *url, const char *headers, char *ubuf, uint32_t max_len, uint32_t *ubytes, int *ustatus);
 int64_t sys_http_post_poll(int id, int *ustatus, uint32_t *ulen);
 int64_t sys_http_post_read(int id, char *ubuf, uint32_t max);

@@ -744,6 +744,36 @@ static void eval_math(const char *s, size_t len, int vw, int vh, sbuf *out)
  * `gap` is translated for flex containers too, where it means the same thing
  * and libcss drops it for the same reason.
  *
+ * THE ROW GAP NEEDS A SECOND CARRIER (#245 enggap). column-gap is ONE number
+ * and CSS has two: `gap: <row> <column>`, plus the `row-gap` longhand. Until
+ * now only the column component survived and layout.c spent it on BOTH axes,
+ * so `gap: 24px 8px` put 8px between the flex lines and a bare `column-gap`
+ * opened a row gap the author never wrote.
+ *
+ * The row component rides `clip`, chosen on the same three properties the
+ * radius carrier was: it is NOT INHERITED (libcss has it in the uncommon
+ * group and css__compose_clip only follows the parent on an explicit
+ * `inherit`, so a row gap cannot leak into a nested flex container); it is
+ * FOUR LENGTHS with a full parse/cascade/computed path, of which we spend one;
+ * and it is inert here, because this engine never clips anything. Its initial
+ * value is CSS_CLIP_AUTO, which is DISTINGUISHABLE from a carried
+ * CSS_CLIP_RECT, so an unstyled element cannot be mistaken for a zero gap.
+ *
+ * THE COLLISION IS REAL AND IS THE PRICE, and it is a cheap one: `clip` is a
+ * deprecated property whose one surviving idiom on the modern web is
+ * `.sr-only { clip: rect(0 0 0 0) }`, which carries 0 and is therefore inert.
+ * Only a plain non-negative LENGTH is carried: a percentage row gap has
+ * nothing to resolve against at this stage and `normal` is not a length, so
+ * both are dropped and the row gap stays 0. libcss rejects a percentage in a
+ * clip rect anyway, so the guard here and the parser agree.
+ *
+ * IT RIDES THE THIRD COMPONENT (`bottom`), NOT THE FIRST, because libcss's
+ * generated get_clip() reads the TOP and RIGHT units with a `&`/`>>`
+ * precedence bug and reports both as em. Measured: a 10px row gap in the top
+ * slot laid out as 150px. The full diagnosis is in the read site in layout.c;
+ * the two ends of the carrier must agree on the slot, so do not move one
+ * without the other.
+ *
  * BORDER-RADIUS RIDES THE SAME MECHANISM, for the same reason: libcss has no
  * radius properties at all (there is no CSS_PROP_BORDER_*_RADIUS in
  * properties.h and no getter in computed.h), so `border-radius: 10px` is a
@@ -769,6 +799,34 @@ static void eval_math(const char *s, size_t len, int vw, int vh, sbuf *out)
  * what `border-radius: 50%` means for a square and a reasonable answer
  * otherwise.
  */
+
+/*
+ * Emit the ROW-GAP CARRIER for the value s[a..b), preceded by a `;` when sep is
+ * set and something is actually emitted (#245 enggap). See the carrier note
+ * above. Emits nothing at all for anything that is not a plain non-negative
+ * length, which leaves the row gap at its pre-enggap inert 0.
+ */
+static void emit_row_gap(sbuf *out, const char *s, size_t a, size_t b, int sep)
+{
+	size_t j;
+
+	while (a < b && is_space(s[a])) a++;
+	while (b > a && is_space(s[b - 1])) b--;
+	if (b <= a || b - a > 24) return;
+	if (!is_digit(s[a]) && s[a] != '.') return;
+	for (j = a; j < b; j++) {
+		/* a percentage has no basis here; a space, a paren or a comma
+		 * means this is not the single length it has to be. */
+		if (s[j] == '%' || is_space(s[j]) || s[j] == '(' ||
+				s[j] == ')' || s[j] == ',')
+			return;
+	}
+	if (sep) sb_putc(out, ';');
+	/* rect(top, right, BOTTOM, left): the third, for the reason above. */
+	sb_puts(out, "clip:rect(0px,0px,");
+	sb_putn(out, s + a, b - a);
+	sb_puts(out, ",0px)");
+}
 
 /* Reduce a grid-template-columns value to a column count and/or a minimum
  * column width. Returns 1 if it produced anything. */
@@ -1235,12 +1293,18 @@ static void grid_rewrite(const char *s, size_t len, sbuf *out)
 			}
 			int is_gtc = match_ci(s, len, i, "grid-template-columns");
 			int is_gap = match_ci(s, len, i, "gap") || match_ci(s, len, i, "grid-gap");
+			/* #245 enggap: the row-gap LONGHAND, which libcss drops
+			 * entirely, onto the clip carrier. Checked separately from
+			 * is_gap: match_ci anchors at a property-name start, so
+			 * "row-gap" never matched "gap" and the two cannot collide. */
+			int is_rgap = match_ci(s, len, i, "row-gap") ||
+					match_ci(s, len, i, "grid-row-gap");
 			/* Only the shorthand. The per-corner longhands
 			 * (border-top-left-radius and friends) are left alone:
 			 * there is one carrier and four of them, so taking the
 			 * last one seen would be arbitrary. */
 			int is_rad = match_ci(s, len, i, "border-radius");
-			if (is_gtc || is_gap || is_rad) {
+			if (is_gtc || is_gap || is_rad || is_rgap) {
 				size_t k = i;
 				size_t vs, ve;
 				while (k < len && s[k] != ':' && s[k] != ';' && s[k] != '}') k++;
@@ -1295,14 +1359,26 @@ static void grid_rewrite(const char *s, size_t len, sbuf *out)
 					} else {
 						sb_puts(out, "column-count:1");
 					}
+				} else if (is_rgap) {
+					/* The row-gap longhand sets only the cross axis,
+					 * so it emits the carrier and NO column-gap. */
+					emit_row_gap(out, s, vs, ve, 0);
 				} else {
-					/* `gap: <row> <column>`; one value sets both. Take the
-					 * column component, which is the one we can act on. */
+					/* `gap: <row> <column>`; one value sets both. The
+					 * COLUMN component goes to column-gap, which libcss
+					 * has, and the ROW component to the clip carrier
+					 * (#245 enggap). Before that, only the column
+					 * component survived and layout spent it on both
+					 * axes. */
 					size_t a = vs, b = ve, sp = 0, j;
 					for (j = vs; j < ve; j++) if (is_space(s[j])) sp = j;
 					if (sp) { a = sp + 1; while (a < b && is_space(s[a])) a++; }
 					sb_puts(out, "column-gap:");
 					sb_putn(out, s + a, b - a);
+					/* The row component is everything up to the LAST
+					 * space, or the whole value when there is none, so a
+					 * one-value gap still sets both axes to it. */
+					emit_row_gap(out, s, vs, sp ? sp : ve, 1);
 				}
 				i = ve;
 				continue;
@@ -1450,10 +1526,24 @@ int cssvar_selftest(void (*report)(const char *line))
 	    "column-count:2", "grid-template" },
 	  { "gap becomes column-gap",
 	    ".g{gap:1rem}", 800, 600, "column-gap:1rem", "grid-template" },
+	  { "a one-value gap also carries the SAME row gap",
+	    ".g{gap:1rem}", 800, 600, "clip:rect(0px,0px,1rem,0px)", NULL },
 	  { "gap with two values takes the column component",
 	    ".g{gap:2rem 12px}", 800, 600, "column-gap:12px", NULL },
+	  { "gap with two values carries the ROW component separately",
+	    ".g{gap:2rem 12px}", 800, 600, "clip:rect(0px,0px,2rem,0px)", NULL },
 	  { "row-gap is not mistaken for gap",
-	    ".g{row-gap:4px}", 800, 600, "row-gap:4px", "column-gap" },
+	    ".g{row-gap:4px}", 800, 600, "clip:rect(0px,0px,4px,0px)", "column-gap" },
+	  { "the row-gap longhand survives as the carrier, not verbatim",
+	    ".g{row-gap:4px}", 800, 600, NULL, "row-gap:4px" },
+	  { "grid-row-gap is carried too",
+	    ".g{grid-row-gap:9px}", 800, 600, "clip:rect(0px,0px,9px,0px)", NULL },
+	  { "the carrier rides the THIRD rect component, never the first",
+	    ".g{row-gap:4px}", 800, 600, NULL, "rect(4px" },
+	  { "a percentage row gap is dropped, not carried",
+	    ".g{row-gap:10%}", 800, 600, NULL, "clip:rect" },
+	  { "a bare column-gap opens no row gap",
+	    ".g{column-gap:7px}", 800, 600, "column-gap:7px", "clip:rect" },
 	  { "a clamped gap resolves before it is carried",
 	    ".g{gap:clamp(1rem,4vw,2rem)}", 776, 600, "column-gap:31px", "clamp" },
 	  { "border-radius rides column-rule-width",

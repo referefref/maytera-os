@@ -35,6 +35,12 @@ int userhome_path(const char *sub, const char *name, char *out, unsigned long ca
 // root and the paths inside it come to disagree.
 int userhome_root(char *out, unsigned long cap);
 
+// #appwrite: report a refused write to the one channel that does not itself
+// depend on the permission that just failed (sys_bootlog -> /BOOTLOG.TXT).
+// Called by userconf_open_write() and by any save site that wants the same
+// breadcrumb. Bounded internally; safe to call on every failure.
+void uc_report_write_refusal(const char *what, const char *path, int rc);
+
 // Build "<home>/CONFIG/<name>". Returns 0 on success, -1 if it will not fit.
 // Fails rather than truncating: a truncated path is a different file.
 int userconf_path(const char *name, char *out, unsigned long cap);

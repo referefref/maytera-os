@@ -201,7 +201,13 @@ What it does **not** defend against, and must not be described as if it does:
 - compromise of the escrow itself, which is why the escrow is the immutable core
 
 **Prompt injection becomes a privilege-escalation vector** once an agent holds
-contracts. Nova (#449) helps at the input boundary and will never be complete.
+contracts. There is no input-boundary detector any more and there should not
+be: the one this paragraph used to cite was MEASURED in 2026-09 to pass 18 of
+18 hostile strings written in one sitting, while blocking an ordinary window
+title, and it was removed (`docs/AI_PROMPT_INJECTION.md`). Detecting
+adversarial text is a race the defender loses, so the sentence "it helps and
+will never be complete" understated the problem: a control believed to help is
+what the next design decision rests on.
 The real containment is this architecture: bounded scope plus bounded time plus a
 journal converts "the AI was tricked" from unbounded compromise into a bounded,
 visible, reversible incident. Design for containment, not for making injection

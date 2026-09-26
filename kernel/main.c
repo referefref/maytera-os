@@ -184,62 +184,6 @@ static void hb_top_consumers(char *out, int outsz, uint64_t interval_ticks) {
     prev_n = n;
 }
 
-// #684: copy the /CONFIG/KIMI.KEY deployment seed into the logged-in user's own
-// protected AI settings, once. See the call site for the reasoning.
-static void provision_ai_key(login_result_t *lr) {
-    if (!lr || !g_fat_fs.mounted) return;
-
-    char dest[256];
-    if (userconf_kpath("AISVC.CFG", dest, sizeof(dest)) != 0) return;
-
-    // Already provisioned, or the user has their own settings: never clobber.
-    uint32_t esz = 0;
-    void *existing = fat_read_file(&g_fat_fs, dest, &esz);
-    if (existing) { kfree(existing); return; }
-
-    uint32_t ksz = 0;
-    char *seed = (char *)fat_read_file(&g_fat_fs, "/CONFIG/KIMI.KEY", &ksz);
-    if (!seed) {
-        // The normal deployment case. The user types their key into Settings.
-        return;
-    }
-
-    // Trim to the first line and strip trailing whitespace, matching what the
-    // deleted userland load_key() did, so a hand-edited seed behaves the same.
-    uint32_t n = 0;
-    while (n < ksz && seed[n] != '\n' && seed[n] != '\r') n++;
-    while (n > 0 && (seed[n - 1] == ' ' || seed[n - 1] == '\t')) n--;
-    if (n == 0 || n > 200) { kfree(seed); return; }
-
-    char buf[256];
-    const char *pfx = "api_key=";
-    uint32_t w = 0;
-    while (pfx[w]) { buf[w] = pfx[w]; w++; }
-    for (uint32_t i = 0; i < n; i++) buf[w++] = seed[i];
-    buf[w++] = '\n';
-    kfree(seed);
-
-    // Ensure <home>/CONFIG exists, then write and lock the file down to the
-    // user: 0600, owned by them. perms_set (not perms_on_create) because this
-    // must establish the mode even though Ring 0 just created the path.
-    char dir[256];
-    uint32_t cut = 0;
-    for (uint32_t i = 0; dest[i]; i++) if (dest[i] == '/') cut = i;
-    if (cut > 0) {
-        for (uint32_t i = 0; i < cut; i++) dir[i] = dest[i];
-        dir[cut] = 0;
-        fat_mkdir(&g_fat_fs, dir);
-        perms_on_create(dir, lr->uid, lr->gid, 1);
-    }
-    if (fat_write_file(&g_fat_fs, dest, buf, w) == 0) {
-        perms_set(dest, lr->uid, lr->gid, 0600);
-        if (perms_sync() != 0)
-            kprintf("[PERMS] initial sync failed; permissions are NOT on disk\n");
-        kprintf("[AI] #684: provisioned %s from the /CONFIG/KIMI.KEY seed "
-                "(uid=%u, mode 0600)\n", dest, lr->uid);
-    }
-}
-
 static void heartbeat_worker(void *arg) {
     (void)arg;
     extern volatile uint64_t timer_ticks;      // cpu/isr.c, monotonic PIT tick
@@ -1348,7 +1292,14 @@ static void desktop_session_thread(void *arg) {
     // no-op-if-already-set logic applies then), which costs nothing:
     // nobody can read Settings during a session with no desktop chrome
     // anyway (g_setup_pending).
-    if (login_result.home[0]) provision_ai_key(&login_result);
+    //
+    // The body is shared with the cron launch path (proc/cron.c) since the
+    // headless-AI fix: ai_provision_key_for() in fs/userconf.c, which takes
+    // the identity EXPLICITLY rather than reading the session uid. It also
+    // refuses an empty home itself, so this guard is belt and braces.
+    if (login_result.home[0])
+        ai_provision_key_for(login_result.uid, login_result.gid,
+                             login_result.home, "login");
 
     // #95: build the background services registry now (parses
     // /CONFIG/SERVICES.CFG). Actually starting the services is deferred
@@ -5377,7 +5328,7 @@ void kernel_shell(void) {
                         // with it. Given a call site rather than deleted,
                         // because after the honesty pass it now states the
                         // MEASURED posture (what is randomised, what is not,
-                        // SMAP held off, Nova loaded but not enforcing) rather
+                        // SMAP held off) rather
                         // than reciting feature names.
                         extern void security_print_status(void);
                         security_print_status();

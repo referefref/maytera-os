@@ -217,11 +217,32 @@ static void tls_build_record_header(uint8_t *header, uint8_t content_type,
     header[4] = length & 0xff;
 }
 
+// #postfix: the outgoing record-length gate + the plaintext ceiling live in
+// rustkern/tlsfrag.rs. Locked to the C constants below so the two can never
+// drift (that drift is exactly what #497 was).
+extern uint32_t tls_out_fragment_rs(uint64_t remaining, uint32_t max_plaintext);
+extern int      tls_out_record_ok_rs(uint64_t body_len);
+extern uint32_t tls_out_max_plaintext_rs(void);
+
 // Send raw TLS record
 static int tls_send_record(tls_context_t *ctx, uint8_t content_type,
                            const uint8_t *data, size_t length) {
     uint8_t header[5];
-    tls_build_record_header(header, content_type, TLS_VERSION_1_2, length);
+
+    // #postfix: tls_build_record_header() takes a uint16_t, so a body longer
+    // than 65535 used to have its DECLARED length wrap while the full body was
+    // still written to the socket, desyncing the peer's record framing against
+    // a garbage stream. -Wall -Wextra does not imply -Wconversion, so nothing
+    // in the build ever said a word about it. Refuse, loudly, naming the limit:
+    // an illegal record is never worth emitting, and an explicit error beats a
+    // corrupted connection that fails somewhere else entirely.
+    if (!tls_out_record_ok_rs((uint64_t)length)) {
+        kprintf("[TLS] refusing oversize record: body=%u bytes, limit=%u (type=%u)\n",
+                (unsigned)length, (unsigned)TLS_MAX_RECORD_SIZE, (unsigned)content_type);
+        return TLS_ERR_INVALID_PARAM;
+    }
+
+    tls_build_record_header(header, content_type, TLS_VERSION_1_2, (uint16_t)length);
 
     int ret = ctx->send_func(ctx->user_data, header, 5);
     if (ret < 0) return ret;
@@ -2414,11 +2435,10 @@ int tls_connect(tls_context_t *ctx) {
     return (ctx->state == TLS_STATE_ESTABLISHED) ? 0 : TLS_ERR_HANDSHAKE;
 }
 
-int tls_send(tls_context_t *ctx, const void *data, size_t length) {
-    if (ctx->state != TLS_STATE_ESTABLISHED) {
-        return TLS_ERR_INVALID_PARAM;
-    }
-
+// #postfix: emit EXACTLY ONE application-data record. `length` must already be
+// <= TLS_MAX_PLAINTEXT_SIZE; tls_send() below is what guarantees that. Returns
+// 0 on success or a negative TLS error.
+static int tls_send_app_record(tls_context_t *ctx, const uint8_t *data, size_t length) {
     if (ctx->is_tls13) {
         uint8_t *enc = kmalloc(length + 64);
         if (!enc) return TLS_ERR_NO_MEMORY;
@@ -2439,12 +2459,64 @@ int tls_send(tls_context_t *ctx, const void *data, size_t length) {
 
         ret = tls_send_record(ctx, TLS_CONTENT_APPLICATION, enc, enc_len);
         kfree(enc);
-        return (ret < 0) ? ret : (int)length;
+        return ret;
     }
 
     // TLS 1.2 path
-    int ret = tls_send_encrypted(ctx, TLS_CONTENT_APPLICATION, data, length);
-    return (ret < 0) ? ret : (int)length;
+    return tls_send_encrypted(ctx, TLS_CONTENT_APPLICATION, data, length);
+}
+
+// #postfix: FRAGMENT. This function used to hand its whole payload to one
+// record, so any request over 2^14 bytes went out as an illegal TLSPlaintext
+// and a conforming peer answered record_overflow (alert 22) and hung up. That
+// is the whole "HTTPS POST fails once the body passes ~16 KB" defect: an
+// 11 KB request worked, a 23 KB request did not, and neither declared limit
+// (aiclient BODY_MAX 65536, kernel POST cap 128 KB) came anywhere near it.
+// tls.h has named the right ceiling since #497 and nothing on the send path
+// had ever read it.
+//
+// This is NOT a spin/poll loop: each iteration consumes at least one byte
+// (tls_out_fragment_rs returns 0 only when nothing remains), so the loop is
+// bounded by `length` and always makes forward progress. All blocking lives
+// further down in https_tcp_send(), which already has its own no-progress
+// deadline.
+int tls_send(tls_context_t *ctx, const void *data, size_t length) {
+    if (ctx->state != TLS_STATE_ESTABLISHED) {
+        return TLS_ERR_INVALID_PARAM;
+    }
+    if (length > 0x7fffffffu) {
+        kprintf("[TLS] send refused: %u bytes exceeds the int return contract\n",
+                (unsigned)length);
+        return TLS_ERR_INVALID_PARAM;
+    }
+
+    const uint8_t *p = (const uint8_t *)data;
+
+    // Preserve the historical behaviour for an empty payload: one empty record.
+    if (length == 0) {
+        int ret = tls_send_app_record(ctx, p, 0);
+        return (ret < 0) ? ret : 0;
+    }
+
+    size_t off = 0;
+    while (off < length) {
+        uint32_t frag = tls_out_fragment_rs((uint64_t)(length - off), TLS_MAX_PLAINTEXT_SIZE);
+        if (frag == 0) {
+            // Unreachable by construction. If it ever becomes reachable, fail
+            // instead of looping forever on a zero-length fragment.
+            kprintf("[TLS] send plan returned 0 with %u of %u bytes left\n",
+                    (unsigned)(length - off), (unsigned)length);
+            return TLS_ERR_INVALID_PARAM;
+        }
+        int ret = tls_send_app_record(ctx, p + off, frag);
+        if (ret < 0) {
+            kprintf("[TLS] send failed at offset %u of %u (fragment %u bytes): %d\n",
+                    (unsigned)off, (unsigned)length, (unsigned)frag, ret);
+            return ret;
+        }
+        off += frag;
+    }
+    return (int)length;
 }
 
 int tls_recv(tls_context_t *ctx, void *buffer, size_t length) {
@@ -2883,5 +2955,32 @@ void tls_parse_rust_selftest(void) {
         bootlog_write("[RUST-PERF] tls_parse: C=%llu RS=%llu cyc/walk ratio=%llu.%02llu",
                       (unsigned long long)c_cyc, (unsigned long long)r_cyc,
                       (unsigned long long)(ratio100 / 100), (unsigned long long)(ratio100 % 100));
+    }
+
+    // #postfix: the outgoing fragmentation plan carries its own copies of the
+    // two record limits (rustkern/tlsfrag.rs cannot see the C header). #497 was
+    // precisely a drift between a duplicated TLS size constant and the code that
+    // used it, so assert equality at boot rather than hope. Also the only caller
+    // of tls_out_max_plaintext_rs(), which keeps the symbol referenced.
+    {
+        uint32_t rs_max = tls_out_max_plaintext_rs();
+        int frag_edge_ok =
+            tls_out_fragment_rs(TLS_MAX_PLAINTEXT_SIZE - 1, TLS_MAX_PLAINTEXT_SIZE) == TLS_MAX_PLAINTEXT_SIZE - 1 &&
+            tls_out_fragment_rs(TLS_MAX_PLAINTEXT_SIZE,     TLS_MAX_PLAINTEXT_SIZE) == TLS_MAX_PLAINTEXT_SIZE &&
+            tls_out_fragment_rs(TLS_MAX_PLAINTEXT_SIZE + 1, TLS_MAX_PLAINTEXT_SIZE) == TLS_MAX_PLAINTEXT_SIZE &&
+            tls_out_fragment_rs(0, TLS_MAX_PLAINTEXT_SIZE) == 0;
+        int rec_edge_ok =
+            tls_out_record_ok_rs(TLS_MAX_RECORD_SIZE) == 1 &&
+            tls_out_record_ok_rs(TLS_MAX_RECORD_SIZE + 1) == 0 &&
+            tls_out_record_ok_rs(66024) == 0;   // the old uint16_t wrap case
+        if (rs_max != TLS_MAX_PLAINTEXT_SIZE || !frag_edge_ok || !rec_edge_ok) {
+            kprintf("[RUST-DIFF] tlsfrag: FAIL rs_max=%u c_max=%u frag_edge=%d rec_edge=%d\n",
+                    (unsigned)rs_max, (unsigned)TLS_MAX_PLAINTEXT_SIZE, frag_edge_ok, rec_edge_ok);
+            bootlog_write("[RUST-DIFF] tlsfrag: FAIL rs_max=%u c_max=%u", (unsigned)rs_max,
+                          (unsigned)TLS_MAX_PLAINTEXT_SIZE);
+        } else {
+            kprintf("[RUST-DIFF] tlsfrag: OK max_plaintext=%u max_record=%u\n",
+                    (unsigned)rs_max, (unsigned)TLS_MAX_RECORD_SIZE);
+        }
     }
 }

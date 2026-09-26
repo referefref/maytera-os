@@ -25,6 +25,27 @@
 static int node_is(dom_node *node, const char *name);
 
 /*
+ * engwalkstack (#245): THE SOURCE STAMP.
+ *
+ * WHY THIS EXISTS. The previous pass on this file measured a change that was
+ * never compiled into the binary it measured, and its positive control came
+ * back byte-identical, which is indistinguishable from a change that compiled
+ * and did nothing (blame.md). Its check was "the two binaries differ", which
+ * answers "is there ANY change in there" and says nothing about whether the
+ * particular edit under measurement is. That gap only exists because nothing
+ * in the artifact names the source it came from.
+ *
+ * The build passes -DENGWALK_LAYOUT_STAMP="<md5 of this file>" and the app
+ * prints it at startup, so the serial log of any run states the md5 of the
+ * layout.c that is actually executing, and it can be compared against the file
+ * on disk. An unstamped build says so rather than lying.
+ */
+#ifndef ENGWALK_LAYOUT_STAMP
+#define ENGWALK_LAYOUT_STAMP "unstamped"
+#endif
+const char *layout_src_stamp(void) { return ENGWALK_LAYOUT_STAMP; }
+
+/*
  * engfloat2 (#245): the maximum number of CONCURRENT float bands modelled in
  * one containing block. Real pages rarely stack more than a couple of floats
  * on the same line; a small fixed cap keeps the state flat (no allocation, and
@@ -55,6 +76,14 @@ typedef struct {
 	int line_right;            /* x a line must wrap before */
 	int line_height;           /* tallest run on the current line */
 	bool line_has_content;
+	/*
+	 * Set the moment an item carrying a non-baseline vertical-align is emitted
+	 * onto the line being filled, cleared every time a line closes (#245
+	 * engvalign). It is the AE=0 gate: on a page that never authors
+	 * vertical-align this stays false for every line and valign_line() returns
+	 * before touching a single item.
+	 */
+	bool line_has_valign;
 	/*
 	 * A collapsed space that has not been spent yet, carried ACROSS text
 	 * nodes. Whitespace between two inline elements is its own text node
@@ -128,6 +157,26 @@ typedef struct {
 	 * block, so a page with no absolutes never reads it (AE=0).
 	 */
 	int pcb_x, pcb_y, pcb_w, pcb_h;
+	/*
+	 * engwalkstack (#245): walk() RECURSION DEPTH, and the flex working-set
+	 * pool. Both exist to keep the layout walk inside the 2 MB user stack.
+	 *
+	 * depth is bumped by the walk() wrapper on entry and dropped on return,
+	 * so it is exactly the number of walk frames live right now. A subtree
+	 * deeper than WALK_MAX_DEPTH is DROPPED rather than allowed to overflow
+	 * the stack; depth_peak records how close a page came.
+	 *
+	 * fp_free / fp_live are the LIFO pool the seven per-item flex arrays now
+	 * live in, instead of walk()'s frame. Flex container nesting is strictly
+	 * LIFO (a nested container's frame is released before its parent's), so
+	 * the pool needs nothing more than a singly-linked free stack: no free
+	 * list search, no fragmentation, no per-page reallocation.
+	 */
+	int depth;
+	int depth_peak;
+	struct flex_frame *fp_free;
+	int fp_live;
+	int fp_peak;
 } lstate;
 
 /*
@@ -147,11 +196,65 @@ static uint32_t blend_rgb(uint32_t fg, uint32_t bg, uint32_t a)
 	return (r << 16) | (g << 8) | b;
 }
 
-/* engflex (#245): cap on flex items a single row container can align in a
+/*
+ * engflex (#245): cap on flex items a single row container can align in a
  * paint pass; a container with more than this is left packed at the start
- * (correct, just unaligned) rather than aligned. Real nav/toolbar rows are
- * far under this. */
-#define FLEX_MAX_ITEMS 64
+ * (correct, just unaligned) rather than aligned.
+ *
+ * RAISED 64 -> 256 (#245 engflexclose). 64 was sized for "real nav/toolbar
+ * rows", and it does cover those, but a 100-cell product grid or icon wall is
+ * an ordinary page and it fell off the cliff: the walk sets `ok = 0` at the
+ * 65th element, which does not degrade the alignment, it turns off the ENTIRE
+ * flex pipeline for that container. No flex-basis, no grow, no shrink, no
+ * justify-content, no align-items, and no WRAP, so a `flex-wrap: wrap` grid of
+ * 100 cells did not wrap as a flex container at all.
+ *
+ * THE COST IS STACK, AND IT IS PAID PER DOM NESTING LEVEL BY EVERY PAGE.
+ * The six per-item arrays (bnd, cy, grow, shrink, basis, xc) live in walk()'s
+ * frame, and walk() RECURSES once per element depth, so the cap multiplies the
+ * frame whether or not the page contains a single flex container. MEASURED
+ * with `gcc -fstack-usage` on this exact source, and the slope is exactly
+ * 40 bytes per item of cap:
+ *
+ *   cap     walk() frame   flex_wrap_lines   max walk depth in a 2MB stack
+ *    64       3936 B          3088 B            533
+ *   128       6496 B          5904 B            323
+ *   256      11616 B         11536 B            180
+ *   512      21856 B         22800 B             96
+ *  1024      42336 B         45328 B             49
+ *
+ * USER_STACK_SIZE is 2 MB (kernel/proc/process.h:29) and walk() has NO
+ * RECURSION DEPTH GUARD, so that last column is a real cliff, not a budget.
+ * 256 keeps a >4x margin over the deepest DOM a real page produces (the HTTP
+ * Archive's extreme tail is around 100 levels) while covering a 250-cell grid.
+ * 512 and beyond do NOT have that margin and must not be reached by editing
+ * this number.
+ *
+ * THE THREE OPTIONS, and why this one:
+ *   (a) RAISE THE CAP, this change. Memory cost: 40 bytes x cap x DOM depth of
+ *       stack, on every page. Bounded and measured above. Cheap to 256.
+ *   (b) FALL BACK GRACEFULLY past the cap, e.g. align the first N and leave the
+ *       rest. Memory cost: ZERO. Rejected: it does not render a 100-item grid
+ *       correctly either, it renders the first 64 cells aligned and the other
+ *       36 somewhere else, which is worse to look at and much worse to debug
+ *       than the uniform packing we have today.
+ *   (c) HANDLE THEM PROPERLY: move the six per-item arrays off walk()'s frame
+ *       into a LIFO bump pool on lstate (flex nesting is strictly LIFO, so a
+ *       pool needs no free list). Memory cost: walk()'s frame DROPS to about
+ *       1376 B, better than today's 3936, so the depth budget goes UP to
+ *       ~1500 levels, and the cap stops being a stack question at all; the
+ *       pool itself is 32 bytes x cap x flex NESTING depth of heap, which is
+ *       kilobytes. That is the right end state and it is DEFERRED, not
+ *       dismissed. Its gate: it changes no rendering at all when the pool
+ *       allocation succeeds and the cap is unchanged, so its AE argument is
+ *       the byte-identical dump of the whole existing corpus at cap 256,
+ *       plus a new fixture at a cap the pool raises and walk's frame cannot.
+ *
+ * The one-shot leaf frames (flex_wrap_lines, flex_grow_pass, flex_shrink_pass)
+ * also grow with the cap but are NOT multiplied by depth: flex_wrap_lines is
+ * called after the child walk has returned, so at most one is ever live.
+ */
+#define FLEX_MAX_ITEMS 256
 
 static layout_item *item_new(lstate *st)
 {
@@ -165,14 +268,20 @@ static layout_item *item_new(lstate *st)
 	return it;
 }
 
-static void emit_run(lstate *st, const char *s, int len, int size,
+/*
+ * Emit one positioned text run. Returns the item so a caller that knows
+ * something extra about the run (engletsp: its letter-spacing) can stamp it,
+ * or NULL when nothing was emitted. Callers that do not care ignore the
+ * return, which is why adding it changed no existing call site.
+ */
+static layout_item *emit_run(lstate *st, const char *s, int len, int size,
 		uint32_t color, int bold, int italic, int underline,
 		int face, int fstyle)
 {
 	layout_item *it;
-	if (len <= 0) return;
+	if (len <= 0) return NULL;
 	it = item_new(st);
-	if (!it) return;
+	if (!it) return NULL;
 	it->kind = 0;
 	if (len > LAYOUT_RUN_MAX - 1) len = LAYOUT_RUN_MAX - 1;
 	memcpy(it->text, s, len);
@@ -193,6 +302,7 @@ static void emit_run(lstate *st, const char *s, int len, int size,
 		}
 		it->href[i] = 0;
 	}
+	return it;
 }
 
 /*
@@ -224,6 +334,361 @@ static void align_line(lstate *st)
 }
 
 /*
+ * A flex line's CROSS SIZE: the largest bottom edge any of its items reaches,
+ * measured from the line's top. The ONE place this engine computes that
+ * number (#245 engnowrapstretch); flex_align, the wrap driver's per-line loop
+ * and the nowrap stretch pass all call it, so the three cannot drift apart.
+ * Split out unchanged from the two identical loops that were already here, so
+ * the extraction is byte-identical by construction.
+ *
+ * A text run carries no h, so its cross size is its font size; a box carries
+ * its border-box h. items[lo..hi) is the range to measure, which the callers
+ * pass either as a whole flex container or as one line's slice of it.
+ */
+static int flex_line_cross(lstate *st, int lo, int hi, int line_top)
+{
+	int i, lh = 0;
+
+	for (i = lo; i < hi; i++) {
+		layout_item *it = &st->out->items[i];
+		int ih = (it->kind == 0) ? it->size : it->h;
+		int bot = (it->y - line_top) + ih;
+		if (bot > lh)
+			lh = bot;
+	}
+	return lh;
+}
+
+/*
+ * Per-item CROSS-AXIS inputs for align-items:stretch (#245 engstretchitems)
+ * and for per-item POSITIONAL align-self (#245 engflexclose).
+ * Gathered from each flex item's OWN computed style during the (unchanged)
+ * child walk, because by the time the wrap driver runs the items are a flat
+ * array of positioned boxes and their styles no longer exist anywhere.
+ *
+ * INERT AT ZERO, DELIBERATELY. `stretch` is our own boolean, set only after a
+ * POSITIVE check that the item's resolved align-self is stretch AND its cross
+ * size is auto; it is never a raw libcss enum. libcss numbers this family
+ * INHERIT = 0x0 with the INITIAL value at 0x1, so a raw enum living anywhere
+ * that starts life zeroed reads as "inherit" and 0 stops meaning "do nothing".
+ * That trap has bitten this engine twice, and it is at its most dangerous
+ * here, because the INITIAL value of align-items is the ACTIVE one. min_h and
+ * max_h are -1 for "not declared", so a zeroed struct also clamps nothing.
+ *
+ * `pos` is the same discipline applied to POSITIONAL align-self: FLEX_SELF_AUTO
+ * is 0 and means "this item said nothing, use the line's keyword", which is
+ * exactly what `align-self: auto`, the property's INITIAL value, means in CSS.
+ * So a page that writes no align-self leaves every `pos` at 0 and cannot reach
+ * a single new branch. A raw CSS_ALIGN_SELF_* here would be catastrophic:
+ * CSS_ALIGN_SELF_INHERIT is 0x0 and CSS_ALIGN_SELF_STRETCH (the value the
+ * cascade actually resolves `auto` to on most pages) is 0x1, so the zeroed
+ * default would mean something and the initial value would arm the path.
+ */
+#define FLEX_SELF_AUTO   0   /* item said nothing: defer to the line keyword */
+#define FLEX_SELF_START  1   /* top-packed: flex-start, baseline, stretch */
+#define FLEX_SELF_CENTER 2
+#define FLEX_SELF_END    3
+
+typedef struct {
+	int stretch;   /* 1 = grow this item's box to its line's cross size */
+	int min_h;     /* px, -1 = none. Applied AFTER max_h, so it wins. */
+	int max_h;     /* px, -1 = none */
+	uint8_t pos;   /* FLEX_SELF_*, 0 = AUTO = use the container's align-items */
+} flex_cross_t;
+
+/*
+ * engwalkstack (#245): THE FLEX PER-ITEM WORKING SET, OFF walk()'s FRAME.
+ *
+ * THE PROBLEM THIS SOLVES. The seven per-item arrays a row flex container
+ * needs (bnd, cy, grow, shrink, basis, minf, xc) used to be plain locals in
+ * walk(). walk() RECURSES once per DOM nesting level, so their combined size,
+ * exactly 40 bytes per item of FLEX_MAX_ITEMS, was multiplied by the depth of
+ * the page, and was paid by EVERY page whether or not it contained a single
+ * flex container, because a frame is reserved on entry and gcc does not sink
+ * an alloca-free array into the branch that uses it. MEASURED with
+ * `gcc -fstack-usage` on this file: walk() was 3936 B at cap 64 and 11616 B at
+ * cap 256, which took the deepest DOM that fits the 2 MB USER_STACK_SIZE from
+ * 533 levels to 180. That made FLEX_MAX_ITEMS a stack question, and a cap that
+ * is a stack question cannot be raised to cover a 250-cell product grid.
+ *
+ * WHY A LIFO POOL AND NOT PLAIN malloc/free PER CONTAINER. Flex containers
+ * nest strictly: an inner container's frame is acquired after and released
+ * before its parent's. So a checked-in frame can always be handed straight
+ * back out, and the free list is a stack. A page with N nested flex containers
+ * allocates N frames ONCE and reuses them for every sibling container after,
+ * so a 500-container page still performs at most (max nesting) mallocs.
+ *
+ * WHAT IT COSTS. sizeof(flex_frame) is about 10 KB at cap 256, on the HEAP,
+ * bounded by FLEX_MAX_NEST frames. A page with no flex container at all never
+ * calls malloc here, which is what keeps the no-flex corpus byte-identical.
+ *
+ * WHAT HAPPENS WHEN IT CANNOT ALLOCATE. flex_frame_get() returns NULL and the
+ * container takes the plain child walk: items are packed at the start,
+ * correct but unaligned and unwrapped. That is EXACTLY the pre-existing
+ * over-cap fallback (`ok = 0`), so the degraded rendering is one already-known
+ * behaviour rather than a new one, and it is never a crash.
+ */
+#define FLEX_MAX_NEST 32
+
+typedef struct flex_frame {
+	struct flex_frame *link;   /* free-list next; dead while checked out */
+	int          bnd[FLEX_MAX_ITEMS + 1];
+	int          cy[FLEX_MAX_ITEMS];
+	css_fixed    grow[FLEX_MAX_ITEMS];
+	css_fixed    shrink[FLEX_MAX_ITEMS];
+	int          basis[FLEX_MAX_ITEMS];
+	int          minf[FLEX_MAX_ITEMS];
+	flex_cross_t xc[FLEX_MAX_ITEMS];
+} flex_frame;
+
+static flex_frame *flex_frame_get(lstate *st)
+{
+	flex_frame *f;
+	if (st->fp_live >= FLEX_MAX_NEST) return NULL;
+	f = st->fp_free;
+	if (f) {
+		st->fp_free = f->link;
+	} else {
+		f = (flex_frame *) malloc(sizeof *f);
+		if (!f) return NULL;
+	}
+	f->link = NULL;
+	st->fp_live++;
+	if (st->fp_live > st->fp_peak) st->fp_peak = st->fp_live;
+	return f;
+}
+
+static void flex_frame_put(lstate *st, flex_frame *f)
+{
+	if (!f) return;
+	f->link = st->fp_free;
+	st->fp_free = f;
+	st->fp_live--;
+}
+
+static void flex_pool_drain(lstate *st)
+{
+	while (st->fp_free) {
+		flex_frame *f = st->fp_free;
+		st->fp_free = f->link;
+		free(f);
+	}
+	st->fp_live = 0;
+}
+
+/*
+ * engwalkstack (#245): THE walk() RECURSION DEPTH CEILING.
+ *
+ * walk() had no depth guard at any cap, so a page nested deeply enough ran the
+ * user stack off its end: not a diagnosable failure, a fault at whatever
+ * unrelated code the corrupted frame returned into.
+ *
+ * SIZED AGAINST THE FRAME THIS CHANGE PRODUCES, not the old one, and against
+ * a MEASURED frame rather than an estimated one. `gcc -fstack-usage` on this
+ * file, after the pool, reports:
+ *
+ *   cap     walk_node frame   flex_wrap_lines
+ *     64        2544 B            3088 B
+ *    128        2544 B            5904 B
+ *    256        2544 B           11536 B   <- shipped
+ *    512        2544 B           22800 B
+ *   1024        2544 B           45328 B
+ *   4096        2544 B          180496 B
+ *
+ * The recursive frame's slope against the cap is now exactly ZERO, where it
+ * used to be 40 bytes per item. FLEX_MAX_ITEMS has stopped being a stack
+ * question, which was the whole point. (flex_wrap_lines still scales, but it
+ * runs AFTER the child walk has returned, so at most ONE is ever live no
+ * matter how deep or how nested the page: it is a one-off, not a per-level
+ * cost. Nothing it calls re-enters walk. It is what bounds how far the cap
+ * could be pushed from here, and that bound is now thousands, not hundreds.)
+ *
+ * THE ARITHMETIC FOR 256. USER_STACK_SIZE is 2 MB (kernel/proc/process.h:29).
+ * 256 x 2544 = 651,264 B, 31% of it. The remaining 1.4 MB covers the single
+ * live flex_wrap_lines, the leaf passes under it (flex_shrink_pass is the
+ * largest at 7248 B), the text/measure path, and every frame beneath
+ * layout_document in the app. A third of the stack for the recursion is a
+ * margin, not a budget that just happens to fit.
+ *
+ * AND 256 IS MORE THAN THE PAGE COULD SURVIVE BEFORE THIS CHANGE: at cap 256
+ * with the arrays on the frame, 2 MB ran out at 180 levels, with nothing
+ * checking. It is also ~2.5x the deepest DOM real pages produce (the HTTP
+ * Archive's extreme tail sits near 100 levels). A page that trips this is
+ * pathological or hostile, which is exactly the case that must fail cleanly
+ * instead of running the stack off its end.
+ */
+#define WALK_MAX_DEPTH 256
+
+/*
+ * Map the container's align-items keyword into the same FLEX_SELF_* space the
+ * per-item override lives in, so flex_cross_place compares ONE kind of value.
+ * Everything this engine does not place (flex-start, baseline, stretch, and
+ * any future libcss value) lands on FLEX_SELF_START, which is the top-packed
+ * behaviour that was already there.
+ */
+static uint8_t flex_self_of_align(uint8_t align)
+{
+	if (align == CSS_ALIGN_ITEMS_CENTER)   return FLEX_SELF_CENTER;
+	if (align == CSS_ALIGN_ITEMS_FLEX_END) return FLEX_SELF_END;
+	return FLEX_SELF_START;
+}
+
+/*
+ * Place a flex line's items on the CROSS axis inside a line of a GIVEN cross
+ * size, per align-items, WITH A PER-ITEM align-self OVERRIDE (#245
+ * engflexclose). Only center and flex-end MOVE anything; flex-start,
+ * baseline and stretch keep the top-packed placement. That is still right for
+ * stretch now that it GROWS the items (#245 engstretchitems): a stretched item
+ * is exactly as tall as its line, so it starts at the line top whatever this
+ * function would compute. Growing it is flex_stretch_items' job, above.
+ *
+ * PER ITEM, NOT PER LINE (#245 engflexclose). The alignment applied to item k
+ * is `xc[k].pos` when the item declared a positional align-self, and the
+ * container's align-items otherwise. That is the whole of what align-self
+ * does on the cross axis, and it is an EXTENSION of this one primitive rather
+ * than a second placement formula: the dy arithmetic below is untouched, only
+ * the keyword feeding it is now chosen per item. `xc` may be NULL for a caller
+ * that has no per-item data, in which case every item takes the line keyword
+ * and the behaviour is exactly what it was.
+ *
+ * AE=0 BY CONSTRUCTION, and this is the unusual case where the gate SURVIVES
+ * the implementation rather than being spent by it: `auto` is align-self's
+ * initial value and means "use the container's", so a page that does not write
+ * the property computes FLEX_SELF_AUTO on every item, the early-return below
+ * fires under exactly the old condition, and each surviving item takes exactly
+ * the keyword it took before. There is no keyword a page can stop writing to
+ * get the old behaviour back, because the old behaviour IS the no-keyword
+ * behaviour.
+ *
+ * Split out of flex_align (#245 engstretch) so align-content:stretch, which
+ * GROWS a line's cross size, can re-place that line's items against the new
+ * height with the SAME arithmetic rather than a second copy of it. There is
+ * one cross-placement formula in this engine, not two.
+ *
+ * The placement is ABSOLUTE, not incremental: dy is measured from each item's
+ * own current bounding box to the target, so calling this twice on a line with
+ * the same line_cross is a no-op, and calling it again with a LARGER one lands
+ * the items exactly where a single call with that larger value would have.
+ * That is what makes the stretch path safe to run after flex_align has already
+ * centred the line at its natural height.
+ *
+ * bnd[0..cnt] are this line's item boundaries; the caller may pass a slice of a
+ * larger array (bnd + line_start), because only the differences matter.
+ */
+static void flex_cross_place(lstate *st, int line_top, int line_cross,
+		uint8_t align, const flex_cross_t *xc, const int *bnd, int cnt)
+{
+	int i, k;
+	uint8_t lineal = flex_self_of_align(align);
+	int any = (lineal != FLEX_SELF_START);
+
+	/* Early out under EXACTLY the old condition when no item overrides:
+	 * the line keyword places nothing and no align-self asks for anything
+	 * either, so there is nothing to do. This is the branch every page that
+	 * writes neither property takes. */
+	for (k = 0; !any && xc && k < cnt; k++)
+		if (xc[k].pos == FLEX_SELF_CENTER || xc[k].pos == FLEX_SELF_END)
+			any = 1;
+	if (!any)
+		return;
+	for (k = 0; k < cnt; k++) {
+		int top = 0x3fffffff, bot = 0, item_cross, dy;
+		uint8_t a = (xc && xc[k].pos != FLEX_SELF_AUTO)
+			? xc[k].pos : lineal;
+		if (a != FLEX_SELF_CENTER && a != FLEX_SELF_END)
+			continue;
+		for (i = bnd[k]; i < bnd[k + 1]; i++) {
+			layout_item *it = &st->out->items[i];
+			int ih = (it->kind == 0) ? it->size : it->h;
+			if (it->y < top) top = it->y;
+			if (it->y + ih > bot) bot = it->y + ih;
+		}
+		if (bot <= top)
+			continue;
+		item_cross = bot - top;
+		dy = (a == FLEX_SELF_CENTER)
+			? (line_top + (line_cross - item_cross) / 2) - top
+			: (line_top + (line_cross - item_cross)) - top;
+		if (dy)
+			for (i = bnd[k]; i < bnd[k + 1]; i++)
+				st->out->items[i].y += dy;
+	}
+}
+
+/*
+ * align-items / align-self STRETCH: grow a stretching item's principal box on
+ * the CROSS axis so it fills its line (#245 engstretchitems). This is the step
+ * that makes the items on a flex line the same height, which is what CSS does
+ * BY DEFAULT, because stretch is align-items' INITIAL value.
+ *
+ * Until now an item's cross size was whatever the item measured, and growing a
+ * LINE (align-content:stretch, #245 engstretch) moved the items inside it but
+ * never grew them. Growing the line and growing the item are two different
+ * steps; this is the second one.
+ *
+ * ABSOLUTE, NOT INCREMENTAL, AND GROW-ONLY, which is what makes it safe to
+ * call twice on the same line: the target is measured from the item's own box
+ * top to the line's bottom edge, so a second call with a LARGER line_cross
+ * lands the box exactly where a single call with that value would have, and a
+ * second call with the same one does nothing. align-content:stretch depends on
+ * that, because it grows the line AFTER the per-line pass already filled it.
+ * It is the same absolute-placement property flex_cross_place has, for the
+ * same reason.
+ *
+ * BOUNDED:
+ *   - only an item whose xc[k].stretch the caller POSITIVELY set, i.e. whose
+ *     cross size is AUTO and whose resolved align-self is stretch. An item
+ *     with a declared height keeps it (CSS: a definite cross size does not
+ *     stretch), and an explicit align-self of flex-start / center / flex-end
+ *     opts that item out even inside a stretch container.
+ *   - only the item's PRINCIPAL BOX, its first kind-1 box. A text-only item
+ *     has no box to grow, and a REPLACED item (kind 3 image) is deliberately
+ *     left alone rather than stretched out of its aspect ratio; both are on
+ *     the deferred list in docs/BROWSER_ENGINE_FLEXWRAP_PLAN.md.
+ *   - max-height clamps the growth DOWN and min-height then floors it, IN
+ *     THAT ORDER, because CSS applies the minimum last and it wins.
+ *   - h only ever INCREASES, so an item already reaching the line's bottom is
+ *     untouched.
+ *
+ * The item box's `h` is its BORDER box, so min/max-height are spent here as
+ * border-box lengths: exact under box-sizing:border-box, and off by the item's
+ * vertical padding+border otherwise. That is the same bounded approximation
+ * flex_basis_pass documents for flex-basis on the main axis.
+ *
+ * RETURNS the number of boxes it actually grew (#245 engnowrapstretch), so a
+ * caller can tell "this pass changed nothing" from "this pass ran". The nowrap
+ * call site uses it to decide whether the container's pen has to be raised;
+ * the wrap driver ignores it and is unaffected.
+ */
+static int flex_stretch_items(lstate *st, int line_top, int line_cross,
+		const int *bnd, const flex_cross_t *xc, int ks, int ke)
+{
+	int k, i, n = 0;
+
+	if (st->measuring)
+		return 0;
+	for (k = ks; k < ke; k++) {
+		int bi = -1, target;
+		if (!xc[k].stretch)
+			continue;
+		for (i = bnd[k]; i < bnd[k + 1]; i++)
+			if (st->out->items[i].kind == 1) { bi = i; break; }
+		if (bi < 0)
+			continue;
+		target = (line_top + line_cross) - st->out->items[bi].y;
+		if (xc[k].max_h >= 0 && target > xc[k].max_h)
+			target = xc[k].max_h;
+		if (xc[k].min_h >= 0 && target < xc[k].min_h)
+			target = xc[k].min_h;
+		if (target > st->out->items[bi].h) {
+			st->out->items[bi].h = target;
+			n++;
+		}
+	}
+	return n;
+}
+
+/*
  * Flexbox main-axis (justify-content) and cross-axis (align-items) alignment
  * for a ROW-direction, SINGLE-LINE flex container (#245 engflex).
  *
@@ -245,7 +710,7 @@ static void align_line(lstate *st)
 static void flex_align(lstate *st, int fstart, int fend, int line_top,
 		int content_x, int content_w, int used_x,
 		uint8_t justify, uint8_t align,
-		const int *bnd, const int *cy, int cnt)
+		const int *bnd, const int *cy, const flex_cross_t *xc, int cnt)
 {
 	int n = st->out->n_items;
 	int i, k;
@@ -289,37 +754,30 @@ static void flex_align(lstate *st, int fstart, int fend, int line_top,
 		}
 	}
 
-	/* Cross axis: position each item within the line per align-items. Only
-	 * center and flex-end move anything; stretch/flex-start/baseline keep the
-	 * existing top-packed behaviour. A flex item's cross-size is the bounding
-	 * box of its own items (text runs carry no h, so their cross-size is the
-	 * font size). */
-	if (align == CSS_ALIGN_ITEMS_CENTER || align == CSS_ALIGN_ITEMS_FLEX_END) {
-		int line_cross = 0;
-		for (i = fstart; i < fend; i++) {
-			layout_item *it = &st->out->items[i];
-			int ih = (it->kind == 0) ? it->size : it->h;
-			int bot = (it->y - line_top) + ih;
-			if (bot > line_cross)
-				line_cross = bot;
-		}
-		for (k = 0; k < cnt; k++) {
-			int top = 0x3fffffff, bot = 0, item_cross, dy;
-			for (i = bnd[k]; i < bnd[k + 1]; i++) {
-				layout_item *it = &st->out->items[i];
-				int ih = (it->kind == 0) ? it->size : it->h;
-				if (it->y < top) top = it->y;
-				if (it->y + ih > bot) bot = it->y + ih;
-			}
-			if (bot <= top)
-				continue;
-			item_cross = bot - top;
-			dy = (align == CSS_ALIGN_ITEMS_CENTER)
-				? (line_top + (line_cross - item_cross) / 2) - top
-				: (line_top + (line_cross - item_cross)) - top;
-			if (dy)
-				for (i = bnd[k]; i < bnd[k + 1]; i++)
-					st->out->items[i].y += dy;
+	/* Cross axis: position each item within the line per align-items, with a
+	 * per-item align-self override (#245 engflexclose). Only center and
+	 * flex-end move anything; stretch/flex-start/baseline keep the existing
+	 * top-packed behaviour. A flex item's cross-size is the bounding box of
+	 * its own items (text runs carry no h, so their cross-size is the font
+	 * size).
+	 *
+	 * THE ARMING TEST IS NOW "THE LINE KEYWORD PLACES, OR SOME ITEM DOES",
+	 * not just the line keyword, because align-self:center inside a default
+	 * (stretch) container has to reach the primitive. flex_cross_place makes
+	 * exactly the same test again and returns immediately when it fails, so
+	 * this one only saves the flex_line_cross scan; the two cannot disagree
+	 * about when placement happens because the condition is written once
+	 * here and once there in the same terms. */
+	{
+		int place = (flex_self_of_align(align) != FLEX_SELF_START);
+		for (k = 0; !place && xc && k < cnt; k++)
+			if (xc[k].pos == FLEX_SELF_CENTER ||
+					xc[k].pos == FLEX_SELF_END)
+				place = 1;
+		if (place) {
+			int line_cross = flex_line_cross(st, fstart, fend, line_top);
+			flex_cross_place(st, line_top, line_cross, align,
+					xc, bnd, cnt);
 		}
 	}
 }
@@ -338,6 +796,15 @@ static void flex_align(lstate *st, int fstart, int fend, int line_top,
  *     separate flex_shrink_pass, which floors each item at a bounded
  *     min-content measure (flex_item_min_content). See
  *     docs/BROWSER_ENGINE_FLEXSIZE_PLAN.md.
+ *   - the AUTOMATIC MINIMUM SIZE (#245 engflexmin). CSS floors every flex item
+ *     at min-width:auto = its min-content size, and the distribution that
+ *     honours it is a FREEZE-AT-MIN LOOP, not a single clamp. minf[k] carries
+ *     that floor, measured by flex_basis0_pass BEFORE it collapsed the box
+ *     (the same flex_item_min_content() primitive the shrink pass uses), and is
+ *     0 for every item the seed did not collapse. A zero floor can never bind
+ *     here because growth is non-negative and a non-seeded item enters at its
+ *     content width, so the loop resolves on round 0 with exactly the
+ *     pre-engflexmin arithmetic and the item list is byte-identical.
  *   - a default container (every flex-grow factor is the initial 0) makes
  *     sum == 0 and this returns 0 having touched nothing, so its item list is
  *     byte-identical.
@@ -352,11 +819,13 @@ static void flex_align(lstate *st, int fstart, int fend, int line_top,
  */
 static int flex_grow_pass(lstate *st, int line_top, int content_x,
 		int content_w, int used_x, const int *bnd, const int *cy,
-		const css_fixed *grow, int cnt)
+		const css_fixed *grow, const int *minf, int cnt)
 {
 	int k, i, freev, cum, distributed, last_grow;
+	int last_free, remaining, iter;
 	css_fixed sum;
-	int ek[FLEX_MAX_ITEMS];
+	int ek[FLEX_MAX_ITEMS], bi[FLEX_MAX_ITEMS];
+	int base[FLEX_MAX_ITEMS], froz[FLEX_MAX_ITEMS];
 
 	if (st->measuring || cnt < 1)
 		return 0;
@@ -383,19 +852,93 @@ static int flex_grow_pass(lstate *st, int line_top, int content_x,
 	if (sum <= 0 || last_grow < 0)
 		return 0;
 
-	/* Per-item growth in integer px; the rounding remainder goes to the last
-	 * growing item so the line fills the container exactly (no residual gap). */
-	distributed = 0;
+	/* Each item's principal box and its FLEX BASE SIZE, the width it carries
+	 * on entry. flex_basis0_pass collapsed every `flex: N` seeded box to 0, so
+	 * for those the base is 0 and the whole container main size arrives here
+	 * as free space; that is precisely the case a floor has to police. */
 	for (k = 0; k < cnt; k++) {
+		bi[k] = -1;
+		base[k] = 0;
+		froz[k] = 0;
+		for (i = bnd[k]; i < bnd[k + 1]; i++) {
+			layout_item *it = &st->out->items[i];
+			if (it->kind == 1 || it->kind == 3) { bi[k] = i; break; }
+		}
+		if (bi[k] >= 0)
+			base[k] = st->out->items[bi[k]].w;
+	}
+
+	/*
+	 * Per-item growth in integer px, floored at the AUTOMATIC MINIMUM SIZE
+	 * (#245 engflexmin; CSS flexbox 9.7 "resolve flexible lengths", step 4).
+	 * This is the FULL freeze-at-min loop, not a single clamp: an item whose
+	 * proportional share falls below minf[k] is set to its floor and FROZEN,
+	 * and because a frozen item then eats MORE than its share, the space left
+	 * for the rest shrinks, which can push a SECOND item under its own floor.
+	 * Repeat until a round finds no new violation.
+	 *
+	 * HARD BOUND: a round that continues freezes at least one item, and there
+	 * are at most cnt <= FLEX_MAX_ITEMS items, so cnt + 1 rounds is a bound
+	 * the loop cannot need, let alone exceed.
+	 *
+	 * INERT WITHOUT A FLOOR, which is the whole AE=0 argument: minf[k] is 0
+	 * for every item flex_basis0_pass did not collapse and base[k] >= 0, so
+	 * `need = minf[k] - base[k]` is <= 0 and can never exceed a non-negative
+	 * share. Round 0 therefore finds no violation, with remaining == freev and
+	 * live == sum, which is exactly the single-shot formula this pass used
+	 * before, and breaks.
+	 */
+	remaining = freev;
+	for (k = 0; k < cnt; k++)
 		ek[k] = 0;
+	for (iter = 0; iter <= cnt; iter++) {
+		css_fixed live = 0;
+		int viol = 0;
+		for (k = 0; k < cnt; k++)
+			if (grow[k] > 0 && bnd[k + 1] > bnd[k] && !froz[k])
+				live += grow[k];
+		if (live <= 0)
+			break;
+		for (k = 0; k < cnt; k++) {
+			int share, need;
+			if (froz[k] || grow[k] <= 0 || bnd[k + 1] <= bnd[k])
+				continue;
+			share = (remaining > 0)
+				? FIXTOINT(FDIV(FMUL(INTTOFIX(remaining),
+						grow[k]), live))
+				: 0;
+			if (share < 0) share = 0;
+			need = minf[k] - base[k];
+			if (need > share) {
+				ek[k] = need;
+				froz[k] = 1;
+				viol += need;
+			} else {
+				ek[k] = share;
+			}
+		}
+		if (!viol)
+			break;
+		remaining -= viol;
+	}
+
+	/* The rounding remainder goes to the last STILL-FLEXIBLE growing item so
+	 * the line fills the container exactly (no residual gap). With no floor
+	 * nothing is frozen, so that is the last growing item, exactly as before.
+	 * If the floors already overshot the container the line legitimately
+	 * OVERFLOWS, which is what a real browser does, and nothing is added. */
+	distributed = 0;
+	last_free = -1;
+	for (k = 0; k < cnt; k++) {
 		if (grow[k] > 0 && bnd[k + 1] > bnd[k]) {
-			ek[k] = FIXTOINT(FDIV(FMUL(INTTOFIX(freev), grow[k]), sum));
-			if (ek[k] < 0) ek[k] = 0;
 			distributed += ek[k];
+			if (!froz[k])
+				last_free = k;
 		}
 	}
 	if (distributed < freev)
-		ek[last_grow] += (freev - distributed);
+		ek[(last_free >= 0) ? last_free : last_grow] +=
+			(freev - distributed);
 
 	/* Apply: shift item k right by the running total of earlier growth, then
 	 * widen its own principal box (first box/image item) by its share. A
@@ -407,13 +950,8 @@ static int flex_grow_pass(lstate *st, int line_top, int content_x,
 			for (i = bnd[k]; i < bnd[k + 1]; i++)
 				st->out->items[i].x += cum;
 		if (ek[k] > 0) {
-			int bi = -1;
-			for (i = bnd[k]; i < bnd[k + 1]; i++) {
-				layout_item *it = &st->out->items[i];
-				if (it->kind == 1 || it->kind == 3) { bi = i; break; }
-			}
-			if (bi >= 0)
-				st->out->items[bi].w += ek[k];
+			if (bi[k] >= 0)
+				st->out->items[bi[k]].w += ek[k];
 			cum += ek[k];
 		}
 	}
@@ -430,12 +968,13 @@ static int flex_grow_pass(lstate *st, int line_top, int content_x,
  *
  * BOUNDED, and never a regression by CONSTRUCTION:
  *   - basis[k] is -1 for every item whose flex-basis is auto/content (the
- *     initial value) OR resolves to <= 0. Those keep their content-based size,
- *     so a container with no explicit positive flex-basis is byte-identical,
- *     AND the `flex: N` shorthand's basis-0 seed is left to the (unchanged)
- *     grow path rather than reworked here. A page's item list therefore cannot
- *     change unless it authored a positive flex-basis this engine previously
- *     ignored.
+ *     initial value) OR resolves to < 0. Those keep their content-based size,
+ *     so a container with no explicit positive flex-basis is byte-identical.
+ *     A basis of exactly 0 carries the distinct 0 sentinel (the `flex: N`
+ *     shorthand seed) and is likewise NOT touched here: `basis[k] > 0` is
+ *     false for it, and flex_basis0_pass handles it on the single-line path
+ *     only. A page's item list therefore cannot change here unless it authored
+ *     a positive flex-basis this engine previously ignored.
  *   - resizes ONLY an item with a principal box (kind 1 box / kind 3 image);
  *     a text-only item has no resizable box, so its basis is skipped (its slot
  *     is left at content width). Same bound the grow pass uses.
@@ -480,8 +1019,144 @@ static int flex_basis_pass(lstate *st, int line_top,
 	return cum;
 }
 
+/*
+ * Forward: the bounded automatic-minimum-size measure, defined below next to
+ * the shrink pass that has always used it. The basis-0 seed has to take each
+ * item's floor BEFORE it collapses the box to zero, so it needs the prototype
+ * here (#245 engflexmin). ONE definition, two callers; no private copy.
+ */
+static int flex_item_min_content(lstate *st, int lo, int hi, int bi, int curw);
+
+/*
+ * Flexbox main-axis SIZING: the basis-0 GROW SEED of the `flex: N` shorthand
+ * (#245 engflexbasis). `flex: 1` expands to `flex-grow:1; flex-shrink:1;
+ * flex-basis:0%`, and the ZERO basis is the whole point of the idiom: every
+ * item starts at zero main size, so the ENTIRE container main size is handed to
+ * the grow factors and a row of unequal text comes out as EQUAL columns.
+ * Seeding from content width instead (what this engine did before) leaves
+ * `flex: 1` items content-sized with only the leftover distributed, which is
+ * visibly wrong on the commonest flexbox idiom on the real web.
+ *
+ * Runs AFTER flex_basis_pass (which handles an explicit POSITIVE length and
+ * deliberately ignores a 0) and BEFORE flex_grow_pass: it collapses each seeded
+ * item's principal box to zero width and shifts the following items left by the
+ * running total, and grow then immediately redistributes the whole container
+ * main size by grow factor.
+ *
+ * BOUNDED, and never a regression by CONSTRUCTION:
+ *   - basis[k] == 0 is a sentinel the caller sets ONLY for an item whose
+ *     computed flex-basis is CSS_FLEX_BASIS_SET, resolves to exactly 0px AND
+ *     whose flex-grow is > 0. Longhand `flex-grow: 1` leaves flex-basis AUTO
+ *     (libcss reports AUTO, not SET), and so do `flex: auto` and `flex: none`,
+ *     so none of them reach here. Every other item keeps the -1 (auto/content)
+ *     sentinel and this returns 0 having touched nothing, so a page that never
+ *     writes the `flex` shorthand is byte-identical.
+ *   - ALL OR NOTHING. If any seeded item has no principal box to collapse (a
+ *     text-only flex item), the line cannot be equalised correctly, so the seed
+ *     is abandoned entirely and the line renders exactly as it did before.
+ *   - NEVER LEAVES A COLLAPSED LINE. The seed is applied only when the
+ *     resulting line leaves STRICTLY POSITIVE free space, i.e. only when
+ *     flex_grow_pass is guaranteed to fire and hand that space straight back.
+ *     Otherwise this returns 0 and the old content-sized behaviour stands, so
+ *     an over-constrained container can never be left with zero-width boxes.
+ *   - ONE LINE PER CALL: bail if any item started below line_top. The
+ *     single-line caller passes the whole container; flex_wrap_lines calls
+ *     this ONCE PER LINE, on that line's sub-slice, after it has repacked the
+ *     line at line_top (#245 engflexwrap2). Wrapping on the HYPOTHETICAL main
+ *     size, which is what made the wrap path wait for engflexmin, is done by
+ *     the caller: it measures the same floor before it breaks lines and uses
+ *     max(basis, floor) there.
+ *   - an item's INNER content is not re-wrapped or re-centred at the new width,
+ *     the same bound every other pass here carries.
+ *
+ * MEASURES THE AUTOMATIC MINIMUM SIZE ON THE WAY PAST (#245 engflexmin). A
+ * collapsed item's floor MUST be taken here and not in flex_grow_pass, because
+ * flex_item_min_content() derives the item's own chrome from its border-box
+ * width and clamps the answer to it; at w == 0 both are meaningless. minf[k]
+ * is written ONLY for an item this pass actually collapsed and only on the
+ * apply path, so every early return leaves the caller's zero-filled array
+ * untouched and grow cannot see a floor that does not exist.
+ * Returns the net px the packed line end moved (<= 0).
+ */
+static int flex_basis0_pass(lstate *st, int line_top, int content_x,
+		int content_w, int used_x, const int *bnd, const int *cy,
+		const int *basis, const css_fixed *grow, int cnt, int *minf)
+{
+	int k, i, cum = 0, nseed = 0, total = 0;
+	int bx[FLEX_MAX_ITEMS];
+
+	if (st->measuring || cnt < 1)
+		return 0;
+	for (k = 0; k < cnt; k++)
+		if (cy[k] != line_top)
+			return 0;
+
+	/* Collect the seeded items and their principal boxes. An empty item
+	 * range (display:none) is simply not a flex item and is skipped, exactly
+	 * as the grow pass skips it; a seeded item with NO box aborts the whole
+	 * seed rather than half-applying it. */
+	for (k = 0; k < cnt; k++) {
+		bx[k] = -1;
+		if (basis[k] != 0 || grow[k] <= 0 || bnd[k + 1] <= bnd[k])
+			continue;
+		for (i = bnd[k]; i < bnd[k + 1]; i++) {
+			layout_item *it = &st->out->items[i];
+			if (it->kind == 1 || it->kind == 3) { bx[k] = i; break; }
+		}
+		if (bx[k] < 0)
+			return 0;
+		total += st->out->items[bx[k]].w;
+		nseed++;
+	}
+	if (nseed == 0 || total <= 0)
+		return 0;
+	/* Only seed when grow is then guaranteed to give the space back. */
+	if (content_w - ((used_x - total) - content_x) <= 0)
+		return 0;
+
+	for (k = 0; k < cnt; k++) {
+		if (cum)
+			for (i = bnd[k]; i < bnd[k + 1]; i++)
+				st->out->items[i].x += cum;
+		if (bx[k] >= 0) {
+			/* Floor first, while the box still has its content
+			 * width; then collapse. (#245 engflexmin) */
+			minf[k] = flex_item_min_content(st, bnd[k], bnd[k + 1],
+					bx[k], st->out->items[bx[k]].w);
+			cum -= st->out->items[bx[k]].w;
+			st->out->items[bx[k]].w = 0;
+		}
+	}
+	return cum;
+}
+
 /* Forward: text measure (defined later); needed by the min-content floor. */
 static int lmeasure(lstate *st, const char *s, int size, int face, int fstyle);
+
+/*
+ * The DRAWN width of an already-emitted text run (#245 engletsp).
+ *
+ * Several passes (flex spans, overflow clipping, table column probes) recover
+ * a run's right edge by re-measuring its text. Once letter-spacing exists, the
+ * bare measure is no longer the width the painter will cover, so every one of
+ * those sites has to ask this instead or a tracked heading reads as narrower
+ * than it is drawn and gets clipped or mis-packed.
+ *
+ * STRICTLY EQUAL to lmeasure() when letter_spacing is 0, which is every run on
+ * a page that never authors the property, so the substitution is inert there.
+ * The glyph count is the byte length on purpose: the run text is single-byte
+ * Latin-1 after utf8_squash() and the rasteriser indexes it by byte.
+ */
+static int item_run_w(lstate *st, const layout_item *it)
+{
+	int w = lmeasure(st, it->text, it->size, it->face, it->fstyle);
+	if (it->letter_spacing) {
+		int n = 0;
+		while (it->text[n]) n++;
+		w += it->letter_spacing * n;
+	}
+	return w;
+}
 
 /*
  * A BOUNDED min-content main size (px) for one flex item, the floor flex-shrink
@@ -517,11 +1192,16 @@ static int flex_item_min_content(lstate *st, int lo, int hi, int bi, int curw)
 					if (n > LAYOUT_RUN_MAX - 1) n = LAYOUT_RUN_MAX - 1;
 					memcpy(w, s + a, n); w[n] = '\0';
 					ww = lmeasure(st, w, it->size, it->face, it->fstyle);
+					/* engletsp: an unbreakable word is drawn
+					 * with the run's tracking, so the floor
+					 * has to include it. Inert at 0. */
+					if (it->letter_spacing)
+						ww += it->letter_spacing * n;
 					if (ww > widest) widest = ww;
 				}
 				a = (s[b] == ' ') ? b + 1 : b;
 			}
-			r = it->x + lmeasure(st, it->text, it->size, it->face, it->fstyle);
+			r = it->x + item_run_w(st, it);
 			if (it->x < cx0) cx0 = it->x;
 			if (r > cx1) cx1 = r;
 		} else {
@@ -659,14 +1339,200 @@ static void flex_item_span(lstate *st, int lo, int hi, int *pminx, int *pmaxx)
 		layout_item *it = &st->out->items[i];
 		int l = it->x, r;
 		if (it->kind == 0)
-			r = it->x + lmeasure(st, it->text, it->size,
-					it->face, it->fstyle);
+			r = it->x + item_run_w(st, it);   /* engletsp */
 		else
 			r = it->x + it->w;
 		if (l < minx) minx = l;
 		if (r > maxx) maxx = r;
 	}
 	*pminx = minx; *pmaxx = maxx;
+}
+
+/*
+ * FLEX-DIRECTION: ROW-REVERSE (#245 engrowrev), as a MAIN-AXIS REFLECTION of
+ * the finished `row` layout. This is the main-axis mirror image of the
+ * cross-axis reflection engwraprev added for flex-wrap:wrap-reverse, and it is
+ * the same trick for the same reason.
+ *
+ * Per CSS Flexbox 1 section 5.1, row-reverse uses the SAME axis as row and
+ * differs only in that main-start and main-end are SWAPPED. Nothing about
+ * SIZING changes: flex-basis, the automatic minimum size, grow, shrink and the
+ * greedy line break all read main SIZES, never main positions, so they produce
+ * the identical numbers. Nothing on the CROSS axis changes either: align-items,
+ * align-self, align-content, per-item stretch and the row gap are untouched.
+ * Only where each item SITS along the main axis differs, so reflecting the
+ * finished forward result is not an approximation of a second code path, it IS
+ * the second code path.
+ *
+ * THE EQUIVALENCE IS EXACT, INCLUDING THE INTEGER ROUNDING. Every placement in
+ * this engine truncates toward zero, so the thing worth checking rather than
+ * assuming is whether "run the formulas then reflect" differs from "run the
+ * formulas in the reflected frame". It does not. Every main-axis pass computes
+ * one number for item k: the distance from MAIN-START to the item's LEADING
+ * edge, `(packed offset) + dx(k)`. A forward pass adds that to content_x and
+ * the leading edge is the left one; a reverse pass subtracts it from
+ * content_x + content_w and the leading edge is the right one. The reflection
+ * below maps the first to the second exactly, because reflecting an interval
+ * maps its left edge's distance from the left of the box to its right edge's
+ * distance from the right of the box. The truncation happens in dx(k), before
+ * either frame is chosen, so there is nothing left to round differently.
+ *
+ *   justify-content:center in a 47px box on an 18px item. Forward
+ *   dx = (47 - 18) / 2 = 14, so the item occupies offsets 14..32. Reflected it
+ *   occupies 47 - 32 .. 47 - 14 = 15..33. A native reverse pass computes the
+ *   same (47 - 18) / 2 = 14 from the RIGHT edge, putting the leading (right)
+ *   edge at 47 - 14 = 33 and the left at 15: offsets 15..33. Identical, with
+ *   the odd spare pixel correctly moved to the other end. Fixture sections 3
+ *   and 4 measure exactly this pair.
+ *   space-between anchors item 0 flush with main-start and the last item flush
+ *   with main-end; after reflection that is the right and left edges, which is
+ *   what CSS asks for. space-around and space-evenly are symmetric
+ *   distributions of the same running-total shape.
+ *
+ * OVERFLOW REFLECTS TOO, and is right for free: a packed line wider than the
+ * container overflows to the RIGHT forward, and the reflection turns that into
+ * an overflow to the LEFT, which is main-end under row-reverse.
+ *
+ * REFLECTING THE POSITIONS IS NOT THE SAME AS REFLECTING EVERY EMITTED ITEM,
+ * and that is the one real trap, exactly as it was on the cross axis. A flex
+ * item is a RANGE of layout_items, bnd[k]..bnd[k+1], holding its principal
+ * box, its text runs and any nested boxes. Reflecting each layout_item about
+ * the container midline individually would mirror the item's text runs among
+ * themselves, turning the first word of a line into its last: correct for the
+ * item as a whole, catastrophic inside it, and MORE visible here than on the
+ * cross axis because words differ in width where lines of text do not differ
+ * in height. So the reflection is computed on each ITEM's bounding box, with
+ * the flex_item_span() primitive the wrap driver already measures items with,
+ * and applied as a RIGID TRANSLATION of that item's whole range. Text inside
+ * an item stays left-to-right, which is what a real browser does:
+ * flex-direction does not reverse text.
+ *
+ * WHAT IT REFLECTS ABOUT is [content_x, content_x + content_w), which is this
+ * element's own main-axis content box and is the SAME pair flex_align() already
+ * measures justify-content's free space against. There is one notion of the
+ * container's main box in this engine, not two.
+ *
+ * THERE IS NO PEN TO REPAIR, which is where this is genuinely simpler than the
+ * cross-axis case. engwraprev had to recompute last_top/last_h because the
+ * cross axis IS the block-progression axis; the main axis is not, the
+ * container's used width and height are unchanged by a reflection, and
+ * cursor_y / line_height are untouched. That is also why this can live at ONE
+ * call site covering BOTH the wrap and the nowrap paths rather than being
+ * plumbed into flex_wrap_lines(): the reflection is per ITEM and every line of
+ * a wrap container spans the same main-axis interval.
+ *
+ * ANONYMOUS FLEX ITEMS: bare text directly inside a flex container gets no
+ * bnd[] entry of its own, so it is not an item here. It is NOT, however, left
+ * behind: the recording loop sets bnd[k] to n_items as element k OPENS, so a
+ * bare run between two elements falls inside the PRECEDING item's range and is
+ * dragged rigidly with it (and a run before the first element falls inside
+ * item 0's, because bnd[0] is fstart). It therefore moves, and it widens that
+ * neighbour's measured span. Fixture section 12 measures this rather than
+ * assuming it. See docs/BROWSER_ENGINE_FLEXWRAP_PLAN.md for the deferral and
+ * its gate.
+ */
+static void flex_main_reflect(lstate *st, int content_x, int content_w,
+		const int *bnd, int cnt)
+{
+	int k, i;
+	/* x + x' == axis for any reflected edge. */
+	int axis = 2 * content_x + content_w;
+
+	if (st->measuring || cnt < 1)
+		return;
+
+	for (k = 0; k < cnt; k++) {
+		int minx, maxx, dx;
+		if (bnd[k] >= bnd[k + 1])
+			continue;
+		flex_item_span(st, bnd[k], bnd[k + 1], &minx, &maxx);
+		if (maxx <= minx)
+			continue;
+		dx = axis - maxx - minx;
+		if (dx)
+			for (i = bnd[k]; i < bnd[k + 1]; i++)
+				st->out->items[i].x += dx;
+	}
+}
+
+/*
+ * align-content (#245 engaligncontent): the CROSS-AXIS keyword that says what
+ * a multi-line flex container does with the space its LINES do not fill.
+ *
+ * OUR OWN CONSTANTS, WITH THE INERT CASE AT 0, DELIBERATELY. libcss numbers
+ * this enum CSS_ALIGN_CONTENT_INHERIT = 0x0 with the INITIAL value (STRETCH)
+ * at 0x1, so a raw libcss enum carried anywhere that starts life zeroed reads
+ * as "inherit" rather than as "nothing to do", and 0 stops meaning inert. The
+ * constants below put DO-NOTHING at 0 and everything this engine does not
+ * handle falls through the switch's default onto it.
+ *
+ * STRETCH NOW SHIPS (#245 engstretch) and is the one value that is not a
+ * rigid translation: it GROWS each line's cross size by an equal share of the
+ * leftover space. It is align-content's INITIAL value, so it is the one
+ * keyword here that arms WITHOUT being written, and FLEX_AC_START stops being
+ * the value an unstyled container maps to. What still holds the blast radius
+ * down is the OTHER gate, cross_h >= 0: a flex container with an auto height
+ * grows to exactly its content and has no leftover cross space at all, so
+ * every flex container that does not declare a height is untouched. What
+ * stretch does NOT yet do is grow the ITEMS inside the grown line, because
+ * align-items:stretch cross-SIZE growth is still deferred; see the limit note
+ * on flex_wrap_lines and in docs/BROWSER_ENGINE_FLEXWRAP_PLAN.md.
+ */
+#define FLEX_AC_START   0
+#define FLEX_AC_END     1
+#define FLEX_AC_CENTER  2
+#define FLEX_AC_BETWEEN 3
+#define FLEX_AC_AROUND  4
+#define FLEX_AC_EVENLY  5
+#define FLEX_AC_STRETCH 6
+
+/*
+ * CROSS-AXIS DIRECTION for flex_wrap_lines (#245 engwraprev). flex-wrap:wrap
+ * puts cross-start at the TOP and stacks the lines downwards; wrap-reverse
+ * SWAPS the cross-start and cross-end edges, so the lines stack bottom-to-top
+ * and flex-start / flex-end mean the opposite ends of both align-items and
+ * align-content.
+ *
+ * OUR OWN CONSTANTS, WITH THE INERT CASE AT 0, for the same reason FLEX_AC_*
+ * above has its own: libcss numbers this family CSS_FLEX_WRAP_INHERIT = 0x0
+ * with the INITIAL value (NOWRAP) at 0x1, so a raw libcss enum living anywhere
+ * that starts life zeroed reads as "inherit" rather than "nothing to do" and 0
+ * stops meaning inert. FLEX_WRAP_FWD is today's behaviour exactly.
+ */
+#define FLEX_WRAP_FWD   0
+#define FLEX_WRAP_REV   1
+
+/*
+ * MAIN-AXIS DIRECTION (#245 engrowrev). flex-direction:row runs the main axis
+ * left-to-right; row-reverse SWAPS main-start and main-end, so items are
+ * placed right-to-left and justify-content:flex-start means the RIGHT edge.
+ *
+ * OUR OWN CONSTANTS, WITH THE INERT CASE AT 0, for the same reason FLEX_AC_*
+ * and FLEX_WRAP_* above have their own: libcss numbers this family
+ * CSS_FLEX_DIRECTION_INHERIT = 0x0 with the INITIAL value (ROW) at 0x1, so a
+ * raw libcss enum living anywhere that starts life zeroed reads as "inherit"
+ * rather than "nothing to do" and 0 stops meaning inert. FLEX_ROW_FWD is
+ * today's behaviour exactly.
+ */
+#define FLEX_ROW_FWD    0
+#define FLEX_ROW_REV    1
+
+static uint8_t flex_align_content_of(uint8_t v)
+{
+	switch (v) {
+	case CSS_ALIGN_CONTENT_FLEX_END:      return FLEX_AC_END;
+	case CSS_ALIGN_CONTENT_CENTER:        return FLEX_AC_CENTER;
+	case CSS_ALIGN_CONTENT_SPACE_BETWEEN: return FLEX_AC_BETWEEN;
+	case CSS_ALIGN_CONTENT_SPACE_AROUND:  return FLEX_AC_AROUND;
+	case CSS_ALIGN_CONTENT_SPACE_EVENLY:  return FLEX_AC_EVENLY;
+	case CSS_ALIGN_CONTENT_STRETCH:       return FLEX_AC_STRETCH;
+	/* INHERIT and FLEX_START keep the existing top-packed stack. The inert
+	 * default is the point: any keyword this engine does not model, present
+	 * or future, lands on today's behaviour rather than on an arbitrary one.
+	 * Note that a COMPUTED style never carries INHERIT, so the 0x0 case is
+	 * belt and braces, not a live path. */
+	default:                              return FLEX_AC_START;
+	}
 }
 
 /*
@@ -679,16 +1545,104 @@ static void flex_item_span(lstate *st, int lo, int hi, int *pminx, int *pmaxx)
  * packed line) so the wrap decision uses each item's hypothetical main size,
  * exactly as CSS specifies.
  *
- * GATED: only ever called when css_computed_flex_wrap == WRAP, so a
- * nowrap/default flex row and non-flex pages never enter here and stay byte-
- * identical (AE=0). A single item wider than the container keeps its own line
- * (CSS: an item that cannot fit is not split). Lines stack top-to-bottom.
+ * GATED: only ever called when css_computed_flex_wrap is WRAP or (since #245
+ * engwraprev) WRAP-REVERSE, so a nowrap/default flex row and non-flex pages
+ * never enter here and stay byte-identical (AE=0). A single item wider than
+ * the container keeps its own line (CSS: an item that cannot fit is not
+ * split). Lines stack top-to-bottom, or bottom-to-top under wrap-reverse.
  *
- * DEFERRED (docs/BROWSER_ENGINE_FLEXWRAP_PLAN.md): flex-wrap:wrap-reverse
- * (falls through to the single-line path, unchanged), align-content
- * distribution of leftover cross-axis space, and per-line cross-size stretch.
- * gap is used for BOTH the column gap between items and the row gap between
- * lines.
+ * FLEX-WRAP:WRAP-REVERSE (#245 engwraprev) is `reverse`, and it is the LAST
+ * thing this function does: a cross-axis REFLECTION of the finished forward
+ * layout. wrap-reverse wraps into exactly the same lines as wrap and differs
+ * only in that cross-start and cross-end are swapped, so a reflection is not
+ * an approximation of a separate bottom-up pass, it IS that pass, down to the
+ * integer rounding. See the long note at the reflection itself. `reverse` is
+ * FLEX_WRAP_FWD (0) for every wrap container, so that path is inert.
+ *
+ * THE `flex: N` BASIS-0 SEED ON THE WRAP PATH (#245 engflexwrap2). CSS breaks
+ * lines on each item's HYPOTHETICAL MAIN SIZE, which is the flex base size
+ * clamped UP by the AUTOMATIC MINIMUM SIZE. For a `flex: N` item the base size
+ * is 0, so its hypothetical main size is exactly its automatic minimum size.
+ * Until engflexmin this engine had no such minimum, which is why the seed was
+ * deliberately kept off this path (a zero basis with no clamp packs every
+ * `flex: 1` item onto one line). It now has one, from the SAME
+ * flex_item_min_content() primitive the shrink pass and the single-line seed
+ * use, so this pass:
+ *   1. measures each seeded item's floor F[k] HERE, BEFORE any line breaking
+ *      and BEFORE any collapse, while every box still carries its content
+ *      width. That ORDER IS THE WHOLE POINT: flex_item_min_content() derives
+ *      the item's chrome from its border-box width AND clamps its answer to
+ *      it, so asking after flex_basis0_pass has set w = 0 returns 0, which is
+ *      inert and INDISTINGUISHABLE from "no item hit its minimum".
+ *   2. breaks lines on max(basis, floor), i.e. on F[k] for a seeded item and
+ *      on the measured post-basis span for every other item.
+ *   3. runs flex_basis0_pass per LINE, so each line's seeded items collapse
+ *      and flex_grow_pass hands that line's whole main size back by grow
+ *      factor, with that line's floors as the freeze-at-min array.
+ * ARMED ONLY when at least one item carries the basis-0 sentinel AND every
+ * such item has a principal box (the same ALL-OR-NOTHING rule the single-line
+ * seed uses, applied container-wide so line breaking and seeding can never
+ * disagree about which items are seeded). Otherwise F[] stays all-zero, the
+ * seed is not called, and this pass is byte-identical to engflexwrap.
+ *
+ * ALIGN-CONTENT (#245 engaligncontent, closed out by #245 engstretch). Once
+ * the lines are stacked, the leftover CROSS-axis space is distributed between
+ * and around them per align-content: flex-end, center, space-between,
+ * space-around, space-evenly and now STRETCH, with the same per-value
+ * arithmetic flex_align uses on the main axis and the LINE count in place of
+ * the item count. For the first five it is a RIGID TRANSLATION of each line's
+ * already-emitted items; STRETCH also GROWS each line's cross size by an equal
+ * share and re-places that line's items inside the taller line, which is why
+ * it is the only value here that is not a pure translate. It requires a
+ * DEFINITE cross size (cross_h, the container's declared content height in px,
+ * -1 for auto), because an auto-height flex container grows to its content and
+ * by definition has no leftover space.
+ *
+ * NEGATIVE free space now follows the CSS fallbacks (#245 engstretch) instead
+ * of leaving everything packed at the start: space-between and stretch behave
+ * as flex-start, space-around and space-evenly as center, and flex-end and
+ * center overflow at the TOP.
+ *
+ * ALIGN-ITEMS:STRETCH, PER LINE (#245 engstretchitems). Each line now GROWS
+ * the items on it to its own cross size, which closes the limit the paragraph
+ * above used to record: growing the LINE and growing the ITEM are two separate
+ * steps and both now exist. They compose without double-counting because
+ * flex_stretch_items is absolute and grow-only, so the align-content:stretch
+ * path simply re-runs it against the grown line. A ONE-line container with
+ * top-aligned items now fills that line with its items instead of leaving
+ * them at their measured heights.
+ *
+ * THE BLAST RADIUS IS REAL AND DELIBERATE: stretch is align-items' INITIAL
+ * value, so unlike every earlier step in this series there is NO keyword a
+ * page has to write to arm it. What bounds it instead is that this whole
+ * function is only ever reached from a flex-wrap:wrap container, or (since
+ * #245 engwraprev) a wrap-reverse one, that an item
+ * needs an AUTO cross size to stretch at all, and that a line whose items are
+ * already the same height grows nothing. A nowrap flex container is NOT
+ * stretched (the single-line path is untouched); see the DEFERRED list in
+ * docs/BROWSER_ENGINE_FLEXWRAP_PLAN.md, which names the gate that will have to
+ * carry the no-regression argument when that deferral is lifted.
+ *
+ * DEFERRED (docs/BROWSER_ENGINE_FLEXWRAP_PLAN.md): cross-axis stretch on the
+ * SINGLE-LINE (nowrap) path, and per-item POSITIONAL align-self (an item that
+ * opts out of stretching keeps the container's align-items placement).
+ *
+ * ROW-GAP DISTINCT FROM COLUMN-GAP (#245 enggap). `gap` is the MAIN-axis
+ * (column) gap spent between items on a line; `row_gap` is the CROSS-axis gap
+ * spent between the lines. They were one number until now, so `gap: 20px 8px`
+ * put 8px between the lines as well as between the cells, and a bare
+ * `column-gap` opened a row gap nothing had asked for. libcss has no row-gap
+ * property at all, so a row gap reaches computed style on a CARRIER; see the
+ * carrier note in cssvar.c.
+ *
+ * THE ALIGN-CONTENT INTERACTION IS THE PART THAT IS EASY TO GET WRONG, and it
+ * comes out right BY CONSTRUCTION rather than by a second sum: the leftover
+ * cross space below is measured from the STACKED POSITIONS
+ * (last_top + last_h - ftop), and line_top has already spent row_gap after
+ * every line but the last, so `extent` INCLUDES the gaps and `freev` is what
+ * is left AFTER them. Summing the line heights independently and subtracting
+ * would have handed align-content space the gaps had already consumed, and
+ * every value would have pushed the last line past the bottom of the box.
  *
  * bnd[0..cnt] are the item boundaries in items[]; grow/shrink/basis are the
  * per-item factors the caller already gathered. ftop is the y all items
@@ -697,15 +1651,25 @@ static void flex_item_span(lstate *st, int lo, int hi, int *pminx, int *pmaxx)
  * the pen at the bottom of the wrapped container.
  */
 static void flex_wrap_lines(lstate *st, int ftop, int content_x,
-		int content_w, uint8_t justify, uint8_t align, int gap,
+		int content_w, uint8_t justify, uint8_t align,
+		uint8_t acontent, int cross_h, int reverse,
+		int gap, int row_gap,
 		const int *bnd, const css_fixed *grow, const css_fixed *shrink,
-		const int *basis, int cnt)
+		const int *basis, const flex_cross_t *xc, int cnt)
 {
 	int k, i, l, nlines;
 	int W[FLEX_MAX_ITEMS];
+	int F[FLEX_MAX_ITEMS];
 	int lstart[FLEX_MAX_ITEMS + 1];
 	int allcy[FLEX_MAX_ITEMS];
+	/* #245 engstretch: each line's final top and cross size. align-content
+	 * needed only the LAST line's pair while every value was a rigid
+	 * translation; stretch changes each line's SIZE, so it needs all of
+	 * them. nlines <= cnt <= FLEX_MAX_ITEMS. */
+	int ltop[FLEX_MAX_ITEMS];
+	int lhgt[FLEX_MAX_ITEMS];
 	int line_top, last_top = ftop, last_h = 0;
+	int do_seed, nseed = 0;
 
 	if (st->measuring || cnt < 1)
 		return;
@@ -716,11 +1680,53 @@ static void flex_wrap_lines(lstate *st, int ftop, int content_x,
 		allcy[k] = ftop;
 	flex_basis_pass(st, ftop, bnd, allcy, basis, cnt);
 
-	/* measure each item's post-basis main-axis width. */
+	/*
+	 * STEP 1 (#245 engflexwrap2): the AUTOMATIC MINIMUM SIZE of every
+	 * basis-0 seeded item, measured NOW, on the still-packed line, before
+	 * any break and before any collapse. See the ORDER note in the header:
+	 * taken after a collapse this returns 0 and does nothing, silently.
+	 *
+	 * ALL OR NOTHING, container-wide: a seeded item with no principal box
+	 * cannot be collapsed, so the single-line seed abandons the whole line.
+	 * Detecting it here disarms line breaking too, which keeps the break
+	 * decision and the per-line seed in agreement about which items are
+	 * seeded. F[] then stays all-zero and this pass is byte-identical to
+	 * the pre-engflexwrap2 code.
+	 */
+	do_seed = 1;
+	for (k = 0; k < cnt; k++) {
+		int bx = -1;
+		F[k] = 0;
+		if (basis[k] != 0 || grow[k] <= 0 || bnd[k + 1] <= bnd[k])
+			continue;
+		for (i = bnd[k]; i < bnd[k + 1]; i++) {
+			layout_item *it = &st->out->items[i];
+			if (it->kind == 1 || it->kind == 3) { bx = i; break; }
+		}
+		if (bx < 0) { do_seed = 0; break; }
+		F[k] = flex_item_min_content(st, bnd[k], bnd[k + 1], bx,
+				st->out->items[bx].w);
+		nseed++;
+	}
+	if (!do_seed || nseed == 0) {
+		do_seed = 0;
+		for (k = 0; k < cnt; k++)
+			F[k] = 0;
+	}
+
+	/*
+	 * STEP 2: each item's HYPOTHETICAL MAIN SIZE for line breaking, which
+	 * is max(flex base size, automatic minimum size). A seeded item's base
+	 * size is 0, so that is F[k]; every other item keeps its measured
+	 * post-basis span and F[k] is 0, so an unseeded container breaks lines
+	 * exactly where it did before.
+	 */
 	for (k = 0; k < cnt; k++) {
 		int minx, maxx;
 		flex_item_span(st, bnd[k], bnd[k + 1], &minx, &maxx);
 		W[k] = (maxx > minx) ? (maxx - minx) : 0;
+		if (do_seed && F[k] > 0)
+			W[k] = F[k];
 	}
 
 	/* greedy line breaking: a new line starts when the next item would push
@@ -752,8 +1758,23 @@ static void flex_wrap_lines(lstate *st, int ftop, int content_x,
 		int tx, used_x, lh, grew, shrunk, j;
 		int bl[FLEX_MAX_ITEMS + 1], cyl[FLEX_MAX_ITEMS];
 		css_fixed gl[FLEX_MAX_ITEMS], sl[FLEX_MAX_ITEMS];
-		if (m <= 0)
+		/* #245 engflexwrap2: this line's slice of the automatic
+		 * minimum size. flex_basis0_pass fills it on its apply path
+		 * (from the same primitive, re-measured on the repacked line,
+		 * where a pure translation leaves both the box width and the
+		 * content extent unchanged, so it agrees with F[] above).
+		 * Zero-filled first, so an early return in the seed leaves
+		 * flex_grow_pass with no floor at all and the exact
+		 * pre-engflexmin single-shot arithmetic. */
+		int ml[FLEX_MAX_ITEMS];
+		if (m <= 0) {
+			/* unreachable (lstart is strictly increasing), but leave
+			 * the arrays defined rather than let a future change read
+			 * an uninitialised top. */
+			ltop[l] = line_top;
+			lhgt[l] = 0;
 			continue;
+		}
 
 		/* repack this line at content_x and move it down to line_top. */
 		tx = content_x;
@@ -788,34 +1809,331 @@ static void flex_wrap_lines(lstate *st, int ftop, int content_x,
 			cyl[j] = line_top;
 			gl[j] = grow[ks + j];
 			sl[j] = shrink[ks + j];
+			ml[j] = 0;
 		}
 		bl[m] = bnd[ke];
+		/*
+		 * STEP 3 (#245 engflexwrap2): the basis-0 seed, PER LINE, with
+		 * this line's slice of the recorded basis sentinels. Inert
+		 * unless do_seed armed it above, so a wrap container that never
+		 * writes the `flex` shorthand is byte-identical. The seed writes
+		 * this line's floors into ml[] as it collapses each box, which
+		 * is what turns flex_grow_pass's freeze-at-min loop on.
+		 */
+		if (do_seed)
+			used_x += flex_basis0_pass(st, line_top, content_x,
+					content_w, used_x, bl, cyl,
+					basis + ks, gl, m, ml);
 		grew = flex_grow_pass(st, line_top, content_x, content_w,
-				used_x, bl, cyl, gl, m);
+				used_x, bl, cyl, gl, ml, m);
 		used_x += grew;
-		shrunk = flex_shrink_pass(st, line_top, content_x, content_w,
+		/*
+		 * #245 engflexmin, held PER LINE: grow and shrink stay mutually
+		 * exclusive. Without floors grow distributes EXACTLY the free
+		 * space, so the line ends flush, shrink saw freev == 0 and
+		 * returned 0, and skipping it there is inert. WITH a floor grow
+		 * may legitimately overflow, and letting shrink claw that back
+		 * would undo the very minimum CSS just imposed.
+		 */
+		shrunk = (grew > 0) ? 0 :
+			flex_shrink_pass(st, line_top, content_x, content_w,
 				used_x, bl, cyl, sl, m);
 		used_x += shrunk;
+		/*
+		 * THE LINE'S CROSS SIZE = the tallest item's cross size. This
+		 * loop used to sit BELOW flex_align; #245 engstretchitems moved
+		 * it above, and the number is the same on either side of that
+		 * call. Every item's top is at line_top here, and
+		 * flex_cross_place only ever moves an item DOWN into the band
+		 * [line_top, line_top + lh], with the tallest item (whose
+		 * item_cross IS lh) getting dy == 0, so the maximum bottom,
+		 * which is the only thing this loop reads, cannot change.
+		 *
+		 * It has to be known BEFORE flex_align now, because a stretched
+		 * item's cross size IS the line's: stretch first, and an item
+		 * that fills the line is then centred or end-placed with
+		 * dy == 0, instead of being moved down and then grown from
+		 * wherever the move left it.
+		 */
+		lh = flex_line_cross(st, bnd[ks], bnd[ke], line_top);
+		/*
+		 * #245 engstretchitems: a stretching item's HYPOTHETICAL cross
+		 * size is its content height clamped by its own min/max-height,
+		 * and the line is as tall as the tallest of those, so a
+		 * min-height ABOVE the natural stack grows the LINE and not
+		 * just the one item. Only a STRETCHING item is consulted: this
+		 * engine does not otherwise implement min-height, and making it
+		 * bind for items that do not stretch would be a far wider
+		 * change than this one.
+		 */
+		for (k = ks; k < ke; k++)
+			if (xc[k].stretch && xc[k].min_h > lh)
+				lh = xc[k].min_h;
+		/* #245 engstretchitems: fill the line on the cross axis. */
+		flex_stretch_items(st, line_top, lh, bnd, xc, ks, ke);
+		/* #245 engflexclose: xc is a CONTAINER-wide array indexed by the
+		 * item's container index, while bl/cyl are this line's repacked
+		 * slices, so the align-self slice offset is ks. Passing the whole
+		 * array here would align line 2's items by line 1's keywords. */
 		flex_align(st, bnd[ks], bnd[ke], line_top, content_x, content_w,
-				used_x, justify, align, bl, cyl, m);
-
-		/* line height = tallest item cross-size on this line. */
-		lh = 0;
-		for (i = bnd[ks]; i < bnd[ke]; i++) {
-			layout_item *it = &st->out->items[i];
-			int ih = (it->kind == 0) ? it->size : it->h;
-			int bot = (it->y - line_top) + ih;
-			if (bot > lh)
-				lh = bot;
-		}
+				used_x, justify, align, bl, cyl, xc + ks, m);
 		last_top = line_top;
 		last_h = lh;
-		line_top += lh + gap;
+		ltop[l] = line_top;   /* #245 engstretch */
+		lhgt[l] = lh;
+		/* #245 enggap: the CROSS-axis gap, which is `gap` only when the
+		 * author wrote a single-value `gap`. */
+		line_top += lh + row_gap;
+	}
+
+	/*
+	 * ALIGN-CONTENT (#245 engaligncontent, closed out by #245 engstretch).
+	 * The lines are stacked at their own heights from ftop; now hand them
+	 * whatever cross-axis space the container has left over.
+	 *
+	 * GATED TWO WAYS:
+	 *   - acontent != FLEX_AC_START. An explicit flex-start, an `inherit`
+	 *     and every keyword this engine does not model map to the inert
+	 *     constant and never reach here. STRETCH, the INITIAL value, DOES
+	 *     now reach here, which is exactly what #245 engstretch changed:
+	 *     align-content's initial value stopped being inert.
+	 *   - cross_h >= 0. The container needs a DEFINITE cross size (its
+	 *     declared, non-percentage content height in px; -1 for auto). An
+	 *     auto-height flex container grows to exactly its content, so it has
+	 *     no leftover cross space at all; that is CSS, not a shortcut. This
+	 *     gate is also what keeps arming the initial value from moving the
+	 *     great majority of pages: almost no flex container declares a
+	 *     height, and one that does not cannot enter this block whatever
+	 *     align-content says.
+	 *
+	 * ftop IS the content-box top (the block open advanced the pen by the
+	 * top border and padding before the child walk), so the stacked extent
+	 * measured against it is directly comparable to the declared content
+	 * height.
+	 *
+	 * #245 enggap: line_top spent row_gap after every line but the last, so
+	 * the stacked extent already has the row gaps in it and freev is the
+	 * space left OVER them. Summing the line heights independently and
+	 * subtracting would hand align-content space the gaps already ate.
+	 *
+	 * THE OVERFLOW FALLBACKS (#245 engstretch). When freev is NEGATIVE the
+	 * lines do not fit, and CSS does not just run the same formula with a
+	 * negative number: space-between behaves as flex-start, space-around and
+	 * space-evenly behave as center, and flex-end and center let the lines
+	 * overflow at the START edge (the top) rather than the end. stretch has
+	 * nothing to distribute, so it is flex-start too. It is done as a keyword
+	 * REMAP, once, up front, so there is still exactly ONE arithmetic formula
+	 * per value below rather than a positive and a negative variant of each.
+	 * Before this, every value stayed packed at the start on overflow, which
+	 * was right for space-between by accident and wrong for the other four.
+	 *
+	 * STRETCH is the one value that is NOT a rigid translation of already-
+	 * emitted items. Each line's CROSS SIZE grows by an equal share of freev,
+	 * so line l's TOP moves down by the shares of the l lines above it,
+	 * (freev * l) / nlines. That is the same running-total shape the other
+	 * values use, and taking each line's own share as the difference between
+	 * consecutive boundaries distributes freev EXACTLY, with the rounding
+	 * remainder spread rather than dumped on the last line. The line then has
+	 * a new cross size, so its items are re-placed inside it by
+	 * flex_cross_place(), the SAME primitive flex_align uses, against the
+	 * grown height; that call is absolute rather than incremental, so running
+	 * it after flex_align already placed the line at its natural height lands
+	 * the items exactly where one call at the grown height would have.
+	 *
+	 * THE HONEST LIMIT ON STRETCH. Growing a line does not yet grow the ITEMS
+	 * in it, because align-items:stretch cross-SIZE growth is still deferred.
+	 * So for align-items center / flex-end the items visibly move down inside
+	 * the taller line, and for flex-start (and for align-items:stretch, the
+	 * initial value) flex_cross_place returns immediately and the items keep
+	 * their top placement. On a MULTI-line container the re-stacking is still
+	 * plainly visible, because every line after the first moves down by its
+	 * predecessors' shares. On a container with exactly ONE line and
+	 * top-aligned items, stretch correctly grows the single line to the whole
+	 * box and correctly moves nothing. That case is in the fixture as a
+	 * control so the limit is on the record rather than mistaken for a bug.
+	 */
+	if (acontent != FLEX_AC_START && cross_h >= 0 && nlines > 0) {
+		int extent = (last_top + last_h) - ftop;
+		int freev = cross_h - extent;
+		uint8_t ac = acontent;
+
+		if (freev < 0) {
+			if (ac == FLEX_AC_BETWEEN || ac == FLEX_AC_STRETCH)
+				ac = FLEX_AC_START;
+			else if (ac == FLEX_AC_AROUND || ac == FLEX_AC_EVENLY)
+				ac = FLEX_AC_CENTER;
+		}
+		if (freev != 0 && ac != FLEX_AC_START) {
+			for (l = 0; l < nlines; l++) {
+				int dy, lcross = lhgt[l];
+				switch (ac) {
+				case FLEX_AC_END:
+					dy = freev; break;
+				case FLEX_AC_CENTER:
+					dy = freev / 2; break;
+				case FLEX_AC_BETWEEN:
+					dy = (nlines > 1)
+						? (freev * l) / (nlines - 1)
+						: 0;
+					break;
+				case FLEX_AC_AROUND:
+					dy = (freev * (2 * l + 1)) / (2 * nlines);
+					break;
+				case FLEX_AC_EVENLY:
+					dy = (freev * (l + 1)) / (nlines + 1);
+					break;
+				case FLEX_AC_STRETCH:
+					/* this line's top carries the shares of
+					 * every line above it; its own share is
+					 * the step to the next boundary, so the
+					 * shares sum to exactly freev. */
+					dy = (freev * l) / nlines;
+					lcross += (freev * (l + 1)) / nlines - dy;
+					break;
+				default: dy = 0; break;
+				}
+				if (dy)
+					for (i = bnd[lstart[l]];
+							i < bnd[lstart[l + 1]]; i++)
+						st->out->items[i].y += dy;
+				/* the grown line: re-place its items against the
+				 * NEW cross size, per align-items, and re-grow
+				 * the ones that stretch so they fill it. */
+				if (lcross != lhgt[l]) {
+					flex_cross_place(st, ltop[l] + dy, lcross,
+						align, xc + lstart[l],
+						bnd + lstart[l],
+						lstart[l + 1] - lstart[l]);
+					/*
+					 * #245 engstretchitems. The two steps
+					 * COMPOSE rather than double-count:
+					 * flex_stretch_items is absolute and
+					 * grow-only, so re-running it here with
+					 * the GROWN cross size sets exactly the
+					 * height one call at that size would
+					 * have set, whatever the per-line call
+					 * already did. dy has already moved the
+					 * item boxes, and the target is measured
+					 * from the item's own (moved) top to the
+					 * moved line's bottom, so the shift
+					 * cancels and no gap is ever eaten.
+					 */
+					flex_stretch_items(st, ltop[l] + dy,
+						lcross, bnd, xc,
+						lstart[l], lstart[l + 1]);
+				}
+				/*
+				 * #245 engwraprev: keep EVERY line's final top
+				 * and cross size, not just the last pair. The
+				 * reflection below needs line 0's, because
+				 * line 0 is the one that ends up at the bottom.
+				 * Purely additive: ltop[]/lhgt[] were dead
+				 * after this loop before, and the last-line
+				 * pair below is left exactly as it was.
+				 */
+				ltop[l] += dy;
+				lhgt[l] = lcross;
+				if (l == nlines - 1) {
+					last_top += dy;
+					last_h = lcross;
+				}
+			}
+		}
+	}
+
+	/*
+	 * FLEX-WRAP: WRAP-REVERSE (#245 engwraprev), as a CROSS-AXIS REFLECTION
+	 * of the finished `wrap` layout.
+	 *
+	 * Per CSS Flexbox 1 section 5.2, wrap-reverse wraps into EXACTLY the
+	 * same lines as wrap; the only difference is that cross-start and
+	 * cross-end are SWAPPED. So the lines stack bottom-to-top, and
+	 * flex-start / flex-end mean the opposite ends for both align-items and
+	 * align-content. Nothing on the MAIN axis changes: item order, line
+	 * membership, flex-basis, grow, shrink and justify-content are all
+	 * untouched, which is why reflecting the finished result is not an
+	 * approximation of a second code path but IS the second code path.
+	 *
+	 * THE EQUIVALENCE IS EXACT, INCLUDING THE INTEGER ROUNDING, and that is
+	 * worth spelling out because the obvious worry is that truncation would
+	 * make "run the formulas then reflect" differ from "run the formulas in
+	 * the reflected frame". It does not, because reflecting a placement
+	 * measured from the start edge gives exactly the placement the same
+	 * expression measures from the end edge:
+	 *
+	 *   align-items:center. Forward puts the item at (line - item) / 2 from
+	 *   the line top. Reflected, its offset from the line top becomes
+	 *   line - item - (line - item) / 2, which is what a bottom-up pass
+	 *   computing (line - item) / 2 from the BOTTOM leaves. For line 49 and
+	 *   item 18 both give offsets 16..34, not 15..33.
+	 *   align-content:center. Same argument with freev in place of
+	 *   (line - item).
+	 *   align-content:stretch. Line l's share is
+	 *   freev*(l+1)/nlines - freev*l/nlines. Reflection keeps each line's
+	 *   own share and puts line 0 at cross-start, which is where a bottom-up
+	 *   pass would have started handing shares out.
+	 *   space-between / space-around / space-evenly. The first two are
+	 *   symmetric distributions; space-between anchors line 0 flush with
+	 *   cross-start and the last line flush with cross-end, which after
+	 *   reflection is bottom and top respectively, as CSS requires.
+	 *
+	 * So there is ONE stacking path in this engine, not two, and
+	 * wrap-reverse inherits align-content, align-items:stretch, row-gap and
+	 * the overflow fallbacks for free rather than reimplementing any of them.
+	 *
+	 * REFLECTING THE POSITIONS IS NOT THE SAME AS REFLECTING EVERY EMITTED
+	 * ITEM, and that distinction is the one real trap here. A flex item is a
+	 * RANGE of layout_items, bnd[k]..bnd[k+1], holding its box, its text
+	 * runs and any nested boxes. Reflecting each layout_item about the
+	 * container midline individually would turn the item's first line of
+	 * text into its last: correct for the item, catastrophic inside it. So
+	 * the reflection is computed on each ITEM's bounding box and applied as
+	 * a RIGID TRANSLATION of that item's whole range, which is the same
+	 * shape every other pass in this file uses.
+	 *
+	 * WHAT IS REFLECTED ABOUT. The container's cross size: cross_h when the
+	 * height is definite, otherwise the stacked extent, which IS the
+	 * auto-height container's content height. In the definite case this is
+	 * also what makes align-content:flex-start come out right for free: the
+	 * lines are left packed at ftop by the (inert) FLEX_AC_START path, and
+	 * the reflection then lands them packed at the BOTTOM, which is
+	 * cross-start under wrap-reverse. Overflow reflects too: a stack taller
+	 * than cross_h overflows at the TOP, which is cross-end, as CSS says.
+	 *
+	 * THE PEN. Line 0 is the first line, so it sits at cross-start, which is
+	 * now the bottom, and it is the line the block close must land below.
+	 * The total extent is preserved by a reflection, so an auto-height
+	 * wrap-reverse container is exactly as tall as the same wrap container.
+	 */
+	if (reverse && nlines > 0) {
+		int H = (cross_h >= 0) ? cross_h : (last_top + last_h) - ftop;
+		/* y + y' == axis for any reflected edge. */
+		int axis = 2 * ftop + H;
+
+		for (k = 0; k < cnt; k++) {
+			int top = 0x3fffffff, bot = 0, dy;
+			for (i = bnd[k]; i < bnd[k + 1]; i++) {
+				layout_item *it = &st->out->items[i];
+				int ih = (it->kind == 0) ? it->size : it->h;
+				if (it->y < top) top = it->y;
+				if (it->y + ih > bot) bot = it->y + ih;
+			}
+			if (bot <= top)
+				continue;
+			dy = axis - bot - top;
+			if (dy)
+				for (i = bnd[k]; i < bnd[k + 1]; i++)
+					st->out->items[i].y += dy;
+		}
+		last_top = axis - (ltop[0] + lhgt[0]);
+		last_h = lhgt[0];
 	}
 
 	/* leave the pen at the LAST line's top with its height, so the caller's
 	 * block-close line_break() advances to the bottom of the wrapped set and
-	 * the container grows to contain every line. */
+	 * the container grows to contain every line. Under wrap-reverse the
+	 * bottom-most line is line 0, and the block above has already put its
+	 * reflected top and height here. */
 	st->cursor_y = last_top;
 	st->cursor_x = content_x;
 	st->line_height = last_h;
@@ -918,8 +2236,140 @@ static void fl_add(lstate *st, int side, int x0, int x1, int bottom)
 	st->fl_n = k + 1;
 }
 
+/*
+ * vertical-align (#245 engvalign): the per-item shift, in pixels, positive
+ * DOWN. `h` is the item's own inline box height, `size` its font size and `H`
+ * the final height of the line box it sits in.
+ *
+ * THE MODEL THIS ENGINE ACTUALLY HAS. Every inline run on a line is emitted at
+ * `y = cursor_y`, the TOP of the line box; there is no real baseline table and
+ * no inline formatting context. So `baseline` (the initial value) is where
+ * everything already is, and every other keyword is expressed as a shift away
+ * from that. Two consequences, stated rather than hidden:
+ *
+ *   - `top` and `text-top` both resolve to 0. In a model that top-aligns by
+ *     default they are already satisfied, and they are supported in the sense
+ *     that authoring them is correct and produces the right pixels, not in the
+ *     sense that they execute any code.
+ *   - `middle` centres the element's box in the line box rather than aligning
+ *     its midpoint with the parent's baseline plus half an x-height, which is
+ *     what CSS says. The two agree on the case that matters (a short inline in
+ *     a taller line) and the x-height term is not available without font
+ *     metrics this engine does not read.
+ *
+ * `sub` and `super` are fractions of the font size because that is the only
+ * metric available: 1/5 em down and 1/3 em up are the conventional fallbacks a
+ * renderer uses when the font supplies no subscript/superscript offsets.
+ */
+static int valign_dy(int mode, int px, int h, int size, int H)
+{
+	int slack = H - h;
+	if (slack < 0) slack = 0;
+	switch (mode) {
+	case LAYOUT_VA_SUB:         return (size + 4) / 5;
+	case LAYOUT_VA_SUPER:       return -((size + 2) / 3);
+	case LAYOUT_VA_TOP:
+	case LAYOUT_VA_TEXT_TOP:    return 0;
+	case LAYOUT_VA_MIDDLE:      return slack / 2;
+	case LAYOUT_VA_BOTTOM:
+	case LAYOUT_VA_TEXT_BOTTOM: return slack;
+	case LAYOUT_VA_LENGTH:      return -px;   /* a positive length RAISES */
+	default:                    return 0;
+	}
+}
+
+/*
+ * Resolve vertical-align for the line that is about to close (#245 engvalign).
+ *
+ * WHY THIS IS A LINE-CLOSE PASS AND NOT AN EMIT-TIME ADJUSTMENT. Four of the
+ * keywords are defined against the LINE BOX, whose height is only final once
+ * every run on the line has been emitted: a 12px span asking for `bottom` has
+ * to know that a 32px span later on the same line made the box 38px tall. The
+ * engine already has exactly this shape for the horizontal axis in
+ * align_line(), which is called from the same place for the same reason, so
+ * this follows that precedent rather than inventing a second one.
+ *
+ * LINE HEIGHT: THIS GROWS THE LINE BOX TO CONTAIN SHIFTED CONTENT. That is the
+ * correct half of the choice and it is the reason the pass is not three lines
+ * long. A `super` on an ordinary line raises the run above the line box top;
+ * the box has to grow UPWARD, and because the box top is pinned at cursor_y in
+ * this coordinate system, growing upward means pushing every item on the line
+ * DOWN by the deficit and adding the same amount to line_height. Downward
+ * overflow (a `sub`, or a negative length) just extends line_height. The
+ * alternative, leaving line_height alone, would have let a superscript paint
+ * over the descenders of the line above, and a large `vertical-align: -2em`
+ * paint over the line below.
+ *
+ * WHAT IT DOES NOT DO: it never reflows. Nothing changes width, nothing
+ * re-wraps, no item moves horizontally, and the shift is applied after the
+ * wrap decisions for the line have all been taken. That keeps the #589
+ * measured == drawn invariant intact by construction, because vertical-align
+ * has no business in a measurement.
+ *
+ * AE=0: the whole function is behind st->line_has_valign, which is only ever
+ * set by an item carrying a non-baseline mode. A page that authors no
+ * vertical-align never reaches the first loop.
+ */
+static void valign_line(lstate *st)
+{
+	int i, n, H, rise = 0, drop, lift;
+
+	if (!st->line_has_valign || st->measuring)
+		goto done;
+	n = st->out->n_items;
+	if (st->line_first >= n)
+		goto done;
+	H = st->line_height;
+	drop = H;
+
+	/*
+	 * Resolve each shifted item. Only inline content moves: a block
+	 * background or border (kind 1) keeps the geometry the flow gave it,
+	 * which is the same rule align_line() applies on the x axis.
+	 *
+	 * The mode is reset to BASELINE as it is consumed, so an item can never be
+	 * shifted twice. That matters because a handful of paths close a line by
+	 * zeroing line_height directly instead of calling line_break(), which can
+	 * leave line_first pointing into an already-processed span; with the mode
+	 * cleared, the worst such a path can now cost is a re-scan that moves
+	 * nothing.
+	 */
+	for (i = st->line_first; i < n; i++) {
+		layout_item *it = &st->out->items[i];
+		int dy, bot;
+		if (it->valign == LAYOUT_VA_BASELINE)
+			continue;
+		if (it->kind != 0 && it->kind != 3)
+			continue;
+		dy = valign_dy(it->valign, it->valign_px, it->valign_h,
+				it->size, H);
+		it->y += dy;
+		it->valign = LAYOUT_VA_BASELINE;
+		if (dy < rise)
+			rise = dy;
+		bot = dy + it->valign_h;
+		if (bot > drop)
+			drop = bot;
+	}
+
+	lift = -rise;
+	if (lift > 0) {
+		for (i = st->line_first; i < n; i++) {
+			layout_item *it = &st->out->items[i];
+			if (it->kind == 0 || it->kind == 3)
+				it->y += lift;
+		}
+		drop += lift;
+	}
+	if (drop > st->line_height)
+		st->line_height = drop;
+done:
+	st->line_has_valign = false;
+}
+
 static void line_break(lstate *st)
 {
+	valign_line(st);   /* #245 engvalign: before the pen advances past this line */
 	align_line(st);
 	if (st->line_has_content || st->line_height > 0)
 		st->cursor_y += st->line_height > 0 ? st->line_height : 18;
@@ -961,6 +2411,17 @@ typedef struct {
 	int pad[4];                /* T R B L */
 	uint32_t bcol[4];
 	int bw[4];
+	/*
+	 * CSS outline (#245 engoutline). NOT INHERITED and PAINT-ONLY: read in
+	 * read_style(), copied onto the emitted box by fill_box_style(), and read
+	 * nowhere else in this file. Deliberately absent from has_any_border(),
+	 * from every outer_w/outer_h sum and from the inline line-height growth,
+	 * because an outline occupies no layout space.
+	 * ol_style is a LAYOUT_OL_* value; 0 (LAYOUT_OL_NONE) is inert.
+	 */
+	int ol_w;
+	int ol_style;
+	uint32_t ol_col;
 	int width;                 /* -1 == auto */
 	int min_width;             /* -1 == none */
 	int height;                /* -1 == auto */
@@ -987,6 +2448,26 @@ typedef struct {
 	int text_indent;
 	/* visibility: 0 visible (initial), 1 hidden; inherited, paint-only (#245 engfix6) */
 	int visibility;
+	/*
+	 * letter-spacing / word-spacing in px (#245 engletsp). Both INHERITED,
+	 * both inert at their initial `normal`, which resolves to 0. Both may be
+	 * negative. letter_spacing is added after every glyph of a run (and is
+	 * carried on the emitted layout_item so the painter applies the same
+	 * amount); word_spacing is added to the inter-word gap only.
+	 */
+	int letter_spacing;
+	int word_spacing;
+	/*
+	 * vertical-align (#245 engvalign), as a LAYOUT_VA_* mode plus the resolved
+	 * raise in px for LAYOUT_VA_LENGTH. NOT INHERITED: unlike white-space,
+	 * visibility and letter-spacing, which this reader deliberately propagates
+	 * from the parent estyle, CSS gives vertical-align an initial value of
+	 * `baseline` and no inheritance, so a child of a superscripted span is NOT
+	 * itself superscripted. Defaulting it to the parent's value would raise a
+	 * whole subtree.
+	 */
+	int valign;
+	int valign_px;
 } estyle;
 
 /* white-space modes (#245 engfix5). WS_NORMAL is the initial value and MUST
@@ -1334,8 +2815,236 @@ static void read_style(const css_computed_style *s, const estyle *parent,
 			e->visibility = 1;
 	}
 
+	/*
+	 * letter-spacing and word-spacing (#245 engletsp). Both INHERITED, and
+	 * read with the same defend-against-a-lying-getter pattern white-space
+	 * and visibility use (engfix4): start from the parent's already-resolved
+	 * value and only override when the getter reports an explicit length
+	 * (CSS_*_SPACING_SET). A NORMAL / INHERIT reading is treated as "no
+	 * information" rather than as a reset to zero, so a spaced heading keeps
+	 * its tracking across the inline children libcss may not compose down.
+	 *
+	 * CONSEQUENCE, stated rather than hidden: a descendant that explicitly
+	 * writes `letter-spacing: normal` to CANCEL an ancestor's tracking is not
+	 * honoured, because the getter reports it identically to the unset case.
+	 * That is the same documented trade the visibility reader makes.
+	 *
+	 * The percentage basis is -1 on purpose: neither property accepts a
+	 * percentage, so a stray one resolves to 0 instead of to a fraction of
+	 * the containing block. Resolution is whole pixels, so tracking below
+	 * about 0.06em at a 16px body size rounds away entirely.
+	 *
+	 * Inert at the initial value: a tree that authors neither property
+	 * resolves both to 0 everywhere, every `if (ls)` / `if (ws)` gate below
+	 * is false, and the pre-engletsp code path runs unchanged.
+	 */
+	e->letter_spacing = parent ? parent->letter_spacing : 0;
+	{
+		css_fixed lv; css_unit lu;
+		if (css_computed_letter_spacing(s, &lv, &lu) ==
+				CSS_LETTER_SPACING_SET)
+			e->letter_spacing = fixed_px(lv, lu, e->font_size, -1);
+	}
+	e->word_spacing = parent ? parent->word_spacing : 0;
+	{
+		css_fixed wv; css_unit wu;
+		if (css_computed_word_spacing(s, &wv, &wu) ==
+				CSS_WORD_SPACING_SET)
+			e->word_spacing = fixed_px(wv, wu, e->font_size, -1);
+	}
+
+	/*
+	 * vertical-align (#245 engvalign). NOT inherited and NOT defaulted from
+	 * the parent: see the estyle comment. The switch maps the libcss keyword
+	 * enum onto this engine's LAYOUT_VA_* modes, and anything it does not name
+	 * (BASELINE, INHERIT, and any value a future libcss adds) falls to the
+	 * default and stays at baseline, which is inert.
+	 *
+	 * The percentage basis is e->line_height, which CSS requires for this one
+	 * property, and which is why this block has to sit BELOW the line-height
+	 * resolution earlier in this function rather than beside the other
+	 * length reads. A length is resolved once, here, against the element's own
+	 * font size, so `vertical-align: 0.4em` means 0.4 of the shifted element's
+	 * em and not of its parent's.
+	 *
+	 * A LENGTH that rounds to zero pixels is left at BASELINE rather than
+	 * recorded as a zero-pixel LENGTH shift, so it cannot arm the line-close
+	 * pass for a line where nothing will actually move.
+	 */
+	e->valign = LAYOUT_VA_BASELINE;
+	e->valign_px = 0;
+	{
+		css_fixed vv = 0; css_unit vu = CSS_UNIT_PX;
+		switch (css_computed_vertical_align(s, &vv, &vu)) {
+		case CSS_VERTICAL_ALIGN_SUB:
+			e->valign = LAYOUT_VA_SUB; break;
+		case CSS_VERTICAL_ALIGN_SUPER:
+			e->valign = LAYOUT_VA_SUPER; break;
+		case CSS_VERTICAL_ALIGN_TOP:
+			e->valign = LAYOUT_VA_TOP; break;
+		case CSS_VERTICAL_ALIGN_TEXT_TOP:
+			e->valign = LAYOUT_VA_TEXT_TOP; break;
+		case CSS_VERTICAL_ALIGN_MIDDLE:
+			e->valign = LAYOUT_VA_MIDDLE; break;
+		case CSS_VERTICAL_ALIGN_BOTTOM:
+			e->valign = LAYOUT_VA_BOTTOM; break;
+		case CSS_VERTICAL_ALIGN_TEXT_BOTTOM:
+			e->valign = LAYOUT_VA_TEXT_BOTTOM; break;
+		case CSS_VERTICAL_ALIGN_SET:
+			e->valign_px = fixed_px(vv, vu, e->font_size,
+					e->line_height);
+			if (e->valign_px)
+				e->valign = LAYOUT_VA_LENGTH;
+			break;
+		default:
+			break;
+		}
+	}
+
 	for (i = 0; i < 4; i++)
 		e->bw[i] = read_border_side(s, i, e->font_size, e->eff_bg, &e->bcol[i]);
+
+	/*
+	 * OUTLINE (#245 engoutline). Read here, carried on the emitted box, and
+	 * painted outside the border edge. It is deliberately NOT folded into
+	 * e->bw[] and NOT added to any box size: CSS says an outline takes no
+	 * layout space, so a page that adds one must not reflow by a pixel.
+	 *
+	 * NOT INHERITED. Unlike white-space, visibility and letter-spacing, which
+	 * this reader seeds from `parent`, outline has an initial value of
+	 * none/medium/invert and no inheritance, so these three are written
+	 * unconditionally on every element.
+	 *
+	 * The libcss enums are mapped into LAYOUT_OL_* with an INERT default,
+	 * never stored raw: CSS_OUTLINE_STYLE_INHERIT is 0x0 and
+	 * CSS_OUTLINE_STYLE_NONE is 0x1, so a raw store would arm the paint path
+	 * on every untouched element of every page.
+	 *
+	 * NOTE the collision documented at the colour read below: outline-COLOR is
+	 * this engine's gradient carrier. outline-width and outline-style are not
+	 * carriers for anything, so the style/width gate is unaffected.
+	 */
+	e->ol_w = 0;
+	e->ol_style = LAYOUT_OL_NONE;
+	e->ol_col = 0;
+	switch (css_computed_outline_style(s)) {
+	case CSS_OUTLINE_STYLE_SOLID:
+	/* double/groove/ridge/inset/outset need a multi-pass or shaded edge this
+	 * painter has no primitive for; solid is the honest approximation and is
+	 * what every one of them degrades to most recognisably. */
+	case CSS_OUTLINE_STYLE_DOUBLE:
+	case CSS_OUTLINE_STYLE_GROOVE:
+	case CSS_OUTLINE_STYLE_RIDGE:
+	case CSS_OUTLINE_STYLE_INSET:
+	case CSS_OUTLINE_STYLE_OUTSET:
+		e->ol_style = LAYOUT_OL_SOLID;
+		break;
+	case CSS_OUTLINE_STYLE_DASHED:
+		e->ol_style = LAYOUT_OL_DASHED;
+		break;
+	case CSS_OUTLINE_STYLE_DOTTED:
+		e->ol_style = LAYOUT_OL_DOTTED;
+		break;
+	default:
+		/* none, hidden, inherit and anything libcss grows later: inert. */
+		e->ol_style = LAYOUT_OL_NONE;
+		break;
+	}
+	if (e->ol_style != LAYOUT_OL_NONE) {
+		/*
+		 * MEASURED, not assumed: this libcss's css_computed_outline_width()
+		 * (src/select/computed.c) ALWAYS returns CSS_BORDER_WIDTH_WIDTH. It
+		 * resolves the `medium` keyword to 2px itself and reports it as a
+		 * length; it never returns THIN, MEDIUM, THICK or INHERIT. The three
+		 * keyword cases below are therefore unreachable in this build and are
+		 * kept only so a future libcss that does report them is handled.
+		 *
+		 * THE HAZARD, and the reason these two are INITIALISED: the underlying
+		 * get_outline_width() writes *length and *unit ONLY when the stored
+		 * type is WIDTH, while the wrapper returns WIDTH regardless. So for
+		 * `outline-width: thin` and `: thick` the caller is handed back
+		 * whatever was already in its own variables. Left uninitialised, that
+		 * is a garbage width painted on a real page. Seeded with the `medium`
+		 * value, a thin or thick outline lands on 2px instead, which is the
+		 * closest thing recoverable through this API: thin and thick are
+		 * INDISTINGUISHABLE from each other here, because the one value that
+		 * would tell them apart is the enum the wrapper throws away.
+		 */
+		css_fixed ov = INTTOFIX(2); css_unit ou = CSS_UNIT_PX;
+		int ow = 0;
+		switch (css_computed_outline_width(s, &ov, &ou)) {
+		/* Unreachable in this libcss; see above. The CSS2.1 UA-default keyword
+		 * widths, for a libcss that does report the keyword. */
+		case CSS_OUTLINE_WIDTH_THIN:   ow = 1; break;
+		case CSS_OUTLINE_WIDTH_MEDIUM: ow = 3; break;
+		case CSS_OUTLINE_WIDTH_THICK:  ow = 5; break;
+		case CSS_OUTLINE_WIDTH_WIDTH:
+			/* No percentage basis: outline-width is a <length> only. */
+			ow = fixed_px(ov, ou, e->font_size, -1);
+			break;
+		default: ow = 0; break;   /* inherit */
+		}
+		if (ow < 0) ow = 0;
+		/* Same 8px ceiling read_border_side() applies, and for the same
+		 * reason: ol_w is a uint8_t on the item and a runaway width would
+		 * otherwise paint a slab over the page. */
+		if (ow > 8) ow = 8;
+		if (ow == 0) {
+			e->ol_style = LAYOUT_OL_NONE;
+		} else {
+			css_color oc = 0;
+			uint8_t ct = css_computed_outline_color(s, &oc);
+			uint32_t rgb, a;
+			int carrier = 0;
+			/*
+			 * OUTLINE-COLOR IS ALREADY TAKEN. #245 enggrad rewrites a CSS
+			 * gradient background onto `outline-color: #C5<index>` in
+			 * cssvar_preprocess(), because libcss rejects gradient FUNCTION
+			 * tokens; layout reads that carrier back further down this file to
+			 * emit the gradient paint item. So on any element with a gradient
+			 * background the computed outline-color is the carrier, not an
+			 * author colour, and painting it would draw a ring in an arbitrary
+			 * #C5xxxx blue-grey.
+			 *
+			 * Detected with EXACTLY the same test as the readback site (marker
+			 * byte 0xC5 in the top octet of the RGB, AND a live table index),
+			 * so the two cannot drift into disagreeing about what a carrier
+			 * is. A carrier is treated as "no author colour" and falls through
+			 * to the currentColor path below.
+			 */
+			if (ct == CSS_OUTLINE_COLOR_COLOR) {
+				unsigned int cv = (unsigned int) oc & 0x00FFFFFFu;
+				if ((cv >> 16) == 0xC5u) {
+					int gi = (int) (cv & 0xFFFFu);
+					if (gi >= 0 && gi < cssvar_gradient_count())
+						carrier = 1;
+				}
+			}
+			if (ct == CSS_OUTLINE_COLOR_COLOR && !carrier) {
+				a = (oc >> 24) & 0xffu;
+				rgb = oc & 0xffffffu;
+			} else {
+				/*
+				 * `invert` (the CSS initial value) and `currentColor` both
+				 * land here. A true invert is a read-modify-write of the
+				 * framebuffer and this painter has no such primitive, only an
+				 * opaque rect fill, so both fall back to the element's
+				 * computed text colour. For currentColor that is exact; for
+				 * invert it is a visible, readable stand-in rather than a
+				 * silent no-paint. Stated in the plan doc as a known limit.
+				 */
+				a = 255;
+				rgb = e->color & 0xffffffu;
+			}
+			if (a == 0) {
+				e->ol_style = LAYOUT_OL_NONE;   /* transparent: paint nothing */
+			} else {
+				e->ol_col = (a == 255) ? rgb
+					: blend_rgb(rgb, e->eff_bg, a);
+				e->ol_w = ow;
+			}
+		}
+	}
 
 	/*
 	 * BORDER-RADIUS, arriving as column-rule-width. libcss has no radius
@@ -1772,21 +3481,66 @@ static void apply_text_transform(char *word, int len, int mode) {
  * both the collapse and the whitespace-preserving paths share ONE copy. `word`
  * is mutated in place by text-transform, so it is not const. Callers apply any
  * leading inter-word space and manage pending_space; this helper does not.
+ *
+ * `ls` is the per-glyph spacing to apply to THIS run (#245 engletsp). It is
+ * normally e->letter_spacing; the preserved-whitespace path passes
+ * letter_spacing + word_spacing for a run made entirely of space characters,
+ * because every glyph in such a run is a word separator. It is a parameter
+ * rather than read from `e` so that decision stays at the call site where it
+ * is legible.
+ *
+ * MEASURED WIDTH MUST EQUAL DRAWN WIDTH (#589). The spacing is added to the
+ * advance here AND stamped on the emitted item, and the painter advances its
+ * pen by the same amount per glyph. Widening only the advance would leave the
+ * glyphs drawn tight at the left of a box laid out wide.
  */
 static void emit_word(lstate *st, const estyle *e, char *word, int wl,
-		int do_wrap)
+		int do_wrap, int ls)
 {
 	int ww;
+	layout_item *it;
 	if (e->text_transform)
 		apply_text_transform(word, wl, e->text_transform);
+	/* Spacing is applied AFTER the memoised measure, never folded into the
+	 * key, so the lmeasure cache stays a pure function of (text, size, face,
+	 * style) and a tracked run cannot poison it for an untracked one. */
 	ww = lmeasure(st, word, e->font_size, e->face, e->fstyle);
 	if (ww <= 0) ww = wl * (e->font_size / 2 + 1);
+	if (ls) {
+		/* CSS adds letter-spacing after EVERY character including the
+		 * last. wl is the glyph count exactly: utf8_squash() already
+		 * folded this word to single-byte Latin-1 and the rasteriser
+		 * indexes it by byte. Negative tracking is legal, so clamp the
+		 * ADVANCE at zero: the pen may stop moving, it may never move
+		 * backwards and rewind over the previous word. */
+		ww += ls * wl;
+		if (ww < 0) ww = 0;
+	}
 	if (do_wrap && st->line_has_content && st->cursor_x + ww > st->line_right)
 		line_break(st);
 	/* visibility:hidden (#245 engfix6): reserve the advance, paint nothing. */
-	if (!e->visibility)
-		emit_run(st, word, wl, e->font_size, e->color, e->bold,
+	if (!e->visibility) {
+		it = emit_run(st, word, wl, e->font_size, e->color, e->bold,
 				e->italic, e->underline, e->face, e->fstyle);
+		if (it) {
+			it->letter_spacing = ls;
+			/*
+			 * #245 engvalign: carry the run's vertical-align to the
+			 * line-close pass, which is the first moment the line box
+			 * height is known. The advance below is NOT touched: this
+			 * property moves a run's origin and nothing else, so
+			 * measured width still equals drawn width (#589).
+			 * visibility:hidden takes the other branch and emits no
+			 * item, so a hidden run cannot arm the pass either.
+			 */
+			if (e->valign != LAYOUT_VA_BASELINE) {
+				it->valign = e->valign;
+				it->valign_h = e->line_height;
+				it->valign_px = e->valign_px;
+				st->line_has_valign = true;
+			}
+		}
+	}
 	st->cursor_x += ww;
 	if (e->line_height > st->line_height)
 		st->line_height = e->line_height;
@@ -1808,6 +3562,23 @@ static void layout_text_collapse(lstate *st, const char *text, size_t len,
 	size_t i = 0;
 	int space_w = lmeasure(st, " ", e->font_size, e->face, e->fstyle);
 	if (space_w <= 0) space_w = e->font_size / 3 + 1;
+	/*
+	 * engletsp: the collapsed inter-word gap is ONE space character, so it
+	 * takes word-spacing (which applies to word separators) AND
+	 * letter-spacing (which CSS applies to every character, the space
+	 * included). That is the choice this port makes, and it matches what
+	 * a browser does for `letter-spacing: 3px` on a paragraph.
+	 *
+	 * This gap is pure cursor advance: no glyph is emitted for a collapsed
+	 * space, so there is nothing for the painter to widen and the #589
+	 * invariant is not in play here. Clamped at zero so negative tracking
+	 * can close the gap but never run two words together backwards.
+	 * Inert when both properties are 0: space_w is untouched.
+	 */
+	if (e->word_spacing || e->letter_spacing) {
+		space_w += e->word_spacing + e->letter_spacing;
+		if (space_w < 0) space_w = 0;
+	}
 
 	while (i < len) {
 		size_t ws, we;
@@ -1846,7 +3617,7 @@ static void layout_text_collapse(lstate *st, const char *text, size_t len,
 			st->cursor_x += space_w;
 		st->pending_space = false;
 
-		emit_word(st, e, word, wl, do_wrap);
+		emit_word(st, e, word, wl, do_wrap, e->letter_spacing);
 	}
 }
 
@@ -1892,7 +3663,15 @@ static void layout_text_preserve(lstate *st, const char *text, size_t len,
 				i++;
 			}
 			if (n > 0)
-				emit_word(st, e, sp, n, 0);   /* spaces never wrap */
+				/* engletsp: every glyph in this run IS a word
+				 * separator, so it carries word-spacing as well
+				 * as letter-spacing. Preserved spaces are real
+				 * glyphs (unlike the collapsed gap above), so
+				 * the painter widens them identically and #589
+				 * holds. */
+				emit_word(st, e, sp, n, 0,
+						e->letter_spacing + e->word_spacing);
+			/* spaces never wrap */
 			continue;
 		}
 		{
@@ -1906,7 +3685,7 @@ static void layout_text_preserve(lstate *st, const char *text, size_t len,
 			wl = utf8_squash(text + ws, wl, word, LAYOUT_RUN_MAX);
 			if (wl <= 0) continue;
 			col += wl;
-			emit_word(st, e, word, wl, do_wrap);
+			emit_word(st, e, word, wl, do_wrap, e->letter_spacing);
 		}
 	}
 }
@@ -2016,6 +3795,18 @@ static bool has_any_border(const estyle *e)
 }
 
 /*
+ * #245 engoutline. An element with ONLY an outline (no background, no border)
+ * still needs a kind-1 box emitted to hang the outline on, so this joins the
+ * has_bg/has_any_border gate at each box-emission site. It is deliberately a
+ * SEPARATE predicate from has_any_border(): every caller of that one also
+ * feeds a size or a line height, and an outline must feed neither.
+ */
+static bool has_outline(const estyle *e)
+{
+	return e->ol_w > 0;
+}
+
+/*
  * Move the item at `from` back to index `to`, shifting the rest along. Used to
  * put an inline element's background box IN FRONT of the text runs it belongs
  * behind: the runs are emitted first (the box cannot be sized until the content
@@ -2031,6 +3822,7 @@ static void neutralise_item(layout_item *it)
 {
 	it->has_bg = 0;
 	it->bw[0] = it->bw[1] = it->bw[2] = it->bw[3] = 0;
+	it->ol_w = 0;   /* #245 engoutline: a clipped-away box paints no outline */
 	it->w = 0;
 	it->h = 0;
 	it->underline = 0;
@@ -2061,8 +3853,7 @@ static void overflow_clip(lstate *st, int start, int skip_idx,
 		ix0 = it->x;
 		iy0 = it->y;
 		if (it->kind == 0) {
-			ix1 = ix0 + lmeasure(st, it->text, it->size,
-					it->face, it->fstyle);
+			ix1 = ix0 + item_run_w(st, it);   /* engletsp */
 			iy1 = iy0 + it->size;
 		} else {
 			ix1 = ix0 + it->w;
@@ -2107,10 +3898,18 @@ static void fill_box_style(layout_item *bx, const estyle *e)
 		bx->bw[i] = (uint8_t) e->bw[i];
 		bx->bcol[i] = e->bcol[i];
 	}
+	/* #245 engoutline: paint-only, so this is the ONLY place the outline
+	 * crosses from the cascade to an item. All three are 0 when the element
+	 * authors no outline. */
+	bx->ol_w = (uint8_t) e->ol_w;
+	bx->ol_style = (uint8_t) e->ol_style;
+	bx->ol_col = e->ol_col;
 }
 
 /* ---- recursive box walk ---- */
 static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
+		const estyle *pe, int cb_x, int cb_w, int flex_row);
+static void walk_node(lstate *st, dom_node *node, const css_computed_style *pstyle,
 		const estyle *pe, int cb_x, int cb_w, int flex_row);
 /* Table box generation and layout; see the long note above its definition. */
 static void tbl_walk_children(lstate *st, dom_node *node,
@@ -2244,7 +4043,42 @@ static uint8_t list_resolve_type(dom_node *node, uint8_t css_lt)
 	return lt;
 }
 
+/*
+ * engwalkstack (#245): the depth-counting shell around the real walk.
+ *
+ * WHY A WRAPPER AND NOT A COUNTER INSIDE walk_node. walk_node has eleven
+ * `return` statements; a decrement at each is eleven chances to leak a level,
+ * and a leaked level is a ceiling that creeps down over a long page until the
+ * guard trips on a shallow tree. One entry and one exit cannot get this wrong.
+ *
+ * WHAT THE PAGE DOES WHEN THE CEILING IS HIT, and this is deliberate rather
+ * than whatever fell out: the offending node and its entire subtree emit NO
+ * layout items, so nothing below the limit paints. Everything shallower than
+ * the limit is laid out and painted exactly as it would have been, because the
+ * pen (cursor_x/cursor_y/line state) is untouched by a refused node, so the
+ * page renders as itself with the over-deep branch missing. out->deep_truncated
+ * latches so the app can SAY the page was truncated instead of quietly showing
+ * a short one, which is the same contract out->overflowed already has.
+ *
+ * NOT RESTORED BY tbl_probe. tbl_probe saves and restores out->overflowed
+ * because it throws its own items away, but a probe that hits the ceiling
+ * proves the tree really is that deep and the real walk of the same cell will
+ * hit it too, so latching is the honest signal and un-latching would hide it.
+ */
 static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
+		const estyle *pe, int cb_x, int cb_w, int flex_row)
+{
+	if (st->depth >= WALK_MAX_DEPTH) {
+		st->out->deep_truncated = 1;
+		return;
+	}
+	st->depth++;
+	if (st->depth > st->depth_peak) st->depth_peak = st->depth;
+	walk_node(st, node, pstyle, pe, cb_x, cb_w, flex_row);
+	st->depth--;
+}
+
+static void walk_node(lstate *st, dom_node *node, const css_computed_style *pstyle,
 		const estyle *pe, int cb_x, int cb_w, int flex_row)
 {
 	dom_node_type type;
@@ -2772,6 +4606,14 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 				bx->w = fw; bx->h = fh;
 				bx->has_bg = 1; bx->bg = is_btn ? 0x00E2E2E2u : 0x00FFFFFFu;
 				for (int i = 0; i < 4; i++) { bx->bw[i] = 1; bx->bcol[i] = 0x00909090u; }
+				/* #245 engoutline. The control's chrome is hardcoded above
+				 * rather than taken from the cascade, so fill_box_style() is
+				 * never called here; the outline is stamped by hand so that
+				 * `input { outline: 2px solid ... }` works on the element the
+				 * property is authored on most often. Inert at ol_w == 0. */
+				bx->ol_w = (uint8_t) e.ol_w;
+				bx->ol_style = (uint8_t) e.ol_style;
+				bx->ol_col = e.ol_col;
 				bx->form_kind = is_btn ? 2 : 1;
 				{ int i = 0; while (fname[i] && i < 63) { bx->field_name[i] = fname[i]; i++; } bx->field_name[i] = 0; }
 				{ int i = 0; while (faction[i] && i < LAYOUT_HREF_MAX - 1) { bx->href[i] = faction[i]; i++; } bx->href[i] = 0; }
@@ -2875,12 +4717,23 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 
 	/* Does THIS element make its children flex-level? */
 	int child_flex_row = 0;
+	/*
+	 * #245 engrowrev: does it run that main axis BACKWARDS? Own flag, set
+	 * explicitly from the computed keyword at this one place and never
+	 * carried as a raw libcss enum, because CSS_FLEX_DIRECTION_INHERIT is
+	 * 0x0 and the INITIAL value ROW is 0x1. FLEX_ROW_FWD (0) is today's
+	 * behaviour, so every page that does not write `row-reverse` is
+	 * byte-identical by construction.
+	 */
+	int child_flex_rowrev = FLEX_ROW_FWD;
 	if (style && (e.display == CSS_DISPLAY_FLEX ||
 			e.display == CSS_DISPLAY_INLINE_FLEX)) {
 		uint8_t dir = css_computed_flex_direction(style);
 		if (dir == CSS_FLEX_DIRECTION_ROW || dir == CSS_FLEX_DIRECTION_ROW_REVERSE ||
 				dir == CSS_FLEX_DIRECTION_INHERIT)
 			child_flex_row = 1;
+		if (dir == CSS_FLEX_DIRECTION_ROW_REVERSE)
+			child_flex_rowrev = FLEX_ROW_REV;
 	}
 
 	/*
@@ -2892,12 +4745,69 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 	 */
 	int grid_cols = 0;
 	int track_gap = 0;
+	/*
+	 * #245 enggap: the CROSS-axis gap, a SEPARATE number from track_gap.
+	 * libcss has no row-gap and no gap property, so cssvar.c carries the row
+	 * component on `clip` (a dead, non-inherited, four-length property this
+	 * engine never paints); read the carrier note there before changing
+	 * either side. 0 is the inert value and is what every page that does not
+	 * author a row gap produces, which is why this is byte-identical to the
+	 * shared-gap code on such a page.
+	 */
+	int row_gap = 0;
 	if (style) {
 		css_fixed gv; css_unit gu;
 		if (css_computed_column_gap(style, &gv, &gu) == CSS_COLUMN_GAP_SET) {
 			track_gap = fixed_px(gv, gu, e.font_size, content_w);
 			if (track_gap < 0) track_gap = 0;
 			if (track_gap > 200) track_gap = 200;
+		}
+		{
+			/*
+			 * SEEDED IN FULL, including the units: css_computed_clip()
+			 * writes the rect only for the RECT case, and reading an
+			 * unwritten css_unit was the engoutline uninitialised-width
+			 * bug. The initial value is CSS_CLIP_AUTO (0x1), not RECT,
+			 * so an unstyled element never gets past the test.
+			 *
+			 * THE THIRD COMPONENT, NOT THE FIRST, AND THAT IS NOT A
+			 * TASTE DECISION. libcss's GENERATED getter has an operator
+			 * precedence bug in exactly two of its four unit fields
+			 * (libcss/src/select/autogenerated_propget.h, get_clip):
+			 *
+			 *     rect->tunit = bits & 0x3e00000 >> 21;
+			 *     rect->runit = bits & 0x1f0000 >> 16;
+			 *     rect->bunit = (bits & 0xf800) >> 11;
+			 *     rect->lunit = (bits & 0x7c0) >> 6;
+			 *
+			 * `>>` binds tighter than `&`, so the first two read
+			 * `bits & 0x1f`, which is the TYPE and the four auto flags,
+			 * never the unit. For a plain `rect(Npx,...)` that is the
+			 * constant 2, and CSS_UNIT_EM is 2, so the top and right
+			 * lengths of EVERY clip rect come back as em. MEASURED here
+			 * before the carrier was moved: a 10px row gap laid out as
+			 * 150px, which is 10 * the 15px font size, and 20px and
+			 * above all hit the 200px clamp. The bottom and left fields
+			 * are parenthesised correctly, so the bottom slot reports
+			 * px as px.
+			 *
+			 * libcss is NOT in this repo (only our own port glue is), so
+			 * a two-character fix there would live in an untracked tree
+			 * and the tracked engine would silently depend on it. That
+			 * is the divergence trap this project keeps paying for, so
+			 * the carrier moves instead and the bug is recorded.
+			 */
+			css_computed_clip_rect cr = { 0, 0, 0, 0,
+					CSS_UNIT_PX, CSS_UNIT_PX,
+					CSS_UNIT_PX, CSS_UNIT_PX,
+					false, false, false, false };
+			if (css_computed_clip(style, &cr) == CSS_CLIP_RECT &&
+					!cr.bottom_auto) {
+				row_gap = fixed_px(cr.bottom, cr.bunit,
+						e.font_size, content_w);
+				if (row_gap < 0) row_gap = 0;
+				if (row_gap > 200) row_gap = 200;
+			}
 		}
 		if (e.display == CSS_DISPLAY_GRID) {
 			int32_t cc = 0;
@@ -2988,7 +4898,8 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 		 */
 		if (abs_place_x) { box_x = abs_box_x; content_x = box_x + bl + pl; }
 		if (abs_place_y) { st->cursor_y = abs_box_y; box_start_y = abs_box_y; }
-		if ((e.has_bg || has_any_border(&e)) && !e.visibility) {
+		if ((e.has_bg || has_any_border(&e) || has_outline(&e)) &&
+				!e.visibility) {
 			layout_item *bx = item_new(st);
 			if (bx) {
 				box_idx = st->out->n_items - 1;
@@ -3146,6 +5057,10 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 		 * is drawn `line_height + padding + borders` tall and the line was
 		 * only stepping by `line_height`.
 		 */
+		/* #245 engoutline: has_outline() is deliberately ABSENT from this
+		 * test and e.ol_w from this sum. An outline takes no layout space,
+		 * so an outlined inline must not grow its line box; it is allowed to
+		 * overhang the neighbouring line, which is what CSS specifies. */
 		if (e.has_bg || has_any_border(&e)) {
 			int ih = e.line_height + e.pad[LB_TOP] + e.pad[LB_BOTTOM]
 				+ e.bw[LB_TOP] + e.bw[LB_BOTTOM];
@@ -3246,12 +5161,18 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 		 * rewound to the top of the row for the next column; the row ends at
 		 * the tallest item. That is enough for the two shapes that matter,
 		 * a card deck and a stat row, and it is honest about the rest:
-		 * every track is the same width, there is no row-gap, and nothing
-		 * spans.
+		 * every track is the same width and nothing spans.
+		 *
+		 * The ROW gap is its own number since #245 enggap: `gap: A B` puts
+		 * A between the rows and B between the columns. A one-value `gap`
+		 * still sets both to the same number, and the narrow-grid collapse
+		 * below still zeroes both, so a grid that does not write the
+		 * two-value form is byte-identical to before.
 		 */
 		int gap = track_gap;
+		int rgap = row_gap;
 		int colw = (content_w - gap * (grid_cols - 1)) / grid_cols;
-		if (colw < 60) { grid_cols = 1; colw = content_w; gap = 0; }
+		if (colw < 60) { grid_cols = 1; colw = content_w; gap = 0; rgap = 0; }
 		{
 			dom_node *child = NULL;
 			int col = 0;
@@ -3279,7 +5200,7 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 						col++;
 						if (col >= grid_cols) {
 							col = 0;
-							row_y = row_max + gap;
+							row_y = row_max + rgap;
 							row_max = row_y;
 						}
 					}
@@ -3289,7 +5210,7 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 				}
 			}
 			st->cursor_y = (col == 0 && row_max > row_y) ? row_max
-				: ((col == 0) ? (row_y - gap) : row_max);
+				: ((col == 0) ? (row_y - rgap) : row_max);
 			if (st->cursor_y < row_y) st->cursor_y = row_y;
 			st->line_left = content_x;
 			st->line_right = content_x + content_w;
@@ -3314,6 +5235,10 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 		 */
 		uint8_t fx_just = CSS_JUSTIFY_CONTENT_INHERIT;
 		uint8_t fx_align = CSS_ALIGN_ITEMS_INHERIT;
+		/* #245 engwraprev: the container's computed flex-wrap, read
+		 * once so the wrap gate below can admit BOTH wrap and
+		 * wrap-reverse and tell flex_wrap_lines which it got. */
+		uint8_t fx_wrap = CSS_FLEX_WRAP_INHERIT;
 		/*
 		 * A ROW flex container: record each item's item-array boundary,
 		 * start line and flex-grow factor during the (unchanged) child
@@ -3323,17 +5248,33 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 		 * container (no grow, default justify/align), so a plain flex
 		 * container's item list is byte-identical.
 		 */
-		if (child_flex_row && style && !st->measuring) {
-			int bnd[FLEX_MAX_ITEMS + 1];
-			int cy[FLEX_MAX_ITEMS];
-			css_fixed grow[FLEX_MAX_ITEMS];
-			css_fixed shrink[FLEX_MAX_ITEMS];
-			int basis[FLEX_MAX_ITEMS];
+		/*
+		 * engwalkstack (#245): the seven per-item arrays are checked out
+		 * of the LIFO pool on lstate instead of being declared here, where
+		 * they cost 40 bytes per item of cap on EVERY walk frame of EVERY
+		 * page. A NULL frame (pool exhausted, or nesting past
+		 * FLEX_MAX_NEST) takes the plain child walk below, which is the
+		 * same packed-but-unaligned fallback the over-cap `ok = 0` path
+		 * already produced.
+		 */
+		flex_frame *ff = (child_flex_row && style && !st->measuring)
+				? flex_frame_get(st) : NULL;
+		if (ff) {
+			int *bnd = ff->bnd;
+			int *cy = ff->cy;
+			css_fixed *grow = ff->grow;
+			css_fixed *shrink = ff->shrink;
+			int *basis = ff->basis;
+			/* #245 engstretchitems: per-item cross-axis inputs for
+			 * align-items:stretch, read from each item's own style
+			 * below because the wrap driver cannot get at it. */
+			flex_cross_t *xc = ff->xc;
 			int cnt = 0, ok = 1;
 			int fstart = st->out->n_items;
 			int ftop = st->cursor_y;
 			fx_just = css_computed_justify_content(style);
 			fx_align = css_computed_align_items(style);
+			fx_wrap = css_computed_flex_wrap(style);
 			if (dom_node_get_first_child(node, &child) == DOM_NO_ERR) {
 				while (child) {
 					dom_node *next = NULL;
@@ -3351,6 +5292,14 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 							/* flex-shrink initial value is 1, not 0. */
 							shrink[cnt] = INTTOFIX(1);
 							basis[cnt] = -1;
+							/* #245 engstretchitems: inert
+							 * until positively armed below. */
+							xc[cnt].stretch = 0;
+							xc[cnt].min_h = -1;
+							xc[cnt].max_h = -1;
+							/* #245 engflexclose: AUTO = 0 =
+							 * "use the container's". */
+							xc[cnt].pos = FLEX_SELF_AUTO;
 							ics = mcs_compute_style(st->css,
 									(dom_element *) child, style);
 							if (ics) {
@@ -3362,12 +5311,127 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 									shrink[cnt] = sv;
 								if (css_computed_flex_basis(ics, &bv, &bu)
 										== CSS_FLEX_BASIS_SET) {
-									/* Only a positive length starts an
-									 * item's main size here; a 0 basis
-									 * (the flex:N seed) is left to grow. */
+									/* A positive length starts the item's
+									 * main size in flex_basis_pass. A basis
+									 * that resolves to exactly 0 WITH a
+									 * positive flex-grow is the `flex: N`
+									 * shorthand's seed (#245 engflexbasis):
+									 * recorded as the distinct 0 sentinel
+									 * flex_basis0_pass consumes.
+									 * flex_basis_pass tests `basis[k] > 0`
+									 * so it ignores the 0; the wrap driver
+									 * consumes the same sentinel per line
+									 * (#245 engflexwrap2). A negative
+									 * length stays auto (-1). */
 									int bpx = fixed_px(bv, bu,
 											e.font_size, content_w);
 									if (bpx > 0) basis[cnt] = bpx;
+									else if (bpx == 0 && grow[cnt] > 0)
+										basis[cnt] = 0;
+								}
+								/*
+								 * #245 engstretchitems: does
+								 * this item stretch on the cross
+								 * axis, and what clamps it if it
+								 * does?
+								 *
+								 * align-self OVERRIDES align-items
+								 * per item; its initial value is
+								 * auto, which means "whatever the
+								 * container's align-items says".
+								 * Resolving it here is what lets an
+								 * item opt OUT of a stretch that is
+								 * on by default, which matters
+								 * precisely because stretch is the
+								 * initial value.
+								 *
+								 * A PERCENTAGE height counts as
+								 * AUTO, exactly as read_style
+								 * treats it: it resolves against a
+								 * containing-block height this
+								 * engine does not track, so the box
+								 * really is content-sized and
+								 * stretching it is closer to right
+								 * than leaving it behind.
+								 *
+								 * The css_fixed / css_unit locals
+								 * are SEEDED before every call
+								 * because some libcss getters write
+								 * their out-params only for
+								 * particular stored types.
+								 *
+								 * em resolves against e.font_size,
+								 * the CONTAINER's font size, the
+								 * same approximation the flex-basis
+								 * read above already makes.
+								 */
+								{
+								uint8_t asf = css_computed_align_self(ics);
+								uint8_t rax = (asf == CSS_ALIGN_SELF_AUTO ||
+										asf == CSS_ALIGN_SELF_INHERIT)
+									? fx_align : asf;
+								css_fixed cv = 0;
+								css_unit cu = CSS_UNIT_PX;
+								uint8_t ht = css_computed_height(ics, &cv, &cu);
+								if (rax == CSS_ALIGN_ITEMS_STRETCH &&
+										(ht != CSS_HEIGHT_SET ||
+										 cu == CSS_UNIT_PCT))
+									xc[cnt].stretch = 1;
+								/*
+								 * #245 engflexclose: PER-ITEM POSITIONAL
+								 * align-self. Recorded ONLY when the item
+								 * DECLARED the property; auto and inherit
+								 * leave pos at FLEX_SELF_AUTO, which is 0
+								 * and means "defer to the line keyword".
+								 * auto IS the initial value, so a page
+								 * that does not write align-self records
+								 * nothing here and reaches no new branch.
+								 *
+								 * Everything that is not center or
+								 * flex-end maps to FLEX_SELF_START,
+								 * because top-packed is what this engine
+								 * does with flex-start, baseline and
+								 * stretch on the cross axis. That is NOT
+								 * the same as AUTO: an item writing
+								 * align-self:flex-start inside an
+								 * align-items:center container must stay
+								 * at the top, and only a value DISTINCT
+								 * from AUTO can say so.
+								 *
+								 * `rax` above resolves auto against the
+								 * container for the STRETCH decision,
+								 * which is right there and would be wrong
+								 * here. pos must record what the ITEM
+								 * said, not what it resolves to, or an
+								 * unwritten align-self would "override"
+								 * the container with the container's own
+								 * value and the inert path would stop
+								 * being inert.
+								 */
+								if (asf != CSS_ALIGN_SELF_AUTO &&
+										asf != CSS_ALIGN_SELF_INHERIT)
+									xc[cnt].pos =
+										(asf == CSS_ALIGN_SELF_CENTER)
+											? FLEX_SELF_CENTER :
+										(asf == CSS_ALIGN_SELF_FLEX_END)
+											? FLEX_SELF_END
+											: FLEX_SELF_START;
+								cv = 0; cu = CSS_UNIT_PX;
+								if (css_computed_min_height(ics, &cv, &cu)
+										== CSS_MIN_HEIGHT_SET &&
+										cu != CSS_UNIT_PCT) {
+									int mp = fixed_px(cv, cu,
+											e.font_size, -1);
+									xc[cnt].min_h = (mp > 0) ? mp : -1;
+								}
+								cv = 0; cu = CSS_UNIT_PX;
+								if (css_computed_max_height(ics, &cv, &cu)
+										== CSS_MAX_HEIGHT_SET &&
+										cu != CSS_UNIT_PCT) {
+									int mp = fixed_px(cv, cu,
+											e.font_size, -1);
+									xc[cnt].max_h = (mp > 0) ? mp : -1;
+								}
 								}
 								css_computed_style_destroy(ics);
 							}
@@ -3386,18 +5450,40 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 			}
 			bnd[cnt] = st->out->n_items;
 			if (ok && cnt > 0 &&
-					css_computed_flex_wrap(style) ==
-						CSS_FLEX_WRAP_WRAP) {
+					(fx_wrap == CSS_FLEX_WRAP_WRAP ||
+					 fx_wrap == CSS_FLEX_WRAP_WRAP_REVERSE)) {
 				/*
 				 * flex-wrap:wrap (#245 engflexwrap). Break the packed
 				 * items onto multiple lines and lay each line out with
 				 * the single-line passes, stacking down the cross axis.
-				 * Gated on WRAP so nowrap / wrap-reverse and non-flex
-				 * pages never enter here and stay byte-identical (AE=0).
+				 * Gated on WRAP so nowrap and non-flex pages never
+				 * enter here and stay byte-identical (AE=0).
+				 *
+				 * #245 engwraprev: WRAP-REVERSE now enters here TOO,
+				 * because it wraps into exactly the same lines; only
+				 * the CROSS axis is inverted, which flex_wrap_lines
+				 * applies as a reflection at the very end. NOWRAP (the
+				 * INITIAL value) and every page that does not write
+				 * the keyword still cannot reach the reflection, and
+				 * FLEX_WRAP_FWD is the inert value, so a `wrap`
+				 * container is byte-identical by construction.
+				 *
+				 * align-content (#245 engaligncontent) rides along:
+				 * the mapped keyword and the container's DEFINITE
+				 * content cross size (e.height, -1 when height is
+				 * auto) are all flex_wrap_lines needs to distribute
+				 * the leftover cross space between the lines. Both
+				 * are inert at their initial values.
 				 */
 				flex_wrap_lines(st, ftop, content_x, content_w,
-						fx_just, fx_align, st->flex_gap,
-						bnd, grow, shrink, basis, cnt);
+						fx_just, fx_align,
+						flex_align_content_of(
+							css_computed_align_content(style)),
+						e.height,
+						(fx_wrap == CSS_FLEX_WRAP_WRAP_REVERSE)
+							? FLEX_WRAP_REV : FLEX_WRAP_FWD,
+						st->flex_gap, row_gap,
+						bnd, grow, shrink, basis, xc, cnt);
 			} else if (ok && cnt > 0) {
 				/*
 				 * CSS flexbox order (#245 engflexsize): flex-basis
@@ -3410,22 +5496,169 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 				 * `based`/`grew`/`shrunk` accumulate the net px each
 				 * pass moved the packed line end.
 				 */
-				int used, grew, shrunk;
+				int used, grew, shrunk, seeded, mk;
+				/* #245 engflexmin: each item's automatic minimum
+				 * size, 0 (= no floor) for every item the
+				 * basis-0 seed below does not collapse.
+				 * #245 engwalkstack: pooled, same as the rest. */
+				int *minf = ff->minf;
 				int based = flex_basis_pass(st, ftop, bnd, cy,
 						basis, cnt);
 				used = st->cursor_x + based;
+				for (mk = 0; mk < cnt; mk++)
+					minf[mk] = 0;
+				/*
+				 * #245 engflexbasis: the `flex: N` shorthand's
+				 * basis-0 grow seed. Inert unless an item carries
+				 * the 0 sentinel above, so every page that does
+				 * not write the shorthand is byte-identical.
+				 */
+				seeded = flex_basis0_pass(st, ftop, content_x,
+						content_w, used, bnd, cy,
+						basis, grow, cnt, minf);
+				used += seeded;
 				grew = flex_grow_pass(st, ftop, content_x,
 						content_w, used, bnd, cy,
-						grow, cnt);
+						grow, minf, cnt);
 				used += grew;
-				shrunk = flex_shrink_pass(st, ftop, content_x,
+				/*
+				 * #245 engflexmin: grow and shrink must stay
+				 * mutually exclusive. WITHOUT floors grow
+				 * distributes EXACTLY the free space, so the line
+				 * ends flush and shrink already saw freev == 0
+				 * and returned 0 having touched nothing; skipping
+				 * it there is inert. WITH a floor grow may
+				 * legitimately overflow the container, and
+				 * letting shrink claw that back would undo the
+				 * very minimum CSS just imposed.
+				 */
+				shrunk = (grew > 0) ? 0 :
+					flex_shrink_pass(st, ftop, content_x,
 						content_w, used, bnd, cy,
 						shrink, cnt);
 				used += shrunk;
+				/*
+				 * ALIGN-ITEMS:STRETCH ON THE NOWRAP PATH
+				 * (#245 engnowrapstretch). The single most
+				 * common flex container on the real web is
+				 * `display: flex` with nothing else authored,
+				 * and BOTH of its defaults are the active
+				 * value: align-items' initial value is stretch
+				 * and flex-wrap's is nowrap. Until now stretch
+				 * lived only inside flex_wrap_lines(), which a
+				 * nowrap container cannot enter, so the common
+				 * case did not stretch at all.
+				 *
+				 * SAME PRIMITIVE, SECOND CALLER. This grows
+				 * nothing itself: it works out the single
+				 * line's cross size and hands it to
+				 * flex_stretch_items(), which is ABSOLUTE and
+				 * GROW-ONLY, the property that makes it safe
+				 * to call from more than one place. There is
+				 * no second cross-growth path.
+				 *
+				 * THE LINE'S CROSS SIZE, both cases stated:
+				 *   - AUTO container height (e.height < 0, the
+				 *     overwhelming majority). The single line's
+				 *     cross size is its own content, i.e. the
+				 *     tallest item. Stretching the others up to
+				 *     it is the whole point and is NOT a no-op:
+				 *     it is what makes the cells of a flex row
+				 *     the same height.
+				 *   - DEFINITE container height. CSS Flexbox 1
+				 *     section 9.4: a single-line flex container
+				 *     with a definite cross size has ONE line
+				 *     whose cross size IS that. So the declared
+				 *     content height raises the target. It can
+				 *     only ever RAISE it here, because the
+				 *     primitive is grow-only: a container
+				 *     SHORTER than its content leaves the items
+				 *     at their natural size and overflows,
+				 *     rather than shrinking them.
+				 *
+				 * A stretching item's min-height also raises the
+				 * LINE, exactly as on the wrap path, because the
+				 * hypothetical cross size a line is measured
+				 * against is the item's content height clamped
+				 * by its own min/max.
+				 *
+				 * THE PEN. The wrap driver sets cursor_y and
+				 * line_height itself, so a raised line grows the
+				 * container there. Here the walk already left
+				 * line_height at the tallest item's height, so a
+				 * line raised ABOVE that (only a min-height or a
+				 * declared container height can do it) has to
+				 * raise the pen too, or the grown cell would
+				 * paint outside its own container. Re-measured
+				 * rather than assumed, and only when something
+				 * actually grew, so a pass that changes no box
+				 * cannot move the pen by a single pixel.
+				 *
+				 * BOUNDED:
+				 *   - `any`: at least one item positively armed
+				 *     xc[].stretch. An all-definite-height row
+				 *     never enters, and neither does a container
+				 *     whose align-items is not stretch.
+				 *   - `multi`: the SAME wrap guard flex_align
+				 *     applies two lines below. If the plain flow
+				 *     put an item on a later line, this is not
+				 *     one flex line and single-line reasoning
+				 *     does not hold, so nothing is touched.
+				 *   - grow-only, auto cross size only, principal
+				 *     box only: all inherited from the shared
+				 *     primitive.
+				 */
+				{
+					int sk, any = 0, multi = 0;
+					for (sk = 0; sk < cnt; sk++)
+						if (xc[sk].stretch) { any = 1; break; }
+					for (sk = 0; any && sk < cnt; sk++)
+						if (cy[sk] != ftop) { multi = 1; break; }
+					if (any && !multi) {
+						int lh = flex_line_cross(st, fstart,
+								st->out->n_items, ftop);
+						for (sk = 0; sk < cnt; sk++)
+							if (xc[sk].stretch &&
+									xc[sk].min_h > lh)
+								lh = xc[sk].min_h;
+						/* e.height is the DECLARED, non-percentage
+						 * content height in px, and -1 for auto,
+						 * so the auto case is inert here. */
+						if (e.height > lh)
+							lh = e.height;
+						if (flex_stretch_items(st, ftop, lh,
+								bnd, xc, 0, cnt) > 0) {
+							int nh = flex_line_cross(st, fstart,
+									st->out->n_items, ftop);
+							if (nh > st->line_height)
+								st->line_height = nh;
+						}
+					}
+				}
 				flex_align(st, fstart, st->out->n_items, ftop, content_x, content_w,
 						used, fx_just, fx_align,
-						bnd, cy, cnt);
+						bnd, cy, xc, cnt);
 			}
+			/*
+			 * #245 engrowrev: flex-direction:row-reverse, LAST, as a
+			 * main-axis reflection of whichever path above ran. It is
+			 * deliberately OUTSIDE both branches and not plumbed into
+			 * flex_wrap_lines(): the reflection is per ITEM about the
+			 * container's main-axis content box, every line of a wrap
+			 * container spans that same interval, and nothing after
+			 * this reads an item's x. So one call covers the wrap, the
+			 * wrap-reverse and the nowrap paths, and there is exactly
+			 * one main-axis direction formula in this file.
+			 *
+			 * The gate is a REAL KEYWORD: flex-direction's initial
+			 * value is `row`, `column` never sets child_flex_row at
+			 * all, and child_flex_rowrev is an own flag whose inert
+			 * value is 0, so no page that does not write
+			 * `flex-direction: row-reverse` can reach this.
+			 */
+			if (ok && cnt > 0 && child_flex_rowrev == FLEX_ROW_REV)
+				flex_main_reflect(st, content_x, content_w,
+						bnd, cnt);
 		} else if (dom_node_get_first_child(node, &child) == DOM_NO_ERR) {
 			while (child) {
 				dom_node *next = NULL;
@@ -3437,6 +5670,10 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 				child = next;
 			}
 		}
+		/* engwalkstack (#245): LIFO release. Unconditional and on the one
+		 * path out of both branches, so the frame cannot leak; a no-op for
+		 * the NULL (not a flex container, or pool exhausted) case. */
+		flex_frame_put(st, ff);
 	}
 	st->flex_gap = gap_outer;
 
@@ -3495,7 +5732,7 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 				int r;
 				if (i2 == box_idx) continue;
 				if (q->kind == 0)
-					r = q->x + lmeasure(st, q->text, q->size, q->face, q->fstyle);
+					r = q->x + item_run_w(st, q);   /* engletsp */
 				else
 					r = q->x + q->w;
 				if (r > inner_r) inner_r = r;
@@ -3648,8 +5885,7 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 					q = &st->out->items[i2];
 					bot = q->y + (q->kind == 0 ? q->size : q->h);
 					if (q->kind == 0)
-						right = q->x + lmeasure(st, q->text,
-								q->size, q->face, q->fstyle);
+						right = q->x + item_run_w(st, q);   /* engletsp */
 					else
 						right = q->x + q->w;
 					if (bot > mb) mb = bot;
@@ -3825,7 +6061,8 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 		 * either a page doing something strange or a page doing it on
 		 * purpose, and neither is worth quadratic layout time.
 		 */
-		if ((e.has_bg || has_any_border(&e)) && !e.visibility &&
+		if ((e.has_bg || has_any_border(&e) || has_outline(&e)) &&
+				!e.visibility &&
 				st->out->n_items > inline_first &&
 				st->out->n_items - inline_first <= 1024) {
 			int first = inline_first;
@@ -3852,7 +6089,7 @@ static void walk(lstate *st, dom_node *node, const css_computed_style *pstyle,
 					int qx2;
 					if (q->kind != 0 || q->y != y) continue;
 					if (q->x < minx) minx = q->x;
-					qx2 = q->x + lmeasure(st, q->text, q->size, q->face, q->fstyle);
+					qx2 = q->x + item_run_w(st, q);   /* engletsp */
 					if (qx2 > maxx) maxx = qx2;
 				}
 				if (maxx <= minx) continue;
@@ -4041,6 +6278,7 @@ static int tbl_probe(lstate *st, dom_node *cell, const css_computed_style *pstyl
 	int save_ll = st->line_left, save_lr = st->line_right;
 	int save_lh = st->line_height;
 	bool save_hc = st->line_has_content, save_ps = st->pending_space;
+	bool save_hv = st->line_has_valign;   /* #245 engvalign */
 	int save_oof = st->oof_max_y, save_gap = st->flex_gap;
 	int save_meas = st->measuring;
 	int right = 0, i;
@@ -4049,6 +6287,7 @@ static int tbl_probe(lstate *st, dom_node *cell, const css_computed_style *pstyl
 	st->line_left = 0; st->line_right = probe_w;
 	st->line_height = 0;
 	st->line_has_content = false; st->pending_space = false;
+	st->line_has_valign = false;   /* #245 engvalign */
 	st->oof_max_y = 0; st->flex_gap = 0;
 	st->measuring = 1;
 
@@ -4058,7 +6297,7 @@ static int tbl_probe(lstate *st, dom_node *cell, const css_computed_style *pstyl
 		layout_item *q = &st->out->items[i];
 		int r;
 		if (q->kind == 0)
-			r = q->x + lmeasure(st, q->text, q->size, q->face, q->fstyle);
+			r = q->x + item_run_w(st, q);   /* engletsp */
 		else if (q->kind == 3)
 			r = q->x + q->w;
 		else
@@ -4072,6 +6311,7 @@ static int tbl_probe(lstate *st, dom_node *cell, const css_computed_style *pstyl
 	st->line_left = save_ll; st->line_right = save_lr;
 	st->line_height = save_lh;
 	st->line_has_content = save_hc; st->pending_space = save_ps;
+	st->line_has_valign = save_hv;   /* #245 engvalign */
 	st->oof_max_y = save_oof; st->flex_gap = save_gap;
 	st->measuring = save_meas;
 	return right;
@@ -4298,7 +6538,8 @@ static void tbl_layout(lstate *st, tbl_grid *g, const css_computed_style *tstyle
 		int x = content_x;
 		int last_row = (i == g->nrows - 1);
 
-		if ((r->e.has_bg || has_any_border(&r->e)) && !r->e.visibility) {
+		if ((r->e.has_bg || has_any_border(&r->e) || has_outline(&r->e)) &&
+				!r->e.visibility) {
 			layout_item *bx = item_new(st);
 			if (bx) {
 				r->box_idx = st->out->n_items - 1;
@@ -4522,6 +6763,8 @@ int layout_document(mcs_ctx *css, dom_document *doc, int content_width,
 	out->has_doc_bg = 0;
 	out->doc_bg = 0x00ffffffu;
 	out->overflowed = 0;
+	out->deep_truncated = 0;   /* engwalkstack (#245) */
+	out->walk_depth_peak = 0;  /* engwalkstack (#245) */
 	out->n_scrolls = 0;   /* engscroll (#245) */
 	g_lp_style = g_lp_text = g_lp_flow = g_lp_meas = g_lp_attr = 0;
 	g_lp_nelem = g_lp_ntext = 0;
@@ -4540,6 +6783,7 @@ int layout_document(mcs_ctx *css, dom_document *doc, int content_width,
 	st.line_right = st.width;
 	st.line_height = 0;
 	st.line_has_content = false;
+	st.line_has_valign = false;   /* #245 engvalign; lstate is NOT memset */
 	st.pending_space = false;
 	st.oof_max_y = 0;
 	st.flex_gap = 0;
@@ -4567,6 +6811,17 @@ int layout_document(mcs_ctx *css, dom_document *doc, int content_width,
 	st.pcb_y = 0;
 	st.pcb_w = st.width;
 	st.pcb_h = g_vp_h;
+	/*
+	 * engwalkstack (#245): lstate is field-initialised, NOT memset (see the
+	 * engfloat2 note above), so the depth counter and the pool head MUST be
+	 * zeroed here. A garbage `depth` would refuse to walk any page at all or
+	 * refuse nothing; a garbage `fp_free` would be freed as a pointer.
+	 */
+	st.depth = 0;
+	st.depth_peak = 0;
+	st.fp_free = NULL;
+	st.fp_live = 0;
+	st.fp_peak = 0;
 
 	memset(&base, 0, sizeof(base));
 	base.display = CSS_DISPLAY_BLOCK;
@@ -4587,6 +6842,11 @@ int layout_document(mcs_ctx *css, dom_document *doc, int content_width,
 
 	walk(&st, root, NULL, &base, 0, st.width, 0);
 	line_break(&st);
+	/* engwalkstack (#245): hand the pool back to the heap. The frames are
+	 * per-document scratch, not a cache: a page keeps them for the whole
+	 * walk and nothing outside it may read them. */
+	flex_pool_drain(&st);
+	out->walk_depth_peak = st.depth_peak;
 
 	/*
 	 * Clamp every corner radius to half the shorter side, in ONE place, after

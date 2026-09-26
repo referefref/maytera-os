@@ -24,7 +24,16 @@
 #include "../security/seclog.h"   // seclog_report_capability
 
 extern int fb_owner_is(uint32_t pid);
+extern uint32_t fb_owner_pid(void);
 extern uint64_t sched_now_ms(void);
+
+// Refusal codes for SYS_SCREENSHOT_REQUEST, all distinct on purpose. A
+// screenshot that never appears is otherwise indistinguishable from a
+// screenshot that was never going to appear, and the only symptom userland
+// gets is its own timeout. See the comment on SHOT_EPERM_WRITER.
+#define SHOT_EPERM_REQUESTER (-13)  // EACCES: the REQUESTER cannot write there
+#define SHOT_EPERM_WRITER    (-14)  // the COMPOSITOR (the real writer) cannot
+#define SHOT_ENOWRITER       (-15)  // nothing owns the framebuffer to write it
 
 #define SHOTQ_MAX      4
 #define SHOTQ_PATHLEN  128
@@ -80,7 +89,71 @@ int64_t sys_screenshot_request(const char *u_path)
     // the same perms_check() the whole filesystem uses; the grant does not
     // widen it.
     if (perms_check(path, p->euid, p->egid, W_OK) != 0)
-        return -13;   // EACCES
+        return SHOT_EPERM_REQUESTER;   // EACCES
+
+    // =======================================================================
+    // #shotwriter: THE PRINCIPAL THAT IS CHECKED MUST BE THE PRINCIPAL THAT
+    // WRITES.
+    // =======================================================================
+    // The check above validates the REQUESTER. The requester never writes this
+    // file. sys_screenshot_poll() below hands the path to whoever owns the
+    // framebuffer, and gui/desktop.c launches /APPS/COMPOSIT with
+    // proc_as_session(), so the process that actually creates the BMP is the
+    // SESSION USER, which in general is a different uid from the caller.
+    //
+    // MEASURED on golden 2472: a flow run as ROOT sailed through the check
+    // above (perms_check() returns 0 on its first line for uid 0), the request
+    // was enqueued, and then the uid-1000 compositor could not create the file.
+    // The only thing userland ever saw was
+    //
+    //     the compositor did not write a complete /HOME/FLOWSHOT.BMP within 12s
+    //
+    // i.e. a PERMISSION problem wearing a TIMEOUT's clothes, twelve seconds
+    // after the decision that doomed it, with nothing anywhere naming the uid
+    // that was refused. A gate that validates one identity and is exercised by
+    // another is not a gate; it is a delay.
+    //
+    // WHY THIS OPTION AND NOT THE OTHERS. Confining the accepted scope to the
+    // session user's own tree would be a POLICY change (root could no longer
+    // capture to /BOOT, and a multi-user machine's rules would silently differ
+    // from every other write in the system). Performing the write from Ring 0
+    // would move framebuffer composition into the kernel, which is the exact
+    // direction this project has spent #469 and #305 moving away from. Asking
+    // the question about the real writer is the smallest change that makes the
+    // answer true, and it keeps every capability property intact: the grant
+    // still has to cover the exact path, the use is still consumed only after
+    // every check passes, and neither consent nor the input-credit rules are
+    // touched.
+    //
+    // BOTH checks must pass. The requester's is not redundant: without it, a
+    // process could aim the compositor's authority at a path the requester
+    // itself has no business naming.
+    {
+        uint32_t wpid = fb_owner_pid();
+        process_t *w = wpid ? proc_get(wpid) : 0;
+        if (!w) {
+            // Nothing will ever dequeue this. Enqueuing it would produce the
+            // same silent 12-second timeout by a different route.
+            char d[160];
+            snprintf(d, sizeof(d),
+                     "REFUSED screen.capture: no compositor owns the framebuffer");
+            seclog_report_capability((unsigned)p->pid, d);
+            return SHOT_ENOWRITER;
+        }
+        if (w->pid != p->pid &&
+            perms_check(path, w->euid, w->egid, W_OK) != 0) {
+            kprintf("[SHOTQ] refused %s: requester pid=%u uid=%u may write it but the "
+                          "COMPOSITOR (pid=%u uid=%u), which does the writing, may not\n",
+                          path, (unsigned)p->pid, (unsigned)p->euid,
+                          (unsigned)w->pid, (unsigned)w->euid);
+            char d[192];
+            snprintf(d, sizeof(d),
+                     "REFUSED screen.capture: compositor uid=%u cannot write %s",
+                     (unsigned)w->euid, path);
+            seclog_report_capability((unsigned)p->pid, d);
+            return SHOT_EPERM_WRITER;
+        }
+    }
 
     if (shotq_full()) return -11;   // EAGAIN: transient, not a permission answer
 

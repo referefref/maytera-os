@@ -174,6 +174,16 @@ int screenshot_capture(const char *path) {
 // to a path perms_check() permits, so it is no longer an attacker-chosen path
 // out of a file any app could write. No busy-wait: this rides the existing
 // adaptive frame/idle cadence, and the poll returns 0 immediately when empty.
+// #469: the capability queue gets the FULL-RESOLUTION 24-bit writer, not
+// screenshot_capture() above. That one is shaped for an SSH exec read and
+// deliberately downscales into an 8-bit 3-3-2 palette, and the shared BMP
+// decoder (kernel/gui/image.c:87) accepts only 24 or 32 bpp, so every capability
+// capture decoded as IMAGE_ERR_UNSUPPORTED: measured on golden 2473 as
+// "could not decode the captured frame". The downscale was a second, quieter
+// defect: a caller's crop rect is expressed in the TARGET WINDOW's coordinates,
+// which only line up with a frame captured at the framebuffer's own resolution.
+static int screenshot_capture_full(const char *path);
+
 void screenshot_poll(void) {
     char path[160];
     long n = sys_screenshot_poll(path, (int)sizeof(path));
@@ -181,7 +191,7 @@ void screenshot_poll(void) {
     if (n >= (long)sizeof(path)) n = (long)sizeof(path) - 1;
     path[n] = '\0';
     if (path[0] != '/') return;   // the kernel only queues plain absolute paths
-    screenshot_capture(path);
+    screenshot_capture_full(path);
 }
 // ===========================================================================
 // #148: PrintScreen hotkey - a DIFFERENT save target from screenshot_capture()

@@ -88,6 +88,49 @@ static int index_lookup(const char *app, char *out, int ocap) {
     return 0;
 }
 
+// #469m: see the contract in contract.h. This deliberately does NOT use the
+// /APPS/<UPPERCASE> convention fallback, because the whole point is to
+// distinguish "declared" from "there happens to be a binary with that name".
+int contract_declared(const char *app) {
+    if (!app || !app[0]) return 0;
+    int fd = open(CT_INDEX, O_RDONLY);
+    if (fd < 0) return 1;              // no index: preserve the old behaviour
+    close(fd);
+    char path[128];
+    return index_lookup(app, path, (int)sizeof(path)) ? 1 : 0;
+}
+
+int contract_declared_list(char *out, int ocap) {
+    if (!out || ocap <= 0) return 0;
+    out[0] = 0;
+    int fd = open(CT_INDEX, O_RDONLY);
+    if (fd < 0) return 0;
+    static char buf[8192];
+    long n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    int o = 0, count = 0;
+    for (long i = 0; i < n; ) {
+        long e = i; while (e < n && buf[e] != '\n') e++;
+        buf[e] = 0;
+        const char *a = strstr(buf + i, "app: ");
+        const char *p = strstr(buf + i, "path: ");
+        if (a && p) {
+            a += 5;
+            int L = 0; while (a[L] && a[L] != ',' && a[L] != '}' && a[L] != ' ') L++;
+            if (L > 0 && o + L + 2 < ocap) {
+                if (count) { out[o++] = ','; out[o++] = ' '; }
+                for (int k = 0; k < L; k++) out[o++] = a[k];
+                out[o] = 0;
+                count++;
+            }
+        }
+        i = e + 1;
+    }
+    return count;
+}
+
 void contract_app_path(const char *app, char *out, int ocap) {
     if (ocap <= 0) return;
     if (index_lookup(app, out, ocap)) return;

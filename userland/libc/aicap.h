@@ -102,6 +102,77 @@ void aicap_audit(const char *tool_id, const char *cap, const char *args,
                  const char *result, const char *how);
 
 // ---------------------------------------------------------------------------
+// #469m AI LOOP INSTRUMENTATION. One record per phase-bearing step of the AI
+// loop, written through the SAME bounded-tail append and the SAME RTC
+// timestamp aicap_audit() uses (one implementation, in aicap.c), to a SEPARATE
+// file.
+//
+// WHY A SEPARATE FILE AND NOT MORE COLUMNS ON AIAUDIT.LOG. The audit log is a
+// SECURITY artifact with a bounded tail: a metrics record is emitted several
+// times per turn, and folding telemetry into that same bounded buffer would let
+// a chatty measurement run EVICT the authorization records the log exists to
+// keep. Different retention needs, different file; the append implementation,
+// the cap logic and the timestamp are shared so the two cannot drift.
+//
+// REDACTION BY CONSTRUCTION. This record carries NO request body, NO response
+// body, NO HTTP headers, NO endpoint URL and NO tool arguments: only sizes,
+// durations, counts, the configured MODEL NAME, and enumerated outcome strings.
+// The bearer token exists in aiclient.c only inside the headers buffer handed
+// to http_post_start(), which nothing here can reach. The one caller-supplied
+// string, `tool`, is sanitized to [A-Za-z0-9._-] and truncated. A credential
+// cannot appear in this file because no field that could carry one is written.
+//
+// Durations are MICROSECONDS from mono_us() (TSC-backed), never uptime_ms():
+// blame.md's timer-ticks-is-not-a-wall-clock entry records that KVM replays a
+// starved vCPU's lost tick IRQs in BURSTS, so a tick-derived interval misreports
+// real elapsed time during exactly the stalls an instrument needs to see.
+// 0 means NOT MEASURED for this record kind, never "took no time".
+// ---------------------------------------------------------------------------
+#define AIMETRIC_LOG "/CONFIG/AIMETRIC.LOG"
+
+typedef struct {
+    const char *op;        // "chat" | "vision" | "action" | "capture"
+    const char *model;     // configured model name (not a secret), "" if unknown
+    const char *style;     // "bearer" | "anthropic" | ""
+    const char *outcome;   // enumerated, see aiclient.c: ok / http_<n> / neterr /
+                           // timeout / guard_block / no_content / denied / ...
+    const char *tool;      // sanitized tool id for an "action" record, else ""
+    int  turn;             // monotonic turn id within this process
+    int  step;             // step within the turn (0 = first POST)
+    int  attempt;          // transport attempt 1..3; retries are SEPARATE records
+    long req_bytes;        // request body bytes actually sent
+    long resp_bytes;       // response body bytes read
+    long img_bytes;        // source image bytes before base64 (0 = none)
+    long b64_bytes;        // base64-encoded image bytes (0 = none)
+    long tok_in;           // prompt tokens the API reported, -1 = not reported
+    long tok_out;          // completion tokens the API reported, -1 = not reported
+    unsigned long us_build;     // request body marshalling
+    unsigned long us_encode;    // base64 (chat/vision) or JPEG (capture) encode
+    unsigned long us_poststart; // the http_post_start() call itself
+    unsigned long us_ttfb;      // post_start return -> first poll reporting bytes
+    unsigned long us_total;     // post_start -> response complete (or failure)
+    unsigned long us_parse;     // reply content extraction
+    unsigned long us_dispatch;  // tool gate + executor (action records)
+    unsigned long us_capture;   // screenshot request + wait for the file
+    unsigned long us_decode;    // BMP decode of the captured frame
+    unsigned long us_scale;     // crop + downscale
+    unsigned long us_io;        // reading/writing the frame file
+    // #469m RECORD VERSION aim2. us_state is the cost of refreshing the
+    // one-line running-app state (a wm_get_windows syscall) that the system
+    // prompt now carries on every POST. It is here because that line is the
+    // single largest measured accuracy lever in the AI loop and it is paid for
+    // on EVERY request, so the claim "it is cheap" has to be a column in the
+    // log rather than an assertion in a comment. A reader of an aim1 line will
+    // simply find one fewer field; the version tag is what tells them which.
+    unsigned long us_state;     // wm_get_windows() for the running-app line
+} aicap_metric_t;
+
+// Emit one instrumentation record. Never blocks on the network; a failed write
+// is silently dropped, because losing a measurement must never change the
+// behaviour of the thing being measured.
+void aicap_metric(const aicap_metric_t *m);
+
+// ---------------------------------------------------------------------------
 // #712 escrow support. These expose the existing token mint/revoke and add a
 // process-lifetime capability DENYLIST, so the escrow layer (escrow.c) can:
 //   - mint a scoped grant (aicap_grant_scoped) instead of hand-rolling tokens,

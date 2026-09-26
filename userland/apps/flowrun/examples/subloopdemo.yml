@@ -1,0 +1,33 @@
+name: subloopdemo
+# An ASYNC SUB-LOOP. AWAIT mode runs the sub-body to completion, then fires the
+# `joined` output and continues (fully real). Running `/APPS/FLOWRUN subloopdemo`
+# writes exactly "sub-body result" to /HOME/SUBLOOPOUT.TXT.
+#
+# HONEST LIMITATION: FIRE-AND-FORGET mode today ALSO runs the sub-body to
+# completion at spawn (the runner is single-threaded and adds NO kernel threads),
+# so there is NO real background concurrency yet; every_ms and max_conc are
+# parsed but not scheduled. True background concurrency is a later kernel-threads
+# item. Switch `mode:` to `fire-and-forget` to see the honest stderr note; the
+# result is the same today.
+nodes:
+  - id: t1
+    type: trigger
+    params: { kind: manual }
+  - id: sl
+    type: subloop
+    mode: await
+    every_ms: 500
+    params: { max_conc: 2 }
+  - id: work
+    type: transform
+    params: { op: constant, text: "sub-body result", loop: sl }
+  - id: sink
+    type: file
+    params: { op: write, path: /HOME/SUBLOOPOUT.TXT }
+edges:
+  - from: [t1, out]
+    to:   [sl, in]
+  - from: [work, out]
+    to:   [sl, collect]
+  - from: [sl, result]
+    to:   [sink, text]

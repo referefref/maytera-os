@@ -387,6 +387,16 @@ tls_cert_next_rs
 tls13_cert_next_rs
 
 # ---------------------------------------------------------------------------
+# rustkern/tlsfrag.rs - #postfix: the OUTGOING TLS record fragmentation plan.
+# tls_send() used to emit its whole payload as ONE record, so any HTTPS request
+# over 2^14 bytes was illegal on the wire and drew a fatal record_overflow.
+# net/tls/tls.c declares these extern and calls them on every send.
+# ---------------------------------------------------------------------------
+tls_out_fragment_rs
+tls_out_record_ok_rs
+tls_out_max_plaintext_rs
+
+# ---------------------------------------------------------------------------
 # rustkern/certverify.rs - #510 / MAYTERA-SEC-2026-0017: TLS 1.3 CertificateVerify
 # (RFC 8446 4.4.3). Security-load-bearing: proven to abort the handshake on a
 # bit-flipped signature.
@@ -462,6 +472,14 @@ uac_parse_config_rs
 # tables sat in the PMM free list).
 ptwalk_collect_rs
 ptwalk_contains_rs
+
+# rustkern/ptro.rs (#procspawn): which identity-mapped physical pages a Ring-0
+# write can actually reach. Same root cause family as #647 and the same reason
+# it is Rust (pure pointer chasing over the adopted firmware hierarchy); #647
+# could only see TABLE pages, and the firmware write-protects whole 2MB blocks.
+# Called from mm/vmm.c vmm_reserve_unwritable_identity_pages(). No strangler
+# flag: there is no C original.
+ptro_collect_rs
 
 # rustkern/proc_mem.rs, vfs_path.rs, conn.rs, procinfo.rs
 # #487/#349 Task Manager kernel accessors + Ring-3 introspection builders.
@@ -1395,14 +1413,17 @@ net_probe_rs
 net_set_dns_rs
 
 # ---------------------------------------------------------------------------
-# rustkern/aiguard.rs - #745 LLM prompt-injection screen. New code, not a port:
-# no _c twin and no -DRUST_* flag. These are the ONLY things that make
-# security/nova.c reachable; if they go MISSING the matcher silently returns to
-# having zero callers, which is the exact defect #745 exists to remove.
+# rustkern/aiguard.rs is DELETED (#469m aititleinject, 2026-09-26) and its three
+# symbols with it: aiguard_screen_rs, aiguard_screen_post_rs,
+# aiguard_selftest_rs. This block used to warn that losing them would silently
+# return security/nova.c to zero callers. nova.c is gone too, on the owner's
+# decision, after it was MEASURED to pass 18 of 18 hostile strings written in
+# one sitting while blocking the ordinary window title "Contract as signed.pdf"
+# at HIGH. There are no C callers left to break, which is the condition this
+# file requires before a line may be deleted. The tombstone stays so a future
+# reader does not read the absence as the dropped-subsystem accident this gate
+# exists to catch. See docs/AI_PROMPT_INJECTION.md.
 # ---------------------------------------------------------------------------
-aiguard_screen_rs
-aiguard_screen_post_rs
-aiguard_selftest_rs
 
 # rustkern/fetchown.rs - #745 (task #36) async HTTP job slot ownership + lifetime
 fetchown_slots_rs
@@ -1514,6 +1535,21 @@ cap_req_resolve_rs
 cap_req_reap_rs
 cap_req_tick_rs
 caps_selftest_rs
+
+# #capalways: STANDING consent ("Always allow"). Persists the user's DECISION
+# (not the grant) so an identical later request skips the prompt and the
+# input-credit test. Table + exact 5-field match + /CONFIG/CAPALLOW.CFG
+# parse/serialize live here; only the file I/O is C. Consumed by proc/caps.c.
+cap_always_reset_rs
+cap_always_count_rs
+cap_always_match_rs
+cap_always_add_rs
+cap_always_parse_rs
+cap_always_serialize_rs
+# Opens a request slot straight into GRANTED (never OPEN) so cap_req_view_rs,
+# which reports only an OPEN slot, cannot flash the compositor a prompt that a
+# standing consent already answered.
+cap_req_autogrant_rs
 
 # rustkern/procreap.rs - #745 (task 37) zombie process-slot reclaim policy.
 # The async-fetch worker's zombie was never reclaimable because its ppid

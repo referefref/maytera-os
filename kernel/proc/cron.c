@@ -20,6 +20,8 @@
 #include "../fs/fat.h"
 #include "../exec/elf.h"
 #include "../gui/syslog.h"
+#include "../fs/userconf.h"   // headless-AI: ai_provision_key_for()
+#include "users.h"            // headless-AI: owner uid -> gid + home
 
 extern fat_fs_t g_fat_fs;
 extern volatile uint64_t timer_ticks;   // cpu/isr.h, 250 Hz monotonic
@@ -629,6 +631,33 @@ static void cron_launch_program(const char *path, uint32_t owner_uid) {
         kprintf("[CRON] launch '%s' failed: not found\n", path); return; }
     if (elf_validate(data, sz) != 0) { kfree(data);
         kprintf("[CRON] launch '%s' failed: bad ELF\n", path); return; }
+    // HEADLESS AI: give the job's owner their AI key BEFORE the job starts,
+    // exactly as a login would (#684). Without this, a job whose owner has
+    // never logged in on this machine (every root job; any job that fires on
+    // a fresh machine before the first login) has no <home>/CONFIG/AISVC.CFG,
+    // so aiclient_have_key() is false and a headless LLM workflow fails with
+    // "no API key". Same no-op rules as login: no seed, or AISVC.CFG already
+    // present (including a user who cleared their key), means nothing is done.
+    //
+    // IDENTITY: only a uid with a REAL user-table entry is provisioned (uid 0
+    // is root, home "/"). An unknown uid is REFUSED, never defaulted to "/":
+    // that fallback is precisely the #OOBEAUTH hazard, a non-root identity
+    // writing and chmodding under root's /CONFIG.
+    //
+    // CONTEXT: this runs on the cron worker, a kernel PROCESS (proc_create_ex
+    // in cron_start_worker), from cron_run_due() with no lock held; the same
+    // function already does fat_read_file() and proc_create_user_as() just
+    // below, so filesystem I/O here is equally legal.
+    {
+        user_entry_t *ou = user_lookup_uid(owner_uid);
+        if (owner_uid == 0)
+            ai_provision_key_for(0, 0, "/", "cron");
+        else if (ou && ou->home[0])
+            ai_provision_key_for(owner_uid, ou->gid, ou->home, "cron");
+        else
+            kprintf("[CRON] uid=%u has no user-table entry; AI key NOT provisioned\n",
+                    owner_uid);
+    }
     // #692: THE FIX. This runs on the cron worker, a kernel thread, so the
     // old inherit gave the job uid 0 no matter who created it. It now runs
     // as the job's recorded owner, with the gid resolved from that uid.

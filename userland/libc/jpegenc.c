@@ -1,5 +1,6 @@
-// jpegenc.c - Maytera Studio baseline JPEG encoder (Studio plan P5: file
-// formats). A pure function over an ARGB buffer: no document, no UI, no file
+// jpegenc.c - SHARED baseline JPEG encoder (userland/libc). Written for
+// Maytera Studio (plan P5: file formats); moved into libc by #469 when it
+// gained a third consumer (paint, imgconv, the AI-vision capture path). A pure function over an ARGB buffer: no document, no UI, no file
 // I/O. imgio.c owns the flatten + write around it; the host-side self-test in
 // tools/ (see the paintphase CHANGELOG entry) compiles this same file with
 // -DJPEGENC_HOST and decodes the result with an independent decoder.
@@ -22,9 +23,12 @@
 #include <string.h>
 #include <stdint.h>
 #else
-#include "studio.h"
-#include "../../libc/stdlib.h"
-#include "../../libc/string.h"
+// #469: this file MOVED here from userland/apps/paint/. It never
+// needed studio.h for anything but uint32_t, which types.h (pulled in
+// by jpegenc.h) supplies, so the move cost it nothing.
+#include "jpegenc.h"
+#include "stdlib.h"
+#include "string.h"
 #endif
 
 // --------------------------------------------------------------------------

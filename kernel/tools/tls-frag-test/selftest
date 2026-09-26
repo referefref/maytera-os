@@ -1,0 +1,64 @@
+#!/bin/bash
+# tls-frag-test/selftest - prove the OUTGOING TLS record fragmentation plan.
+#
+# WHY THIS EXISTS (measured 2026-09-25, golden 2474). net/tls/tls.c tls_send()
+# handed its ENTIRE payload to one TLS record. RFC 5246 6.2.1 / RFC 8446 5.1 cap
+# TLSPlaintext at 2^14 = 16384 bytes, so every HTTPS request whose request line
+# + headers + body passed 16384 went out as an illegal record and a conforming
+# peer answered a fatal record_overflow alert. A Maytera Flow posting a 7701-byte
+# JPEG (about 11.5 KB on the wire) worked; the same flow with a 15639-byte JPEG
+# (about 23 KB) failed as an opaque "Network error (POST returned -1)". tls.h has
+# carried TLS_MAX_PLAINTEXT_SIZE since #497 and the send path had never read it.
+#
+# This harness `include!`s the REAL kernel source (rustkern/tlsfrag.rs), so it
+# compiles what ships. It drives the same loop shape tls_send() uses, through a
+# transport that reproduces the wire format including the uint16_t record-header
+# length field, and a peer model that walks the stream by declared length only.
+#
+# RED-PROOF: `--prove-red` mutates a COPY of the plan so it returns the whole
+# remaining payload, which is EXACTLY what tls_send() did before this fix, and
+# confirms the harness goes red. A green test that has never been seen failing
+# is not evidence.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+KERNEL=$(cd "$HERE/../.." && pwd)
+SRC="$KERNEL/rustkern/tlsfrag.rs"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+[ -f "$SRC" ] || { echo "tls-frag-test: missing $SRC" >&2; exit 1; }
+
+build_and_run() {
+  local rs="$1" label="$2"
+  TLSFRAG_RS="$rs" rustc --edition 2021 -O \
+      -o "$WORK/ft" "$HERE/frag_test.rs" 2>"$WORK/cc.log" || {
+    echo "tls-frag-test: FAILED to compile ($label)" >&2
+    tail -20 "$WORK/cc.log" >&2
+    return 2
+  }
+  "$WORK/ft"
+}
+
+if [ "${1:-}" = "--prove-red" ]; then
+  echo "=== RED PROOF: the plan reverted to the pre-fix behaviour (no fragmentation) ==="
+  sed 's|let n: u32 = if remaining >= cap as u64 { cap } else { remaining as u32 };|let n: u32 = if remaining > u32::MAX as u64 { u32::MAX } else { remaining as u32 };|' \
+      "$SRC" > "$WORK/mutant.rs"
+  if ! grep -q 'remaining > u32::MAX as u64' "$WORK/mutant.rs"; then
+    echo "tls-frag-test: BROKEN - the red-proof mutation did not apply." >&2
+    echo "  rustkern/tlsfrag.rs changed shape; update the sed in this script." >&2
+    exit 1
+  fi
+  if build_and_run "$WORK/mutant.rs" mutant >"$WORK/out.log" 2>&1; then
+    echo "tls-frag-test: BROKEN - the UNFRAGMENTED plan PASSED." >&2
+    echo "  The harness cannot detect the bug it exists for, so green means nothing." >&2
+    sed -n 1,20p "$WORK/out.log" >&2
+    exit 1
+  fi
+  echo "OK: the unfragmented plan FAILS the harness, as it must:"
+  grep -E "plaintext limit|record_overflow|FAILURES" "$WORK/out.log" | head -6
+  echo
+fi
+
+echo "=== the plan AS SHIPPED ==="
+build_and_run "$SRC" shipped

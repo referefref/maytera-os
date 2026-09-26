@@ -1,0 +1,52 @@
+name: agentdemo
+# A bounded AGENT-PROMISE loop ("promise completion"). The agent runs its
+# perceive->decide->act body repeatedly until a TERMINATION PROMISE is met, then
+# reports the reason. This demo is deterministic and needs no network so
+# `/APPS/FLOWRUN agentdemo` succeeds on an offline VM: the "decide" node is a
+# transform threshold on the agent's own iteration index, so goal_met becomes
+# true once index >= 2 (the 3rd pass) => done=objective, iterations=3.
+#
+# The success note "metric >= 5" and the perceive->metric wiring make the
+# MEASURED promise real too (it would fire at index 5), but OBJECTIVE is checked
+# first, so this run terminates on objective and never reaches the metric target.
+# The budgets (max_iters / max_minutes / max_tokens) are the safety net.
+#
+# For the REAL AI decide path, replace the `decide` transform with an `llm` node
+# whose prompt instructs the model to emit "goal_met: true|false" (h_llm parses
+# that into the goal_met output). That path needs network + /CONFIG/KIMI.KEY.
+nodes:
+  - id: t1
+    type: trigger
+    params: { kind: manual }
+  - id: ag
+    type: agent
+    objective: reach the goal within budget
+    success: "metric >= 5"
+    max_iters: 12
+    max_minutes: 5
+    max_tokens: 100
+  - id: perceive
+    type: transform
+    params: { op: concat, loop: ag }
+  - id: decide
+    type: transform
+    params: { op: gte, value: 2, loop: ag }
+  - id: act
+    type: transform
+    params: { op: constant, text: "act: step taken", loop: ag }
+  - id: report
+    type: file
+    params: { op: write, path: /HOME/AGENTOUT.TXT }
+edges:
+  - from: [t1, out]
+    to:   [ag, in]
+  - from: [ag, index]
+    to:   [perceive, in]
+  - from: [perceive, out]
+    to:   [ag, metric]
+  - from: [ag, index]
+    to:   [decide, in]
+  - from: [decide, out]
+    to:   [ag, goal_met]
+  - from: [ag, done]
+    to:   [report, text]

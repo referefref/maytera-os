@@ -1,0 +1,29 @@
+# Maytera Flow - Milestone 1 deterministic example (no network required).
+#
+# trigger(manual) -> transform(constant) -> file(write)
+#
+# Running  /APPS/FLOWRUN hello  parses this, fires the manual trigger, produces
+# the constant text on the transform's output port, and the file node writes it
+# to /HOME/FLOWOUT.TXT. Expected result: /HOME/FLOWOUT.TXT contains exactly
+# "Maytera Flow M1 OK" and the runner prints  FLOWRUN-OK 18.
+name: hello
+nodes:
+  - id: t1
+    type: trigger
+    params:
+      kind: manual
+  - id: x1
+    type: transform
+    params:
+      op: constant
+      text: "Maytera Flow M1 OK"
+  - id: f1
+    type: file
+    params:
+      op: write
+      path: /HOME/FLOWOUT.TXT
+edges:
+  - from: [t1, out]
+    to: [x1, in]
+  - from: [x1, out]
+    to: [f1, text]

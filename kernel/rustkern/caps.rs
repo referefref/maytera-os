@@ -135,6 +135,8 @@ const SYS_SERIAL_OPEN_NUM: u64 = 438;
 // syscall-cap-lint the same way the two above are.
 const SYS_CAP_INJECT_KEY_NUM: u64 = 439;
 const SYS_CAP_INJECT_MOUSE_NUM: u64 = 440;
+// #469 AI-VISION: the RELEASE half of the same contract, gated identically.
+const SYS_CAP_INJECT_KEY_UP_NUM: u64 = 460;
 
 // ---------------------------------------------------------------------------
 // The grant, mirrored by cap_grant_t in proc/process.h. #[repr(C)], size-locked
@@ -213,6 +215,7 @@ pub extern "C" fn cap_required_for_syscall(num: u64) -> u32 {
         SYS_SERIAL_OPEN_NUM => CAP_SERIAL_PORT,
         SYS_CAP_INJECT_KEY_NUM => CAP_INPUT_INJECT,
         SYS_CAP_INJECT_MOUSE_NUM => CAP_INPUT_INJECT,
+        SYS_CAP_INJECT_KEY_UP_NUM => CAP_INPUT_INJECT,
         _ => CAP_NONE,
     }
 }
@@ -1578,5 +1581,593 @@ pub extern "C" fn caps_selftest_rs() -> u32 {
         return 96; // and the self grant (same class)
     }
 
+    // -- standing consent ("Always allow") round trip, codes 100-109 --------
+    // WHY THIS EXISTS: the on-device test could not reach the interesting case.
+    // input.inject's scope is "<window-id>:<title>", so a real title like
+    // "POKEMON YELLOW" CONTAINS A SPACE, and the store's file format is space
+    // separated. The end-to-end flow reaches its objective from the vision call
+    // alone and never raises an input.inject prompt, so that consent is never
+    // created and the space path is never walked. These checks walk it directly.
+    //
+    // NOT VACUOUS: against the pre-fix code, which validated the scope with
+    // token_ok() (refusing every byte <= 0x20), the add at 100 returns CAP_EARG
+    // and this goes RED immediately.
+    cap_always_reset_rs();
+    let spaced = b"12345:POKEMON YELLOW\0";
+    let app = b"/APPS/FLOWRUN\0";
+    if unsafe {
+        cap_always_add_rs(1000, CAP_INPUT_INJECT, CAP_SCOPE_WINDOW_TARGET,
+                          app.as_ptr(), spaced.as_ptr())
+    } != 1 {
+        return 100; // a scope with a space MUST be storable
+    }
+    if unsafe {
+        cap_always_match_rs(1000, CAP_INPUT_INJECT, CAP_SCOPE_WINDOW_TARGET,
+                            app.as_ptr(), spaced.as_ptr())
+    } != 1 {
+        return 101; // and must match back in memory
+    }
+    // Round trip through the FILE representation, which is where a space would
+    // be lost: serialize, wipe, reparse, match again.
+    let mut buf = [0u8; 512];
+    let n_out = unsafe { cap_always_serialize_rs(buf.as_mut_ptr(), buf.len() as u32) };
+    if n_out <= 0 {
+        return 102;
+    }
+    cap_always_reset_rs();
+    if cap_always_count_rs() != 0 {
+        return 103;
+    }
+    if unsafe { cap_always_parse_rs(buf.as_ptr(), n_out as u32) } != 1 {
+        return 104; // exactly one record must come back
+    }
+    if unsafe {
+        cap_always_match_rs(1000, CAP_INPUT_INJECT, CAP_SCOPE_WINDOW_TARGET,
+                            app.as_ptr(), spaced.as_ptr())
+    } != 1 {
+        return 105; // THE POINT: the space survived the file round trip
+    }
+    // A near miss must NOT match: every field is significant, no prefix rule.
+    if unsafe {
+        cap_always_match_rs(1000, CAP_INPUT_INJECT, CAP_SCOPE_WINDOW_TARGET,
+                            app.as_ptr(), b"12345:POKEMON\0".as_ptr())
+    } != 0 {
+        return 106;
+    }
+    if unsafe {
+        cap_always_match_rs(1001, CAP_INPUT_INJECT, CAP_SCOPE_WINDOW_TARGET,
+                            app.as_ptr(), spaced.as_ptr())
+    } != 0 {
+        return 107; // a different uid is a different principal
+    }
+    // A control byte in the scope must STILL be refused: a newline would forge
+    // a second record when the table is written back out.
+    if unsafe {
+        cap_always_add_rs(1000, CAP_SCREEN_CAPTURE, CAP_SCOPE_PATH,
+                          app.as_ptr(), b"/HOME/a\nb\0".as_ptr())
+    } != CAP_EARG {
+        return 108;
+    }
+    // The APP field is not last on the line, so a space there is still refused.
+    if unsafe {
+        cap_always_add_rs(1000, CAP_SCREEN_CAPTURE, CAP_SCOPE_PATH,
+                          b"/APPS/MY APP\0".as_ptr(), b"/HOME/x\0".as_ptr())
+    } != CAP_EARG {
+        return 109;
+    }
+    cap_always_reset_rs();
+
     0
+}
+
+// ===========================================================================
+// STANDING CONSENT ("Always allow") - #capalways, owner request 2026-09-25
+// ---------------------------------------------------------------------------
+// A normal grant is time-bounded (GRANT_MAX_TTL_MS, 15 min) and dies with the
+// process, which is why a flow cannot re-arm itself and why the synthetic-key
+// block is meaningful. That is correct for a one-off consent, but it makes a
+// long-running unattended agent impossible: every 15 minutes a human must press
+// a key. "Always allow" persists the DECISION, not the grant.
+//
+// WHAT IT CHANGES AND WHAT IT DOES NOT:
+//   * The human still approves ONCE, at the real compositor prompt, with real
+//     input credit. There is NO API that creates a standing consent; it can
+//     only be born from CAP_ACT_APPROVE_ALWAYS, which only the compositor can
+//     send (caller_is_compositor) while a prompt it drew is open.
+//   * A matching standing consent then lets a later request skip the prompt AND
+//     the input-credit requirement, because the input credit exists to stop an
+//     app raising a prompt nobody asked for, and there is no prompt to raise.
+//   * Each issued grant is STILL time-bounded and still consumed normally. The
+//     standing record only removes the human from the re-issue, it does not
+//     create an immortal grant.
+//
+// IDENTITY, AND WHY THE PROCESS NAME IS ENOUGH HERE:
+// A record is keyed on (uid, app name, cap, scope_kind, exact scope) - all five
+// must match, and the scope is the kernel-validated noun, never the app's raw
+// string. The name is not a strong identity on its own, but /APPS is root-owned
+// 0755, so substituting the binary behind a name already requires root, and
+// root is not inside this threat model (it can issue itself anything). So
+// name-keying adds NO capability an attacker did not already have. Hashing the
+// image at exec would be strictly better and is the obvious hardening; it needs
+// an exec-path/digest field on process_t, which this change deliberately does
+// not add because touching the ELF loader risks boot for a convenience feature.
+// Recorded here so the limitation is explicit rather than discovered later.
+pub const CAP_ALWAYS_MAX: usize = 32;
+pub const APPNAME_MAX: usize = 32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CapAlways {
+    pub used: u32,
+    pub uid: u32,
+    pub cap: u32,
+    pub scope_kind: u32,
+    pub app: [u8; APPNAME_MAX],
+    pub scope: [u8; SCOPE_MAX],
+}
+
+const ALWAYS_EMPTY: CapAlways = CapAlways {
+    used: 0,
+    uid: 0,
+    cap: 0,
+    scope_kind: 0,
+    app: [0u8; APPNAME_MAX],
+    scope: [0u8; SCOPE_MAX],
+};
+
+static mut ALWAYS: [CapAlways; CAP_ALWAYS_MAX] = [ALWAYS_EMPTY; CAP_ALWAYS_MAX];
+
+fn cstr_eq(a: &[u8], b: *const u8) -> bool {
+    if b.is_null() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < a.len() {
+        let c = unsafe { *b.add(i) };
+        if a[i] != c {
+            return false;
+        }
+        if c == 0 {
+            return true;
+        }
+        i += 1;
+    }
+    // a ran out with no NUL: equal only if src also ends here
+    unsafe { *b.add(i) == 0 }
+}
+
+// A stored field must be a single printable token: no spaces (the file is
+// space-separated) and no control bytes. Refusing at STORE time means the
+// parser never has to reason about a quoted or embedded-space field.
+fn token_ok(src: *const u8, max: usize) -> bool {
+    if src.is_null() {
+        return false;
+    }
+    let mut i = 0usize;
+    loop {
+        if i >= max {
+            return false; // unterminated
+        }
+        let c = unsafe { *src.add(i) };
+        if c == 0 {
+            break;
+        }
+        if c <= 0x20 || c >= 0x7F {
+            return false;
+        }
+        i += 1;
+    }
+    i > 0
+}
+
+// The SCOPE may legitimately contain spaces and is therefore validated
+// separately from `app`. input.inject's scope is built as "<window-id>:<title>"
+// and a real window title such as "POKEMON YELLOW" has a space in it; rejecting
+// that made input.inject impossible to remember, which the on-device test caught
+// (screen.capture auto-granted, input.inject still prompted). Safe because scope
+// is the LAST field on the line, so a space cannot be confused with a separator.
+// Control bytes ARE still refused: a newline would forge a second record.
+fn scope_token_ok(src: *const u8, max: usize) -> bool {
+    if src.is_null() {
+        return false;
+    }
+    let mut i = 0usize;
+    loop {
+        if i >= max {
+            return false; // unterminated
+        }
+        let c = unsafe { *src.add(i) };
+        if c == 0 {
+            break;
+        }
+        if c < 0x20 || c == 0x7F {
+            return false;
+        }
+        i += 1;
+    }
+    i > 0
+}
+
+fn copy_token(dst: &mut [u8], src: *const u8) {
+    for b in dst.iter_mut() {
+        *b = 0;
+    }
+    if src.is_null() {
+        return;
+    }
+    let mut i = 0usize;
+    while i < dst.len() - 1 {
+        let c = unsafe { *src.add(i) };
+        if c == 0 {
+            break;
+        }
+        dst[i] = c;
+        i += 1;
+    }
+}
+
+/// Drop every standing record (used before a reload, and by the self-test).
+#[no_mangle]
+pub extern "C" fn cap_always_reset_rs() {
+    let t = unsafe { &mut *core::ptr::addr_of_mut!(ALWAYS) };
+    for e in t.iter_mut() {
+        *e = ALWAYS_EMPTY;
+    }
+}
+
+/// How many standing records are live.
+#[no_mangle]
+pub extern "C" fn cap_always_count_rs() -> u32 {
+    let t = unsafe { &*core::ptr::addr_of!(ALWAYS) };
+    let mut n = 0u32;
+    for e in t.iter() {
+        if e.used != 0 {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// 1 if a standing consent covers exactly this (uid, app, cap, scope_kind,
+/// scope), else 0. Every field must match; there is no wildcard and no prefix
+/// match, because a standing privilege that widens silently is the thing this
+/// whole design exists to avoid.
+///
+/// # Safety
+/// `app` and `scope` are NUL-terminated kernel buffers.
+#[no_mangle]
+pub unsafe extern "C" fn cap_always_match_rs(
+    uid: u32,
+    cap: u32,
+    scope_kind: u32,
+    app: *const u8,
+    scope: *const u8,
+) -> i32 {
+    if cap == CAP_NONE || app.is_null() || scope.is_null() {
+        return 0;
+    }
+    let t = unsafe { &*core::ptr::addr_of!(ALWAYS) };
+    for e in t.iter() {
+        if e.used == 0 || e.uid != uid || e.cap != cap || e.scope_kind != scope_kind {
+            continue;
+        }
+        if cstr_eq(&e.app, app) && cstr_eq(&e.scope, scope) {
+            return 1;
+        }
+    }
+    0
+}
+
+/// Record a standing consent. 1 = added, 0 = already present (idempotent),
+/// CAP_EMAX = table full, CAP_EARG = a field that would corrupt the file.
+///
+/// # Safety
+/// `app` and `scope` are NUL-terminated kernel buffers.
+#[no_mangle]
+pub unsafe extern "C" fn cap_always_add_rs(
+    uid: u32,
+    cap: u32,
+    scope_kind: u32,
+    app: *const u8,
+    scope: *const u8,
+) -> i64 {
+    if cap == CAP_NONE || cap >= CAP_CLASS_MAX {
+        return CAP_EARG;
+    }
+    // `app` stays a strict token because it is not the last field on the line.
+    if !token_ok(app, APPNAME_MAX) || !scope_token_ok(scope, SCOPE_MAX) {
+        return CAP_EARG;
+    }
+    if unsafe { cap_always_match_rs(uid, cap, scope_kind, app, scope) } == 1 {
+        return 0;
+    }
+    let t = unsafe { &mut *core::ptr::addr_of_mut!(ALWAYS) };
+    for e in t.iter_mut() {
+        if e.used == 0 {
+            e.used = 1;
+            e.uid = uid;
+            e.cap = cap;
+            e.scope_kind = scope_kind;
+            copy_token(&mut e.app, app);
+            copy_token(&mut e.scope, scope);
+            return 1;
+        }
+    }
+    CAP_EMAX
+}
+
+// --- tiny decimal helpers (no_std, no core::fmt in the kernel) -------------
+fn parse_u32(buf: &[u8], pos: &mut usize) -> Option<u32> {
+    let mut v: u64 = 0;
+    let mut any = false;
+    while *pos < buf.len() {
+        let c = buf[*pos];
+        if c < b'0' || c > b'9' {
+            break;
+        }
+        v = v * 10 + (c - b'0') as u64;
+        if v > 0xFFFF_FFFF {
+            return None;
+        }
+        any = true;
+        *pos += 1;
+    }
+    if any {
+        Some(v as u32)
+    } else {
+        None
+    }
+}
+
+fn skip_spaces(buf: &[u8], pos: &mut usize) {
+    while *pos < buf.len() && buf[*pos] == b' ' {
+        *pos += 1;
+    }
+}
+
+fn read_token(buf: &[u8], pos: &mut usize, dst: &mut [u8]) -> bool {
+    for b in dst.iter_mut() {
+        *b = 0;
+    }
+    let mut o = 0usize;
+    while *pos < buf.len() {
+        let c = buf[*pos];
+        if c == b' ' || c == b'\n' || c == b'\r' {
+            break;
+        }
+        if o + 1 >= dst.len() {
+            return false;
+        }
+        dst[o] = c;
+        o += 1;
+        *pos += 1;
+    }
+    o > 0
+}
+
+fn emit(out: &mut [u8], o: &mut usize, s: &[u8]) -> bool {
+    for &c in s {
+        if *o + 1 >= out.len() {
+            return false;
+        }
+        out[*o] = c;
+        *o += 1;
+    }
+    true
+}
+
+fn emit_u32(out: &mut [u8], o: &mut usize, mut v: u32) -> bool {
+    let mut d = [0u8; 10];
+    let mut n = 0usize;
+    if v == 0 {
+        d[0] = b'0';
+        n = 1;
+    } else {
+        while v > 0 {
+            d[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            n += 1;
+        }
+    }
+    while n > 0 {
+        n -= 1;
+        if *o + 1 >= out.len() {
+            return false;
+        }
+        out[*o] = d[n];
+        *o += 1;
+    }
+    true
+}
+
+/// Parse /CONFIG/CAPALLOW.CFG into the table, REPLACING it. Lines are
+/// `<uid> <cap> <scope_kind> <app> <scope>`; `#` comments and blank lines are
+/// skipped; a malformed line is skipped rather than aborting the load, so one
+/// bad edit cannot lock every standing consent out. Returns records loaded.
+///
+/// # Safety
+/// `buf` points to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn cap_always_parse_rs(buf: *const u8, len: u32) -> i32 {
+    cap_always_reset_rs();
+    if buf.is_null() || len == 0 {
+        return 0;
+    }
+    let b = unsafe { core::slice::from_raw_parts(buf, len as usize) };
+    let mut pos = 0usize;
+    let mut loaded = 0i32;
+    while pos < b.len() {
+        // isolate one line
+        let start = pos;
+        while pos < b.len() && b[pos] != b'\n' {
+            pos += 1;
+        }
+        let mut end = pos;
+        if end > start && b[end - 1] == b'\r' {
+            end -= 1;
+        }
+        if pos < b.len() {
+            pos += 1; // step over '\n'
+        }
+        let line = &b[start..end];
+        if line.is_empty() || line[0] == b'#' {
+            continue;
+        }
+        let mut lp = 0usize;
+        skip_spaces(line, &mut lp);
+        let uid = match parse_u32(line, &mut lp) {
+            Some(v) => v,
+            None => continue,
+        };
+        skip_spaces(line, &mut lp);
+        let cap = match parse_u32(line, &mut lp) {
+            Some(v) => v,
+            None => continue,
+        };
+        skip_spaces(line, &mut lp);
+        let sk = match parse_u32(line, &mut lp) {
+            Some(v) => v,
+            None => continue,
+        };
+        skip_spaces(line, &mut lp);
+        let mut app = [0u8; APPNAME_MAX];
+        if !read_token(line, &mut lp, &mut app) {
+            continue;
+        }
+        skip_spaces(line, &mut lp);
+        // REST OF LINE, not a token: a scope may contain spaces (see
+        // scope_token_ok). Trailing whitespace is trimmed so a stray space
+        // before the newline cannot change what the record means.
+        let mut scope = [0u8; SCOPE_MAX];
+        {
+            let mut end = line.len();
+            while end > lp && (line[end - 1] == b' ' || line[end - 1] == b'\t') {
+                end -= 1;
+            }
+            if end <= lp || end - lp >= SCOPE_MAX {
+                continue;
+            }
+            let mut o = 0usize;
+            while lp < end {
+                scope[o] = line[lp];
+                o += 1;
+                lp += 1;
+            }
+        }
+        if scope[0] == 0 {
+            continue;
+        }
+        if cap == CAP_NONE || cap >= CAP_CLASS_MAX {
+            continue;
+        }
+        let r = unsafe {
+            cap_always_add_rs(uid, cap, sk, app.as_ptr(), scope.as_ptr())
+        };
+        if r == 1 {
+            loaded += 1;
+        }
+    }
+    loaded
+}
+
+/// Render the table back to file text. Returns bytes written, or CAP_EARG if
+/// the buffer is too small (the caller then does NOT write, so a truncated
+/// file can never replace a good one).
+///
+/// # Safety
+/// `out` points to `cap` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn cap_always_serialize_rs(out: *mut u8, cap_len: u32) -> i32 {
+    if out.is_null() || cap_len == 0 {
+        return CAP_EARG as i32;
+    }
+    let o_slice = unsafe { core::slice::from_raw_parts_mut(out, cap_len as usize) };
+    let mut o = 0usize;
+    if !emit(o_slice, &mut o, b"# MayteraOS standing capability consents (\"Always allow\").\n") {
+        return CAP_EARG as i32;
+    }
+    if !emit(o_slice, &mut o, b"# <uid> <cap> <scope_kind> <app> <scope>. Delete a line to revoke.\n") {
+        return CAP_EARG as i32;
+    }
+    let t = unsafe { &*core::ptr::addr_of!(ALWAYS) };
+    for e in t.iter() {
+        if e.used == 0 {
+            continue;
+        }
+        if !emit_u32(o_slice, &mut o, e.uid) { return CAP_EARG as i32; }
+        if !emit(o_slice, &mut o, b" ") { return CAP_EARG as i32; }
+        if !emit_u32(o_slice, &mut o, e.cap) { return CAP_EARG as i32; }
+        if !emit(o_slice, &mut o, b" ") { return CAP_EARG as i32; }
+        if !emit_u32(o_slice, &mut o, e.scope_kind) { return CAP_EARG as i32; }
+        if !emit(o_slice, &mut o, b" ") { return CAP_EARG as i32; }
+        let mut i = 0usize;
+        while i < e.app.len() && e.app[i] != 0 {
+            if o + 1 >= o_slice.len() { return CAP_EARG as i32; }
+            o_slice[o] = e.app[i];
+            o += 1;
+            i += 1;
+        }
+        if !emit(o_slice, &mut o, b" ") { return CAP_EARG as i32; }
+        i = 0;
+        while i < e.scope.len() && e.scope[i] != 0 {
+            if o + 1 >= o_slice.len() { return CAP_EARG as i32; }
+            o_slice[o] = e.scope[i];
+            o += 1;
+            i += 1;
+        }
+        if !emit(o_slice, &mut o, b"\n") { return CAP_EARG as i32; }
+    }
+    o as i32
+}
+
+/// Open-and-immediately-grant, for a request already covered by a STANDING
+/// consent. Identical bookkeeping to `cap_req_open_rs` except the slot lands in
+/// CAP_ST_GRANTED, never CAP_ST_OPEN, so `cap_req_view_rs` (which reports only
+/// an OPEN slot) cannot show the compositor a prompt that nobody needs to
+/// answer. The requester's existing poll loop then sees GRANTED unchanged.
+///
+/// # Safety
+/// `reason`, `scope`, `app` are NUL-terminated kernel buffers.
+#[no_mangle]
+pub unsafe extern "C" fn cap_req_autogrant_rs(
+    pid: u32,
+    uid: u32,
+    now_ms: u64,
+    cap: u32,
+    duration_ms: u32,
+    scope_kind: u32,
+    reason: *const u8,
+    scope: *const u8,
+    app: *const u8,
+    elev_open: u32,
+) -> i64 {
+    if pid == 0 {
+        return CAP_EARG;
+    }
+    let g = unsafe { &mut *core::ptr::addr_of_mut!(GREQ) };
+    if g.state == CAP_ST_OPEN || elev_open != 0 {
+        return CAP_EBUSY;
+    }
+    let seq = unsafe {
+        let n = core::ptr::read_volatile(core::ptr::addr_of!(CAP_NEXT_SEQ));
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(CAP_NEXT_SEQ), n + 1);
+        n
+    };
+    g.seq = seq;
+    g.opened_ms = now_ms;
+    g.state = CAP_ST_GRANTED;
+    g.req_pid = pid;
+    g.req_uid = uid;
+    g.cap = cap;
+    let dur = if duration_ms as u64 > GRANT_MAX_TTL_MS {
+        GRANT_MAX_TTL_MS as u32
+    } else {
+        duration_ms
+    };
+    g.duration_ms = dur;
+    g.scope_kind = scope_kind;
+    copy_scope(&mut g.scope, scope);
+    sanitize(&mut g.reason, reason);
+    sanitize(&mut g.app, app);
+    seq as i64
 }

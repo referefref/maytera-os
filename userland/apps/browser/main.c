@@ -319,6 +319,36 @@ static int  g_active_scroll = 0;
 // same class as /TEST.HTML), dump box geometry + scroll descriptors to serial
 // after each layout. Absent on a normal boot, so this is inert (AE=0).
 static int  g_brdump = 0;
+
+// #245 engflexclose: cssvar.c's 47-case self-test had ZERO CALLERS and had
+// never executed inside MayteraOS. Its cases were only ever run by compiling
+// cssvar.c natively on the build host, which tests the HOST's compiler, libc,
+// malloc and int widths, not the freestanding userland the browser actually
+// runs in. This project keeps finding that class of defect (a gate that never
+// ran, an increment script that did not increment, an assert that was
+// documented for a month before it was written), so the suite is wired to a
+// hook here rather than left as a thing someone could run.
+//
+// THE MECHANISM IS THE ONE THIS APP ALREADY HAS, not a new one. The detail
+// lines ride the SAME /BRDUMP.TXT marker g_brdump above gates, which the
+// verification harness already creates on the throwaway image; nothing new
+// has to be staged for the per-case output to appear.
+//
+// THE ONE-LINE SUMMARY IS UNCONDITIONAL, which is the part that makes this a
+// test rather than a debug facility: every launch of the browser on a
+// shipping image proves on serial that the 47 cases pass ON THE TARGET. The
+// cost is 47 cssvar_preprocess() calls over CSS strings of a few dozen bytes,
+// once, before the first page is fetched.
+//
+// The tag is [CSSVAR], deliberately NOT [BRDUMP], so the layout-dump
+// extraction the engine harness greps for is untouched.
+static int  g_cv_cases  = 0;   // cases the suite actually reported
+static int  g_cv_detail = 0;   // print each case (set from g_brdump)
+static void cssvar_report(const char *line)
+{
+    g_cv_cases++;
+    if (g_cv_detail) printf("[CSSVAR] %s\n", line);
+}
 static int  g_content_len = 0;   // #89: length of the page in content_buffer (for re-layout on resize)
 static int  last_layout_w = 0;   // #89: window width the page was last laid out at
 // #resizereflow: the current page's PARSED DOM and BUILT CSSOM, kept alive so a
@@ -969,6 +999,36 @@ static char author_css[16384];
 // it costs one printf per LOAD (not per token), so it stays in permanently.
 extern int printf(const char *fmt, ...);
 
+/*
+ * engwalkstack (#245): one provenance line per launch.
+ *
+ * The md5s are injected by the build (-DENGWALK_LAYOUT_STAMP for the engine,
+ * -DENGWALK_MAIN_STAMP for this file) and default to "unstamped", so a build
+ * that did not pass them says so instead of printing a plausible wrong thing.
+ * The point is that a serial log now NAMES the sources that produced the
+ * binary that wrote it, which is what makes an A/B measurement checkable:
+ * "the two binaries differ" does not tell you the edit you are measuring is
+ * in either of them (blame.md, engflexclose).
+ */
+#ifndef ENGWALK_MAIN_STAMP
+#define ENGWALK_MAIN_STAMP "unstamped"
+#endif
+static void br_buildstamp(void) {
+    printf("[BUILDSTAMP] browser layout.c=%s main.c=%s\n",
+           layout_src_stamp(), ENGWALK_MAIN_STAMP);
+}
+
+/*
+ * engwalkstack (#245): report a page the layout walk had to cut short. One
+ * line, only when it happened, so a normal page pays nothing.
+ */
+static void br_report_depth(void) {
+    if (g_layout.deep_truncated)
+        printf("[LAYOUT] page TRUNCATED: DOM nested past the walk depth ceiling; "
+               "the over-deep subtree was not laid out (peak depth %d)\n",
+               g_layout.walk_depth_peak);
+}
+
 static void br_layout_dump(const char *tag) {
     if (!g_brdump) return;
     printf("[BRDUMP] %s items=%d n_scrolls=%d\n", tag,
@@ -978,6 +1038,11 @@ static void br_layout_dump(const char *tag) {
         if (it->kind != 1) continue;
         printf("[BRDUMP]  box[%d] x=%d y=%d w=%d h=%d bg=%06x\n",
                i, it->x, it->y, it->w, it->h, (unsigned)it->bg);
+        /* #245 engoutline: only printed when an outline is actually armed, so
+         * a page that authors none dumps byte-identically to before. */
+        if (it->ol_w)
+            printf("[BRDUMP]   outline[%d] w=%d style=%d col=%06x\n",
+                   i, it->ol_w, it->ol_style, (unsigned)it->ol_col);
     }
     for (int i = 0; i < g_layout.n_scrolls; i++) {
         scroll_box *sb = &g_layout.scrolls[i];
@@ -1050,6 +1115,7 @@ static void render_page(const char *html, int html_len) {
         images_begin();
     }
     br_layout_dump("render");
+    br_report_depth();   // engwalkstack (#245)
     unsigned long t_lay = uptime_ms();
 #ifdef BROWSER_PERF
     printf("[BRPERF] bytes=%d parse=%lu js=%lu css=%lu extcss=%lu layout=%lu "
@@ -1155,6 +1221,7 @@ static void relayout_page(void) {
         if (g_box_scroll_x[i] < 0) g_box_scroll_x[i] = 0;
     }
     br_layout_dump("relayout");
+    br_report_depth();   // engwalkstack (#245)
 
     // Re-key each cached image to its new item index by matching href; free any
     // whose <img> no longer appears at the new width, then compact the cache.
@@ -1938,6 +2005,61 @@ static uint32_t *grad_cache_get(int item, int w, int h, int gidx) {
     return px;
 }
 
+// ============================================================================
+// #245 engletsp: CSS letter-spacing at paint time.
+//
+// WHY THE PAINTER HAS TO CARE. layout.c adds letter-spacing to the advance it
+// gives a run, which is what makes the box the right width and the wrap point
+// right. The OS text call draws a whole string in ONE go, advancing the pen by
+// the font's own per-glyph step, so if the painter used it unchanged the glyphs
+// would sit tight at the left of a box laid out wide: measured width would stop
+// equalling drawn width, which is exactly the invariant #589 exists to hold.
+//
+// So a run with non-zero letter-spacing is drawn one glyph at a time. The step
+// between glyphs is recovered from SUFFIX widths:
+//
+//     step(i) = measure(text + i) - measure(text + i + 1)
+//
+// which is the glyph's advance PLUS its kern pair with the next glyph, because
+// ttf_measure_string_f() and every draw path share one cursor step (#589). That
+// matters: chopping the string into one-character measures instead would drop
+// every kerning pair and the run would come out narrower than layout was told.
+// The suffix differences telescope, so with letter_spacing 0 this loop lands
+// every glyph on exactly the pixel the single-call path would have.
+//
+// COST, stated rather than hidden: one extra SYS_MEASURE_TTF per glyph of a
+// spaced run, per repaint, for the visible items only. Runs with no tracking
+// (every run on a page that never authors the property) take the untouched
+// single-call path and pay nothing.
+static int run_drawn_w(const layout_item *it) {
+    int w = ttf_measure_ex(it->text, it->face, it->size, it->fstyle);
+    if (it->letter_spacing) {
+        int n = 0;
+        while (it->text[n]) n++;   // post-squash Latin-1: one byte, one glyph
+        w += it->letter_spacing * n;
+    }
+    return w;
+}
+
+static void draw_run_spaced(int win, int x, int y, const layout_item *it) {
+    char g[2];
+    int i = 0;
+    int cur = ttf_measure_ex(it->text, it->face, it->size, it->fstyle);
+    g[1] = '\0';
+    while (it->text[i]) {
+        int next = it->text[i + 1]
+                 ? ttf_measure_ex(it->text + i + 1, it->face, it->size, it->fstyle)
+                 : 0;
+        g[0] = it->text[i];
+        if (g[0] != ' ')   // a space paints nothing; skip the syscall
+            win_draw_text_ttf_ex(win, x, y, g, it->face, it->size,
+                                 it->fstyle, it->color);
+        x += (cur - next) + it->letter_spacing;
+        cur = next;
+        i++;
+    }
+}
+
 static void draw_content(void) {
     // Render the page onto a canvas the colour the document asked for, so the
     // document's own colours read correctly regardless of the desktop theme.
@@ -2020,6 +2142,44 @@ static void draw_content(void) {
             }
             continue;
         }
+        // CSS OUTLINE (#245 engoutline). Painted just OUTSIDE the border edge
+        // and occupying no layout space, which is the whole difference between
+        // an outline and a border: layout never saw ol_w, so the box geometry
+        // below is bit-for-bit what it would have been without this block.
+        //
+        // AE=0 by construction: layout leaves ol_w at 0 on every item of a page
+        // that never authors an outline (item_new() memsets, and LAYOUT_OL_NONE
+        // is 0), so the guard is false and not one pixel differs.
+        //
+        // Placed BEFORE both box painters, and taking no `continue`, so it runs
+        // for the rounded path and the square path alike. Consequence worth
+        // stating: the ring is square even on a radius-rounded box, and a later
+        // sibling's background can paint over it because real browsers draw
+        // outlines in a later stacking phase and this engine has only one.
+        //
+        // dashed and dotted are PAINTED SOLID. The only primitive here is
+        // clip_fill(), an axis-aligned opaque rect; a dash generator is out of
+        // scope. it->ol_style keeps the distinction for whoever adds one.
+        if (it->kind == 1 && it->ol_w > 0) {
+            int ow = it->ol_w;
+            int ox0 = pad_x + it->x - ow;
+            int oy0 = sy - ow;
+            int oww = it->w + 2 * ow;
+            int ohh = it->h + 2 * ow;
+            int cx0 = CONTENT_X + 1, cx1 = CONTENT_X + CONTENT_W - 1;
+            int cy0 = CONTENT_Y + 1, cy1 = CONTENT_Y + CONTENT_H - 1;
+            int mid = ohh - 2 * ow;
+            if (scroll_max() > 0) cx1 -= SB_W;
+            clip_fill(ox0, oy0, oww, ow, 1, it->ol_col, cx0, cy0, cx1, cy1);
+            clip_fill(ox0, oy0 + ohh - ow, oww, ow, 1, it->ol_col,
+                      cx0, cy0, cx1, cy1);
+            if (mid > 0) {
+                clip_fill(ox0, oy0 + ow, ow, mid, 1, it->ol_col,
+                          cx0, cy0, cx1, cy1);
+                clip_fill(ox0 + oww - ow, oy0 + ow, ow, mid, 1, it->ol_col,
+                          cx0, cy0, cx1, cy1);
+            }
+        }
         if (it->kind == 1 && it->radius > 0) {
             // ROUNDED BOX. A uniform border is painted as the outer shape in
             // the border colour with the inner shape painted over it in the
@@ -2100,19 +2260,25 @@ static void draw_content(void) {
         // been told. A real bold face exists for every family this resolves to;
         // where one does not, fstyle carries the bit and the rasteriser
         // emboldens with an advance that measure() sees too.
-        win_draw_text_ttf_ex(window_handle, sx, sy, it->text,
-                             it->face, it->size, it->fstyle, it->color);
+        // #245 engletsp: letter_spacing is 0 for every run on a page that does
+        // not author the property, and that case takes the original single
+        // call below, unchanged.
+        if (it->letter_spacing)
+            draw_run_spaced(window_handle, sx, sy, it);
+        else
+            win_draw_text_ttf_ex(window_handle, sx, sy, it->text,
+                                 it->face, it->size, it->fstyle, it->color);
         if (it->href[0] && g_link_hit_n < 512) {
             link_hit_t *lh = &g_link_hits[g_link_hit_n++];
             lh->x = sx; lh->y = sy;
-            lh->w = ttf_measure_ex(it->text, it->face, it->size, it->fstyle);
+            lh->w = run_drawn_w(it);
             lh->h = it->size + 3;
             int k = 0;
             while (it->href[k] && k < 255) { lh->href[k] = it->href[k]; k++; }
             lh->href[k] = 0;
         }
         if (it->underline) {
-            int w = ttf_measure_ex(it->text, it->face, it->size, it->fstyle);
+            int w = run_drawn_w(it);
             gui_fill_rect(window_handle, sx, sy + it->size,
                           w, 1, it->color);
         }
@@ -3375,6 +3541,19 @@ int main(int argc, char **argv) {
             ub[k] = 0; if (k > 0) { str_cpy(url_buffer, ub); url_cursor = k; } } } }
     { FILE *tf = fopen("/TEST.HTML", "r"); if (tf) { fclose(tf); str_cpy(url_buffer, "test"); url_cursor = 4; } }
     { FILE *df = fopen("/BRDUMP.TXT", "r"); if (df) { fclose(df); g_brdump = 1; } }
+
+    // #245 engflexclose: RUN the cssvar self-test, in the OS, on every launch.
+    // Placed after the /BRDUMP.TXT read so the marker can turn the per-case
+    // detail on, and before navigate() so the result is on serial before any
+    // page can crash the app.
+    // engwalkstack (#245): name the sources this binary was built from, before
+    // anything else can go wrong, so every serial log is self-describing.
+    br_buildstamp();
+
+    g_cv_detail = g_brdump;
+    { int cvf = cssvar_selftest(cssvar_report);
+      printf("[CSSVAR] selftest: %d cases, %d failing, %s\n",
+             g_cv_cases, cvf, cvf ? "FAIL" : "PASS"); }
 
     // [no-ticket] (browser-glass): seed tab 0 with whatever url_buffer ended
     // up as above (home page, or a STARTURL.TXT/TEST.HTML override).

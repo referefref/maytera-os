@@ -453,7 +453,7 @@
 // I/O, inode/bitmap allocation and i_size stay in C. Live under
 // -DRUST_EXT2_DIRADD, C kept as ext2_dirblock_insert_c for one-line rollback.
 // Build numbers 944..951 were burned by the #446 FPU differential builds.
-#define MAYTERA_BUILD_NUMBER 2400   // #404 disk-mgr Stage 4b: VFS resolver + ext2 write-mount (aux mounts under /MNT). Golden number set by build-golden.sh.
+#define MAYTERA_BUILD_NUMBER 2482   // #404 disk-mgr Stage 4b: VFS resolver + ext2 write-mount (aux mounts under /MNT). Golden number set by build-golden.sh.
 
 // Version string helper macros
 #define STRINGIFY(x) STRINGIFY_HELPER(x)

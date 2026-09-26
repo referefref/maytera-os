@@ -16,6 +16,11 @@ item: Timers | /APPS/TIMERS | icon=timers
 item: Markdown Viewer | /APPS/MDVIEW | icon=highlight
 # (prodapps 2026-09-19) History of the #542 system clipboard. icon=notes reused.
 item: Clipboard History | /APPS/CLIPHIST | icon=notes
+# (flowedit 2026-09-24) Maytera Flow visual workflow editor. Reads/writes
+# /CONFIG/WORKFLOWS/*.yml, the same files /APPS/FLOWRUN executes; its Run button
+# launches that runner. icon=converter is reused (a wiring/transform feel); a new
+# icon id would fall back to a vector glyph since icon files live outside the repo.
+item: Maytera Flow | /APPS/FLOW | icon=converter
 item: Authenticator | /APPS/mfa | icon=auth
 item: Launcher | /APPS/LAUNCHER | icon=launcher
 item: Task Switcher | /APPS/WINSWTCH | icon=taskswitch

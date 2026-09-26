@@ -673,10 +673,30 @@ typedef struct {
     // no new syscall and no poll loop. APPENDED, never reordered, same
     // discipline as app_id/maximized above.
     int     opacity;
+    // #469 (ai-vision, 2026-09-24): the user_windows[] SLOT HANDLE that
+    // win_create() returned to this window's owning app, or -1 for a window
+    // with no Ring-3 owner (a kernel/desktop window). APPENDED, never
+    // reordered, same discipline as app_id/maximized/opacity above.
+    //
+    // WHY: SYS_CAP_INJECT_KEY / _MOUSE and a CAP_SCOPE_WINDOW_TARGET consent
+    // request both address a window by that slot handle, while this struct's
+    // `id` is the window manager's id, and until now nothing mapped one to the
+    // other (see the note on SYS_WIN_GET_STATE in userland/libc/syscall.h).
+    // Cross-app input.inject was consequently only usable against a target that
+    // volunteered its own handle out of band. A driver cannot require that.
+    // This is NOT a new privilege: the handle is inert without a consented
+    // grant naming that exact window, and the kernel still refuses a
+    // compositor-owned target at bind and at inject.
+    int     uwin;
 } wm_window_info_t;
-_Static_assert(sizeof(wm_window_info_t) == 140,
-               "#745/#41/#44/#opacityglass: wm_window_info_t layout is duplicated in userland/libc/syscall.h; "
+_Static_assert(sizeof(wm_window_info_t) == 144,
+               "#745/#41/#44/#opacityglass/#469: wm_window_info_t layout is duplicated in userland/libc/syscall.h; "
                "change both or neither");
+
+// #469: the user_windows[] slot handle for a kernel window, or -1. The table is
+// private to proc/syscall.c; this is the one accessor, and it is a linear scan
+// over MAX_USER_WINDOWS (tiny), like uw_slot_for_window() which it wraps.
+int userwin_slot_for_window(window_t *w);
 
 // Syscall: fill buf with info about up to max_count windows
 // Returns number of windows filled in

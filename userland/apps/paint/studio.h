@@ -251,8 +251,10 @@ void io_jpeg_get(int *quality, int *chroma444);
 long io_jpeg_estimate(void);
 // jpegenc.c: baseline JPEG from an ARGB buffer (alpha ignored; flatten
 // first). Returns 0 and a malloc'd *out/*outlen the caller frees, or -1.
-int jpeg_encode_argb(const uint32_t *src, int w, int h, int quality, int chroma444,
-                     unsigned char **out, long *outlen);
+// #469: the encoder MOVED to userland/libc/jpegenc.c (three consumers:
+// this app, imgconv and the AI-vision capture path). The prototype now
+// comes from the shared header so there is exactly one declaration.
+#include "../../libc/jpegenc.h"
 // Printing (#318): flatten to a temp PNG and submit over IPP. `printer` may be
 // NULL for the system default. io_printer_default() fills the default printer
 // name and returns 1 if any printer is configured, 0 if none.

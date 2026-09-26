@@ -608,9 +608,104 @@ window_t *window_create(const char *title, int32_t x, int32_t y, int32_t width, 
     return win;
 }
 
+// ===========================================================================
+// (#sqearlyexit) WINDOW AND WIDGET LIFETIME ACROSS A COMPOSITE WALK.
+//
+// MEASURED, golden 2478, two throwaway VMs, two boots out of two: launching
+// Maytera Squadron and letting it EXIT BY ITSELF panicked the kernel with a
+// General Protection Fault inside the window-manager composite. Two distinct
+// faulting sites were captured, and they are the same bug at two depths:
+//
+//   RIP -> wm_draw_apps(), the `while (win)` list walk below
+//   RIP -> widget_draw() reached from window_draw()'s `while (wd)` walk
+//
+// In every dump the dereferenced pointer held ASCII TEXT rather than a
+// struct. One of them was 0x20274e4f52444155, which is the bytes "UADRON' ":
+// the tail of the `Destroyed window '%s'` line that window_destroy() prints
+// IMMEDIATELY BEFORE it frees the window. The freed block had already been
+// handed back out to the logging path while the composite still pointed at
+// it. That is a use-after-free, not corruption arriving from elsewhere.
+//
+// WHY THE BIG KERNEL LOCK DID NOT PREVENT IT. All of this runs under the BKL,
+// but proc/process.c DROPS the BKL across every context switch
+// (bkl_release_all()), so any preemption inside the walk hands the lock to
+// another thread. The walk is the worst possible place for that to happen:
+// for each window it calls window_draw() and then the app's on_draw handler,
+// which for a user window blits the entire content buffer, 3.9 MB for a
+// fullscreen 1280x800 window. An app exiting on another core during those
+// milliseconds reaches cleanup_user_windows_for_process() -> window_destroy()
+// -> widgets_destroy_all() + kfree(win), and the walk then reads through
+// freed memory.
+//
+// THIS IS NOT SQUADRON-SPECIFIC. Squadron makes it easy to hit for two
+// reasons that are properties of the app, not of the bug: its window is
+// fullscreen, so the unlocked blit is as long as it can be, and it exits on
+// its own clock rather than at a moment the compositor chose. Any app that
+// closes its window while the compositor is compositing can land in the same
+// hole; an app killed BY the compositor cannot, which is exactly what the
+// measurement showed (self-exit: 2 panics in 2 boots; killed from the
+// compositor's own poll: 0 panics in 2 boots, 120 launches).
+//
+// THE FIX IS A DEFERRED FREE WITH THE LINKS LEFT INTACT, the standard
+// safe-unlink-during-iteration construction. While a composite walk is in
+// progress, window_destroy() still unlinks the window from
+// wm_state.window_list and still clears every cached pointer to it, but it
+// frees NOTHING: it parks the window here, leaves win->prev/win->next alone
+// so a walker standing on that node can still step off it, and leaves the
+// widget list attached. window_draw() returns at its first line for a window
+// without WINDOW_FLAG_VISIBLE and wm_get_app_by_window() returns NULL once
+// the registration is gone, so a parked window draws nothing. Everything is
+// released when the OUTERMOST walk ends.
+//
+// NOT A LOCK. Taking one around a multi-millisecond blit would serialise the
+// compositor against every app teardown, and window_destroy() runs on the
+// proc_exit path, where blocking is not allowed (#426). The depth counter and
+// the parking list are only touched at walk entry/exit and inside
+// window_destroy(), none of which sits inside one of the narrowed
+// BKL-dropping regions, so the BKL serialises them.
+#define WM_DEAD_MAX 64
+static window_t *s_wm_dead[WM_DEAD_MAX];
+static int       s_wm_dead_n = 0;
+static int       s_wm_walk_depth = 0;
+// Counters, so this can be measured rather than asserted. Read them from a
+// debug dump if you ever need to know the fix is doing work on a live boot.
+uint64_t g_wm_dead_deferred = 0;   // destroys that happened DURING a walk
+uint64_t g_wm_dead_overflow = 0;   // parking table full: freed immediately
+
+void wm_walk_enter(void) { s_wm_walk_depth++; }
+void wm_walk_leave(void) {
+    if (s_wm_walk_depth > 0) s_wm_walk_depth--;
+    if (s_wm_walk_depth > 0) return;
+    while (s_wm_dead_n > 0) {
+        window_t *w = s_wm_dead[--s_wm_dead_n];
+        s_wm_dead[s_wm_dead_n] = NULL;
+        widgets_destroy_all(w);
+        kfree(w);
+    }
+}
+// Returns 1 if the window has been parked (caller must NOT free it).
+static int wm_park_dead(window_t *win) {
+    if (s_wm_walk_depth <= 0) return 0;
+    if (s_wm_dead_n >= WM_DEAD_MAX) {
+        // Pathological. Freeing now risks the very fault this exists to stop,
+        // so LEAK the struct instead and count it: a leaked 1 KB window_t is
+        // strictly better than a kernel panic, and a non-zero counter is the
+        // signal that WM_DEAD_MAX needs raising.
+        g_wm_dead_overflow++;
+        return 1;
+    }
+    s_wm_dead[s_wm_dead_n++] = win;
+    g_wm_dead_deferred++;
+    return 1;
+}
+
 // Destroy a window
 void window_destroy(window_t *win) {
     if (!win) return;
+    // (#sqearlyexit) ORDER MATTERS: stop this window being DRAWN before any of
+    // its memory is released. A walker that has not yet reached this window
+    // will now skip it at window_draw()'s first line.
+    win->flags &= ~WINDOW_FLAG_VISIBLE;
 
     // #158: a fullscreen window about to be freed MUST NOT leave
     // g_fullscreen_win dangling - every later wm_fullscreen_active() call
@@ -623,8 +718,11 @@ void window_destroy(window_t *win) {
         wm_invalidate_all();
     }
 
-    // Destroy all widgets first
-    widgets_destroy_all(win);
+    // (#sqearlyexit) widgets are NOT destroyed here any more; see the block
+    // comment above. Freeing them here is the second of the two measured
+    // faults (widget_draw() on a freed widget_t). They are released with
+    // the window, either immediately at the bottom of this function or
+    // when the composite walk that is running finishes.
 
     // Remove from window list
     if (win->prev) {
@@ -687,6 +785,9 @@ void window_destroy(window_t *win) {
     }
 
     kprintf("Destroyed window '%s'\n", win->title);
+    // (#sqearlyexit) deferred free while a composite walk is in progress.
+    if (wm_park_dead(win)) return;
+    widgets_destroy_all(win);
     kfree(win);
 }
 
@@ -3364,11 +3465,15 @@ void wm_draw_all(void) {
         win = win->next;
     }
 
-    // Draw from back to front
+    // Draw from back to front. (#sqearlyexit) inside the walk guard: a
+    // window destroyed on another thread between two iterations is parked,
+    // not freed, so win->prev is still readable when we step off it.
+    wm_walk_enter();
     while (win) {
         window_draw(win);
         win = win->prev;
     }
+    wm_walk_leave();
     // Task A: the decorator popup is NOT drawn here. It must render on top of
     // app content, so desktop_run() calls wm_draw_winmenu() after wm_draw_apps().
 }
@@ -3808,6 +3913,11 @@ void wm_draw_apps(void) {
         win = win->next;
     }
 
+    // (#sqearlyexit) see the block comment above window_destroy(): this walk
+    // calls out to window_draw() and then to the app's on_draw handler, which
+    // for a user window blits megabytes and is therefore preemptible, and a
+    // preemption drops the BKL. Park destroys for the duration.
+    wm_walk_enter();
     while (win) {
         if (win->flags & WINDOW_FLAG_VISIBLE) {
             // Draw decorations (border, title bar, buttons, content bg)
@@ -3823,6 +3933,7 @@ void wm_draw_apps(void) {
         }
         win = win->prev;
     }
+    wm_walk_leave();
     s_corner_snap_fresh = 0;    // #27: next composite must re-snapshot
 }
 
@@ -4001,6 +4112,10 @@ int64_t sys_wm_get_windows(wm_window_info_t *buf, int max_count) {
         // A dead owner (process exited, window not yet reaped) also falls
         // through to the empty string, which the compositor's own fallback
         // path is required to treat as "no identity available".
+        // #469: the owning app's own window handle, so a consented driver can
+        // address this window through SYS_CAP_INJECT_* without the target
+        // having to publish it out of band. -1 when there is no Ring-3 owner.
+        buf[n].uwin = userwin_slot_for_window(win);
         buf[n].app_id[0] = '\0';
         if (win->owner_pid != 0) {
             process_t *owner = proc_get(win->owner_pid);

@@ -3,6 +3,8 @@
 // Full license text: userland/libc/LICENSE (MIT License).
 //
 #include "notify.h"
+#include "stdio.h"     // #appwrite: snprintf for the dropped-toast line
+#include "syscall.h"    // #appwrite: sys_bootlog
 #include "syscall.h"
 // MayteraOS notifications producer API (#168).
 //
@@ -53,7 +55,27 @@ int notify_post(const char *title, const char *body, int severity) {
     *p++ = '\n';
     blen = (int)(p - buf);
     int wfd = userconf_open_write(SPOOL_NAME);   /* #683: per-user spool */
-    if (wfd < 0) return -1;
+    if (wfd < 0) {
+        // #appwrite: THE NOTIFICATION CHANNEL IS ITSELF A FILE WRITE, so on a
+        // machine where writes are refused the OS loses its only way to say
+        // that anything was refused. Worse, several callers raise a toast
+        // precisely BECAUSE their own save failed (compositor/desktop.c:973 is
+        // one), so the report and the thing it reports die together and the
+        // feature presents as "the button does nothing".
+        //
+        // This does not make the toast appear. It makes the LOSS OF THE TOAST
+        // visible, in the one channel MEASURED to work from a uid-1000 app on
+        // this image. Deliberately not a retry to some other path: inventing a
+        // second spool location would be a second thing to keep in step, and
+        // the right fix for the underlying refusal is the path the write
+        // targets, not another fallback.
+        char m[224];
+        snprintf(m, sizeof(m),
+                 "[FSDENY-U] notify_post DROPPED (spool unwritable, rc=%d) sev=%d title=%s",
+                 wfd, severity, t);
+        (void)sys_bootlog(m);
+        return -1;
+    }
     sys_write(wfd, buf, blen);
     sys_close(wfd);
     return 0;

@@ -1,0 +1,33 @@
+# Maytera Flow M2 example: FOR-EACH loop over a constant list.
+#
+# The `foreach` node lp iterates the comma-separated `items` list. Its body is
+# the transform `up`, which is a body member of lp (params.loop: lp). Each
+# iteration lp binds its "item" output; up upper-cases it and feeds the result
+# back into lp's "collect" port; lp accumulates the results into its "results"
+# list output, which the file node writes.
+#
+# Deterministic and network-independent. Running `/APPS/FLOWRUN loopdemo`
+# writes exactly "ALPHA,BETA,GAMMA" to /HOME/LOOPOUT.TXT and prints FLOWRUN-OK 16.
+name: loopdemo
+nodes:
+  - id: t1
+    type: trigger
+    params: { kind: manual }
+  - id: lp
+    type: foreach
+    params: { items: "alpha,beta,gamma", max_iters: 100 }
+  - id: up
+    type: transform
+    params: { op: upper, loop: lp }     # body member of lp
+  - id: sink
+    type: file
+    params: { op: write, path: /HOME/LOOPOUT.TXT }
+edges:
+  - from: [t1, out]
+    to:   [lp, in]
+  - from: [lp, item]
+    to:   [up, in]                       # per-iteration item -> transform input
+  - from: [up, out]
+    to:   [lp, collect]                  # per-iteration result -> loop collector
+  - from: [lp, results]
+    to:   [sink, text]                   # collected results -> file

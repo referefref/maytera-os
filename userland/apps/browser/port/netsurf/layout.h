@@ -21,6 +21,11 @@
  *                          nested stacking contexts deferred, see the plan doc)
  *   - position: fixed / sticky  (fixed shares the absolute path but does not
  *                                re-pin to the viewport on scroll; sticky static)
+ *   - outline-offset  (#245 engoutline: the libcss build in this port has NO
+ *                      outline-offset property at all, so there is nothing to
+ *                      read; the outline hugs the border edge)
+ *   - outline dashes/dots (dashed and dotted are PAINTED SOLID; see LAYOUT_OL_*)
+ *   - outline-color: invert  (falls back to the computed text colour)
  *   - box-shadow, gradients, opacity, transforms
  *   - per-corner border-radius (the shorthand's first value rounds all four)
  *
@@ -37,6 +42,40 @@
 #define LAYOUT_MAX_ITEMS 4096
 #define LAYOUT_RUN_MAX   256
 #define LAYOUT_HREF_MAX  512
+
+/*
+ * vertical-align modes (#245 engvalign). Deliberately NOT the libcss
+ * CSS_VERTICAL_ALIGN_* numbering: BASELINE must be 0 here so that a zeroed
+ * layout_item is already at the initial value.
+ */
+#define LAYOUT_VA_BASELINE     0
+#define LAYOUT_VA_SUB          1
+#define LAYOUT_VA_SUPER        2
+#define LAYOUT_VA_TOP          3
+#define LAYOUT_VA_TEXT_TOP     4
+#define LAYOUT_VA_MIDDLE       5
+#define LAYOUT_VA_BOTTOM       6
+#define LAYOUT_VA_TEXT_BOTTOM  7
+#define LAYOUT_VA_LENGTH       8
+
+/*
+ * outline styles (#245 engoutline). Deliberately NOT the libcss
+ * CSS_OUTLINE_STYLE_* numbering, for the same reason as LAYOUT_VA_* above and
+ * one that bites harder here: libcss puts CSS_OUTLINE_STYLE_INHERIT at 0x0 and
+ * CSS_OUTLINE_STYLE_NONE at 0x1 (it aliases css_border_style_e). item_new()
+ * memsets the item, so storing the raw enum would make an untouched item read
+ * as INHERIT and a genuine `outline-style: none` read as a truthy style, which
+ * is exactly backwards: the inert value MUST be 0 on this side.
+ *
+ * DASHED and DOTTED are kept distinct from SOLID even though today's painter
+ * draws all three solid (it has no dash primitive, only an axis-aligned rect
+ * fill). The distinction is plumbed so adding one later touches the painter
+ * only.
+ */
+#define LAYOUT_OL_NONE    0
+#define LAYOUT_OL_SOLID   1
+#define LAYOUT_OL_DASHED  2
+#define LAYOUT_OL_DOTTED  3
 
 /* border sides, in the order CSS writes them */
 #define LB_TOP    0
@@ -86,6 +125,66 @@ typedef struct layout_item {
 	int bold;
 	int italic;
 	int underline;
+	/*
+	 * CSS letter-spacing for this run, in px, ALREADY INCLUDED in the advance
+	 * layout gave the run (#245 engletsp). The painter MUST apply it too, or
+	 * measured width stops equalling drawn width (#589) and the glyphs sit
+	 * tight inside a box laid out wide. Zero is the initial value and means
+	 * "draw the whole string in one call", which is what every run on a page
+	 * that never authors letter-spacing carries, so the legacy paint path is
+	 * untouched. May be NEGATIVE (-0.02em is a common tracking tightener).
+	 *
+	 * The spacing is added after EVERY glyph including the last, which is what
+	 * CSS specifies, so the run's drawn width is measure(text) + ls * glyphs.
+	 * `text` is single-byte Latin-1 by the time it reaches here (utf8_squash
+	 * folds it before measuring), and the rasteriser indexes it by byte, so
+	 * the glyph count is exactly the string length. Do NOT "fix" that into a
+	 * UTF-8 continuation-byte count: 0xB7 (middle dot) would then be dropped.
+	 */
+	int letter_spacing;
+	/*
+	 * CSS vertical-align for this run (#245 engvalign), as a LAYOUT_VA_*
+	 * value, NOT the raw libcss enum. The raw enum starts BASELINE at 1, and
+	 * this engine needs the initial value to be the zero an item_new() memset
+	 * already produces, so that every item on a page that never authors the
+	 * property is inert without a single extra write.
+	 *
+	 * These three fields are layout-internal: they are consumed by the
+	 * line-close pass that resolves the shift into `y`, and the field is reset
+	 * to LAYOUT_VA_BASELINE once that has happened, so an item the painter
+	 * sees always reads 0 here and its `y` is already final. The painter needs
+	 * NO vertical-align code at all: unlike letter-spacing, which changes what
+	 * happens INSIDE a run, vertical-align only moves the run's origin, and
+	 * `y` is what every consumer (draw, link hit rects, overflow extents)
+	 * already reads.
+	 *
+	 * valign_h is the element's OWN inline box height (its computed
+	 * line-height), which the line-box-relative modes need in order to place
+	 * the box inside a taller line. valign_px is the resolved raise in pixels
+	 * and is meaningful only for LAYOUT_VA_LENGTH (positive raises).
+	 */
+	int valign;
+	int valign_h;
+	int valign_px;
+	/*
+	 * CSS outline (#245 engoutline). PAINT-ONLY, and that is the whole point
+	 * of the property: an outline is drawn just OUTSIDE the border edge and
+	 * takes NO layout space, so unlike a border it must never reach a
+	 * position, a width, a height, an inline advance or a line height. Nothing
+	 * in layout.c reads these three fields; only the painter does.
+	 *
+	 * ol_w == 0 means no outline, and 0 is what item_new()'s memset already
+	 * leaves, so every item on a page that never authors an outline carries
+	 * the inert value without a single extra write and the painter's outline
+	 * block is never entered.
+	 *
+	 * ol_style is a LAYOUT_OL_* value, NOT the raw libcss enum (see above).
+	 * ol_col is 0x00RRGGBB, already composited against the effective
+	 * background, the same way bcol[] is.
+	 */
+	uint8_t  ol_w;
+	uint8_t  ol_style;
+	uint32_t ol_col;
 	char text[LAYOUT_RUN_MAX];
 	char href[LAYOUT_HREF_MAX];  /* link target, or form action for a control */
 	int form_kind;     /* 0 none, 1 text field, 2 submit/button */
@@ -140,10 +239,27 @@ typedef struct layout_result {
 	/* Set when the item array filled up, so the caller can say the page was
 	 * truncated instead of silently showing a short one. */
 	int overflowed;
+	/*
+	 * engwalkstack (#245): set when the walk refused a subtree because the
+	 * DOM nested deeper than WALK_MAX_DEPTH. Same contract as `overflowed`:
+	 * the page rendered, but part of it is missing, and the caller should
+	 * say so rather than present a short page as a complete one.
+	 * walk_depth_peak is the deepest the walk actually got, so how close a
+	 * normal page came to the ceiling is measurable and not guessed at.
+	 */
+	int deep_truncated;
+	int walk_depth_peak;
 	/* engscroll (#245): overflow:scroll/auto containers that overflow. */
 	scroll_box scrolls[LAYOUT_MAX_SCROLLS];
 	int n_scrolls;
 } layout_result;
+
+/*
+ * engwalkstack (#245): the md5 of the layout.c this binary was built from, or
+ * "unstamped". Printed once at startup so a measurement can be tied to the
+ * source it came from instead of to "the two binaries differ".
+ */
+const char *layout_src_stamp(void);
 
 /*
  * Lay out the document tree into `out`. `content_width` is the wrap width in px.

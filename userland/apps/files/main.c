@@ -228,6 +228,25 @@ static int   g_ow_hover = -1;
 static void  draw_te(void);
 static void  draw_openwith(void);
 
+// #317: authenticated SMB browse credentials dialog. Separate Server / Share /
+// Username / Password fields (the password is MASKED, never shown or logged in
+// cleartext), plus Connect / Cancel and a "Save as favourite" checkbox. This
+// supersedes the crude one-line "Add: server share [user] [pass]" text entry as
+// the primary path, and is also auto-opened when an auth-gated SMB server or
+// share fails to list. Entered credentials flow through the SAME net_mount +
+// "/SMB/<server>/<share>" navigation path the discovered/saved rows already use.
+// Each field reuses the shared caret/selection/clipboard textfield widget
+// (textfield.h); the whole dialog is drawn with the shared style engine
+// (gui_textfield_tf / gui_checkbox / gui_button), never a hand-rolled widget.
+static int   g_cred_open  = 0;              // credentials dialog visible
+static int   g_cred_focus = 0;             // 0=Server 1=Share 2=Username 3=Password
+static int   g_cred_save  = 0;             // "Save as favourite" checkbox state
+static char  g_cred_server[64] = "";
+static char  g_cred_share[40]  = "";
+static char  g_cred_user[40]   = "";
+static char  g_cred_pass[40]   = "";
+static textfield_t g_cred_tf[4];           // one caret-aware field per input
+
 static int window_handle = -1;
 static int win_x = 90, win_y = 40;
 static char g_home[MAX_PATH_LEN] = "/APPS";
@@ -241,6 +260,8 @@ static void load_directory(const char *path);
 static void navigate_to(const char *path);                 // defined below (navigation)
 static int  copy_file(const char *src, const char *dst);   // defined below (clipboard)
 static void open_add_network(void);                        // #317 Network "Add" dialog
+static void draw_cred(void);                               // #317 SMB credentials dialog
+static void open_cred_dialog(const char *server, const char *share, const char *user); // #317
 static void files_error(const char *what, const char *detail);   // #742
 static void files_err_clear(void);                               // #742
 
@@ -811,38 +832,12 @@ static void netmount_add(const char *server, const char *share,
     save_netmounts();
 }
 
-// Parse "server share [user] [pass]" or "server/share [user] [pass]".
-static void parse_add_input(const char *in) {
-    char server[64]={0}, share[40]={0}, user[40]={0}, pass[40]={0};
-    int i = 0;
-    char *dst[4]; int sz[4];
-    dst[0]=server; sz[0]=64; dst[1]=share; sz[1]=40;
-    dst[2]=user;   sz[2]=40; dst[3]=pass;  sz[3]=40;
-    for (int t = 0; t < 4; t++) {
-        while (in[i] == ' ') i++;
-        int o = 0;
-        while (in[i] && in[i] != ' ' && o < sz[t]-1) dst[t][o++] = in[i++];
-        dst[t][o] = 0;
-    }
-    // Accept "server/share" in the first token.
-    if (!share[0]) {
-        for (int j = 0; server[j]; j++) {
-            if (server[j] == '/') {
-                int o = 0; for (int k = j+1; server[k] && o < 39; k++) share[o++] = server[k];
-                share[o] = 0; server[j] = 0; break;
-            }
-        }
-    }
-    if (!server[0] || !share[0]) return;
-    netmount_add(server, share, user, pass);
-}
-
+// #317: the "[+ Add Network Location]" row now opens the proper credentials
+// dialog (open_cred_dialog, defined near draw_te below), replacing the old
+// one-line "server share user pass" text entry that put the password in
+// cleartext with no masking and no per-field UI.
 void open_add_network(void) {
-    str_copy(g_te_title, "Add: server share [user] [pass]", sizeof(g_te_title));
-    g_te_buf[0] = 0; g_te_len = 0;
-    g_te_purpose = 2;       // 2 = add network location
-    g_te_open = 1;
-    fb_redraw();
+    open_cred_dialog(0, 0, 0);   // empty; user fills in Server/Share/creds
 }
 
 // #554: zero the permission/attribute fields for a freshly-pushed items[i] -
@@ -2178,7 +2173,7 @@ static unsigned long layout_sig(void) {
 #define SIG(v) s = (s ^ (unsigned long)(v)) * 16777619ul
     SIG(WIN_W); SIG(WIN_H); SIG(prev_on()); SIG(g_in_recycle);
     SIG(g_menu); SIG(g_menu_x); SIG(g_menu_y);
-    SIG(g_props_open); SIG(g_te_open); SIG(g_openwith_open);
+    SIG(g_props_open); SIG(g_te_open); SIG(g_openwith_open); SIG(g_cred_open);
     SIG(gui_confirm_singleton_is_open());
 #undef SIG
     return s;
@@ -2220,6 +2215,7 @@ static void fb_redraw(void) {
     if (g_props_open) draw_props();   // (#251) Properties dialog on top
     if (g_openwith_open) draw_openwith();  // Task C: Open with picker
     if (g_te_open) draw_te();              // Task C: inline Rename text entry
+    if (g_cred_open) draw_cred();          // #317: SMB credentials dialog
     // #745: Recycle Bin delete/empty confirm - drawn LAST so it sits on top
     // of everything else, true modal (see the gate in EVENT_KEY_DOWN/
     // EVENT_MOUSE_DOWN below: it is checked before any other overlay).
@@ -2335,18 +2331,24 @@ static void open_selected(void) {
             return;   // informational, not clickable
         case NR_SAVED:
         case NR_DISC_SHARE:
-            // Mount (guest creds for a discovered share) then browse via the
-            // EXISTING /SMB VFS path - no invented mount syscall.
-            net_mount(r->server, r->share, r->user, r->pass);
-            snprintf(np, sizeof(np), "/SMB/%s/%s", r->server, r->share);
-            navigate_to(np);
+            // Mount (saved or guest creds) then browse via the EXISTING /SMB VFS
+            // path - no invented mount syscall. #317: if the mount is refused
+            // (auth-gated share, or stale saved credentials) fall through to the
+            // credentials dialog, pre-filled with what we know, so the user can
+            // supply a username/password rather than hit a silent empty listing.
+            if (net_mount(r->server, r->share, r->user, r->pass) == 0) {
+                snprintf(np, sizeof(np), "/SMB/%s/%s", r->server, r->share);
+                navigate_to(np);
+            } else {
+                open_cred_dialog(r->server, r->share, r->user);
+            }
             return;
         case NR_DISC_SMB:
             // SMB host answered but shares could not be enumerated (guest denied
-            // srvsvc). Browse the server root via the existing /SMB path; if the
-            // server exposes nothing to us it simply shows empty.
-            snprintf(np, sizeof(np), "/SMB/%s", r->server);
-            navigate_to(np);
+            // srvsvc), which usually means the server is auth-gated. #317: open
+            // the credentials dialog pre-filled with the server so the user can
+            // supply the share name plus a username/password.
+            open_cred_dialog(r->server, "", "");
             return;
         case NR_DISC_NFS:
             // #317 nfsbrowse: an NFS export row carries the server-side export
@@ -2512,7 +2514,6 @@ static int te_key(char c, uint32_t kc) {
     else if (c == '\n' || c == '\r' || kc == 0x1C) {      // Enter = confirm
         g_te_open = 0;
         if (g_te_purpose == 1) rename_commit(g_te_buf);
-        else if (g_te_purpose == 2) { parse_add_input(g_te_buf); navigate_to("/NET"); }  // #317
         else if (g_te_purpose == 3) perms_edit_commit(g_te_buf);  // #554
     } else if (c == '\b' || kc == 0x0E) {
         if (g_te_len > 0) g_te_buf[--g_te_len] = 0;
@@ -2798,6 +2799,142 @@ static int te_hit(int lx, int ly) {
     if (ly >= oy && ly < oy + TE_BTN_H) {
         if (lx >= okx && lx < okx + TE_BTN_W) return 0;
         if (lx >= cax && lx < cax + TE_BTN_W) return 1;
+    }
+    return -1;
+}
+
+// ---- #317 authenticated SMB credentials dialog ----------------------------
+// A modal, four-field connect dialog. The password field is drawn masked (each
+// character shown as a dot), and the real password bytes never leave the
+// g_cred_pass buffer, never appear in a draw call and never reach a log/serial
+// line. Fields reuse the shared caret/selection/clipboard textfield widget
+// (textfield.h) and the shared style renderer (gui_textfield_tf); Connect,
+// Cancel and the "Save as favourite" checkbox use gui_button / gui_checkbox.
+#define CRED_W      400
+#define CRED_H      270
+#define CRED_LBL_W  84
+#define CRED_BTN_W  96
+#define CRED_BTN_H  26
+static inline int cred_bx(void){ return (WIN_W - CRED_W) / 2; }
+static inline int cred_by(void){ return (WIN_H - CRED_H) / 2; }
+static inline int cred_field_y(int i){ return cred_by() + 42 + i * 34; }
+static inline int cred_chk_y(void){ return cred_by() + 42 + 4 * 34 + 6; }
+
+// Open the dialog, optionally pre-filling Server / Share / Username. The
+// password always starts empty. Focus lands on the first empty field.
+static void open_cred_dialog(const char *server, const char *share, const char *user) {
+    str_copy(g_cred_server, server ? server : "", sizeof(g_cred_server));
+    str_copy(g_cred_share,  share  ? share  : "", sizeof(g_cred_share));
+    str_copy(g_cred_user,   user   ? user   : "", sizeof(g_cred_user));
+    g_cred_pass[0] = 0;
+    tf_init(&g_cred_tf[0], g_cred_server, sizeof(g_cred_server));
+    tf_init(&g_cred_tf[1], g_cred_share,  sizeof(g_cred_share));
+    tf_init(&g_cred_tf[2], g_cred_user,   sizeof(g_cred_user));
+    tf_init(&g_cred_tf[3], g_cred_pass,   sizeof(g_cred_pass));
+    g_cred_focus = !g_cred_server[0] ? 0 : (!g_cred_share[0] ? 1 : 2);
+    g_cred_save = 0;
+    g_cred_open = 1;
+    fb_redraw();
+}
+
+static void draw_cred(void) {
+    if (!g_cred_open) return;
+    int bx = cred_bx(), by = cred_by();
+    draw_dialog_frame(bx, by, CRED_W, CRED_H, "Connect to Server");
+    static const char *labels[4] = { "Server:", "Share:", "Username:", "Password:" };
+    static const char *phs[4]    = { "host or IP", "share name",
+                                     "(guest if blank)", "(guest if blank)" };
+    int fx = bx + 16 + CRED_LBL_W;
+    int fw = CRED_W - 32 - CRED_LBL_W;
+    for (int i = 0; i < 4; i++) {
+        int fy = cred_field_y(i);
+        win_draw_text(window_handle, bx + 16, fy + 7, labels[i], DIM_TEXT);
+        textfield_t *tf = &g_cred_tf[i];
+        const char *txt = tf->buf;
+        char mbuf[41];
+        if (i == 3) {   // password: render a masked copy, never the real bytes
+            int n = tf->len; if (n > 40) n = 40;
+            for (int k = 0; k < n; k++) mbuf[k] = '*';
+            mbuf[n] = 0;
+            txt = mbuf;
+        }
+        const char *ph = (tf->len == 0) ? phs[i] : 0;
+        gui_textfield_tf(window_handle, fx, fy, fw, 28, txt, tf->len, tf->cursor,
+                         tf->sel_anchor, g_cred_focus == i, ph);
+    }
+    if (g_cred_focus == 4)  // keyboard focus ring on the Save-favourite checkbox
+        gui_draw_rect(window_handle, bx + 12, cred_chk_y() - 3, CRED_W - 24, 24, 0x3AA6FF);
+    gui_checkbox(window_handle, bx + 16, cred_chk_y(), 18, g_cred_save != 0,
+                 "Save as favourite (persists reboots)", GUI_ST_NORMAL);
+    int oy  = by + CRED_H - CRED_BTN_H - 12;
+    int cnx = bx + CRED_W - 2 * CRED_BTN_W - 24;
+    int cax = bx + CRED_W - CRED_BTN_W - 12;
+    gui_button(window_handle, cnx, oy, CRED_BTN_W, CRED_BTN_H, "Connect",
+               GUI_BTN_PRIMARY, GUI_ST_NORMAL);
+    gui_button(window_handle, cax, oy, CRED_BTN_W, CRED_BTN_H, "Cancel",
+               GUI_BTN_SECONDARY, GUI_ST_NORMAL);
+}
+
+// Attempt the mount with the entered credentials. On success optionally saves
+// the connection as a favourite (reusing netmount_add -> NETMOUNTS.CFG) and
+// navigates into the share; on failure keeps the dialog open so the user can
+// correct the credentials. The password is never included in any status text.
+static void cred_connect(void) {
+    if (!g_cred_server[0] || !g_cred_share[0]) {
+        files_error("Connect failed", "Server and Share are both required");
+        return;   // keep dialog open
+    }
+    if (net_mount(g_cred_server, g_cred_share, g_cred_user, g_cred_pass) != 0) {
+        files_error("Connect failed", "could not mount the share (check name and credentials)");
+        return;   // keep dialog open so the credentials can be corrected
+    }
+    if (g_cred_save)
+        netmount_add(g_cred_server, g_cred_share, g_cred_user, g_cred_pass);
+    g_cred_open = 0;
+    char np[MAX_PATH_LEN];
+    snprintf(np, sizeof(np), "/SMB/%s/%s", g_cred_server, g_cred_share);
+    navigate_to(np);
+}
+
+// Drive a key event into the open credentials dialog. Esc cancels, Enter
+// connects, Tab / Up / Down move focus between fields, everything else goes to
+// the focused field's shared textfield handler (caret, selection, clipboard).
+static void cred_key(const gui_event_t *ev) {
+    if (!g_cred_open) return;
+    char c = ev->key_char; uint32_t kc = ev->keycode;
+    if (c == 27) { g_cred_open = 0; return; }                 // Esc = cancel
+    // Focus order: 0=Server 1=Share 2=Username 3=Password 4=Save-favourite checkbox.
+    // The checkbox is in the keyboard focus cycle so the whole dialog is keyboard-
+    // drivable (mouse clicks do not land headless, #334; validation 2026-09-23).
+    if (c == '\t') { g_cred_focus = (g_cred_focus + 1) % 5; return; }  // Tab
+    if (kc == 0x81) { if (g_cred_focus < 4) g_cred_focus++; return; }  // Down
+    if (kc == 0x80) { if (g_cred_focus > 0) g_cred_focus--; return; }  // Up
+    if (g_cred_focus == 4) {                                   // Save-favourite checkbox focused
+        if (c == ' ') { g_cred_save = !g_cred_save; return; } // Space toggles it
+        if (c == '\n' || c == '\r' || kc == 0x1C) { cred_connect(); return; }
+        return;                                                // no text entry on the checkbox
+    }
+    if (c == '\n' || c == '\r' || kc == 0x1C) { cred_connect(); return; }  // Enter = connect
+    tf_handle_key(&g_cred_tf[g_cred_focus], ev);
+}
+
+// Hit-test a click in the dialog. Returns 0 = Connect, 1 = Cancel, 2 = toggle
+// the checkbox, 10+i = focus field i, -1 = inside (swallow), -2 = outside.
+static int cred_hit(int lx, int ly) {
+    int bx = cred_bx(), by = cred_by();
+    if (lx < bx || lx >= bx + CRED_W || ly < by || ly >= by + CRED_H) return -2;
+    int oy  = by + CRED_H - CRED_BTN_H - 12;
+    int cnx = bx + CRED_W - 2 * CRED_BTN_W - 24;
+    int cax = bx + CRED_W - CRED_BTN_W - 12;
+    if (ly >= oy && ly < oy + CRED_BTN_H) {
+        if (lx >= cnx && lx < cnx + CRED_BTN_W) return 0;
+        if (lx >= cax && lx < cax + CRED_BTN_W) return 1;
+    }
+    int chy = cred_chk_y();
+    if (ly >= chy - 2 && ly < chy + 22 && lx >= bx + 16 && lx < bx + CRED_W - 16) return 2;
+    for (int i = 0; i < 4; i++) {
+        int fy = cred_field_y(i);
+        if (ly >= fy && ly < fy + 28 && lx >= bx + 16 && lx < bx + CRED_W - 16) return 10 + i;
     }
     return -1;
 }
@@ -3096,6 +3233,8 @@ int main(int argc, char **argv) {
                 break;
             }
             // Task C: modal overlays capture keys first.
+            // #317: the SMB credentials dialog is modal - it gets keys first.
+            if (g_cred_open) { cred_key(&event); fb_redraw(); break; }
             if (g_te_open) { te_key(c, kc); fb_redraw(); break; }
             if (g_openwith_open) { if (c == 27) { g_openwith_open = 0; fb_redraw(); } break; }
             if (g_props_open) {
@@ -3161,6 +3300,15 @@ int main(int argc, char **argv) {
                 break;
             }
             // Task C: modal overlays consume clicks first.
+            // #317: the SMB credentials dialog is modal - clicks go to it first.
+            if (g_cred_open) {
+                int h = cred_hit(lx, ly);
+                if (h == 0) cred_connect();                 // Connect
+                else if (h == 1 || h == -2) g_cred_open = 0; // Cancel / click-away
+                else if (h == 2) g_cred_save = !g_cred_save; // toggle favourite
+                else if (h >= 10) g_cred_focus = h - 10;     // focus that field
+                fb_redraw(); break;
+            }
             if (g_te_open) {
                 int h = te_hit(lx, ly);
                 if (h == 0) {
