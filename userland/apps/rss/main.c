@@ -22,6 +22,7 @@
 #include "../../libc/gui_style.h"
 #include "rss_rs.h"
 #include "../../libc/keys.h"   // #243: GUI_KEY_* nav codes
+#include "../../libc/userconf.h"   // #peruser2: per-user feed list
 
 // The Mono reader typeface deliberately uses the crisp 8x16 bitmap font, so
 // capture the real bitmap entry point BEFORE the TTF redirect macro below
@@ -361,7 +362,18 @@ static void clean_text(const char *src, char *out, int cap) {
 }
 
 // ---- Config persistence: /CONFIG/RSSFEEDS.CFG (one "name\turl" per line) ---
-#define CFG_PATH "/CONFIG/RSSFEEDS.CFG"
+// #peruser2: A SUBSCRIPTION LIST IS A PREFERENCE, so it moves to
+// <home>/CONFIG/RSSFEEDS.CFG with reads falling back to the system copy (an
+// administrator-seeded default set still applies to a user who has not edited
+// theirs). Root's home is "/", so root still uses exactly /CONFIG/RSSFEEDS.CFG.
+//
+// This site had the sharpest user-visible symptom in the whole set: load_feeds()
+// calls seed_default_feeds() AND save_feeds() when the read fails, so for a
+// non-root session the save was refused every single launch and the user's
+// subscriptions reverted to the shipped defaults each time the app opened, with
+// no error anywhere. It looked like the app forgetting, not a permission.
+#define CFG_NAME   "RSSFEEDS.CFG"
+#define CFG_LEGACY "/CONFIG/RSSFEEDS.CFG"
 
 static void seed_default_feeds(void) {
     g_feed_count = 0;
@@ -370,19 +382,27 @@ static void seed_default_feeds(void) {
 }
 
 static void save_feeds(void) {
-    sys_mkdir("/CONFIG", 0755);
-    int fd = sys_open(CFG_PATH, O_WRONLY | O_CREAT | O_TRUNC);
-    if (fd < 0) return;
-    char line[300];
-    for (int i = 0; i < g_feed_count; i++) {
-        int n = snprintf(line, sizeof(line), "%s\t%s\n", g_feeds[i].name, g_feeds[i].url);
-        sys_write(fd, line, n);
+    // #peruser2: THE sys_mkdir("/CONFIG", 0755) IS GONE, and that removal is the
+    // point of the whole exercise. A Ring-3 app must not try to create the system
+    // configuration directory: that directory holds SHADOW, MFA.DB, PERMS.DB and
+    // the standing-consent store, and a world-traversable /CONFIG created by an
+    // app is a strictly worse problem than a save that fails (#683/#745).
+    // userconf_open_write() creates <home>/CONFIG, which is the user's own.
+    // static, not on the stack: MAX_FEEDS*300 is 12000 bytes and a userland
+    // thread stack is 16KB (see blame.md, "bss vs 16KB stack").
+    static char buf[MAX_FEEDS * 300];
+    int o = 0;
+    for (int i = 0; i < g_feed_count && o < (int)sizeof(buf) - 300; i++)
+        o += snprintf(buf + o, sizeof(buf) - o, "%s\t%s\n", g_feeds[i].name, g_feeds[i].url);
+    int fd = userconf_open_write(CFG_NAME);
+    if (userconf_finish_write(fd, buf, (unsigned long)o) != 0) {
+        // Reported by userconf_open_write()/finish; nothing else to do here. The
+        // in-RAM list stays as the user set it for this session.
     }
-    sys_close(fd);
 }
 
 static void load_feeds(void) {
-    int fd = sys_open(CFG_PATH, O_RDONLY);
+    int fd = userconf_open_read(CFG_NAME, CFG_LEGACY);   // #peruser2
     if (fd < 0) { seed_default_feeds(); save_feeds(); return; }
     static char buf[8192];
     long n = sys_read(fd, buf, sizeof(buf) - 1);

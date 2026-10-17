@@ -48,23 +48,42 @@ build() {   # $1 = allocator source, $2 = output binary
 # budget replaced by an unreachable limit. Everything else (the range checks,
 # the size sanity checks, the redzone) stays, which is the point: those guards
 # were already there and did NOT stop the spin.
-sed 's/uint64_t steps = 0, limit = heap_walk_limit();/uint64_t steps = 0, limit = (uint64_t)-1;  \/* NEGATIVE CONTROL *\//' \
+# #245 domscript: there are now TWO shapes of budget to disable. The bin walk
+# that replaced find_free_block()'s whole-list scan derives its limit from the
+# bin's own length (so a cycle is caught independently of heap size), so it does
+# not match the one-line form, and a sed that silently covered only two of three
+# sites would leave the third arm proving nothing. The NSUB floor below is what
+# catches that; keep both in step.
+sed -e 's/uint64_t steps = 0, limit = heap_walk_limit();/uint64_t steps = 0, limit = (uint64_t)-1;  \/* NEGATIVE CONTROL *\//' \
+    -e 's/uint64_t limit = (uint64_t) bin_count\[last\] + 8;/uint64_t limit = (uint64_t)-1;  \/* NEGATIVE CONTROL *\//' \
+    -e 's/if (limit > hard) limit = hard;/\/* NEGATIVE CONTROL: no backstop clamp *\//' \
+    -e 's/if (++looked >= HEAP_BIN_SCAN_MAX) break;.*/\/* NEGATIVE CONTROL: no effort cap *\//' \
     "$LIBC/stdlib.c" > "$WORK/stdlib_nobudget.c"
 NSUB=$(grep -c 'NEGATIVE CONTROL' "$WORK/stdlib_nobudget.c")
-if [ "$NSUB" -lt 3 ]; then
-    echo "RESULT: BROKEN - expected >=3 step-budget sites to disable, found $NSUB."
+if [ "$NSUB" -lt 5 ]; then
+    echo "RESULT: BROKEN - expected >=5 step-budget edits to apply, found $NSUB."
     echo "        The walks were restructured; update this test before trusting it."
     exit 1
 fi
 
 rc_all=0
 
-echo "=== ARM 1: NEGATIVE CONTROL ($NSUB step budgets disabled, must hang) ==="
+# #245 domscript: SCENARIO 1 IS NO LONGER A HANG CANDIDATE, and that is a
+# property of the code, not a concession. Its injection (a block whose ->next
+# points at itself) is absorbed by free()'s forward merge, and every absorption
+# ADDS BLK_HDR + the victim's size to the block, so after a couple of rounds
+# block_size_sane() refuses because the block would run past heap_end. The loop
+# is therefore bounded with the step budget removed, so demanding that it hang
+# would be demanding that the allocator be worse. It stays in the POSITIVE arm,
+# where it must still terminate and still report. The remaining three
+# scenarios reach walks whose ONLY bound is the budget / effort cap.
+NEG_SCENARIOS="2 3 4"
+echo "=== ARM 1: NEGATIVE CONTROL ($NSUB bounds disabled, scenarios $NEG_SCENARIOS must hang) ==="
 if ! build "$WORK/stdlib_nobudget.c" "$WORK/t_neg"; then
     echo "RESULT: BROKEN - negative arm did not build"; exit 1
 fi
 neg_bad=0
-for n in 1 2 3 4; do
+for n in $NEG_SCENARIOS; do
     timeout 10 "$WORK/t_neg" $n >/dev/null 2>&1
     rc=$?
     if [ $rc -eq 124 ]; then
@@ -75,7 +94,7 @@ for n in 1 2 3 4; do
     fi
 done
 if [ $neg_bad -eq 0 ]; then
-    echo "RESULT: GOOD - every cycle scenario spins forever without the budget."
+    echo "RESULT: GOOD - every budget-bounded scenario spins forever without the budget."
 else
     echo "RESULT: BAD - a scenario completed without the budget, so it proves nothing."
     rc_all=1

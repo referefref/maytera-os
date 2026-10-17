@@ -352,7 +352,20 @@ static int selection_count(void) {
 // SCOPE for this pass (not part of appqa's census) and are not added here;
 // follow-up should confirm and extend this list rather than assume.
 static int desk_is_console_app(const char *path) {
-    static const char *const console_apps[] = { "myman", "rogue", "angband" };
+    // [deadbtn] PYTHON.ELF ADDED, and it is the follow-up this comment block
+    // asks for ("confirm and extend this list rather than assume"), not an
+    // assumption. MEASURED on golden 2559 in VM 2310: clicking the Start
+    // menu's Python entry spawned successfully (sys_spawn returned a pid, so
+    // the launch-failure toast correctly did NOT fire) and then `ps` showed NO
+    // python process and the screen showed nothing at all. CPython is a
+    // console REPL: with no pty it reads EOF on stdin and exits immediately.
+    // That is the SAME defect as MyMan/Rogue/Angband, so it takes the same
+    // routing rather than a second mechanism. Both spellings are listed
+    // because the shipped binary is /APPS/PYTHON.ELF while a from-source
+    // build also produces /APPS/python (build/app-presence.policy explains
+    // why those are two different programs).
+    static const char *const console_apps[] = { "myman", "rogue", "angband",
+                                                "python.elf", "python" };
     const char *base = path;
     for (const char *p = path; *p; p++) if (*p == '/') base = p + 1;
     for (unsigned i = 0; i < sizeof(console_apps) / sizeof(console_apps[0]); i++) {
@@ -393,12 +406,24 @@ static void launch_app(const char *exec_path) {
     // #239: "@RECYCLE" opens Files directly in its integrated Recycle Bin view
     // (drop a one-shot sentinel the Files app consumes at startup).
     if (exec_path[0] == '@' && exec_path[1] == 'R') {
-        int fd = sys_open("/RECYVIEW.FLG", 0x41);
-        if (fd >= 0) { sys_write(fd, "1", 1); sys_close(fd); }
+        // #peruser2: <home>/RECYVIEW.FLG, see compositor/startmenu.c and the
+        // consumer in apps/files/main.c. Root's home is "/", so a root session
+        // still writes exactly /RECYVIEW.FLG.
+        int fd = userhome_open_write(0, "RECYVIEW.FLG");
+        if (userconf_finish_write(fd, "1", 1) != 0) {
+            // Reported through sys_bootlog; Files opens at its default folder.
+        }
         sys_spawn("/APPS/FILES");
         return;
     }
-    compositor_spawn_app(exec_path);
+    // [deadbtn] This DESK_KIND_SYSTEM path was the one branch in this file
+    // that did not check compositor_spawn_app()'s <0-on-failure return, even
+    // though activate_icon()'s other branches (DESK_KIND_DIR, DESK_KIND_EXEC,
+    // the file-association fallback) already notify_post() on failure (#745).
+    // A desktop icon for a binary absent from this build (e.g. a public image
+    // missing an internal-only app) therefore did nothing visible at all.
+    if (compositor_spawn_app(exec_path) < 0)
+        notify_post("Cannot run program", exec_path, NOTIFY_ERROR);
 }
 
 // ============================================================================

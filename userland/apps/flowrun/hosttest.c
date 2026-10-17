@@ -134,6 +134,39 @@ int flow_plat_input_key(const char *target, int keycode,
     return 0;
 }
 
+// SCRIPTED `launch`. The real seam needs the launch manifest and a compositor,
+// which the host has neither of, so it is scripted the same way the capture and
+// vision seams are: the point of the host test is the GRAPH (does the launch
+// node run before the capture, does its failure abort the flow, are its outputs
+// wired), not the OS underneath it. ht_fail_launch drives the failure path, and
+// ht_launch_before_capture is what proves the ORDER, which is the whole reason
+// the node exists.
+static int  ht_launch_calls = 0;
+static int  ht_fail_launch = 0;
+static int  ht_launch_before_capture = -1;   // 1 = yes, 0 = a capture came first
+static char ht_launch_app[64];
+static char ht_launch_wait[64];
+
+int flow_plat_launch(const char *app, const char *rom, const char *arg,
+                     const char *wait_target, int timeout_ms,
+                     char *out_title, int tcap, int *out_already,
+                     char *err, int errcap) {
+    (void)rom; (void)arg; (void)timeout_ms;
+    if (tcap > 0) out_title[0] = 0;
+    if (out_already) *out_already = 0;
+    ht_launch_calls++;
+    snprintf(ht_launch_app, sizeof(ht_launch_app), "%s", app ? app : "");
+    snprintf(ht_launch_wait, sizeof(ht_launch_wait), "%s", wait_target ? wait_target : "");
+    if (ht_launch_before_capture < 0) ht_launch_before_capture = (ht_cap_calls == 0);
+    if (ht_fail_launch) {
+        snprintf(err, errcap, "scripted launch failure for '%s'", app ? app : "");
+        return -1;
+    }
+    snprintf(out_title, tcap, "Game Boy");
+    return 0;
+}
+
+
 unsigned long flow_plat_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -725,6 +758,59 @@ static int test_keynames(void) {
 }
 
 
+// The launch node's own contract, independent of any example: a missing `app`
+// param is an ERROR and not a default, and a platform refusal aborts the flow
+// rather than being swallowed.
+static int test_launch_node(void) {
+    printf("[test] #469 launch node: required param, defaulting, failure path\n");
+    static flow_graph_t g;
+    char err[FLOW_ERR_MAX] = {0};
+
+    // 1. no `app` param -> parse is fine, execute refuses.
+    const char *noapp =
+        "name: noapp\nnodes:\n"
+        "  - id: t1\n    type: trigger\n    params: { kind: manual }\n"
+        "  - id: l1\n    type: launch\n    params: { timeout_ms: 500 }\n"
+        "edges:\n  - from: [t1, out]\n    to:   [l1, in]\n";
+    memset(&g, 0, sizeof(g));
+    CHECK(flow_parse_bytes(noapp, (int)strlen(noapp), &g, err, sizeof(err)) == 0,
+          "a launch node with no app still PARSES");
+    flow_ctx_t c1; memset(&c1, 0, sizeof(c1)); c1.g = &g;
+    CHECK(flow_execute(&c1) != 0, "and then FAILS to execute");
+    CHECK(strstr(c1.err, "needs param app") != NULL, "naming the missing param");
+
+    // 2. wait_for defaults to "app:<app>", and a platform failure aborts.
+    const char *ok =
+        "name: lnch\nnodes:\n"
+        "  - id: t1\n    type: trigger\n    params: { kind: manual }\n"
+        "  - id: l1\n    type: launch\n    params: { app: gbemu }\n"
+        "edges:\n  - from: [t1, out]\n    to:   [l1, in]\n";
+    memset(&g, 0, sizeof(g));
+    ht_launch_calls = 0; ht_fail_launch = 0; ht_launch_before_capture = -1;
+    CHECK(flow_parse_bytes(ok, (int)strlen(ok), &g, err, sizeof(err)) == 0, "parses");
+    flow_ctx_t c2; memset(&c2, 0, sizeof(c2)); c2.g = &g;
+    CHECK(flow_execute(&c2) == 0, "executes");
+    CHECK(ht_launch_calls == 1, "the platform seam was called exactly once");
+    CHECK(strcmp(ht_launch_wait, "app:gbemu") == 0,
+          "wait_for defaults to \"app:<app>\"");
+    flow_node_t *l1 = find_node(&g, "l1");
+    char tgt[64] = {0}, ttl[64] = {0};
+    read_output(l1, "target", tgt, sizeof(tgt));
+    read_output(l1, "title",  ttl, sizeof(ttl));
+    CHECK(strcmp(tgt, "app:gbemu") == 0, "the target is published as an output");
+    CHECK(strcmp(ttl, "Game Boy") == 0, "so is the matched window title");
+
+    // 3. a refusal is a flow failure, not a warning.
+    memset(&g, 0, sizeof(g));
+    ht_launch_calls = 0; ht_fail_launch = 1;
+    flow_parse_bytes(ok, (int)strlen(ok), &g, err, sizeof(err));
+    flow_ctx_t c3; memset(&c3, 0, sizeof(c3)); c3.g = &g;
+    CHECK(flow_execute(&c3) != 0, "a platform launch refusal FAILS the flow");
+    CHECK(strstr(c3.err, "scripted launch failure") != NULL, "with the real reason");
+    ht_fail_launch = 0;
+    return 0;
+}
+
 // The SHIPPED example flow, parsed and executed end to end against the scripted
 // model. This is the one that stops examples/visiongame.yml rotting: a wrong
 // port name, a renamed param or a broken edge would all still parse as valid
@@ -736,13 +822,17 @@ static int test_example_visiongame(void) {
     ht_cap_calls = ht_vis_calls = ht_keys_sent = 0;
     ht_keys_log[0] = 0;
     ht_fail_capture = 0;
+    ht_launch_calls = 0; ht_fail_launch = 0; ht_launch_before_capture = -1;
     static flow_graph_t g;
     char err[FLOW_ERR_MAX] = {0};
     if (flow_parse_file("examples/visiongame.yml", &g, err, sizeof(err)) != 0) {
         printf("  FAIL parse examples/visiongame.yml: %s\n", err); fails++; return 1;
     }
-    CHECK(g.nnodes == 6, "6 nodes (trigger, agent, capture, llm, input, file)");
-    CHECK(g.nedges == 5, "5 edges");
+    CHECK(g.nnodes == 7,
+          "7 nodes (trigger, LAUNCH, agent, capture, llm, input, file)");
+    CHECK(g.nedges == 6, "6 edges");
+    CHECK(find_node(&g, "gb") != NULL,
+          "the example LAUNCHES the emulator itself (it used to require it running)");
 
     const char *shot = "/tmp/flowrun_visiongame.jpg";
     const char *res  = "/tmp/flowrun_visiongame.txt";
@@ -766,6 +856,24 @@ static int test_example_visiongame(void) {
     CHECK(ht_cap_calls == ht_vis_calls, "one capture per vision call");
     CHECK(ht_keys_sent > 0, "keys were actually injected (the act step is wired)");
     CHECK(strstr(ht_cap_target, "GBEMU") != NULL, "the capture targets the emulator");
+    // The ORDER is the point of the launch node: a capture that ran first
+    // would be the exact bug this change fixes, and would still pass every
+    // other check in this test.
+    CHECK(ht_launch_calls == 1, "the emulator is launched ONCE, not once per iteration");
+    CHECK(ht_launch_before_capture == 1, "and BEFORE the first capture");
+    CHECK(strcmp(ht_launch_app, "gbemu") == 0, "by its manifest launch id");
+    // FLOW_VAL_MAX truncation: the decide prompt was 599 bytes and was being
+    // cut at 511. Assert the shipped values still FIT, so a future edit that
+    // pushes one over the ceiling fails here instead of on a VM.
+    {
+        flow_node_t *see = find_node(&g, "see");
+        const char *sp = see ? flow_param(see, "prompt") : 0;
+        const char *sy = see ? flow_param(see, "system") : 0;
+        CHECK(sp && (int)strlen(sp) < FLOW_VAL_MAX - 1,
+              "the decide prompt fits in FLOW_VAL_MAX (it used to be truncated)");
+        CHECK(sy && (int)strlen(sy) < FLOW_VAL_MAX - 1,
+              "so does the system prompt");
+    }
     // The verdict really lands in a file, which is what a headless reader checks.
     char buf[64] = {0};
     int fd = open(res, O_RDONLY);
@@ -794,6 +902,7 @@ int main(int argc, char **argv) {
     test_capture_badrect();
     test_vision_agent();
     test_vision_budget();
+    test_launch_node();
     test_example_visiongame();
     if (fails == 0) { printf("HOSTTEST-OK all checks passed\n"); return 0; }
     printf("HOSTTEST-FAIL %d check(s) failed\n", fails);

@@ -30,6 +30,7 @@
 #include "../../officelib/include/officeui.h"
 #include "../../officelib/officeui/officetk.h"
 #include "../../officelib/include/formats.h"
+#include "../../libc/contract.h"
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
@@ -53,36 +54,150 @@ enum { M_EDIT_UNDO = 20, M_EDIT_REDO, M_EDIT_CUT, M_EDIT_COPY, M_EDIT_PASTE,
        M_FMT_LAYOUT = 40, M_FMT_BOLD, M_FMT_ITAL,
        M_VIEW_THUMBS = 50, M_VIEW_PRESENT };
 
+// Forward declarations: TB_ITEMS/FILE_ITEMS/EDIT_ITEMS/INSERT_ITEMS/
+// FORMAT_ITEMS just below now carry these as their own .afn (task 3 phase 4,
+// otoolbar.h/gui_menu.h), so they must be declared before the tables; bodies
+// are defined later, unchanged from when they were reached only through
+// SLIDES_ITEMS[].
+static int run_file_new(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_file_open(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_file_save(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_file_save_as(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_file_close(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_new_slide_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_layout_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_duplicate_slide(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_delete_slide(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_insert_textbox(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_insert_image(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_toggle_bold(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_toggle_italic(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_present(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+
+static const ct_terms_t k_t_newdoc = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, 0, "doc.has_path", 0
+};
+static const ct_terms_t k_t_save_to = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_FS, CT_FAIL_IO | CT_FAIL_NOSPACE, "doc.path", 0
+};
+static const ct_terms_t k_t_open_path = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC,
+    CT_FAIL_NOTFOUND | CT_FAIL_IO | CT_FAIL_UNSUPPORTED, "doc.path", 0
+};
+static const ct_terms_t k_t_slide_edit = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_NOSPACE, "doc.slide_count", 0
+};
+static const ct_terms_t k_t_slide_nav = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, CT_FAIL_RANGE, "doc.current_slide", 0
+};
+static const ct_terms_t k_t_shape_edit = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_NEEDSLIVE, "shape.count", 0
+};
+static const ct_terms_t k_t_shape_select = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, CT_FAIL_RANGE | CT_FAIL_NEEDSLIVE, "shape.selected", 0
+};
+static const ct_terms_t k_t_fmt = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_NEEDSLIVE, "shape.bold", 0
+};
+// Dialog-opening actions: MODAL. Refused on the spawn path, allowed against a
+// live instance where a person can answer the dialog.
+static const ct_terms_t k_t_file_dialog = {
+    CT_TIME_SLOW, CT_TF_MODAL | CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_FS,
+    CT_FAIL_IO | CT_FAIL_NOTFOUND, "doc.path", 0
+};
+static const ct_terms_t k_t_file_close = {
+    CT_TIME_FAST, CT_TF_MODAL | CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, 0, "doc.has_path", 0
+};
+static const ct_terms_t k_t_modal_dialog = {
+    CT_TIME_SLOW, CT_TF_MODAL | CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_DOC,
+    CT_FAIL_IO | CT_FAIL_UNSUPPORTED, "doc.slide_count", 0
+};
+static const ct_terms_t k_t_insert_image = {
+    CT_TIME_SLOW, CT_TF_MODAL | CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_DOC,
+    CT_FAIL_IO | CT_FAIL_UNSUPPORTED, "shape.count", 0
+};
+// See the block comment above: no bound exists, refused on spawn, armed on
+// live (the call will usually time out while presentation mode runs on).
+static const ct_terms_t k_t_present = {
+    CT_TIME_UNBOUNDED, CT_TF_ASYNC, 0, CT_SUCC_ARMED, CT_DEPTH_VIEW, 0, "presenting", 0
+};
+
+// otb_item_t now carries the contract exposure too (task 3 phase 4): a
+// row's .tok/.afn/.desc/.terms are read by slides_project() below exactly as
+// .icon/.tooltip are read by otb_draw(), the SAME table handle_tool()
+// dispatches from via otb_ctl_dispatch(). T_PREV/T_NEXT stay tok==0/afn==0
+// (special-cased in handle_tool: they move RELATIVE to the current slide,
+// which is not what slide.goto's absolute-index afn does).
 static const otb_item_t TB_ITEMS[] = {
-    { OTB_BUTTON, T_NEW,     "OFNEW",    "New (Ctrl+N)",             0, 0 },
-    { OTB_BUTTON, T_OPEN,    "OFOPEN",   "Open (Ctrl+O)",            0, 0 },
-    { OTB_BUTTON, T_SAVE,    "OFSAVE",   "Save (Ctrl+S)",            0, 0 },
+    { OTB_BUTTON, T_NEW,     "OFNEW",    "New (Ctrl+N)",             0, 0,
+      .tok = "file.new", .afn = run_file_new,
+      .desc = "Discard the current presentation (after an unsaved-changes prompt if dirty) and start a new blank one",
+      .terms = &k_t_newdoc },
+    { OTB_BUTTON, T_OPEN,    "OFOPEN",   "Open (Ctrl+O)",            0, 0,
+      .tok = "file.open", .afn = run_file_open,
+      .desc = "Raise the interactive Open dialog (.pptx/.odp/.ppt) and load the chosen file",
+      .terms = &k_t_file_dialog },
+    { OTB_BUTTON, T_SAVE,    "OFSAVE",   "Save (Ctrl+S)",            0, 0,
+      .tok = "file.save", .afn = run_file_save,
+      .desc = "Save to the current path, or raise Save As when the presentation has none yet",
+      .terms = &k_t_file_dialog },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
-    { OTB_BUTTON, T_SLNEW,   "SLNEW",    "New Slide... (Ctrl+M)",    0, 0 },
-    { OTB_BUTTON, T_LAYOUT,  "SLLAYOUT", "Slide Layout...",          0, 0 },
+    { OTB_BUTTON, T_SLNEW,   "SLNEW",    "New Slide... (Ctrl+M)",    0, 0,
+      .tok = "slide.new_dialog", .afn = run_new_slide_dialog,
+      .desc = "Raise the Slide Layout picker and insert a new slide with the chosen layout after the active one",
+      .terms = &k_t_modal_dialog },
+    { OTB_BUTTON, T_LAYOUT,  "SLLAYOUT", "Slide Layout...",          0, 0,
+      .tok = "slide.layout_dialog", .afn = run_layout_dialog,
+      .desc = "Raise the Slide Layout picker and apply the chosen layout to the active slide",
+      .terms = &k_t_modal_dialog },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
-    { OTB_BUTTON, T_TEXTBOX, "OFTEXTBX", "Text Box",                 0, 0 },
-    { OTB_BUTTON, T_IMAGE,   "OFIMAGE",  "Insert Image...",          0, 0 },
+    { OTB_BUTTON, T_TEXTBOX, "OFTEXTBX", "Text Box",                 0, 0,
+      .tok = "insert.textbox", .afn = run_insert_textbox,
+      .desc = "Add a text box to the active slide (initial text \"Text box\") and select it",
+      .terms = &k_t_shape_edit },
+    { OTB_BUTTON, T_IMAGE,   "OFIMAGE",  "Insert Image...",          0, 0,
+      .tok = "insert.image", .afn = run_insert_image, .risk = CT_GUARDED, .cap = "fs.read",
+      .desc = "Raise the Insert Image file picker and embed the chosen PNG/JPEG/BMP, centred at 50% slide width",
+      .terms = &k_t_insert_image },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
-    { OTB_TOGGLE, T_BOLD,    "OFBOLD",   "Bold (Ctrl+B)",            0, 0 },
-    { OTB_TOGGLE, T_ITAL,    "OFITALIC", "Italic (Ctrl+I)",          0, 0 },
+    { OTB_TOGGLE, T_BOLD,    "OFBOLD",   "Bold (Ctrl+B)",            0, 0,
+      .tok = "format.toggle_bold", .afn = run_toggle_bold,
+      .desc = "Toggle bold across every run of the selected text shape (Ctrl+B)", .terms = &k_t_fmt },
+    { OTB_TOGGLE, T_ITAL,    "OFITALIC", "Italic (Ctrl+I)",          0, 0,
+      .tok = "format.toggle_italic", .afn = run_toggle_italic,
+      .desc = "Toggle italic across every run of the selected text shape (Ctrl+I)", .terms = &k_t_fmt },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
     { OTB_BUTTON, T_PREV,    "SLPREV",   "Previous Slide",           0, 0 },
     { OTB_BUTTON, T_NEXT,    "SLNEXT",   "Next Slide",               0, 0 },
-    { OTB_BUTTON, T_PLAY,    "SLPLAY",   "Start Presentation (F5)",  0, 0 },
+    { OTB_BUTTON, T_PLAY,    "SLPLAY",   "Start Presentation (F5)",  0, 0,
+      .tok = "view.present", .afn = run_present,
+      .desc = "Start full-screen presentation mode from the active slide (F5); blocks until a person exits it",
+      .terms = &k_t_present },
 };
 #define TB_N ((int)(sizeof(TB_ITEMS) / sizeof(TB_ITEMS[0])))
 
 // Menu tables are static (not const) so the View > Thumbnails check mark and
 // the Format > Bold/Italic enabled state can follow the live state.
+// New/Open/Save are tok == 0: TB_ITEMS owns file.new/open/save, and the
+// shell intercepts OAPP_MID_FILE_NEW/OPEN/SAVE/SAVE_AS/CLOSE before
+// handle_menu() runs anyway (same reasoning as writer/sheets' FILE_ITEMS).
 static gui_menu_item_t FILE_ITEMS[] = {
     { "New",        "Ctrl+N", OAPP_MID_FILE_NEW,     true, false },
     { "Open...",    "Ctrl+O", OAPP_MID_FILE_OPEN,    true, false },
     { "Save",       "Ctrl+S", OAPP_MID_FILE_SAVE,    true, false },
-    { "Save As...", 0,        OAPP_MID_FILE_SAVE_AS, true, false },
+    { "Save As...", 0,        OAPP_MID_FILE_SAVE_AS, true, false,
+      .tok = "file.save_as", .afn = run_file_save_as,
+      .desc = "Raise the Save As dialog regardless of whether the presentation already has a path",
+      .terms = &k_t_file_dialog },
     { 0, 0, 0, false, false },
-    { "Close",      0,        OAPP_MID_FILE_CLOSE,   true, false },
+    { "Close",      0,        OAPP_MID_FILE_CLOSE,   true, false,
+      .tok = "file.close", .afn = run_file_close,
+      .desc = "Close the presentation (after an unsaved-changes prompt if dirty) back to a new blank one",
+      .terms = &k_t_file_close },
 };
+// Undo/Redo/Cut/Copy/Paste stay enabled==false with no afn: handle_menu() has
+// no case for any of M_EDIT_UNDO/REDO/CUT/COPY/PASTE at all (unimplemented,
+// not merely unwired), so leaving them inert here is not a regression.
 static gui_menu_item_t EDIT_ITEMS[] = {
     { "Undo",  "Ctrl+Z", M_EDIT_UNDO,  false, false },
     { "Redo",  "Ctrl+Y", M_EDIT_REDO,  false, false },
@@ -91,24 +206,37 @@ static gui_menu_item_t EDIT_ITEMS[] = {
     { "Copy",  "Ctrl+C", M_EDIT_COPY,  false, false },
     { "Paste", "Ctrl+V", M_EDIT_PASTE, false, false },
     { 0, 0, 0, false, false },
-    { "Duplicate Slide", 0, M_EDIT_DUP_SLIDE, true, false },
-    { "Delete Slide",    0, M_EDIT_DEL_SLIDE, true, false },
+    { "Duplicate Slide", 0, M_EDIT_DUP_SLIDE, true, false,
+      .tok = "slide.duplicate", .afn = run_duplicate_slide,
+      .desc = "Duplicate the active slide (title and shapes) and select the copy", .terms = &k_t_slide_edit },
+    { "Delete Slide",    0, M_EDIT_DEL_SLIDE, true, false,
+      .tok = "slide.delete", .afn = run_delete_slide,
+      .desc = "Delete the active slide (a presentation always keeps at least one)", .terms = &k_t_slide_edit },
 };
+// tok == 0 throughout: TB_ITEMS owns slide.new_dialog/insert.textbox/
+// insert.image, but M_INS_* reach handle_menu() live, so each still needs
+// its own .afn.
 static gui_menu_item_t INSERT_ITEMS[] = {
-    { "New Slide...", "Ctrl+M", M_INS_NEW_SLIDE, true, false },
-    { "Text Box",     0,        M_INS_TEXTBOX,   true, false },
-    { "Image...",     0,        M_INS_IMAGE,     true, false },
+    { "New Slide...", "Ctrl+M", M_INS_NEW_SLIDE, true, false, .afn = run_new_slide_dialog, .terms = &k_t_modal_dialog },
+    { "Text Box",     0,        M_INS_TEXTBOX,   true, false, .afn = run_insert_textbox,   .terms = &k_t_shape_edit },
+    { "Image...",     0,        M_INS_IMAGE,     true, false, .afn = run_insert_image,     .terms = &k_t_insert_image },
 };
+// tok == 0 throughout: TB_ITEMS owns slide.layout_dialog/format.toggle_bold/
+// italic, but M_FMT_* reach handle_menu() live, same reasoning as above.
 static gui_menu_item_t FORMAT_ITEMS[] = {
-    { "Slide Layout...", 0,        M_FMT_LAYOUT, true,  false },
+    { "Slide Layout...", 0,        M_FMT_LAYOUT, true,  false, .afn = run_layout_dialog,  .terms = &k_t_modal_dialog },
     { 0, 0, 0, false, false },
-    { "Bold",            "Ctrl+B", M_FMT_BOLD,   false, false },
-    { "Italic",          "Ctrl+I", M_FMT_ITAL,   false, false },
+    { "Bold",            "Ctrl+B", M_FMT_BOLD,   false, false, .afn = run_toggle_bold,    .terms = &k_t_fmt },
+    { "Italic",          "Ctrl+I", M_FMT_ITAL,   false, false, .afn = run_toggle_italic,  .terms = &k_t_fmt },
 };
+// Thumbnails is a VALUE row (view.thumbnails, CT_RW), special-cased in
+// handle_menu() like writer's view.ruler. Start Presentation's afn is wired
+// for the same M_VIEW_PRESENT-reaches-handle_menu()-live reason as above;
+// tok stays 0 since TB_ITEMS' T_PLAY already owns view.present.
 static gui_menu_item_t VIEW_ITEMS[] = {
     { "Thumbnails",         0,    M_VIEW_THUMBS,  true, true },
     { 0, 0, 0, false, false },
-    { "Start Presentation", "F5", M_VIEW_PRESENT, true, false },
+    { "Start Presentation", "F5", M_VIEW_PRESENT, true, false, .afn = run_present, .terms = &k_t_present },
 };
 static const gui_menu_t MENUS[] = {
     { "File",   FILE_ITEMS,   6 },
@@ -820,8 +948,8 @@ static void laypick_draw(int win, int bx, int by, int bw, int bh, void *ctx) {
     (void)bh;
     lp->ox = bx + (bw - (2 * LT_W + LT_GUT)) / 2;
     lp->oy = by + 4;
-    uint32_t overlay = theme_color(THEME_COLOR_SURFACE_OVERLAY); if (!overlay) overlay = 0x00D4D4D4;
-    uint32_t paper = theme_color(THEME_COLOR_TEXTBOX_BG); if (!paper) paper = 0x00FFFFFF;
+    uint32_t overlay = theme_color(THEME_COLOR_SURFACE_OVERLAY);   // [filesui] see libc/theme.h
+    uint32_t paper = theme_color(THEME_COLOR_TEXTBOX_BG);
     uint32_t line = gui_ensure_contrast(theme_color(THEME_COLOR_BORDER_SUBTLE), paper, GUI_FLOOR_NONTEXT);
     uint32_t strong = gui_ensure_contrast(theme_color(THEME_COLOR_WINDOW_BORDER), overlay, GUI_FLOOR_NONTEXT);
     uint32_t acc = gui_ensure_contrast(theme_color(THEME_COLOR_ACCENT), overlay, GUI_FLOOR_NONTEXT);
@@ -961,14 +1089,14 @@ static int shape_rect(const shape *sh, int j, int *cursor_y, int *rx, int *ry, i
 
 // The slide sheet at g_slide_* (editor canvas or present mode).
 static void draw_slide_sheet(int win, int editing) {
-    uint32_t border = theme_color(THEME_COLOR_WINDOW_BORDER); if (!border) border = 0x00808080;
+    uint32_t border = theme_color(THEME_COLOR_WINDOW_BORDER);   // [filesui] zero test removed: 0 is BLACK, never unset (libc/theme.h).
     // The slide sheet itself stays white regardless of the active OS theme:
     // it represents printed/exported slide content, the same convention every
     // presentation editor uses (a dark app chrome around a white page).
     uint32_t canvas_bg = 0x00FFFFFF;
     uint32_t canvas_ink = 0x00202020;
     uint32_t hint = 0x00909090;
-    uint32_t accent = theme_color(THEME_COLOR_ACCENT); if (!accent) accent = 0x00336666;
+    uint32_t accent = theme_color(THEME_COLOR_ACCENT);   // [filesui] zero test removed: 0 is BLACK, never unset (libc/theme.h).
     accent = gui_ensure_contrast(accent, canvas_bg, GUI_FLOOR_NONTEXT);
 
     win_draw_rect(win, g_slide_x, g_slide_y, g_slide_w, g_slide_h, canvas_bg);
@@ -1064,9 +1192,9 @@ static void thumb_render(int win, int i, int x, int y, int w, int h, void *ctx) 
     (void)ctx;
     if (!g_pres || i < 0 || i >= g_pres->nslide) return;
     const slide *sl = &g_pres->slides[i];
-    uint32_t paper = theme_color(THEME_COLOR_TEXTBOX_BG); if (!paper) paper = 0x00FFFFFF;
+    uint32_t paper = theme_color(THEME_COLOR_TEXTBOX_BG);   // [filesui] see libc/theme.h
     uint32_t ink = gui_ensure_contrast(theme_color(THEME_COLOR_ON_SURFACE), paper, GUI_FLOOR_TEXT);
-    uint32_t bar = gui_ensure_contrast(theme_color(THEME_COLOR_MUTED) ? theme_color(THEME_COLOR_MUTED) : 0x00808080, paper, GUI_FLOOR_NONTEXT);
+    uint32_t bar = gui_ensure_contrast(theme_color(THEME_COLOR_MUTED), paper, GUI_FLOOR_NONTEXT);
     uint32_t imgfill = gui_mix(paper, bar, 96);
     int cap = theme_metric_or(THEME_METRIC_TYPE_CAPTION, 11);
     int nw = native_w(), nh = native_h();
@@ -1132,7 +1260,9 @@ static void thumb_render(int win, int i, int x, int y, int w, int h, void *ctx) 
 
 static void draw(office_app *a) {
     int win = oapp_win(a);
-    uint32_t bg = theme_color(THEME_COLOR_WINDOW_BG); if (!bg) bg = 0x00B4B4B4;
+    // [filesui] zero test removed: it overrode a legitimately black window_bg
+    // with light grey. See libc/theme.h.
+    uint32_t bg = theme_color(THEME_COLOR_WINDOW_BG);
     win_draw_rect(win, g_view_x, g_view_y, g_view_w, g_view_h, bg);
     if (g_show_thumbs) othumbs_draw(win, &g_thumbs, thumb_render, 0);
     draw_slide_sheet(win, 1);
@@ -1237,39 +1367,40 @@ static void handle_mouse_down(int mx, int my) {
     }
 }
 
+// Forward-declared: the contract's setter for view.thumbnails (defined with
+// the rest of the contract, below on_event()), reused here so the View menu
+// and the contract row cannot disagree.
+static int ct_set_show_thumbs(int v);
+
+// T_PREV/T_NEXT stay special-cased (see TB_ITEMS): they move RELATIVE to
+// g_cur_slide, which no afn here expresses (slide.goto's afn is absolute-
+// index-only, matching the ORIGINAL static table, which never had a
+// separate relative-move token either). Every other id is table-driven.
 static int handle_tool(int id) {
     switch (id) {
-        case T_NEW:     do_new(); break;
-        case T_OPEN:    do_open(); break;
-        case T_SAVE:    do_save(0); break;
-        case T_SLNEW:   modal_new_slide(); break;
-        case T_LAYOUT:  modal_slide_layout(); break;
-        case T_TEXTBOX: add_text_box(); break;
-        case T_IMAGE:   insert_image(); break;
-        case T_BOLD:    toggle_style(0); break;
-        case T_ITAL:    toggle_style(1); break;
-        case T_PREV:    goto_slide(g_cur_slide - 1); break;
-        case T_NEXT:    goto_slide(g_cur_slide + 1); break;
-        case T_PLAY:    present_run(); break;
+        case T_PREV: goto_slide(g_cur_slide - 1); return g_quit ? 0 : 1;
+        case T_NEXT: goto_slide(g_cur_slide + 1); return g_quit ? 0 : 1;
         default: break;
     }
+    char scratch[80];
+    otb_ctl_dispatch(TB_ITEMS, TB_N, id, -1, scratch, sizeof(scratch), 0);
     return g_quit ? 0 : 1;
 }
 
+// M_VIEW_THUMBS stays special-cased: it toggles the view.thumbnails VALUE
+// row, not a separate action token, same as writer's view.ruler. Every
+// other menu item is table-driven.
 static int handle_menu(int id) {
-    switch (id) {
-        case M_EDIT_DUP_SLIDE: duplicate_slide(); break;
-        case M_EDIT_DEL_SLIDE: delete_slide(); break;
-        case M_INS_NEW_SLIDE:  modal_new_slide(); break;
-        case M_INS_TEXTBOX:    add_text_box(); break;
-        case M_INS_IMAGE:      insert_image(); break;
-        case M_FMT_LAYOUT:     modal_slide_layout(); break;
-        case M_FMT_BOLD:       toggle_style(0); break;
-        case M_FMT_ITAL:       toggle_style(1); break;
-        case M_VIEW_THUMBS:    g_show_thumbs = !g_show_thumbs; relayout(); sync_chrome(); break;
-        case M_VIEW_PRESENT:   present_run(); break;
-        default: break;
+    if (id == M_VIEW_THUMBS) {
+        ct_set_show_thumbs(!g_show_thumbs);   // same setter view.thumbnails calls
+        return g_quit ? 0 : 1;
     }
+    char scratch[80];
+    if (menu_ctl_dispatch(FILE_ITEMS, (int)(sizeof(FILE_ITEMS)/sizeof(FILE_ITEMS[0])), id, scratch, sizeof(scratch), 0)) return g_quit ? 0 : 1;
+    if (menu_ctl_dispatch(EDIT_ITEMS, (int)(sizeof(EDIT_ITEMS)/sizeof(EDIT_ITEMS[0])), id, scratch, sizeof(scratch), 0)) return g_quit ? 0 : 1;
+    if (menu_ctl_dispatch(INSERT_ITEMS, (int)(sizeof(INSERT_ITEMS)/sizeof(INSERT_ITEMS[0])), id, scratch, sizeof(scratch), 0)) return g_quit ? 0 : 1;
+    if (menu_ctl_dispatch(FORMAT_ITEMS, (int)(sizeof(FORMAT_ITEMS)/sizeof(FORMAT_ITEMS[0])), id, scratch, sizeof(scratch), 0)) return g_quit ? 0 : 1;
+    if (menu_ctl_dispatch(VIEW_ITEMS, (int)(sizeof(VIEW_ITEMS)/sizeof(VIEW_ITEMS[0])), id, scratch, sizeof(scratch), 0)) return g_quit ? 0 : 1;
     return g_quit ? 0 : 1;
 }
 
@@ -1364,8 +1495,471 @@ static int on_event(office_app *a, int type, int p1, int p2) {
     }
 }
 
+// ===========================================================================
+// THE CONTRACT (docs/CONTRACT_COVERAGE_PLAN.md task 3 phase 4). See
+// writer/main.c's own contract block for the full argument; the summary:
+//
+// PROJECTED, not static, for every action with a toolbar or menu control:
+// otb_item_t/gui_menu_item_t now carry tok/afn/desc/terms, so TB_ITEMS[],
+// FILE_ITEMS[] and EDIT_ITEMS[] above are the SAME control tables
+// slides_project() (below) reads, the exact tables handle_tool()/
+// handle_menu() dispatch from via otb_ctl_dispatch()/menu_ctl_dispatch().
+// Fourteen rows moved from a hand-written SLIDES_ITEMS[] entry into this
+// projection (file.new/open/save/save_as/close, slide.new_dialog/
+// layout_dialog/duplicate/delete, insert.textbox/image,
+// format.toggle_bold/italic, view.present), each still calling the
+// IDENTICAL run_*() function it always did.
+//
+// FIVE ROWS REMAIN STATIC in SLIDES_ITEMS below: file.save_to, file.open_path,
+// slide.goto, shape.select have no toolbar/menu control at all (slide.goto's
+// absolute index has no UI equivalent to T_PREV/T_NEXT's relative move;
+// shape.select has none either), and shape.delete_selected is reached only
+// by the Delete KEY in handle_key(), never a table row. Each wraps the SAME
+// model function the interactive path uses (save_presentation,
+// load_presentation, direct g_sel_shape assignment with the same bounds
+// check canvas_hit_shape()'s caller applies), so a non-interactive caller
+// can author and navigate a deck without a mouse or a file dialog. Slides'
+// 13 value rows also stay static, same as every other contracted app.
+//
+// main() checks contract_is_invocation() right after oapp_create() (see
+// writer/main.c's note on why check 8 does not see this ordering, and why it
+// is still safe). Dialog-raising actions (file.open/save/save_as/close,
+// slide.new_dialog, slide.layout_dialog, insert.image) declare CT_TF_MODAL
+// and are refused on this spawn path, allowed against a live instance.
+//
+// view.present is CT_TIME_UNBOUNDED with no bound ANY caller can honestly be
+// given: present_run() holds the process in its own input loop until a
+// person exits presentation mode, which could be any length of time. It is
+// refused on the spawn path exactly like a MODAL action, and on a live call
+// contract_invoke_live()'s OWN bounded wait (CTLIVE_WAIT_MS) will usually
+// time out (CT_LIVE_TIMEOUT) while presentation mode keeps running - an
+// honest "armed, not observed finishing" outcome, which is why it declares
+// CT_SUCC_ARMED rather than claiming the call's return means anything about
+// when the audience stopped looking at slide one. NOT exercised by this
+// tranche's automated verification for exactly that reason: it would either
+// time the harness out or require a person to press Escape.
+//
+// NOT COVERED: mouse click-to-select-shape, drag-to-move/resize, and the
+// thumbnail strip's scroll/drag - gestures rather than discrete controls.
+// shape.select and slide.goto are the primitives that reach the same end
+// state without them.
+// ===========================================================================
+
+
+// ---- the handler wrappers: each calls the EXACT function the menu/toolbar
+// switch calls. ---------------------------------------------------------
+static int run_file_new(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    do_new();
+    snprintf(out, (size_t)ocap, "has_path=%d slide_count=%d", g_has_path, g_pres ? g_pres->nslide : 0);
+    return 0;
+}
+static int run_file_open(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    do_open();
+    snprintf(out, (size_t)ocap, "path=%s", g_has_path ? g_path : "(none)");
+    return 0;
+}
+static int run_file_save(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    int ok = do_save(0);
+    snprintf(out, (size_t)ocap, "path=%s", g_has_path ? g_path : "(none)");
+    return ok ? 0 : -1;
+}
+static int run_file_save_as(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    int ok = do_save(1);
+    snprintf(out, (size_t)ocap, "path=%s", g_has_path ? g_path : "(none)");
+    return ok ? 0 : -1;
+}
+static int run_file_close(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (confirm_discard("closing")) new_presentation();
+    snprintf(out, (size_t)ocap, "has_path=%d", g_has_path);
+    return 0;
+}
+static int run_file_save_to(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0] || !argv[0][0]) { snprintf(out, (size_t)ocap, "need-path"); return -1; }
+    int ok = save_presentation(argv[0]);
+    snprintf(out, (size_t)ocap, "path=%s", g_has_path ? g_path : "(none)");
+    return ok ? 0 : -1;
+}
+static int run_file_open_path(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0] || !argv[0][0]) { snprintf(out, (size_t)ocap, "need-path"); return -1; }
+    if (!confirm_discard("opening another file")) { snprintf(out, (size_t)ocap, "discard-declined"); return -1; }
+    load_presentation(argv[0]);
+    snprintf(out, (size_t)ocap, "path=%s has_path=%d", g_path, g_has_path);
+    return g_has_path ? 0 : -1;
+}
+static int run_new_slide_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    int before = g_pres ? g_pres->nslide : 0;
+    modal_new_slide();
+    snprintf(out, (size_t)ocap, "slide_count=%d current_slide=%d", g_pres ? g_pres->nslide : 0, g_cur_slide);
+    return (g_pres && g_pres->nslide > before) ? 0 : -1;
+}
+static int run_layout_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!cur_slide()) { snprintf(out, (size_t)ocap, "no-slide"); return -1; }
+    modal_slide_layout();
+    snprintf(out, (size_t)ocap, "layout=%d", slide_layout(g_cur_slide));
+    return 0;
+}
+static int run_duplicate_slide(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!cur_slide()) { snprintf(out, (size_t)ocap, "no-slide"); return -1; }
+    int before = g_pres->nslide;
+    duplicate_slide();
+    snprintf(out, (size_t)ocap, "slide_count=%d current_slide=%d", g_pres->nslide, g_cur_slide);
+    return g_pres->nslide > before ? 0 : -1;
+}
+static int run_delete_slide(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!g_pres) { snprintf(out, (size_t)ocap, "no-presentation"); return -1; }
+    delete_slide();
+    snprintf(out, (size_t)ocap, "slide_count=%d current_slide=%d", g_pres->nslide, g_cur_slide);
+    return 0;
+}
+static int run_goto_slide(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0] || !g_pres) { snprintf(out, (size_t)ocap, "need-index"); return -1; }
+    int idx = atoi(argv[0]);
+    if (idx < 0 || idx >= g_pres->nslide) { snprintf(out, (size_t)ocap, "out-of-range 0..%d", g_pres->nslide - 1); return -1; }
+    goto_slide(idx);
+    snprintf(out, (size_t)ocap, "current_slide=%d", g_cur_slide);
+    return 0;
+}
+static int run_insert_textbox(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    slide *sl = cur_slide();
+    if (!sl) { snprintf(out, (size_t)ocap, "no-slide"); return -1; }
+    int before = sl->nshape;
+    add_text_box();
+    sl = cur_slide();
+    snprintf(out, (size_t)ocap, "shape_count=%d selected=%d", sl ? sl->nshape : 0, g_sel_shape);
+    return (sl && sl->nshape > before) ? 0 : -1;
+}
+static int run_insert_image(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    slide *sl = cur_slide();
+    if (!sl) { snprintf(out, (size_t)ocap, "no-slide"); return -1; }
+    int before = sl->nshape;
+    insert_image();
+    sl = cur_slide();
+    snprintf(out, (size_t)ocap, "shape_count=%d selected=%d", sl ? sl->nshape : 0, g_sel_shape);
+    return (sl && sl->nshape > before) ? 0 : -1;
+}
+static int run_delete_selected_shape(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    slide *sl = cur_slide();
+    if (!sl || g_sel_shape < 0) { snprintf(out, (size_t)ocap, "no-selection"); return -1; }
+    delete_selected_shape();
+    sl = cur_slide();
+    snprintf(out, (size_t)ocap, "shape_count=%d", sl ? sl->nshape : 0);
+    return 0;
+}
+// A caller-named shape pick with no click: the SAME g_sel_shape assignment
+// canvas_hit_shape()'s caller applies, with the SAME bound check.
+static int run_select_shape(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    slide *sl = cur_slide();
+    if (!sl) { snprintf(out, (size_t)ocap, "no-slide"); return -1; }
+    if (argc < 1 || !argv[0]) { snprintf(out, (size_t)ocap, "need-index"); return -1; }
+    int idx = atoi(argv[0]);
+    if (idx < -1 || idx >= sl->nshape) { snprintf(out, (size_t)ocap, "out-of-range -1..%d", sl->nshape - 1); return -1; }
+    g_sel_shape = idx;
+    sync_chrome();
+    snprintf(out, (size_t)ocap, "selected=%d", g_sel_shape);
+    return 0;
+}
+static int run_toggle_bold(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!sel_shape()) { snprintf(out, (size_t)ocap, "no-text-shape-selected"); return -1; }
+    toggle_style(0);
+    const doc_runfmt *f = shape_first_fmt(sel_shape());
+    snprintf(out, (size_t)ocap, "bold=%d", f ? f->bold : 0);
+    return 0;
+}
+static int run_toggle_italic(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!sel_shape()) { snprintf(out, (size_t)ocap, "no-text-shape-selected"); return -1; }
+    toggle_style(1);
+    const doc_runfmt *f = shape_first_fmt(sel_shape());
+    snprintf(out, (size_t)ocap, "italic=%d", f ? f->italic : 0);
+    return 0;
+}
+static int run_present(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    present_run();   // blocks in its own input loop until the person exits
+    snprintf(out, (size_t)ocap, "presenting=%d", g_presenting);
+    return 0;
+}
+
+// CT_CHECK_ACTFN: a leading-`it`-parameter mismatch is a warning, not an
+// error (contract.h); these turn it into a build-stopping one.
+CT_CHECK_ACTFN(run_file_new);
+CT_CHECK_ACTFN(run_file_open);
+CT_CHECK_ACTFN(run_file_save);
+CT_CHECK_ACTFN(run_file_save_as);
+CT_CHECK_ACTFN(run_file_close);
+CT_CHECK_ACTFN(run_file_save_to);
+CT_CHECK_ACTFN(run_file_open_path);
+CT_CHECK_ACTFN(run_new_slide_dialog);
+CT_CHECK_ACTFN(run_layout_dialog);
+CT_CHECK_ACTFN(run_duplicate_slide);
+CT_CHECK_ACTFN(run_delete_slide);
+CT_CHECK_ACTFN(run_goto_slide);
+CT_CHECK_ACTFN(run_insert_textbox);
+CT_CHECK_ACTFN(run_insert_image);
+CT_CHECK_ACTFN(run_delete_selected_shape);
+CT_CHECK_ACTFN(run_select_shape);
+CT_CHECK_ACTFN(run_toggle_bold);
+CT_CHECK_ACTFN(run_toggle_italic);
+CT_CHECK_ACTFN(run_present);
+
+// ---- the readable state a caller checks a control against ------------------
+static int ct_get_has_path(void) { return g_has_path; }
+static int ct_get_readonly(void) { return g_readonly; }
+static int ct_get_dirty(void)    { return g_app ? oapp_is_dirty(g_app) : 0; }
+static int ct_get_slide_count(void)    { return g_pres ? g_pres->nslide : 0; }
+static int ct_get_current_slide(void)  { return g_cur_slide; }
+static int ct_get_current_layout(void) { return (g_pres && g_pres->nslide > 0) ? slide_layout(g_cur_slide) : 0; }
+static int ct_get_shape_selected(void) { return g_sel_shape; }
+static int ct_get_shape_count(void) { slide *sl = cur_slide(); return sl ? sl->nshape : 0; }
+static int ct_get_shape_bold(void)   { const doc_runfmt *f = shape_first_fmt(sel_shape()); return f ? f->bold : 0; }
+static int ct_get_shape_italic(void) { const doc_runfmt *f = shape_first_fmt(sel_shape()); return f ? f->italic : 0; }
+static int ct_get_presenting(void) { return g_presenting; }
+static int ct_str_path(char *o, int n) { snprintf(o, (size_t)n, "%s", g_has_path ? g_path : "(none)"); return 0; }
+static int ct_get_show_thumbs(void) { return g_show_thumbs; }
+static int ct_set_show_thumbs(int v) {
+    g_show_thumbs = v ? 1 : 0;
+    VIEW_ITEMS[0].checked = g_show_thumbs ? true : false;
+    relayout(); sync_chrome();
+    return 0;
+}
+
+static const ct_item_t SLIDES_ITEMS[] = {
+    // ---- value rows ---------------------------------------------------
+    {
+      .name = "doc.path",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_str_path,
+      .desc = "Absolute path of the open presentation, or (none) for an unsaved Untitled",
+    },
+    {
+      .name = "doc.has_path",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_has_path,
+      .desc = "Whether the open presentation has ever been saved to a path",
+    },
+    {
+      .name = "doc.readonly",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_readonly,
+      .desc = "Whether the open presentation was loaded read-only (legacy .ppt)",
+    },
+    {
+      .name = "doc.dirty",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_dirty,
+      .desc = "Whether the presentation has unsaved changes",
+    },
+    {
+      .name = "doc.slide_count",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 100000,
+      .getfn = ct_get_slide_count,
+      .desc = "Number of slides in the open presentation",
+    },
+    {
+      .name = "doc.current_slide",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 100000,
+      .getfn = ct_get_current_slide,
+      .desc = "Index of the active slide",
+    },
+    {
+      .name = "doc.current_layout",
+      .type = CT_ENUM,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 3,
+      .options = "Title Slide|Title and Content|Two Content|Blank",
+      .getfn = ct_get_current_layout,
+      .desc = "Layout of the active slide",
+    },
+    {
+      .name = "shape.selected",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .lo = -1,
+      .hi = 1000,
+      .getfn = ct_get_shape_selected,
+      .desc = "Index of the selected shape on the active slide, -1 for none",
+    },
+    {
+      .name = "shape.count",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1000,
+      .getfn = ct_get_shape_count,
+      .desc = "Number of shapes on the active slide",
+    },
+    {
+      .name = "shape.bold",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_shape_bold,
+      .desc = "Whether the selected text shape's first run is bold",
+    },
+    {
+      .name = "shape.italic",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_shape_italic,
+      .desc = "Whether the selected text shape's first run is italic",
+    },
+    {
+      .name = "view.thumbnails",
+      .type = CT_BOOL,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_show_thumbs,
+      .setfn = ct_set_show_thumbs,
+      .desc = "Whether the slide thumbnail strip is shown (View > Thumbnails)",
+    },
+    {
+      .name = "presenting",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_presenting,
+      .desc = "Whether presentation mode is currently running",
+    },
+
+    // ---- action rows: STATIC because there is no toolbar/menu control to --
+    // project them from (see the big comment above). Each still calls the
+    // exact function a UI control would call if one existed for it.
+    {
+      .name = "file.save_to",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_GUARDED,
+      .actfn = run_file_save_to,
+      .ctx = "fs.write",
+      .desc = "Save the presentation to an exact path with no dialog, the same pptx_save/odp_save Save uses",
+      .terms = &k_t_save_to,
+    },
+    {
+      .name = "file.open_path",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_GUARDED,
+      .actfn = run_file_open_path,
+      .ctx = "fs.read",
+      .desc = "Open an exact path with no dialog (after an unsaved-changes prompt if dirty), the same office_open_presentation() Open uses",
+      .terms = &k_t_open_path,
+    },
+    {
+      .name = "slide.goto",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_goto_slide,
+      .desc = "Move to the slide at argv[0] (an index)",
+      .terms = &k_t_slide_nav,
+    },
+    {
+      .name = "shape.delete_selected",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_delete_selected_shape,
+      .desc = "Delete the selected shape from the active slide (Delete key)",
+      .terms = &k_t_shape_edit,
+    },
+    {
+      .name = "shape.select",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_select_shape,
+      .desc = "Select the shape at argv[0] (an index, -1 to clear) on the active slide",
+      .terms = &k_t_shape_select,
+    },
+};
+#define SLIDES_N_ITEMS ((int)(sizeof(SLIDES_ITEMS) / sizeof(SLIDES_ITEMS[0])))
+
+// slides_project() chains the three control tables that carry a contract
+// token, toolbar first.
+static int slides_project(int idx, ct_item_t *out) {
+    if (idx < 0) return 0;
+    int n = otb_ctl_count(TB_ITEMS, TB_N);
+    if (idx < n) return otb_ctl_project(TB_ITEMS, TB_N, idx, out);
+    idx -= n;
+#define SL_MENU_N(arr) ((int)(sizeof(arr) / sizeof((arr)[0])))
+    n = menu_ctl_count(FILE_ITEMS, SL_MENU_N(FILE_ITEMS));
+    if (idx < n) return menu_ctl_project(FILE_ITEMS, SL_MENU_N(FILE_ITEMS), idx, out);
+    idx -= n;
+    n = menu_ctl_count(EDIT_ITEMS, SL_MENU_N(EDIT_ITEMS));
+    if (idx < n) return menu_ctl_project(EDIT_ITEMS, SL_MENU_N(EDIT_ITEMS), idx, out);
+#undef SL_MENU_N
+    return 0;
+}
+
+static const ct_contract_t SLIDES_CONTRACT = {
+    "slides", "Slides",
+    "Every File/Edit/Insert/Format/View toolbar and menu action with a "
+    "control is PROJECTED from TB_ITEMS[]/FILE_ITEMS[]/EDIT_ITEMS[] "
+    "(slides_project(), below), the SAME tables otb_draw()/"
+    "gui_menu_bar_draw() and handle_tool()/handle_menu() read and dispatch "
+    "from. Five rows stay STATIC in SLIDES_ITEMS below because there is no "
+    "table to project them from: file.save_to, file.open_path, slide.goto "
+    "and shape.select have no toolbar/menu control at all, and "
+    "shape.delete_selected is reached only by the Delete key. Dialog-opening "
+    "rows (file.open/save/save_as/close, slide.new_dialog, "
+    "slide.layout_dialog, insert.image) declare CT_TF_MODAL and are refused "
+    "on a fresh spawn; call them against a live instance. view.present is "
+    "CT_TIME_UNBOUNDED (see the block comment above run_present()): refused "
+    "on spawn, armed rather than awaited on live, and NOT exercised by this "
+    "tranche's automated verification. NOT covered: mouse "
+    "click-to-select-shape, drag-to-move/resize, and the thumbnail strip's "
+    "scroll/drag - gestures rather than discrete controls - shape.select "
+    "and slide.goto are the primitives that reach the same end state "
+    "without them.",
+    SLIDES_ITEMS, SLIDES_N_ITEMS,
+    slides_project,
+    0,   // no persisted config to load
+    0    // no persisted config to commit
+};
+
+
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
     g_app = oapp_create("SLIDES", 960, 620);
     if (!g_app) return 1;
     layout_reset_all();
@@ -1374,6 +1968,15 @@ int main(int argc, char **argv) {
     oapp_set_toolbar(g_app, &g_tb);
     othumbs_config(&g_thumbs, 0, 0, OTHUMB_STRIP_W, 100, 0, -1);
     new_presentation();
+
+    // ---- THE CONTRACT, ANSWERED BEFORE oapp_run() IS EVER ENTERED ----------
+    // See writer/main.c's own note: contract-lint check 8 does not see this
+    // ordering (it matches a literal win_create()/win_create_bg() token,
+    // which office_app's oapp_create() is not), but the real property holds:
+    // this returns before oapp_run()'s event loop is ever entered, so the
+    // process never paints and never blocks.
+    if (contract_is_invocation(argc, argv))
+        return contract_cli(argc, argv, &SLIDES_CONTRACT);
 #ifdef SLIDES_VERIFY_AUTOOPEN
     // THROWAWAY VERIFICATION BUILD ONLY (never in the shipped/landed source,
     // never defined by the normal Makefile target): headless QMP keyboard

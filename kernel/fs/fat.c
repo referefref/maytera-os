@@ -1,6 +1,8 @@
 // fat.c - FAT12/FAT16/FAT32 Filesystem Driver
 #include "fat.h"
-#include "ext2.h"   // #99 Phase C: ext2-as-root hook (g_root_ext2, ext2_read_whole)
+#include "volblind.h"   // [volaudit] #246 blind-ask detector
+#include "ext2.h"
+#include "fsenoent.h"   // #aicappersist: why an ext2 read missed   // #99 Phase C: ext2-as-root hook (g_root_ext2, ext2_read_whole)
 
 #include "../drivers/ata.h"
 #include "blockdev.h"   // #307: route sector I/O to ATA or USB MSC root
@@ -237,6 +239,51 @@ static void fat_unlock(void) {
 
 // Inner (unlocked) implementations; the public wrappers below take the FAT lock.
 static int      fat_open_inner(fat_fs_t *fs, const char *path, fat_file_t *file);
+
+// [noaccount] STAMP THE HANDLE WITH WHERE ITS FILE IS. One implementation for
+// all four open paths (mounted-image, ext2-backed, the root directory, and the
+// FAT directory walk), because four copies of "remember the path" is four
+// chances for one of them to remember the basename instead, which is the state
+// this replaces.
+//
+// REFUSES RATHER THAN TRUNCATES, and leaves the field EMPTY when it refuses.
+// What reads this decides where to file a user's data in the Recycle Bin, so a
+// prefix of the right path is worse than no path: no path fails closed and is
+// visibly a miss, a prefix silently restores somebody's document to the wrong
+// directory. A non-absolute path is refused for the same reason; this handle
+// is opened from absolute paths everywhere in the tree, and accepting a
+// relative one would mean storing something that is only meaningful relative
+// to a cwd the handle does not carry.
+static void fat_set_handle_path(fat_file_t *file, const char *path) {
+    if (!file) return;
+    file->path[0] = '\0';
+    if (!path || path[0] != '/') return;
+    size_t k = 0;
+    while (path[k] && k + 1 < sizeof(file->path)) { file->path[k] = path[k]; k++; }
+    if (path[k]) { file->path[0] = '\0'; return; }   // did not fit: NOT a prefix
+    file->path[k] = '\0';
+}
+
+// [usbescrow] #246: LET A CALLER THAT OPENED A HANDLE WITH A VOLUME-RELATIVE
+// PATH TELL THE HANDLE WHERE THE FILE ACTUALLY IS.
+//
+// fat_open() can only stamp the path it was given. The fd layer opens a file on
+// a hot-plugged removable volume with that VOLUME's relative path ("/UT.TXT")
+// against that volume's own fat_fs_t, so the handle came back carrying a path
+// that looks absolute and names a DIFFERENT file: the one at that name in the
+// ROOT directory. Both readers of this field decide where a user's data goes
+// (advlock_resolve_fd feeds ftruncate's pre-image hook, and the partial-write
+// hook files the pre-image in the Recycle Bin under it), so a volume-relative
+// path there is worse than an empty one: empty fails closed and is visibly a
+// miss, while "/UT.TXT" quietly protects, or restores, the wrong file.
+//
+// It calls the SAME fat_set_handle_path() fat_open() does, so the "a prefix is
+// never stored, a non-absolute path is refused" rule has exactly one
+// implementation and cannot drift.
+void fat_handle_set_abs_path(fat_file_t *file, const char *abspath) {
+    fat_set_handle_path(file, abspath);
+}
+
 static int      fat_read_inner(fat_file_t *file, void *buffer, uint32_t size);
 static int      fat_readdir_inner(fat_file_t *dir, fat_dir_entry_t *entry, char *name_out, size_t name_cap);
 static void     fat_list_dir_inner(fat_fs_t *fs, const char *path);
@@ -396,6 +443,12 @@ static char fat_img_path(const char *path, const char **rel) {
 // that is not present on ext2 may still be ESP-only, so a miss falls through.
 // ===========================================================================
 int fat_open(fat_fs_t *fs, const char *path, fat_file_t *file) {
+    // [volaudit] #246 blind-ask detector. First statement, before the
+    // ext2/image dispatch and before fat_lock(), so the report names the
+    // caller and not a lock holder. See fs/volblind.h; it is a pointer
+    // compare away from free when fs is not &g_fat_fs.
+    VOLBLIND_CHECK("fat_open", fs, path);
+
     // #196: a removable drive with a mounted image serves its files from the
     // image. This must precede the ext2 branch (the /WINDIR/DRIVE_E folder is
     // itself an ext2 directory, and it would otherwise shadow the disc).
@@ -426,11 +479,7 @@ int fat_open(fat_fs_t *fs, const char *path, fat_file_t *file) {
                 file->attr = isdir ? FAT_ATTR_DIRECTORY : FAT_ATTR_ARCHIVE;
                 file->position = 0;
                 file->open = 1;
-                { const char *b = rel, *q = rel;
-                  for (; *q; q++) if (*q == '/' || *q == '\\') b = q + 1;
-                  size_t k = 0;
-                  while (k + 1 < sizeof(file->name) && b[k]) { file->name[k] = b[k]; k++; }
-                  file->name[k] = 0; }
+                fat_set_handle_path(file, path);
                 return 0;
             }
             // Mounted, but the disc does not have this path: report a miss
@@ -480,13 +529,7 @@ int fat_open(fat_fs_t *fs, const char *path, fat_file_t *file) {
                     file->atime_date = d;
                 }
             }
-            {   // file->name is the basename, as fat_open_inner leaves it
-                const char *b = path, *q = path;
-                for (; *q; q++) if (*q == '/') b = q + 1;
-                size_t k = 0;
-                while (k + 1 < sizeof(file->name) && b[k] != 0) { file->name[k] = b[k]; k++; }
-                file->name[k] = 0;
-            }
+            fat_set_handle_path(file, path);
             return 0;
         }
         // not on ext2: fall through to the FAT ESP below
@@ -570,6 +613,12 @@ int fat_readdir_n(fat_file_t *dir, fat_dir_entry_t *entry, char *name_out, size_
     int r = fat_readdir_inner(dir, entry, name_out, name_cap); fat_unlock(); return r;
 }
 void fat_list_dir(fat_fs_t *fs, const char *path) {
+    // [volaudit] #246 blind-ask detector. First statement, before the
+    // ext2/image dispatch and before fat_lock(), so the report names the
+    // caller and not a lock holder. See fs/volblind.h; it is a pointer
+    // compare away from free when fs is not &g_fat_fs.
+    VOLBLIND_CHECK("fat_list_dir", fs, path);
+
     if (!fat_lock()) return;
     fat_list_dir_inner(fs, path); fat_unlock();
 }
@@ -633,6 +682,12 @@ static int img_ro_refuse(const char *path) {
 }
 
 int fat_create(fat_fs_t *fs, const char *path) {
+    // [volaudit] #246 blind-ask detector. First statement, before the
+    // ext2/image dispatch and before fat_lock(), so the report names the
+    // caller and not a lock holder. See fs/volblind.h; it is a pointer
+    // compare away from free when fs is not &g_fat_fs.
+    VOLBLIND_CHECK("fat_create", fs, path);
+
     if (img_ro_refuse(path)) return FAT_EROFS;   // #VOLAPI
     // Create an (empty) file on ext2 when it is root; ext2 has no standalone
     // create, so an empty write produces a zero-length file.
@@ -641,6 +696,12 @@ int fat_create(fat_fs_t *fs, const char *path) {
     int r = fat_create_inner(fs, path); fat_unlock(); return r;
 }
 int fat_mkdir(fat_fs_t *fs, const char *path) {
+    // [volaudit] #246 blind-ask detector. First statement, before the
+    // ext2/image dispatch and before fat_lock(), so the report names the
+    // caller and not a lock holder. See fs/volblind.h; it is a pointer
+    // compare away from free when fs is not &g_fat_fs.
+    VOLBLIND_CHECK("fat_mkdir", fs, path);
+
     if (img_ro_refuse(path)) return FAT_EROFS;   // #VOLAPI
     // task #578: preserve ext2_mkdir()'s distinct "-2 == already exists"
     // return instead of collapsing every non-zero result to a generic -1.
@@ -661,6 +722,12 @@ int fat_mkdir(fat_fs_t *fs, const char *path) {
     int r = fat_mkdir_inner(fs, path); fat_unlock(); return r;
 }
 int fat_delete(fat_fs_t *fs, const char *path) {
+    // [volaudit] #246 blind-ask detector. First statement, before the
+    // ext2/image dispatch and before fat_lock(), so the report names the
+    // caller and not a lock holder. See fs/volblind.h; it is a pointer
+    // compare away from free when fs is not &g_fat_fs.
+    VOLBLIND_CHECK("fat_delete", fs, path);
+
     if (img_ro_refuse(path)) return FAT_EROFS;   // #VOLAPI
     if (fat_path_on_ext2(fs, path)) {
         int er = ext2_unlink(fat_ext2_vol_path(path));
@@ -682,6 +749,13 @@ int fat_delete(fat_fs_t *fs, const char *path) {
     int r = fat_delete_inner(fs, path); fat_unlock(); return r;
 }
 int fat_rename(fat_fs_t *fs, const char *old_path, const char *new_path) {
+    // [volaudit] #246 blind-ask detector. First statement, before the
+    // ext2/image dispatch and before fat_lock(), so the report names the
+    // caller and not a lock holder. See fs/volblind.h; it is a pointer
+    // compare away from free when fs is not &g_fat_fs.
+    VOLBLIND_CHECK("fat_rename(old)", fs, old_path);
+    VOLBLIND_CHECK("fat_rename(new)", fs, new_path);
+
     if (img_ro_refuse(old_path) || img_ro_refuse(new_path)) return FAT_EROFS;   // #VOLAPI
     // #746: ext2 DOES have an in-place rename now (ext2_rename), and this used
     // to be fat_copy + fat_delete: it read and rewrote every byte, so a failure
@@ -809,6 +883,13 @@ int fat_write(fat_file_t *file, const void *buffer, uint32_t size) {
     int r = fat_write_inner(file, buffer, size); fat_unlock(); return r;
 }
 int fat_copy(fat_fs_t *fs, const char *src_path, const char *dst_path) {
+    // [volaudit] #246 blind-ask detector. First statement, before the
+    // ext2/image dispatch and before fat_lock(), so the report names the
+    // caller and not a lock holder. See fs/volblind.h; it is a pointer
+    // compare away from free when fs is not &g_fat_fs.
+    VOLBLIND_CHECK("fat_copy(src)", fs, src_path);
+    VOLBLIND_CHECK("fat_copy(dst)", fs, dst_path);
+
     // #316: fat_copy_inner uses raw FAT file handles (fat_open/read/write),
     // which cannot see files that live only on the ext2 root volume. When
     // either endpoint is on ext2, do a routed whole-file read+write so the
@@ -826,6 +907,13 @@ int fat_copy(fat_fs_t *fs, const char *src_path, const char *dst_path) {
     int r = fat_copy_inner(fs, src_path, dst_path); fat_unlock(); return r;
 }
 int fat_move(fat_fs_t *fs, const char *src_path, const char *dst_path) {
+    // [volaudit] #246 blind-ask detector. First statement, before the
+    // ext2/image dispatch and before fat_lock(), so the report names the
+    // caller and not a lock holder. See fs/volblind.h; it is a pointer
+    // compare away from free when fs is not &g_fat_fs.
+    VOLBLIND_CHECK("fat_move(src)", fs, src_path);
+    VOLBLIND_CHECK("fat_move(dst)", fs, dst_path);
+
     // #725: fat_move had NO ext2 redirect while its sibling fat_rename did, so
     // Files' cut+paste of an ext2-root file moved nothing (fat_move_inner only
     // ever saw the FAT ESP). ext2 has no in-place rename, so do the same
@@ -846,6 +934,12 @@ int fat_move(fat_fs_t *fs, const char *src_path, const char *dst_path) {
     int r = fat_move_inner(fs, src_path, dst_path); fat_unlock(); return r;
 }
 int fat_write_file(fat_fs_t *fs, const char *path, const void *data, uint32_t size) {
+    // [volaudit] #246 blind-ask detector. First statement, before the
+    // ext2/image dispatch and before fat_lock(), so the report names the
+    // caller and not a lock holder. See fs/volblind.h; it is a pointer
+    // compare away from free when fs is not &g_fat_fs.
+    VOLBLIND_CHECK("fat_write_file", fs, path);
+
     if (img_ro_refuse(path)) return FAT_EROFS;   // #VOLAPI
     // (#133) Complete the ext2-root cutover: "/" writes must land on the ext2
     // root, matching fat_read_file (which already serves "/" from ext2). Without
@@ -857,6 +951,12 @@ int fat_write_file(fat_fs_t *fs, const char *path, const void *data, uint32_t si
     int r = fat_write_file_inner(fs, path, data, size); fat_unlock(); return r;
 }
 int fat_exists(fat_fs_t *fs, const char *path) {
+    // [volaudit] #246 blind-ask detector. First statement, before the
+    // ext2/image dispatch and before fat_lock(), so the report names the
+    // caller and not a lock holder. See fs/volblind.h; it is a pointer
+    // compare away from free when fs is not &g_fat_fs.
+    VOLBLIND_CHECK("fat_exists", fs, path);
+
     // #99 Phase C / #568: mirror fat_read_file's ext2-root dispatch. With ext2
     // as the root fs, an existence test on a normal "/" path must consult the
     // ext2 volume FIRST; fat_exists_inner (below) only sees the FAT ESP, so it
@@ -1994,7 +2094,7 @@ static int fat_open_inner(fat_fs_t *fs, const char *path, fat_file_t *file) {
             file->first_cluster = 0;
             file->current_cluster = 0;
         }
-        strcpy(file->name, "/");
+        fat_set_handle_path(file, path);
         return 0;
     }
 
@@ -2057,7 +2157,9 @@ static int fat_open_inner(fat_fs_t *fs, const char *path, fat_file_t *file) {
     file->atime_date = entry.access_date;
     file->ctime_date = entry.create_date;
     file->ctime_time = entry.create_time;
-    fat_name_to_str(entry.name, file->name);
+    // [noaccount] the ABSOLUTE path, not fat_name_to_str(entry.name, ...),
+    // which produced the basename of the LAST component walked above.
+    fat_set_handle_path(file, path);
 
     return 0;
 }
@@ -2144,10 +2246,15 @@ static int fat_read_inner(fat_file_t *file, void *buffer, uint32_t size) {
         size = file->file_size - file->position;
     }
 
+    // #e2rdio: set when a cluster read FAILED, as opposed to the loop ending
+    // because the file ran out. Without this the two are indistinguishable at
+    // the bottom of the function, which is the whole defect.
+    int io_failed = 0;
     while (bytes_read < size && file->current_cluster != 0) {
         // Read current cluster
         if (fat_read_cluster(fs, file->current_cluster, cluster_buf) <= 0) {
             kprintf("[FAT] Read failed at cluster %u\n", file->current_cluster);
+            io_failed = 1;
             break;
         }
 
@@ -2182,6 +2289,36 @@ static int fat_read_inner(fat_file_t *file, void *buffer, uint32_t size) {
     }
 
     kfree(cluster_buf);
+    // =====================================================================
+    // #e2rdio, THE SAME DEFECT IN THE SIBLING FILESYSTEM.
+    //
+    // This used to `return bytes_read;` unconditionally, and bytes_read is 0
+    // when the FIRST cluster read failed. So a device failure on the FAT ESP
+    // became read() == 0, which is EOF, which userland reads as "the file is
+    // truncated" - byte for byte the same laundering the ext2 branch of
+    // proc/fdlayer.c did.
+    //
+    // It is fixed at the same time deliberately. blame.md records mm/heap.c's
+    // private spinlock being fixed while mm/pmm.c, in the same directory, kept
+    // the identical defect for months. A second instance of a defect you are
+    // already holding in your hand is not a separate ticket.
+    //
+    // A PARTIAL read still returns its bytes, as read(2) requires. Only a
+    // failure that produced NOTHING becomes an error, so no caller that
+    // distinguishes short-from-failed changes behaviour. Every caller of
+    // fat_read() was audited: fat_read_file (!= size -> NULL), fs/xattr.c
+    // (< header -> XATTR_EIO), gui/ttf.c, dos/imgfile.c, dos/int21svc.c
+    // (r <= 0 -> break), fs/netfs.c, fs/fat_vfs.c, fs/fat_readahead.c and
+    // fat.c's own copy loop (> 0) all already treat a negative correctly, and
+    // fat_read() already returned -1 for other reasons, so negatives are not
+    // new to any of them.
+    //
+    // HONEST GAP: FAT does NOT feed the [E2RDIO] ledger and gets no device-read
+    // retry. Both live at ext2's device seam (e2_dev_read); FAT's equivalent is
+    // fat_read_cluster(), and instrumenting it is a separate change. What is
+    // fixed here is the half that loses information.
+    // =====================================================================
+    if (io_failed && bytes_read == 0) return -5;   // -EIO, never "end of file"
     return bytes_read;
 }
 
@@ -2553,6 +2690,12 @@ static void fat_list_dir_inner(fat_fs_t *fs, const char *path) {
 
 // Read entire file
 void *fat_read_file(fat_fs_t *fs, const char *path, uint32_t *size_out) {
+    // [volaudit] #246 blind-ask detector. First statement, before the
+    // ext2/image dispatch and before fat_lock(), so the report names the
+    // caller and not a lock holder. See fs/volblind.h; it is a pointer
+    // compare away from free when fs is not &g_fat_fs.
+    VOLBLIND_CHECK("fat_read_file", fs, path);
+
     extern fat_fs_t g_fat_fs;
     // task #317: network-filesystem routing. Paths under "/SMB/<server>/<share>"
     // are served by the SMB2 client (net/smb.c), mirroring the ext2 "/ext2"
@@ -2601,6 +2744,14 @@ void *fat_read_file(fat_fs_t *fs, const char *path, uint32_t *size_out) {
     FAT_TRACE("[FAT] fat_read_file: opening %s\n", path);
     if (fat_open(fs, path, &file) != 0) {
         kprintf("[FAT] fat_read_file: open failed: %s\n", path);
+        // #aicappersist: this line has meant two different things for a long
+        // time: "the optional config is not configured" (correct, and routine)
+        // and "a file that IS on the ext2 root would not read". Both printed the
+        // same words, and the second is a real fault. Ask which, once per
+        // verdict per boot. Only for ext2-routed paths; an ESP miss is a FAT
+        // question and this instrument cannot answer it.
+        if (!path_img_shadows(path) && fat_path_on_ext2(fs, path))
+            fsenoent_report(FSE_SITE_READWHOLE, fat_ext2_vol_path(path), 0);
         return NULL;
     }
     FAT_TRACE("[FAT] fat_read_file: opened, is_dir=%d\n", file.is_dir);
@@ -3218,6 +3369,12 @@ static int fat_set_readonly_inner(fat_fs_t *fs, const char *path, int readonly) 
     return 0;
 }
 int fat_set_readonly(const char *path, int readonly) {
+    // [volaudit] #246 blind-ask detector. First statement, before the
+    // ext2/image dispatch and before fat_lock(), so the report names the
+    // caller and not a lock holder. See fs/volblind.h; it is a pointer
+    // compare away from free when fs is not &g_fat_fs.
+    { extern fat_fs_t g_fat_fs; VOLBLIND_CHECK("fat_set_readonly", &g_fat_fs, path); }
+
     // #725: the comment above says ext2 paths "never call" these. There are
     // currently ZERO callers of either function, so that sentence has never
     // been tested; make it true by construction instead. An ext2 inode has no
@@ -3244,6 +3401,12 @@ static int fat_get_attr_info_inner(fat_fs_t *fs, const char *path,
     return 0;
 }
 int fat_get_attr_info(const char *path, uint8_t *attr_out, int *is_dir_out) {
+    // [volaudit] #246 blind-ask detector. First statement, before the
+    // ext2/image dispatch and before fat_lock(), so the report names the
+    // caller and not a lock holder. See fs/volblind.h; it is a pointer
+    // compare away from free when fs is not &g_fat_fs.
+    { extern fat_fs_t g_fat_fs; VOLBLIND_CHECK("fat_get_attr_info", &g_fat_fs, path); }
+
     extern fat_fs_t g_fat_fs;
     if (!g_fat_fs.mounted) return -1;
     // #725: fat_get_attr_info_inner() calls fat_open_inner(), which is the
@@ -3306,6 +3469,12 @@ static int fat_persist_dirent(fat_file_t *file) {
 // and silently succeeding on them is how a caller ends up believing a timestamp
 // was set when nothing was written (#725 in miniature).
 int fat_set_times(fat_fs_t *fs, const char *path, int64_t atime, int64_t mtime) {
+    // [volaudit] #246 blind-ask detector. First statement, before the
+    // ext2/image dispatch and before fat_lock(), so the report names the
+    // caller and not a lock holder. See fs/volblind.h; it is a pointer
+    // compare away from free when fs is not &g_fat_fs.
+    VOLBLIND_CHECK("fat_set_times", fs, path);
+
     if (!fs || !fs->mounted || !path) return -1;
     fat_file_t f;
     if (fat_open(fs, path, &f) != 0) return -1;

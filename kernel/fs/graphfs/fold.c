@@ -287,6 +287,22 @@ int gfs_grant_issue(uint32_t actor, uint32_t holder, uint32_t target,
                        GFSJ_EFFECT_REVERSIBLE, pl, n, out_edge);
 }
 
+int gfs_relate(uint32_t from, uint32_t to, uint16_t rel) {
+    // A GRANT is authority and has exactly one issuer (gfs_grant_issue, under
+    // GFS_NODE_ESCROW). Refusing it HERE means this entry point cannot be used
+    // to mint a contract even by a caller that passes the right constant.
+    if (rel == GFS_REL_GRANT) return GFSF_E_ARG;
+    unsigned char pl[GFSJ_INLINE_MAX];
+    unsigned long n = gfsf_enc_edge_add(pl, sizeof(pl), from, to,
+                                        GFS_EXPIRY_NEVER, rel, GFS_SCOPE_ANY);
+    if (!n) return GFSF_E_ARG;
+    // The actor IS the `from` identity: an AI task records its own actions, and
+    // the record is bound to it by the journal header's actor_id as well as by
+    // the edge payload, so the two cannot disagree.
+    return fold_mutate(GFSJ_ACTOR_NODE, from, GFSJ_OP_EDGE_ADD,
+                       GFSJ_EFFECT_NA, pl, n, 0);
+}
+
 int gfs_grant_revoke(uint32_t actor, uint64_t edge_seq, uint16_t reason) {
     unsigned char pl[GFSJ_INLINE_MAX];
     unsigned long n = gfsf_enc_edge_revoke(pl, sizeof(pl), edge_seq, reason);

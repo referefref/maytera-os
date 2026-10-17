@@ -9,6 +9,7 @@
 
 #include "term_common.h"
 #include "term_emu.h"   // term_cell_t, term_sgr_t, the parser, wcwidth
+#include "term_menu.h"  // TERM_MENU_BAR_H: chrome the initial window must pay for
 
 
 // Terminal cell metrics, derived from the SELECTED font at runtime (#241).
@@ -34,8 +35,37 @@ extern int term_char_h;
 // LOADED font's metrics (term_prefs_load() runs before win_create()), so a
 // non-default font size is honoured from the very first frame, not just
 // after the first resize.
-#define TERM_WIDTH      (TERM_INIT_COLS * TERM_CHAR_W + 4)   // +4 for padding
-#define TERM_HEIGHT     (TERM_INIT_ROWS * TERM_CHAR_H + 24)  // +24 for title bar adjustment
+//
+// TWO SEPARATE ALLOWANCES, AND CONFLATING THEM COST US 78x22 (#745, angband).
+// TERM_INIT_COLS/TERM_INIT_ROWS is a PROMISE about the GRID, and 80x24 is the
+// floor essentially every curses program assumes: Angband refuses to start
+// below it outright ("Angband needs at least an 80x24 'curses' screen",
+// src/main-gcu.c MIN_TERM0_COLS/MIN_TERM0_LINES), and it is not alone. What
+// the window actually delivered was 78x22, because two later features each
+// took their share out of the grid without growing the window:
+//   - the SCROLLBAR GUTTER (#206): term_handle_resize() subtracts
+//     GUI_SCROLL_W from the content width before dividing by TERM_CHAR_W, so
+//     640px of content is 78 columns, not 80.
+//   - the MENU BAR (#307): term_content_y is TERM_MENU_BAR_H, and
+//     tl_relayout() starts every pane below it, so 384px of content is 22
+//     rows, not 24.
+// So the reserve is named and added HERE, in the one place the initial window
+// size is computed, which is what makes TERM_INIT_COLS x TERM_INIT_ROWS a
+// statement about the grid the user gets rather than about a rectangle the
+// chrome then eats. A feature that takes pixels off the grid must add its
+// reserve to this list, or it silently shrinks the promised grid again.
+#define TERM_GRID_RESERVE_W  GUI_SCROLL_W       // #206 scrollbar gutter
+#define TERM_GRID_RESERVE_H  TERM_MENU_BAR_H    // #307 menu bar
+// The WINDOW CONTENT AREA needed for an exactly TERM_INIT_COLS x TERM_INIT_ROWS
+// grid, chrome included.
+#define TERM_CONTENT_W  (TERM_INIT_COLS * TERM_CHAR_W + TERM_GRID_RESERVE_W)
+#define TERM_CONTENT_H  (TERM_INIT_ROWS * TERM_CHAR_H + TERM_GRID_RESERVE_H)
+// SYS_WIN_CREATE takes the OUTER size, so the compositor frame is added on top:
+// kernel/gui/window.c's client rect is bounds minus 2*BORDER_WIDTH wide and
+// minus TITLEBAR_HEIGHT + 2*BORDER_WIDTH tall, i.e. the shipped 2/20 metrics'
+// +4 and +24. These are the FRAME, not grid chrome; keep them distinct.
+#define TERM_WIDTH      (TERM_CONTENT_W + 4)    // +4: 2*BORDER_WIDTH
+#define TERM_HEIGHT     (TERM_CONTENT_H + 24)   // +24: TITLEBAR_HEIGHT + 2*BORDER_WIDTH
 
 // term_cell_t is defined in term_emu.h: a Unicode codepoint, tagged 32-bit
 // fg/bg (default / 256-index / 24-bit RGB) and an attribute bitset. The old

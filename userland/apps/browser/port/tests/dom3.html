@@ -1,0 +1,8 @@
+<html><body id="b"><script>
+try { null.x; } catch (e) { console.log('caught=' + (e instanceof TypeError)); }
+console.log('date_obj_year_plausible=' + (new Date().getFullYear() > 2000));
+console.log('typeofwindow=' + typeof window + ' windowIsGlobal=' + (window === this));
+document.write('written-');
+console.log('json=' + JSON.parse('{"z":9}').z);
+var o = {}; o[Date.now() > 0 ? 'k' : 'j'] = 1; console.log('key=' + ('k' in o));
+</script></body></html>

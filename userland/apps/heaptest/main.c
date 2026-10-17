@@ -26,6 +26,15 @@
 // The allocator's own report counter. Not in stdlib.h on purpose: this is
 // test-only introspection, see the comment at its definition in stdlib.c.
 extern unsigned __malloc_walk_report_count(void);
+// #245 domscript: the guards report through TWO channels. A corruption caught
+// by a value guard (range, size sanity, "this block is not in its own bin")
+// never touches the walk-overrun counter, and after the size-binned free list
+// landed, some shapes are ALWAYS caught that way. Counting only one channel
+// would score a loudly reported corruption as a silent continue.
+extern unsigned __malloc_diag_report_count(void);
+static unsigned reports(void) {
+    return __malloc_walk_report_count() + __malloc_diag_report_count();
+}
 
 // Mirror of stdlib.c's private block header. BLK_HDR is the PADDED header
 // size the allocator actually uses for pointer arithmetic (32, not
@@ -37,8 +46,22 @@ typedef struct block_header {
     unsigned long size;
     int free;
     struct block_header *next;
+    struct block_header *prev;     // #245 domscript
 } block_header_t;
 #define HDR(p) ((block_header_t *)((char *)(p) - BLK_HDR))
+
+// #245 domscript: the free-list links live in the FREE block's payload, so a
+// bin-list cycle is poked through the returned pointer itself. Mirror of
+// stdlib.c's free_link_t / FLINK().
+typedef struct free_link {
+    block_header_t *fnext;
+    block_header_t *fprev;
+} free_link_t;
+#define FL(p) ((free_link_t *)(p))
+
+// Big enough to land in the catch-all bin (stdlib.c: HEAP_BIN_MAX_EXACT 1024),
+// the only bin find_free_block() has to SEARCH and so the only one with a walk.
+#define BIG_DATA 4096
 
 static int g_pass = 0, g_fail = 0;
 
@@ -57,6 +80,30 @@ static void wnum(unsigned long v) {
     ws(&b[i]);
 }
 
+// #245 domscript: DRAIN DAMAGE BETWEEN SCENARIOS, AND PROVE THE HEAP WENT QUIET.
+//
+// Each scenario asserts "the report count went up", so a scenario that inherits
+// a still-noisy heap from the previous one can be credited with a report it did
+// not cause, which is a test that can pass for the wrong reason. The allocator
+// reports a damaged free bin ONCE and then drops it, so one pass of ordinary
+// traffic is enough to flush it; a second pass must then be silent. settle()
+// does both and returns whether the heap really did go quiet, and every
+// scenario asserts that before it takes its baseline.
+static void traffic(void) {
+    void *v[8];
+    for (int i = 0; i < 8; i++) v[i] = malloc(64 + (unsigned)i * 192);
+    for (int i = 0; i < 8; i++) free(v[i]);
+    void *b = malloc(8192);
+    if (b) free(b);
+}
+
+static int settle(void) {
+    traffic();
+    unsigned q = reports();
+    traffic();
+    return reports() == q;
+}
+
 static void ck(const char *what, int cond) {
     if (cond) { g_pass++; ws("  PASS "); } else { g_fail++; ws("  FAIL "); }
     ws(what);
@@ -73,7 +120,7 @@ int main(int argc, char **argv) {
     // guard that simply fires all the time, which would be worse than no
     // guard at all.
     {
-        unsigned base = __malloc_walk_report_count();
+        unsigned base = reports();
         void *v[128];
         for (int i = 0; i < 128; i++) v[i] = malloc(48 + (unsigned)i * 8);
         for (int i = 0; i < 128; i += 2) free(v[i]);
@@ -81,75 +128,125 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 128; i++) v[i] = realloc(v[i], 200 + (unsigned)i);
         for (int i = 0; i < 128; i++) free(v[i]);
         ws("  (control did ~500 malloc/realloc/free with a clean list)\n");
-        ck("control: clean heap produces ZERO walk-overrun reports",
-           __malloc_walk_report_count() == base);
+        ck("control: clean heap produces ZERO corruption reports",
+           reports() == base);
     }
 
-    // ---- 1. coalesce_all() OUTER walk: an allocated block whose ->next
-    // points at itself. Reached from free() -> coalesce_all(); the outer loop
-    // does b = b->next forever.
+    // ---- 1. free()'s FORWARD MERGE: a block whose ->next points at itself.
+    // #245 domscript: this used to reach coalesce_all()'s outer walk, which no
+    // longer exists (backward coalescing is now O(1) through ->prev). The same
+    // one-word corruption is now met by the merge loop in free(), which absorbs
+    // the self-referential successor, doubles the block's size doing so, and is
+    // stopped by block_size_sane() once the block would run past heap_end.
+    // Being bounded by a VALUE guard rather than by the step budget is why the
+    // report arrives on the diag channel.
     {
+        ck("heap is quiet before scenario 1", settle());
         void *a = malloc(96), *b = malloc(96), *c = malloc(96);
         block_header_t *ha = HDR(a);
+        unsigned long sa = ha->size;
         block_header_t *sv = ha->next;
-        unsigned before = __malloc_walk_report_count();
+        unsigned before = reports();
         ha->next = ha;                       // self-cycle
-        free(b);                             // -> coalesce_all()
-        unsigned after = __malloc_walk_report_count();
+        free(a);                             // -> free()'s forward merge
+        unsigned after = reports();
         ha->next = sv;                       // repair before continuing
-        ck("coalesce_all outer walk: self-cycle reported, free() returned",
+        ha->size = sa;                       // the runaway merge inflated it
+        ha->free = 0;
+        ck("free() forward merge: self-cycle reported, free() returned",
            after > before);
-        free(a); free(c);
+        free(b); free(c);
     }
 
-    // ---- 2. coalesce_all() INNER merge loop: the exact shape from the
-    // report - b->next == X and X->next == X, with X free. b absorbs X, sets
-    // b->next = X->next == X, and absorbs it again, forever. Every existing
-    // check passes on every iteration: X stays in range, stays free, and its
-    // size never changes, so block_size_sane(X) is true for ever. p1 and p2
-    // are separated by an allocated `gap` so free() does not legitimately
-    // merge them before the corruption is planted.
+    // ---- 2. find_free_block()'s BIN WALK: a cycle in the free list itself.
+    // #245 domscript: find_free_block() no longer walks the all-blocks list, so
+    // the corruption has to go where the walk now looks, which is the free
+    // block's own payload. A block sitting in the catch-all bin that is too
+    // small for the request is the only case that steps at all, and the walk's
+    // step budget comes from that bin's recorded length, so a loop of one is
+    // caught in a handful of steps however large the heap is.
     {
-        void *p1 = malloc(96), *gap = malloc(96), *p2 = malloc(96), *tail = malloc(96);
-        block_header_t *h1 = HDR(p1), *h2 = HDR(p2);
-        free(p1);
-        free(p2);
-        unsigned long s1 = h1->size, s2 = h2->size;
-        block_header_t *sv1 = h1->next, *sv2 = h2->next;
-        unsigned before = __malloc_walk_report_count();
-        h1->next = h2;                       // b   -> X
-        h2->next = h2;                       // X   -> X
-        free(tail);                          // -> coalesce_all() merge loop
-        unsigned after = __malloc_walk_report_count();
-        h1->next = sv1; h2->next = sv2;      // repair pointers AND the sizes
-        h1->size = s1;  h2->size = s2;       // the runaway merge inflated
-        ck("coalesce_all merge loop: b->next->next==b->next reported, free() returned",
+        ck("heap is quiet before scenario 2", settle());
+        // MEASURED IN THE OS (the first version of this scenario FAILED here):
+        // free() coalesces in BOTH directions now, so on a busy heap the block
+        // being freed can be absorbed into a free neighbour, at which point
+        // HDR(big) is no longer a bin node and poking its payload corrupts
+        // nothing. The fixture then proves nothing while looking like a
+        // regression. The two allocated spacers make the merge impossible, so
+        // `big` is guaranteed to enter a bin as itself, and as the most recently
+        // freed block of its class it is guaranteed to be that bin's head.
+        void *lo = malloc(96);
+        void *big = malloc(BIG_DATA);
+        void *hi = malloc(96);
+        void *keep = lo;                     // freed with the rest below
+        free(big);                           // -> catch-all bin, intact
+        FL(big)->fnext = HDR(big);           // bin link points at its own block
+        unsigned before = reports();
+        void *huge = malloc(BIG_DATA * 8);   // too big for `big`: must step
+        unsigned after = reports();
+        FL(big)->fnext = 0;                  // repair the bin immediately: the
+                                             // budget BREAKS out of the scan
+                                             // rather than dropping the bin, so
+                                             // without this the cycle would
+                                             // still be there for scenario 3
+        ck("find_free_block bin walk: bin cycle reported, malloc() returned",
            after > before);
-        free(gap);
+        ck("malloc() still returned usable memory on a cyclic bin", huge != 0);
+        if (huge) {
+            for (int i = 0; i < BIG_DATA * 8; i++) ((char *)huge)[i] = (char)i;
+            ck("the memory malloc() returned on a cyclic bin is writable",
+               ((char *)huge)[BIG_DATA * 8 - 1] == (char)(BIG_DATA * 8 - 1));
+            free(huge);
+        }
+        free(keep);
+        free(hi);
     }
 
-    // ---- 3. find_free_block() AND request_space()'s tail walk. One cycle
-    // exercises both: malloc() calls find_free_block() first (its guard fires
-    // and it returns NULL, meaning "no reusable block"), then falls through
-    // to request_space(), whose tail walk hits the same cycle and fires its
-    // own guard. Two reports from one malloc() is the expected result, and it
-    // is also the proof that malloc() still SUCCEEDS on a cyclic list.
+    // ---- 3. request_space()'s tail walk, reached by closing the loop AT THE
+    // TAIL. #245 domscript, both halves MEASURED IN THE OS rather than assumed:
+    //
+    //   - It used to fire TWICE because find_free_block() walked the same
+    //     chain. It now walks only the free bins, so ONE report is the correct
+    //     expectation and demanding two would fail on a better allocator.
+    //   - Self-cycling a block in the MIDDLE of the list no longer reaches this
+    //     walk at all once the heap is big, because request_space() takes its
+    //     O(1) cached-tail append and never walks. That fast path is guarded by
+    //     `heap_last->next == NULL`, so the corruption has to go on the TAIL:
+    //     then the fast path is correctly refused and the validated walk runs,
+    //     finds the loop and reports. The first version of this scenario poked
+    //     a middle block, reached nothing, and FAILED in the OS while passing
+    //     on a host heap small enough to miss the fast path.
+    //
+    // malloc() must still SUCCEED afterwards.
     {
+        ck("heap is quiet before scenario 3", settle());
         void *k = malloc(96);
-        block_header_t *hk = HDR(k);
-        unsigned before = __malloc_walk_report_count();
-        hk->next = hk;                       // self-cycle, block allocated
-        void *big = malloc(4096);            // find_free_block + request_space
-        unsigned after = __malloc_walk_report_count();
-        ck("find_free_block + request_space tail walk: cycle reported, malloc() returned",
-           after >= before + 2);
+        block_header_t *tail = HDR(k);
+        int guard = 0;
+        while (tail->next && guard++ < 100000) tail = tail->next;
+        ck("found the tail of the block list to corrupt", guard < 100000);
+        // The request has to be one that find_free_block() CANNOT satisfy, or
+        // malloc() returns from a bin and request_space() is never called.
+        // MEASURED: with a fixed 4096 this scenario silently reused the 32 KB
+        // block scenario 2 had freed and reported nothing. Asking for more than
+        // the whole arena has ever been makes that impossible by construction:
+        // no free block can be larger than the arena that contains it.
+        size_t want = malloc_heap_highwater() + 65536;
+        unsigned before = reports();
+        tail->next = tail;                   // self-cycle AT THE TAIL
+        void *big = malloc(want);            // -> request_space tail walk
+        unsigned after = reports();
+        ck("request_space tail walk: cycle reported, malloc() returned",
+           after >= before + 1);
         ck("malloc() still returned usable memory on a cyclic list", big != 0);
         if (big) {
             // Actually touch it; a "returned non-NULL" claim is worthless if
-            // the pages are not there.
-            for (int i = 0; i < 4096; i++) ((char *)big)[i] = (char)i;
+            // the pages are not there. Both ends plus the middle, since this
+            // allocation is now megabytes rather than one page.
+            char *bb = (char *)big;
+            bb[0] = 0x5A; bb[want / 2] = 0x5A; bb[want - 1] = 0x5A;
             ck("the memory malloc() returned on a cyclic list is writable",
-               ((char *)big)[4095] == (char)4095);
+               bb[0] == 0x5A && bb[want / 2] == 0x5A && bb[want - 1] == 0x5A);
         }
         // No repair: request_space() deliberately relinks the new block onto
         // the last known-good node, so hk->next now legitimately points at
@@ -163,6 +260,8 @@ int main(int argc, char **argv) {
     wnum((unsigned long)g_fail);
     ws(" walk_reports=");
     wnum((unsigned long)__malloc_walk_report_count());
+    ws(" guard_reports=");
+    wnum((unsigned long)__malloc_diag_report_count());
     ws(g_fail == 0 ? "  RESULT=OK\n" : "  RESULT=FAILED\n");
 
     // If the guard did not exist, control never reaches here at all.

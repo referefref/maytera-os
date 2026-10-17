@@ -39,4 +39,13 @@ const char *getenv_local(const char *name);
 // echoed text). No-op if there is nothing to complete or nothing matches.
 void term_shell_complete(void);
 
+// --- the builtins, PROJECTED into the tool contract -------------------------
+// g_builtins[] in term_shell.c is the ONE table execute_command() dispatches
+// through and builtin_help() describes from; these two make it the contract's
+// source as well, so a builtin cannot exist without a `shell.<verb>` contract
+// action and cannot have one without existing. term_contract.c chains them into
+// TERMINAL_CONTRACT's projection.
+int term_shell_ct_count(void);
+int term_shell_ct_project(int idx, ct_item_t *out);
+
 #endif // TERM_SHELL_H

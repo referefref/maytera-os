@@ -774,7 +774,17 @@ static void draw_all(void) {
 // platform seam (flow_plat_*) is stubbed at the bottom of this file, exactly as
 // the editor stubs it.
 // ===========================================================================
-#define FLOW_WF_DIR "/CONFIG/WORKFLOWS"
+// #flowperm: the workflow directory is per-session (wfpath.h). It used to be
+// this literal, which a uid-1000 desktop session cannot write: PERMS.DB ships
+// /CONFIG as 0:0:0711. Resolved once at first use rather than at file scope so
+// it picks up the session's real home.
+#include "wfpath.h"
+static const char *flow_wf_dir(void) {
+    static char d[192];
+    if (!d[0]) wf_dir(d, (int)sizeof(d));
+    return d;
+}
+#define FLOW_WF_DIR flow_wf_dir()
 
 static int flow_path_exists(const char *path) {
     int fd = open(path, O_RDONLY, 0);
@@ -801,7 +811,7 @@ static int flow_write_workflow(const char *name, const char *buf, int len) {
     sys_mkdir("/CONFIG", 0755);
     sys_mkdir(FLOW_WF_DIR, 0755);
     char path[256];
-    snprintf(path, sizeof(path), FLOW_WF_DIR "/%s.yml", name);
+    snprintf(path, sizeof(path), "%s/%s.yml", FLOW_WF_DIR, name);
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return -1;
     int w = 0; long k;
@@ -814,12 +824,12 @@ static int flow_write_workflow(const char *name, const char *buf, int len) {
 static void flow_unique_name(const char *base, char *out, int cap) {
     char cand[FLOW_ID_MAX], path[220];
     flowgen_sanitize_name(base, cand, sizeof(cand));
-    snprintf(path, sizeof(path), FLOW_WF_DIR "/%s.yml", cand);
+    snprintf(path, sizeof(path), "%s/%s.yml", FLOW_WF_DIR, cand);
     if (!flow_path_exists(path)) { strlcpy(out, cand, (size_t)cap); return; }
     for (int n = 2; n < 1000; n++) {
         char c2[FLOW_ID_MAX];
         snprintf(c2, sizeof(c2), "%s-%d", cand, n);
-        snprintf(path, sizeof(path), FLOW_WF_DIR "/%s.yml", c2);
+        snprintf(path, sizeof(path), "%s/%s.yml", FLOW_WF_DIR, c2);
         if (!flow_path_exists(path)) { strlcpy(out, c2, (size_t)cap); return; }
     }
     strlcpy(out, cand, (size_t)cap);
@@ -976,7 +986,7 @@ static void flow_finish_save(char *yaml, int yaml_cap, const char *want_name,
     // Re-parse the file on disk for the node/edge count in the report.
     static char rb[FLOWGEN_YAML_MAX];
     int nn = 0, ne = 0;
-    char path[256]; snprintf(path, sizeof(path), FLOW_WF_DIR "/%s.yml", name);
+    char path[256]; snprintf(path, sizeof(path), "%s/%s.yml", FLOW_WF_DIR, name);
     if (flow_read_file(path, rb, sizeof(rb)) > 0 &&
         flowgen_validate(rb, (int)strlen(rb), &g, err, sizeof(err)) == 0) {
         nn = g.nnodes; ne = g.nedges;
@@ -1025,7 +1035,7 @@ static void flow_do_transform(flowgen_mode_t mode, const char *name_in,
     char name[FLOW_ID_MAX];
 
     flowgen_sanitize_name(name_in, name, sizeof(name));
-    char path[256]; snprintf(path, sizeof(path), FLOW_WF_DIR "/%s.yml", name);
+    char path[256]; snprintf(path, sizeof(path), "%s/%s.yml", FLOW_WF_DIR, name);
     if (flow_read_file(path, existing, sizeof(existing)) <= 0) {
         static char m[256];
         snprintf(m, sizeof(m), "Flow: no workflow named '%s' in %s. Try /flow list.",
@@ -1070,7 +1080,7 @@ static void flow_do_transform(flowgen_mode_t mode, const char *name_in,
 static void flow_do_spawn(const char *app, const char *label, const char *name_in) {
     char name[FLOW_ID_MAX];
     flowgen_sanitize_name(name_in, name, sizeof(name));
-    char path[256]; snprintf(path, sizeof(path), FLOW_WF_DIR "/%s.yml", name);
+    char path[256]; snprintf(path, sizeof(path), "%s/%s.yml", FLOW_WF_DIR, name);
     if (!flow_path_exists(path)) {
         static char m[256];
         snprintf(m, sizeof(m), "Flow: no workflow named '%s'. Try /flow list.", name);
@@ -1981,14 +1991,29 @@ static void poll_dock(void) {
 // from the event loop (NOT a busy-wait): a plain sys_open miss is cheap and
 // returns immediately.
 // ---------------------------------------------------------------------------
+// #peruserrows: the compositor's launcher now writes userconf_open_write(
+// "AIASK.TXT") = <home>/CONFIG/AIASK.TXT, because /CONFIG is root-owned 0711 and
+// the compositor runs as uid 1000, so the old hand-off could not happen at all in
+// a normal session. Read the per-user copy FIRST, then the legacy literal (a
+// pre-existing or offline-placed file still fires), and unlink WHICHEVER ONE WAS
+// READ, not a fixed path: consuming the wrong name is how a one-shot becomes a
+// repeating one. Root's home is "/", so for root both candidates are the same
+// file and nothing changes.
 #define ASK_PATH   "/CONFIG/AIASK.TXT"
 static void process_ask_file(void) {
-    int fd = sys_open(ASK_PATH, O_RDONLY);
+    char askp[224];
+    int fd = -1;
+    if (userconf_path("AIASK.TXT", askp, sizeof(askp)) == 0)
+        fd = sys_open(askp, O_RDONLY);
+    if (fd < 0) {
+        strncpy(askp, ASK_PATH, sizeof(askp) - 1); askp[sizeof(askp) - 1] = 0;
+        fd = sys_open(askp, O_RDONLY);
+    }
     if (fd < 0) return;                       // nothing pending: return at once
     static char ask[MAX_INPUT];
     long n = sys_read(fd, ask, sizeof(ask) - 1);
     sys_close(fd);
-    sys_unlink(ASK_PATH);                     // consume-once
+    sys_unlink(askp);                         // consume-once, the path we read
     if (n <= 0) return;
     ask[n] = 0;
     // Trim a single trailing newline / stray whitespace.
@@ -2603,6 +2628,20 @@ int flow_plat_app_invoke(const char *app, int argc, char **argv,
 // capturing a window, asking a model about the picture, and pressing a key in
 // another app's window are all privileged, consented operations that belong to
 // the RUNNER. Refused here with a reason, never faked.
+// aichat compiles flow.c only to VALIDATE generated workflow YAML with the
+// runner's own parser; it never executes a graph. Refuse, like the other
+// non-executing consumers do.
+int flow_plat_launch(const char *app, const char *rom, const char *arg,
+                     const char *wait_target, int timeout_ms,
+                     char *out_title, int tcap, int *out_already,
+                     char *err, int errcap) {
+    (void)app; (void)rom; (void)arg; (void)wait_target; (void)timeout_ms;
+    if (tcap > 0) out_title[0] = 0;
+    if (out_already) *out_already = 0;
+    if (errcap > 0) snprintf(err, errcap, "aichat does not execute workflows");
+    return -1;
+}
+
 int flow_plat_capture(const char *target, int rx, int ry, int rw, int rh,
                       int max_w, int max_h, int quality, const char *path,
                       int *out_w, int *out_h, char *err, int errcap) {

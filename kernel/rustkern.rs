@@ -94,7 +94,10 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/scprof.rs"] mod scprof;   // #121: per-syscall time census + read-path phases
 #[path = "rustkern/rqlock.rs"] mod rqlock;   // #143: run-queue lock contention verdict
 #[path = "rustkern/bklstat.rs"] mod bklstat; // #166: BKL window deltas + invariants
+#[path = "rustkern/vmascale.rs"] mod vmascale; // #245: VMA-list-length instrument
 #[path = "rustkern/wakeloss.rs"] mod wakeloss;  // #167: block/wake race verdict
+#[path = "rustkern/kstackid.rs"] mod kstackid;   // #heapinvptr: is an unregistered pointer a kernel stack?
+#[path = "rustkern/kstackreg.rs"] mod kstackreg;   // the kernel-stack live-block registry, reserve-then-commit
 #[path = "rustkern/bmp.rs"] mod bmp;
 #[path = "rustkern/blkstage.rs"] mod blkstage;   // #SB: single-owner claim over the block-write staging buffer
 
@@ -131,7 +134,12 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/dosmick.rs"] mod dosmick;   // (#mickey) what a DOS guest is told the mouse did: unit-gain counters + clamp homing   // #745 (local 105): DOS host-window letterbox geometry
 #[path = "rustkern/dos4gw.rs"] mod dos4gw;   // #740: DOS/4GW guest bridge - INT frame marshalling, MISS census, DPMI memory
 #[path = "rustkern/dpmi.rs"] mod dpmi;   // #740: the DPMI host core (INT 31h) for DOS/4GW guests
-#[path = "rustkern/cfgread.rs"] mod cfgread;   // #192: is a config-file read outcome worth a log line?
+#[path = "rustkern/cfgread.rs"] mod cfgread;
+#[path = "rustkern/fsenoent.rs"] mod fsenoent;
+#[path = "rustkern/heapzero.rs"] mod heapzero;   // #heapdbl: which cause zeroed a heap block header
+#[path = "rustkern/heapshadow.rs"] mod heapshadow;   // #aicappersist: the physical window the kernel heap shadows   // #aicappersist: which of the three causes made this ENOENT   // #192: is a config-file read outcome worth a log line?
+#[path = "rustkern/heapwin.rs"] mod heapwin;   // #heapwin: WHO already owned a page inside the heap window, and where it sits
+#[path = "rustkern/heapframe.rs"] mod heapframe;   // #deadpml4: what the heap's page mappings cost, and how high the arena may safely grow
 #[path = "rustkern/dpmi_rmcs.rs"] mod dpmi_rmcs;   // #740: DPMI 0300h simulate-real-mode-interrupt marshaller
 #[path = "rustkern/drvmap.rs"] mod drvmap;   // #739: drive-letter policy for mounted disk images
 #[path = "rustkern/dosovl.rs"] mod dosovl;   // #rawrite: per-user write overlay for a DOS game directory
@@ -142,6 +150,7 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/elevate.rs"] mod elevate;   // #745: system-wide install elevation policy
 #[path = "rustkern/exfat.rs"] mod exfat;
 #[path = "rustkern/ext2.rs"] mod ext2;
+#[path = "rustkern/e2rdio.rs"] mod e2rdio;   // #e2rdio: ext2 read-path device-I/O ledger + fault injector
 #[path = "rustkern/ext2extent.rs"] mod ext2extent;
 #[path = "rustkern/ext2fsck.rs"] mod ext2fsck;
 #[path = "rustkern/fat.rs"] mod fat;
@@ -152,11 +161,20 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/caps.rs"] mod caps;   // Stage 1 capability API: grant model + requirement table + consent state machine
 #[path = "rustkern/capdev.rs"] mod capdev;   // #246 Stage 4: CAP_SCOPE_DEVICE device-identity policy (fingerprint + logical key + confidence + TOFU verdict)
 #[path = "rustkern/escrowundo.rs"] mod escrowundo;   // #246 Stage 5B: escrow rollback/undo reversibility policy
+#[path = "rustkern/escrowmark.rs"] mod escrowmark;   // #246: escrow actor MARK policy (spawn inheritance, self-exit, delete disposition)
+#[path = "rustkern/recycle.rs"] mod recycle;   // Recycle Bin policy: retention (default 30d, never=0), index-row format, trash naming
 #[path = "rustkern/fdown.rs"] mod fdown;   // #fdguard: legacy fd table cross-process ownership
 #[path = "rustkern/advlock.rs"] mod advlock;   // #404 Stage 6: POSIX (fcntl) + BSD (flock) advisory file-lock manager
 #[path = "rustkern/ptsown.rs"] mod ptsown;   // #fdguard: /dev/pts/N attach ownership
 #[path = "rustkern/fsperm.rs"] mod fsperm;
 #[path = "rustkern/fstatkind.rs"] mod fstatkind;   // #120: what KIND of object an fd refers to
+#[path = "rustkern/fdopenpolicy.rs"] mod fdopenpolicy;   // #747: one answer to "does this open destroy the file"
+#[path = "rustkern/smbseq.rs"] mod smbseq;
+#[path = "rustkern/smbident.rs"] mod smbident;   // #749 pass 2: WHO the SMB session ended up as, vs who was asked for   // #749: the SMB2 message sequence + credit window, bound to its connection
+#[path = "rustkern/aesccm.rs"] mod aesccm;     // AES-CCM AEAD mode: the cipher SMB 3.0.2 mandates (the tree had GCM, which that dialect refuses)
+#[path = "rustkern/smbcrypt.rs"] mod smbcrypt; // SMB3 encryption: seal outbound, unseal inbound, refuse cleartext once armed
+#[path = "rustkern/smbsign.rs"] mod smbsign;   // SMB2 message signing: produce outbound, VERIFY inbound
+#[path = "rustkern/smbpreauth.rs"] mod smbpreauth; // SMB 3.1.1 PRE-AUTH INTEGRITY: authenticate the opening handshake itself
 #[path = "rustkern/ghash.rs"] mod ghash;
 #[path = "rustkern/hdadma.rs"] mod hdadma;   // #71: HD Audio output-DMA liveness verdict (two-LPIB-read delta)
 #[path = "rustkern/pcmmix.rs"] mod pcmmix;
@@ -189,6 +207,7 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/modex.rs"] mod modex;   // #740: Mode X (unchained VGA) geometry + present scanline kernel
 #[path = "rustkern/mono.rs"] mod mono;
 #[path = "rustkern/mprotect.rs"] mod mprotect;   // #404: SYS_MPROTECT Ring-3 argument validation
+#[path = "rustkern/ntsecret.rs"] mod ntsecret;   // #smbdisk: nt$<32hex> on-disk SMB credential form (parse/format, strict)
 #[path = "rustkern/netattach.rs"] mod netattach;   // hot-plug NIC attach handoff (xhci rescan -> net worker)
 #[path = "rustkern/netbread.rs"] mod netbread;   // #imacnet: durable net breadcrumbs + DNS resolver failover
 #[path = "rustkern/netstat.rs"] mod netstat;   // #745: structured net status + non-blocking probe
@@ -210,6 +229,10 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/accesssys.rs"] mod accesssys; // #dosperm: SYS_ACCESS, so Ring 3 can ASK perms_check()
 #[path = "rustkern/dosstate.rs"] mod dosstate;   // #dosperm: a DOS game may write the files it shipped with
 #[path = "rustkern/permhome.rs"] mod permhome;   // #PERMSKIP: "is this PERMS.DB key a user home?"
+#[path = "rustkern/renamevol.rs"] mod renamevol;   // [renamevol] which filesystem serves a two-path op when either end is on a removable volume
+#[path = "rustkern/volperm.rs"] mod volperm;       // [openperm] is a path exempt from the permission table, and what ownership does a mounted removable volume get
+#[path = "rustkern/volblind.rs"] mod volblind;   // [volaudit] runtime detector: the ROOT fs asked about a path on a mounted removable volume
+#[path = "rustkern/sticky.rs"] mod sticky;   // #prewrite: S_ISVTX, the ONE definition of "may this principal remove this name"
 #[path = "rustkern/selftestreg.rs"] mod selftestreg; // #PERMSKIP: the register of self-tests that DID NOT RUN
 #[path = "rustkern/ptwalk.rs"] mod ptwalk;   // #647: live page-table hierarchy walk
 #[path = "rustkern/ptro.rs"] mod ptro;      // #procspawn: which identity pages Ring 0 can actually write
@@ -226,6 +249,9 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/tickack.rs"] mod tickack;       // #tickdead: WHERE an interrupt is acknowledged, and BLOCKED-vs-ABSENT blame
 #[path = "rustkern/tickwatch.rs"] mod tickwatch;   // #745 (#62): periodic-tick health verdict + failover decision   // #67: SMP livelock diagnostic + run-queue placement policy
 #[path = "rustkern/seccore.rs"] mod seccore;
+#[path = "rustkern/secstore.rs"] mod secstore;
+#[path = "rustkern/totp.rs"] mod totp;   // #secretuse: base32 + RFC 6238 TOTP + the store record parser + the secret tier table   // #secretuse: the on-disk form of an encrypted secret store (AEAD framing, header-as-AAD, strict parse)
+#[path = "rustkern/sha1.rs"] mod sha1;   // #secretuse: SHA-1 + the hash half of HMAC-SHA1, for RFC 6238 TOTP (collision-broken; see the file header for why that is OK inside HMAC and nowhere else)
 #[path = "rustkern/sha256.rs"] mod sha256;
 #[path = "rustkern/loginmode.rs"] mod loginmode; // #745: LOGIN.CFG parse + compose
 #[path = "rustkern/sessionid.rs"] mod sessionid; // #745: session lock + account uid policy
@@ -237,6 +263,7 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/sshdcfg.rs"] mod sshdcfg;   // #697: sshd listen + auth policy
 #[path = "rustkern/sha512.rs"] mod sha512;
 #[path = "rustkern/taskmgr.rs"] mod taskmgr;
+#[path = "rustkern/uiready.rs"] mod uiready;   // #317: boot auto-launch readiness - a real UI on screen as a CONDITION, not a 14 s guess
 #[path = "rustkern/uiscale.rs"] mod uiscale;   // global UI scale factor: ONE definition, kernel + Ring 3
 #[path = "rustkern/presentscale.rs"] mod presentscale;   // #halfres: integer PRESENT-SCALE compositing (mirrors uiscale)
 #[path = "rustkern/battery.rs"] mod battery;   // #battmeter: control-method battery _BIF/_BST evaluation
@@ -246,6 +273,7 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/tls_parse.rs"] mod tls_parse;
 #[path = "rustkern/tlsfrag.rs"] mod tlsfrag;   // #postfix: the OUTGOING TLS record fragmentation plan (2^14 plaintext cap)
 #[path = "rustkern/tls_suite.rs"] mod tls_suite;   // #tls-suitefix: the offered cipher suite list, shared by ClientHello and ServerHello
+#[path = "rustkern/binmigrate.rs"] mod binmigrate;   // [binmigrate] where a bootstrap session's per-account state goes when it finally gets an account
 #[path = "rustkern/userconf.rs"] mod userconf;   // #683: per-user config paths
 #[path = "rustkern/usbvol.rs"] mod usbvol;   // #740: data volumes in the boot device tail
 #[path = "rustkern/hotplug.rs"] mod hotplug; // #250: removable-volume list + mount-point path routing
@@ -303,7 +331,11 @@ pub extern "C" fn sec_event_severity(event: u32) -> u32 {
         // an ordinary client offers every key it has and a toast per offer
         // would train the user to ignore all of them.
         7 | 8 => 2,            // AUTH_SUCCESS, AUTH_FAIL
-        12 => 2,               // #745 AI_INJECTION: a refused LLM request
+        // #745 AI_INJECTION: a refused LLM request. RETIRED 2026-09-29 (its
+        // producer, seclog_report_ai_injection, is deleted with the Nova screen
+        // that fed it). The arm STAYS so an existing /CONFIG/SECURITY.LOG still
+        // decodes ordinal 12 correctly; see security.h.
+        12 => 2,
         // #fdguard: a cross-process file-descriptor or /dev/pts attach was
         // REFUSED. WARNING: an app reaching for another process's I/O is a
         // real attempted boundary crossing, worth surfacing like a denial.
@@ -334,9 +366,11 @@ pub extern "C" fn sec_event_name(event: u32) -> *const u8 {
         // comment on seclog_report_elevation() in security/security.c.
         11 => b"ELEVATION\0",
         // #745: an outbound LLM request refused, or allowed with a note, by the
-        // prompt-injection screen. WARNING (see sec_event_severity): a blocked
-        // request is a thing the user asked for that did not happen, so it must
-        // be visible rather than buried at INFO.
+        // prompt-injection screen. RETIRED 2026-09-29: nothing emits ordinal 12
+        // any more (the reporter went with the Nova screen). The NAME stays so a
+        // SECURITY.LOG written before that date still reads back as
+        // AI_INJECTION instead of drifting to UNKNOWN; see security.h for why
+        // the ordinal itself must never be reused.
         12 => b"AI_INJECTION\0",
         // #fdguard: appended per the append-only rule; a matching arm here
         // and in sec_event_severity, or a new event logs as INFO UNKNOWN.
@@ -345,6 +379,14 @@ pub extern "C" fn sec_event_name(event: u32) -> *const u8 {
         // default severity arm, like ELEVATION (per-use refusals are rate-
         // limited into the durable log + GraphFS journal, not toasted).
         14 => b"CAPABILITY\0",
+        // #prewrite: sticky-directory removal refused, or allowed cross-owner
+        // under the directory-owner rule. Named in the SAME change that
+        // appends the ordinal, because #785 appended SERVICE_STATE without a
+        // name and every service transition logged as UNKNOWN for months.
+        15 => b"FS_REMOVE\0",
+        // #kfirewall: the packet filter's policy changed. INFO via the default
+        // arm of sec_event_severity() above; see security.h for why.
+        16 => b"FIREWALL\0",
         // Stage 1 capability API: grant / refusal / revocation. INFO via the
         // default severity arm, like ELEVATION.
         14 => b"CAPABILITY ",

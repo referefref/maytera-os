@@ -40,7 +40,15 @@ int notify_post(const char *title, const char *body, int severity) {
     ns_sani(b, body  ? body  : "", sizeof(b));
     static char buf[SPOOL_CAP + 280];
     int blen = 0;
-    int rfd = userconf_open_read(SPOOL_NAME, 0);
+    // [foundbugs] #168: userconf_open_read_scratch(), not userconf_open_read():
+    // a no-account session's per-user path is "/CONFIG/NOTIFY.TXT", and
+    // /CONFIG ends up root-owned 0711 (searchable, not writable) before any
+    // userland process runs, so this process could never CREATE that file in
+    // the first place; see userconf.h for the full rule. This must match
+    // notif.c's reader and notif_init()'s unlink, and seclog.c's Ring-0
+    // poster, or the spool splits across two files that nobody is
+    // cross-checking.
+    int rfd = userconf_open_read_scratch(SPOOL_NAME);
     if (rfd >= 0) {
         long n = sys_read(rfd, buf, SPOOL_CAP);
         if (n > 0) blen = (int)n;
@@ -54,7 +62,7 @@ int notify_post(const char *title, const char *body, int severity) {
     for (int i = 0; b[i]; i++) *p++ = b[i];
     *p++ = '\n';
     blen = (int)(p - buf);
-    int wfd = userconf_open_write(SPOOL_NAME);   /* #683: per-user spool */
+    int wfd = userconf_open_write_scratch(SPOOL_NAME);   /* #683/#foundbugs: per-user spool, with a no-account fallback */
     if (wfd < 0) {
         // #appwrite: THE NOTIFICATION CHANNEL IS ITSELF A FILE WRITE, so on a
         // machine where writes are refused the OS loses its only way to say
@@ -69,9 +77,14 @@ int notify_post(const char *title, const char *body, int severity) {
         // second spool location would be a second thing to keep in step, and
         // the right fix for the underlying refusal is the path the write
         // targets, not another fallback.
-        char m[224];
+        // #aiaudit: CLAMPED. An over-long sys_bootlog message is DROPPED
+        // WHOLE, not truncated (see BOOTLOG_MSG_MAX in syscall.h), and `t` is
+        // a caller-supplied title with no bound, so a long title silently
+        // deleted the report of its own lost toast. The same shape MEASURED as
+        // a real loss on the AI audit sink (golden 2486, VM 2497).
+        char m[180];
         snprintf(m, sizeof(m),
-                 "[FSDENY-U] notify_post DROPPED (spool unwritable, rc=%d) sev=%d title=%s",
+                 "[FSDENY-U] notify_post DROPPED (spool unwritable, rc=%d) sev=%d title=%.80s",
                  wfd, severity, t);
         (void)sys_bootlog(m);
         return -1;

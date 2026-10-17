@@ -116,6 +116,11 @@ and there is no `grep` in this release at all.
 
 ## Security
 
+Defects this project has found and closed are published: the ledger is
+[`kernel/SECURITY_ADVISORIES.md`](kernel/SECURITY_ADVISORIES.md) and the same set is
+presented at <https://maytera.net/security>. `SECURITY.md` has the threat model, the
+reporting route, and the known-weakness list.
+
 This section states what is actually implemented, and what is not. Several
 neighbouring features are easy to confuse with each other, so they are listed
 separately rather than summarised as "hardened".
@@ -238,11 +243,26 @@ MayteraOS builds with a GCC cross toolchain targeting freestanding x86-64.
 sudo apt install build-essential nasm gnu-efi mtools dosfstools gdisk
 ```
 
-`gnu-efi` provides the `efi.h` headers the UEFI bootloader needs. A few
-userland apps are written in Rust and need a pinned `rustc` (see their
-`rust-toolchain.toml`); `build.sh --all-apps` reports those as failures at the
-end and carries on, so the rest of the system still builds without a Rust
-toolchain.
+`gnu-efi` provides the `efi.h` headers the UEFI bootloader needs.
+
+**A pinned `rustc` is REQUIRED, not optional.** Parts of the kernel are Rust and
+`kernel/Makefile` refuses to build when the active `rustc` is not the pinned
+version, so step 2 of `build.sh` stops without it; eleven userland apps need it
+too. An earlier revision of this section said Rust apps were "reported as
+failures at the end" and that "the rest of the system still builds without a Rust
+toolchain", and both halves were wrong: the kernel does not, and a failing app no
+longer carries on (see below).
+
+**AN APP THAT DOES NOT BUILD NOW STOPS THE BUILD.** Until 2026-10-03 `build.sh
+--all-apps` collected failures, printed `Build complete, WITH FAILURES`, named
+them, and exited 0. That shipped a MayteraOS image without AI Chat or Maytera
+Flow: three apps needed a library that only a test app built, so they worked on a
+machine that had built before and failed on a clean clone, and the build reported
+success either way. The only way through is now a line in `build-apps.policy`
+beside `build.sh`, naming the app, a CLASS (`TESTONLY` or `DEBT`) and a written
+reason, and the build also fails on a reason-less line, on a line for a directory
+that no longer exists, and on a `DEBT` line for an app that has started building
+again. The file is meant to shrink.
 
 ```sh
 git clone https://github.com/referefref/maytera-os.git
@@ -262,20 +282,27 @@ missing port directory killed the whole build before any app was built.
 **Not everything builds from a clean clone, and this time the numbers are a
 fresh measurement rather than a carried-over one.** Measured on Debian 12 with
 gcc 12.2.0 and rustc 1.97.0, building exactly what you get from
-`git clone` plus `./build.sh --all-apps`:
+`git clone` plus `./build.sh --all-apps`. Each row below is also a line in
+`build-apps.policy`, so the table and the build agree by construction rather than
+by somebody remembering to update both:
 
-- The kernel, the UEFI bootloader, `userland/libc` and `userland/libgl` all
-  build.
-- `userland/apps` holds 185 app directories, 184 of them with a Makefile
-  (`reloctest` has none). **181 of those 184 build. Three do not**, listed
-  below with the actual reason.
-- Those 184 directories produce **184 app binaries**, because some directories
-  build more than one executable (test helpers alongside the app itself).
+- The kernel, the UEFI bootloader and the four shared libraries that have a
+  Makefile (`userland/libc`, `libhelp`, `libgl`, `libSDL`) all build.
+- `userland/apps` holds 249 app directories, 248 of them with a Makefile
+  (`reloctest` has none). **246 of those 248 build. Two do not**, listed
+  below with the actual reason, and both are named in `build-apps.policy`.
+- Some directories build more than one executable (a test helper alongside the
+  app), and several install under an upper-case name, so the binary count is
+  higher than the directory count.
+- Re-measured 2026-10-03 on the publish tree of commit `9b33c98e`, by running
+  the build rather than by carrying the previous numbers forward. The earlier
+  revision of this list said 185/184/181 and named three failures including
+  `classicube`, which is not even in this repository: it is on the publish
+  exclusion list, so there is no directory to fail.
 
 | App | Why it does not build |
 |---|---|
-| `browser` | Needs a NetSurf port and a Duktape build that are not in this repository. Its Makefile leaves `NS` and `DUK` set to a literal `<workspace>` placeholder, and three of its port helper scripts carry the same placeholder in a shell assignment and do not parse. Known gap, not a regression. |
-| `classicube` | Ships only the MayteraOS platform layer, deliberately. The upstream engine is fetched, not vendored: run `userland/apps/classicube/fetch-upstream.sh all` to populate `vendor/` first, as `PORT-STATUS.md` says. The build stops with "ClassiCube engine source not found". |
+| `browser` | Needs a NetSurf port and a Duktape build that are not in this repository. Its Makefile leaves `MAYTERA_NS_ROOT` and `MAYTERA_DUK_ROOT` set to a literal `<workspace>` placeholder, so gcc is handed an `-I` directory that does not exist. The user-visible consequence: the Internet category of the Start menu loses its first entry. Known gap, not a regression. |
 | `ipc_test` | Genuinely broken, and the previous README's guess that this row was stale is now measured and wrong. It fails at link with `undefined reference to shm_info` and `undefined reference to msg_channel_info`: the test calls two libc entry points that no longer exist. |
 
 **A build defect that this release fixes, recorded because it bit exactly the

@@ -39,7 +39,18 @@ CC="${CC:-gcc}"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-mkdir -p "$WORK/crypto" "$WORK/mm"
+mkdir -p "$WORK/crypto" "$WORK/mm" "$WORK/fs"
+
+# rsa.c gained #include "fs/bootlog.h" (secroad2) AFTER this oracle was written.
+# Because NOTHING EVER RAN THIS FILE, the breakage sat unnoticed and the whole
+# KAT died with: fatal error: fs/bootlog.h: No such file or directory.
+# Shimmed here the same way every other kernel header in this script is.
+cat > "$WORK/fs/bootlog.h" <<'EOF'
+#ifndef KAT_BOOTLOG_H
+#define KAT_BOOTLOG_H
+static inline void bootlog_write(const char *f, ...) { (void)f; }
+#endif
+EOF
 
 # 1) Shim the kernel headers ecdsa.c/rsa.c pull in, reduced to what the verify
 #    path actually needs. Quote-includes resolve relative to the source file, so

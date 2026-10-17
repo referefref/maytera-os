@@ -915,7 +915,10 @@ void fat_readahead_print_context(readahead_context_t *ctx) {
     }
 
     kprintf("[RA] Read-Ahead Context:\n");
-    kprintf("  File: %s\n", ctx->file ? ctx->file->name : "(null)");
+    // [noaccount] ->path, not ->name: this line now prints the absolute path
+    // rather than the basename, which is strictly more useful in a dump whose
+    // whole job is to say which file a stalled read-ahead was working on.
+    kprintf("  File: %s\n", ctx->file ? ctx->file->path : "(null)");
     kprintf("  Last cluster: %u\n", ctx->last_cluster);
     kprintf("  Last position: %u\n", ctx->last_position);
     kprintf("  Sequential count: %u\n", ctx->sequential_count);

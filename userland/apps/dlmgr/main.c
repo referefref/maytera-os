@@ -2,8 +2,8 @@
 //
 // WHAT IT DOES. Paste a URL, press Add; the transfer is queued (two run at a
 // time), shows live progress (bytes, total, rate, phase), and lands in the
-// user's Downloads folder (<home>/DOWNLOAD, the skeleton folder Files already
-// shows as "Downloads"). Pause / Resume / Retry / Remove, a persisted queue
+// user's Downloads folder (<home>/DOWNLOADS, resolved by libc's
+// userhome_downloads_dir()). Pause / Resume / Retry / Remove, a persisted queue
 // (DLMGR.QUE in that folder) so finished and failed entries survive a restart,
 // and an "Open folder" button that opens Files on the folder.
 //
@@ -28,6 +28,8 @@
 #include "../../libc/pwd.h"
 #include "../../libc/unistd.h"
 #include "../../libc/sys/stat.h"
+#include "../../libc/userconf.h"   // [filesui] the named-places accessors
+#include "../../libc/places.h"     // [filesui] places_have_home()
 
 #define WIN_W 820
 #define WIN_H 540
@@ -129,14 +131,39 @@ static int ci_prefix(const char *s, const char *pfx) {
 }
 
 // ---- downloads folder -------------------------------------------------------
+// [filesui] THIS WAS THE THIRD PLACE THE LAYOUT WAS NAMED, and the only one that
+// WRITES. It read:
+//
+//     const char *home = "/HOME/ADMIN";
+//     struct passwd *pw = getpwuid(getuid());
+//     if (pw && pw->pw_dir && ...) home = pw->pw_dir;
+//     snprintf(g_dir, sizeof(g_dir), "%s/DOWNLOAD", home);
+//
+// Three separate faults in five lines. It was a THIRD implementation of "where
+// is home" (libc has userhome_root(); Files had its own getpwuid() copy, now
+// gone). Its fallback was ANOTHER USER'S HOME, so a session with no account of
+// its own downloaded into admin's folder, or tried to and was refused. And it
+// built the path from a literal, which is how the header comment above came to
+// say "<home>/DOWNLOAD, the skeleton folder Files already shows as Downloads":
+// somebody noticed the singular/plural mismatch and wrote it down instead of
+// fixing it. The directory is DOWNLOADS now and this asks the accessor.
 static void resolve_dir(void) {
-    const char *home = "/HOME/ADMIN";
-    struct passwd *pw = getpwuid(getuid());
-    if (pw && pw->pw_dir && pw->pw_dir[0] && !(pw->pw_dir[0] == '/' && pw->pw_dir[1] == 0)) home = pw->pw_dir;
-    snprintf(g_dir, sizeof(g_dir), "%s/DOWNLOAD", home);
+    // userscratch_dir() for a session with no account: /TMP, which is 01777, is
+    // somewhere a download can actually land. The old fallback was a directory
+    // the session could not write, so the first download failed with -13.
+    if (userhome_downloads_dir(g_dir, sizeof(g_dir)) != 0 ||
+        !places_have_home()) {
+        if (userscratch_dir(g_dir, sizeof(g_dir)) != 0)
+            snprintf(g_dir, sizeof(g_dir), "/TMP");
+    }
     struct stat st;
     if (stat(g_dir, &st) != 0) {
-        mkdir(home, 0755);
+        // userconf_ensure_parent_dir() is mkdir -p, so it makes the home as well
+        // as the folder inside it. This replaces the two hand-rolled mkdirs,
+        // which could only ever create one level.
+        char probe[256];
+        snprintf(probe, sizeof(probe), "%s/.", g_dir);
+        userconf_ensure_parent_dir(probe);
         mkdir(g_dir, 0755);
     }
     snprintf(g_quefile, sizeof(g_quefile), "%s/DLMGR.QUE", g_dir);

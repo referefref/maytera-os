@@ -44,6 +44,8 @@ extern char  t_last_outfile[];
 extern int   t_last_argc;
 extern int   t_last_append;
 extern int   t_last_had_redir;
+extern int   t_last_envc;            // #112: the envc the library asked for
+extern int   t_last_env_was_environ; // 1 when envp pointed at our own environ
 void         t_reset(void);
 
 static int fails = 0;
@@ -75,7 +77,7 @@ static void path_in_dir(char *out, unsigned long cap, const char *leaf) {
 int spawn_tests(void);
 int spawn_tests(void) {
     char p_exit7[256], p_say[256], p_cat[256], p_notelf[256];
-    char p_out[256], p_in[256];
+    char p_out[256], p_in[256], p_env[256], p_envout[256];
     char buf[256];
     pid_t pid;
     int rc, st;
@@ -86,10 +88,13 @@ int spawn_tests(void) {
     path_in_dir(p_notelf, sizeof(p_notelf), "notanelf.bin");
     path_in_dir(p_out,    sizeof(p_out),    "redirected.txt");
     path_in_dir(p_in,     sizeof(p_in),     "input.txt");
+    path_in_dir(p_env,    sizeof(p_env),    "helper_env");
+    path_in_dir(p_envout, sizeof(p_envout), "envout.txt");
 
     t_out("\n--- 1. the syscall numbers actually issued ---\n");
     t_out("      SYS_SPAWN_ARGS  from ../syscall.h = "); t_outd(SYS_SPAWN_ARGS);  t_out("\n");
     t_out("      SYS_SPAWN_REDIR from ../syscall.h = "); t_outd(SYS_SPAWN_REDIR); t_out("\n");
+    t_out("      SYS_SPAWN_ENV   from ../syscall.h = "); t_outd(SYS_SPAWN_ENV);   t_out("\n");
     t_out("      SYS_WAITPID     from ../syscall.h = "); t_outd(SYS_WAITPID);     t_out("\n");
 
     {
@@ -98,7 +103,11 @@ int spawn_tests(void) {
         rc = posix_spawn(&pid, p_exit7, 0, 0, argv, 0);
         ck_eq(rc, 0, "plain posix_spawn returns 0");
         ck_eq(t_calls, 1, "issued exactly one spawn syscall");
-        ck_eq((int)t_last_num, SYS_SPAWN_ARGS, "and it was SYS_SPAWN_ARGS");
+        // #112: posix_spawn() issues ONE SYS_SPAWN_ENV, not the old
+        // SYS_SPAWN_ARGS. This assertion said ARGS until #deadtests, which is
+        // why run_spawn.sh exited 2 instead of failing an assertion: the model
+        // never saw 394 at all.
+        ck_eq((int)t_last_num, SYS_SPAWN_ENV, "and it was SYS_SPAWN_ENV");
         ck(strcmp(t_last_path, p_exit7) == 0, "arg1 was the path");
         ck_eq(t_last_argc, 1, "arg3 was argc");
         ck_eq(t_last_had_redir, 0, "no redirect on the plain path");
@@ -139,7 +148,9 @@ int spawn_tests(void) {
         t_reset();
         rc = posix_spawn(&pid, p_say, &fa, 0, argv, 0);
         ck_eq(rc, 0, "spawn with the redirect succeeded");
-        ck_eq((int)t_last_num, SYS_SPAWN_REDIR, "it used SYS_SPAWN_REDIR");
+        // SYS_SPAWN_ENV carries the redirects too, so the old two-syscall
+        // split is gone from the posix_spawn path.
+        ck_eq((int)t_last_num, SYS_SPAWN_ENV, "it used SYS_SPAWN_ENV");
         ck(strcmp(t_last_outfile, p_out) == 0, "outfile arg was the redirect target");
         ck_eq(t_last_append, 0, "append arg was 0 for O_TRUNC");
         st = -1;
@@ -282,10 +293,64 @@ int spawn_tests(void) {
         char *many[70];
         int i;
 
+        // #112/#deadtests: envp PROPAGATES now. This block asserted
+        // "-> ENOSYS (nothing propagates here)", which was true until
+        // SYS_SPAWN_ENV shipped and false afterwards; nothing ran the test, so
+        // the assertion outlived the behaviour. The three envc cases are three
+        // DIFFERENT requests and each is checked, plus the child is made to
+        // report what it actually received.
+        {
+            char *envargv[] = { p_env, 0 };
+            posix_spawn_file_actions_t efa;
+            ck_eq(posix_spawn_file_actions_init(&efa), 0, "env: file_actions_init");
+            ck_eq(posix_spawn_file_actions_addopen(&efa, 1, p_envout,
+                      O_WRONLY | O_CREAT | O_TRUNC, 0644), 0, "env: addopen(1)");
+            t_reset();
+            ck_eq(posix_spawn(&pid, p_env, &efa, 0, envargv, myenv), 0,
+                  "envc > 0: a constructed envp is accepted");
+            ck_eq(t_calls, 1, "envc > 0: one spawn syscall");
+            ck_eq((int)t_last_num, SYS_SPAWN_ENV, "envc > 0: via SYS_SPAWN_ENV");
+            ck_eq(t_last_envc, 1, "envc > 0: envc was 1");
+            ck_eq(t_last_env_was_environ, 0, "envc > 0: not our own environ");
+            st = -1;
+            mos_waitpid(pid, &st, 0);
+            buf[0] = 0;
+            t_slurp(p_envout, buf, (long)sizeof(buf));
+            ck(strcmp(buf, "env:bar\n") == 0,
+               "envc > 0: the CHILD really saw FOO=bar");
+            posix_spawn_file_actions_destroy(&efa);
+        }
+
+        // envp == NULL is INHERIT on this OS (spawn.c says so explicitly), NOT
+        // empty. That distinction is the whole reason envc is a tri-state.
         t_reset();
-        ck_eq(posix_spawn(&pid, p_exit7, 0, 0, argv, myenv), ENOSYS,
-              "a deliberately constructed envp -> ENOSYS (nothing propagates here)");
-        ck_eq(t_calls, 0, "no spawn syscall was issued");
+        ck_eq(posix_spawn(&pid, p_exit7, 0, 0, argv, 0), 0,
+              "envp == NULL: accepted");
+        ck_eq(t_last_env_was_environ, 1, "envp == NULL means INHERIT, not empty");
+        ck(t_last_envc >= 0, "envp == NULL: envc is the inherited count");
+        mos_waitpid(pid, &st, 0);
+
+        // A vector whose first entry is NULL is a deliberately EMPTY
+        // environment: `env -i`. It must reach the kernel as envc == 0 and
+        // NOT be confused with "no environment supplied" (envc < 0).
+        {
+            char *empty[] = { 0 };
+            t_reset();
+            ck_eq(posix_spawn(&pid, p_exit7, 0, 0, argv, empty), 0,
+                  "envc == 0: an empty environment is accepted");
+            ck_eq(t_last_envc, 0, "envc == 0: and it is 0, not -1");
+            mos_waitpid(pid, &st, 0);
+        }
+
+        // A malformed entry REFUSES the whole spawn. It is never dropped: a
+        // half PATH still looks like a PATH to whatever reads it.
+        {
+            char *bad[] = { (char *)"NOEQUALSSIGN", 0 };
+            t_reset();
+            ck_eq(posix_spawn(&pid, p_exit7, 0, 0, argv, bad), EINVAL,
+                  "an entry that is not NAME=VALUE -> EINVAL");
+            ck_eq(t_calls, 0, "and no spawn syscall was issued");
+        }
 
         for (i = 0; i < 399; i++) big[i] = 'x';
         big[399] = 0;

@@ -1,0 +1,11 @@
+<html><body id="b"><script>
+var cur = document.getElementById('b'), n = 0;
+for (var i = 0; i < 600; i++) { var e = document.createElement('div'); e.setAttribute('i', '' + i); cur.appendChild(e); cur = e; n++; }
+console.log('chained=' + n + ' lastattr=' + cur.getAttribute('i'));
+var flat = document.getElementById('b'), m = 0;
+for (var j = 0; j < 500; j++) { flat.appendChild(document.createElement('p')); m++; }
+console.log('flat=' + m);
+console.log('sum=' + (function () { var s = 0; for (var k = 1; k <= 100; k++) s += k; return s; })());
+console.log('math=' + Math.sqrt(144) + ',' + Math.pow(2, 10) + ',' + Math.round(2.5) + ',' + Math.floor(-1.5));
+console.log('str=' + 'abc'.toUpperCase() + ',' + [3,1,2].sort().join('-') + ',' + JSON.stringify({a:1,b:[2,3]}));
+</script></body></html>

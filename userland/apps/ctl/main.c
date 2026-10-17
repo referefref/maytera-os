@@ -83,7 +83,14 @@ static void usage(void) {
 // became a second caller. Two copies of "how do I reach an app's contract"
 // would be exactly the fault this API exists to remove.
 static int run_contract(const char *app, int argc, char **argv) {
-    static char out[4096];
+    // 64 KB, STATIC (not stack: app ELFs are a single RWX PT_LOAD and a 64 KB
+    // frame is not worth the risk). 4096 was enough when the biggest contract was
+    // Settings' 41 rows; Maytera Studio's describe is already 62994 bytes and
+    // Terminal's is 92 rows, so the old buffer silently cut every large answer.
+    // contract_invoke() now FAILS a truncated reply rather than returning a
+    // prefix, so this is the size that makes the common case succeed rather than
+    // the thing that hides the problem.
+    static char out[65536];
     int rc = contract_invoke(app, argc, argv, out, (int)sizeof(out));
     size_t n = strlen(out);
     if (n) write(1, out, n);

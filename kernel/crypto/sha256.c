@@ -6,6 +6,22 @@
 #include "../cpu/dlprof.h"
 #include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
+// ---------------------------------------------------------------------------
+// #D1: userland/libc/sha256.c is a DELIBERATE twin of the hashing core below.
+//
+// It exists because Ring-3 cannot call into here (the App Store / updater
+// package-signature chain needs SHA-256 in userland). De-duplicating was
+// assessed on 2026-10-01 and REJECTED with evidence; the reasoning is in
+// crypto/sha256_twin_kat.sh's header, which is also the gate that now holds the
+// two in agreement. If you change K[], the macros, sha256_init/update/final or
+// the padding here, that oracle fails until the userland twin follows.
+//
+// Note for anyone writing a NEW oracle: pbkdf2_shadow_kat.sh and
+// secretuse_kat.sh both stage THIS file by sed-ing exactly its four #include
+// lines. Adding a fifth kernel include here breaks them, which is how
+// ecdsa_verify_kat.sh silently died once (see run-all-kats.sh's header).
+// ---------------------------------------------------------------------------
+
 // SHA-256 constants (first 32 bits of fractional parts of cube roots of first 64 primes)
 static const uint32_t K[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,

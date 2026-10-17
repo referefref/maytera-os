@@ -90,10 +90,43 @@ long syscall0(long n);
 long syscall1(long n, long a);
 long syscall2(long n, long a, long b);
 
+long syscall3(long n, long a, long b, long c);
+
+// #deadtests: WHAT THE TWO MODELLED SYSCALLS BELOW ARE FOR.
+//
+// This harness used to answer -1 to everything but SYS_GET_VERSION, and
+// test_refusals() asserted that flock() and utime() "must never claim
+// success". BOTH of those statements became false in the tree and nothing
+// noticed, because run_posixhdr.sh had no caller and did not even link
+// (utime.c reached for a syscall3() this file never defined).
+//
+//   flock  - real since #404 Stage 6: kernel/proc/advlock.c, SYS_FLOCK 441.
+//   utime  - real since #115:         kernel/proc/syscall.c sys_utime(), 387.
+//
+// So the refusals are modelled as the KERNEL actually behaves, and the
+// assertions below check the contract instead of a refusal that is gone.
+#define SC_GET_VERSION 246
+#define SC_FLOCK       441
+#define SC_UTIME       387
+
+// Whole-file advisory lock state, enough to model sys_flock()'s answers for a
+// single fd: granted, re-granted (an upgrade on the same owner), released.
+static int  g_flock_held = 0;
+static int  g_flock_last_op = 0;
+
+// What the last SYS_UTIME carried. The POINT of utime()'s NULL-times path is
+// that it must send the UTIME_NOW SENTINEL and NOT a userland time(), because
+// time() on this OS returns seconds since BOOT (#113); a wrong "now" would
+// stamp every file with 1970-plus-uptime. Recording the raw arguments is the
+// only way a host test can assert that.
+#define SC_UTIME_NOW  ((long)-2)
+static long g_utime_a = 0, g_utime_m = 0;
+static int  g_utime_calls = 0;
+
 long syscall0(long n) { (void)n; return -1; }
 long syscall1(long n, long a) { (void)n; (void)a; return -1; }
 long syscall2(long n, long a, long b) {
-    if (n == 246) {   // SYS_GET_VERSION
+    if (n == SC_GET_VERSION) {
         char *dst = (char *)a;
         int cap = (int)b, i = 0;
         if (g_version_fail) return -1;
@@ -101,7 +134,40 @@ long syscall2(long n, long a, long b) {
         dst[i] = 0;
         return i;
     }
+    if (n == SC_FLOCK) {   // sys_flock(fd, operation)
+        int fd = (int)a, op = (int)b;
+        int bare = op & ~4 /*LOCK_NB*/;
+        if (fd != 0) return -9;                    /* EBADF, as advlock_resolve_fd */
+        g_flock_last_op = bare;
+        switch (bare) {
+            case 1: case 2: g_flock_held = bare; return 0;   /* LOCK_SH / LOCK_EX */
+            case 8:         g_flock_held = 0;    return 0;   /* LOCK_UN */
+            default:        return -22;                      /* EINVAL */
+        }
+    }
     return -1;
+}
+
+// sys_utime(path, atime, mtime), modelled on kernel/proc/syscall.c:
+//   SMB/NFS path            -> -38 ENOSYS (honest refusal, neither client sets times)
+//   a time below UTIME_KEEP -> -22 EINVAL
+//   a path we do not have   -> -5  EIO    (fat_set_times failed)
+//   otherwise               -> 0
+long syscall3(long n, long a, long b, long c) {
+    if (n != SC_UTIME) return -1;
+    const char *path = (const char *)a;
+    if (!path) return -1;
+    g_utime_a = b; g_utime_m = c; g_utime_calls++;
+    if (strncmp(path, "/SMB/", 5) == 0 || strncmp(path, "/NFS/", 5) == 0) return -38;
+    // The sentinels are resolved FIRST, exactly as sys_utime() does, so the
+    // range check below sees resolved seconds. Checking the range first would
+    // reject UTIME_NOW (-2) and the model would disagree with the kernel on
+    // the one path utime(path, NULL) always takes.
+    if (b == SC_UTIME_NOW) b = 1700000000L;
+    if (c == SC_UTIME_NOW) c = 1700000000L;
+    if (b < (long)-1 || c < (long)-1) return -22;
+    if (strcmp(path, "/r/f3") != 0) return -5;
+    return 0;
 }
 
 // --- an in-memory file tree, for ftw ---------------------------------------
@@ -143,6 +209,14 @@ int stat(const char *path, struct stat *st) {
     memset(st, 0, sizeof(*st));
     st->st_mode  = n->isdir ? (S_IFDIR | 0755) : (S_IFREG | 0644);
     st->st_nlink = 1;
+    // #deadtests: A MODELLED MOUNT BOUNDARY, so nftw's FTW_MOUNT branch can
+    // actually be exercised. userland/libc/ftw.c says of that branch, in the
+    // tree, "THIS BRANCH IS UNEXERCISED ON THE CURRENT IMAGE AND IS THEREFORE
+    // NOT PROVEN TO WORK ... it needs a real test then", because on the real
+    // image a walk from "/" cannot REACH the ESP boundary (the ESP is
+    // reachable by name but never enumerated). A host model can reach one.
+    // /r/a/b and everything under it is a second filesystem.
+    st->st_dev = (strncmp(path, "/r/a/b", 6) == 0) ? 2 : 1;
     return 0;
 }
 
@@ -630,34 +704,77 @@ static void test_uname(void) {
 }
 
 // ===========================================================================
-// sys/file, utime - the two that must never claim success
+// sys/file + utime - the two that are REAL now, against a model of the kernel
+//
+// This section used to assert that both "must never claim success" and demand
+// ENOSYS. flock() has forwarded to SYS_FLOCK since #404 Stage 6 and utime()
+// to SYS_UTIME since #115, so that assertion had become a false statement
+// about the tree. It survived because nothing ran this test (#deadtests).
 // ===========================================================================
 
-static void test_refusals(void) {
+static void test_times_and_locks(void) {
     struct utimbuf ub;
     struct timeval tv[2];
-    printf("--- sys/file + utime (must always fail)\n");
+    printf("--- sys/file + utime (real syscalls, modelled kernel)\n");
 
+    // ---- flock: forwards, and maps the kernel's negative rc to errno -------
     errno = 0;
-    CKINT(flock(0, LOCK_EX), -1, "flock: refuses");
-    CKINT(errno, ENOSYS, "flock: ENOSYS");
+    CKINT(flock(0, LOCK_EX), 0, "flock: LOCK_EX granted");
+    CKINT(g_flock_held, LOCK_EX, "flock: kernel saw LOCK_EX");
+    CKINT(flock(0, LOCK_SH), 0, "flock: downgrade to LOCK_SH");
+    CKINT(flock(0, LOCK_UN), 0, "flock: LOCK_UN releases");
+    CKINT(g_flock_held, 0, "flock: lock released");
+    CKINT(flock(0, LOCK_EX | LOCK_NB), 0, "flock: LOCK_NB is not an error");
+    CKINT(g_flock_last_op, LOCK_EX, "flock: LOCK_NB masked off the op");
+    CKINT(flock(0, LOCK_UN), 0, "flock: release again");
     errno = 0;
-    CKINT(flock(0, LOCK_UN), -1, "flock: unlock refuses too");
-    CKINT(errno, ENOSYS, "flock: unlock ENOSYS");
+    CKINT(flock(0, 99), -1, "flock: bad operation refuses");
+    CKINT(errno, EINVAL, "flock: bad operation EINVAL");
+    errno = 0;
+    CKINT(flock(7, LOCK_EX), -1, "flock: unknown fd refuses");
+    CKINT(errno, EBADF, "flock: unknown fd EBADF");
 
+    // ---- utime: explicit times reach the kernel verbatim -------------------
     ub.actime = 1; ub.modtime = 2;
-    errno = 0;
-    CKINT(utime("/r/f3", &ub), -1, "utime: refuses");
-    CKINT(errno, ENOSYS, "utime: ENOSYS");
-    errno = 0;
-    CKINT(utime("/r/f3", 0), -1, "utime: NULL times refuses");
-    CKINT(errno, ENOSYS, "utime: NULL times ENOSYS");
+    g_utime_calls = 0; errno = 0;
+    CKINT(utime("/r/f3", &ub), 0, "utime: explicit times accepted");
+    CKINT(g_utime_calls, 1, "utime: one SYS_UTIME issued");
+    CKINT(g_utime_a, 1, "utime: atime passed verbatim");
+    CKINT(g_utime_m, 2, "utime: mtime passed verbatim");
 
-    tv[0].tv_sec = 1; tv[0].tv_usec = 0;
-    tv[1].tv_sec = 2; tv[1].tv_usec = 0;
+    // ---- utime(NULL): THE #113 INVARIANT -----------------------------------
+    // A NULL `times` means "now" and that MUST travel as the UTIME_NOW
+    // sentinel for the kernel to resolve. If this ever regresses to calling
+    // userland time(), every touched file is stamped 1970 plus the uptime.
+    g_utime_a = g_utime_m = 0; errno = 0;
+    CKINT(utime("/r/f3", 0), 0, "utime: NULL times accepted");
+    CKINT(g_utime_a, SC_UTIME_NOW, "utime: NULL sends UTIME_NOW atime");
+    CKINT(g_utime_m, SC_UTIME_NOW, "utime: NULL sends UTIME_NOW mtime");
+
+    // ---- utimes: sub-second precision is TRUNCATED, not rounded ------------
+    tv[0].tv_sec = 1; tv[0].tv_usec = 999999;
+    tv[1].tv_sec = 2; tv[1].tv_usec = 999999;
+    g_utime_a = g_utime_m = 0; errno = 0;
+    CKINT(utimes("/r/f3", tv), 0, "utimes: accepted");
+    CKINT(g_utime_a, 1, "utimes: usec truncated on atime");
+    CKINT(g_utime_m, 2, "utimes: usec truncated on mtime");
+    g_utime_a = g_utime_m = 0;
+    CKINT(utimes("/r/f3", 0), 0, "utimes: NULL times accepted");
+    CKINT(g_utime_a, SC_UTIME_NOW, "utimes: NULL sends UTIME_NOW");
+
+    // ---- the refusals that are still real ----------------------------------
     errno = 0;
-    CKINT(utimes("/r/f3", tv), -1, "utimes: refuses");
-    CKINT(errno, ENOSYS, "utimes: ENOSYS");
+    CKINT(utime(0, &ub), -1, "utime: NULL path refuses");
+    CKINT(errno, EINVAL, "utime: NULL path EINVAL");
+    errno = 0;
+    CKINT(utimes(0, tv), -1, "utimes: NULL path refuses");
+    CKINT(errno, EINVAL, "utimes: NULL path EINVAL");
+    errno = 0;
+    CKINT(utime("/SMB/srv/share/f", &ub), -1, "utime: SMB refuses");
+    CKINT(errno, ENOSYS, "utime: SMB ENOSYS (not a silent success)");
+    errno = 0;
+    CKINT(utime("/r/nosuch", &ub), -1, "utime: unknown file refuses");
+    CKINT(errno, EIO, "utime: unknown file EIO");
 }
 
 // ===========================================================================
@@ -769,9 +886,29 @@ static void test_ftw(void) {
     errno = 0;
     CKINT(nftw("/r", cb4, 8, FTW_CHDIR), -1, "nftw: FTW_CHDIR refused");
     CKINT(errno, EINVAL, "nftw: FTW_CHDIR EINVAL");
-    errno = 0;
-    CKINT(nftw("/r", cb4, 8, FTW_MOUNT), -1, "nftw: FTW_MOUNT refused");
-    CKINT(errno, EINVAL, "nftw: FTW_MOUNT EINVAL");
+    // FTW_MOUNT: HONOURED since #120, not refused. This asserted the old
+    // EINVAL refusal and nothing ran it, so the assertion outlived the
+    // behaviour by months. The model gives /r/a/b a second st_dev, which the
+    // real image cannot currently present to a walk.
+    v_n = 0; errno = 0;
+    CKINT(nftw("/r", cb4, 8, 0), 0, "nftw: plain walk completes");
+    CKINT(v_n, 7, "nftw: plain walk crosses the boundary");
+    v_n = 0; errno = 0;
+    CKINT(nftw("/r", cb4, 8, FTW_MOUNT), 0, "nftw: FTW_MOUNT accepted");
+    CKINT(v_n, 6, "nftw: FTW_MOUNT pruned the sub-mount");
+    {   int i, saw_b = 0, saw_f2 = 0;
+        for (i = 0; i < v_n && i < MAX_VISITS; i++) {
+            if (strcmp(v_path[i], "/r/a/b") == 0)    { saw_b = 1;
+                CKINT(v_type[i], FTW_D, "nftw: boundary dir still FTW_D"); }
+            if (strcmp(v_path[i], "/r/a/b/f2") == 0) saw_f2 = 1;
+        }
+        CKINT(saw_b, 1, "nftw: FTW_MOUNT still REPORTS the boundary dir");
+        CKINT(saw_f2, 0, "nftw: FTW_MOUNT did not descend past it");
+    }
+    // An unrecognised flag bit IS still EINVAL (ftw.c's flag mask).
+    v_n = 0; errno = 0;
+    CKINT(nftw("/r", cb4, 8, 0x40), -1, "nftw: unknown flag refused");
+    CKINT(errno, EINVAL, "nftw: unknown flag EINVAL");
     errno = 0;
     CKINT(nftw("/r", cb4, 0, 0), -1, "nftw: nopenfd 0 refused");
     CKINT(errno, EINVAL, "nftw: nopenfd 0 EINVAL");
@@ -839,7 +976,7 @@ int main(void) {
     test_libgen();
     test_uio();
     test_uname();
-    test_refusals();
+    test_times_and_locks();
     test_ftw();
     test_endian_param();
     printf("\n%d checks, %d failures\n", checks, fails);

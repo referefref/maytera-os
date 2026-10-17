@@ -32,4 +32,14 @@ dom_document *mdb_document(mdb_parser *p);
 /* Tear down parser + document. */
 void mdb_destroy(mdb_parser *p);
 
+/*
+ * #245 deepdom: launch canary for the deep-DOM depth cap. Parses one document
+ * under the cap and one over it and checks the clamp fires exactly at the cap
+ * while losing no text. Returns the number of FAILING cases (0 = pass); pass a
+ * report callback for one line per case, or NULL for the summary only.
+ */
+int mdb_depth_selftest(void (*report)(const char *line));
+int mdb_depth_selftest_count(void);
+int mdb_depth_selftest_cases(void);
+
 #endif

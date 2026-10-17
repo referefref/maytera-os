@@ -526,6 +526,34 @@ if [ "$SELFTEST" = "1" ]; then
   note "--- now linting the shipped themes in $DIR ---"
 fi
 
+# REFUSE A DIRECTORY THAT HAS NOTHING TO LINT (#gatecross, 2026-10-02).
+#
+# Until this guard existed, `theme-scale-lint.sh /does/not/exist` printed
+# "0 clean, 0 grandfathered" and "RESULT: OK" and exited 0. lint_dir()'s
+# `[ -e "$f" ] || continue` makes an unmatched glob a silent skip, so an absent
+# or empty directory produced a cheerful PASS. That is the single fault class
+# this repo has been bitten by most often - a check that answers a question it
+# never actually asked - and it mattered here, because build/build-golden.sh
+# hands this gate a path assembled from a materialised gate set: a typo or a
+# missing overlay in that path would have shipped an unlinted theme set with a
+# green gate line in the log. MEASURED before the fix: rc=0 on /nope/nothere.
+#
+# (The handover note for #gatecross said build/testfail-knob-gate.sh had the same
+# defect. MEASURED: it does not. It exits 2 on a missing directory AND on a
+# directory with no Makefile. One gate needed this, not two.)
+if [ ! -d "$DIR" ]; then
+  note "FAIL: $DIR is not a directory, so no theme was linted. Refusing to"
+  note "FAIL: report OK for a check that never read anything."
+  exit 1
+fi
+_nthemes=0
+for _t in "$DIR"/*.mtheme; do [ -e "$_t" ] && _nthemes=$((_nthemes+1)); done
+if [ "$_nthemes" -eq 0 ]; then
+  note "FAIL: $DIR contains no *.mtheme file. Either the path is wrong or the"
+  note "FAIL: themes are missing; both are failures, not a clean run of zero."
+  exit 1
+fi
+
 clean=0; suppressed=0
 lint_dir "$DIR" || fail=1
 note "mtheme v2 scale/contrast lint: ${clean} clean, ${suppressed} grandfathered (lint.baseline=legacy-v1)"

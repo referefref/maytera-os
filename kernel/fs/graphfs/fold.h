@@ -134,6 +134,25 @@ int gfs_node_restore(uint32_t node_id, uint16_t reason);
 int gfs_grant_issue(uint32_t actor, uint32_t holder, uint32_t target,
                     uint16_t scope, uint32_t ttl_ms, uint64_t *out_edge);
 
+// Record a RELATIONSHIP: a non-GRANT edge from `from` to `to`.
+//
+// WHY THIS EXISTS AND WHY IT IS NOT gfs_grant_issue. A GRANT is authority and
+// only GFS_NODE_ESCROW may issue one; the fold enforces that on the replay path
+// too. A RELATIONSHIP is a statement of fact ("this AI task acted on this
+// object"), carries no authority, and is never consulted by gfs_grant_check.
+// Conflating the two would mean either letting an ordinary actor append a GRANT
+// or being unable to record what an actor DID, and both are worse than one more
+// entry point. `rel` must be a non-GRANT relation (GFS_REL_DERIVED_FROM and so
+// on); passing GFS_REL_GRANT is REFUSED here, before the record is written, so
+// this function can never become a side door into issuing authority.
+//
+// The edge never expires: a record that something happened does not stop having
+// happened. Both endpoints must be live identities, as for any edge.
+//
+// Blocking (it appends a journal record), so process context only. Returns 0,
+// or negative on refusal.
+int gfs_relate(uint32_t from, uint32_t to, uint16_t rel);
+
 // Revoke a contract. Takes effect in memory before this returns
 // (CONTRACT_ARCHITECTURE.md section 6: revocation must bite in flight).
 int gfs_grant_revoke(uint32_t actor, uint64_t edge_seq, uint16_t reason);

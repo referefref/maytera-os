@@ -19,9 +19,12 @@
 #include "aicap.h"      // #293 capability tokens + consent + audit
 #include "aidev.h"      // #708 per-device AI capability manifest
 #include "userconf.h"   // #684: per-user protected AI settings
+#include "capreq.h"     // #peruserrows: THE shared capability request/consent wait
+#include "aisvc.h"      // #<config-ref>: THE reader of AISVC.CFG, shared with Studio
 #include "contract.h"   // #235: THE settings surface, asked not re-described
 #include "keys.h"       // #293: GUI_KEY_* names for input.inject
 #include "b64.h"       // #469: the SHARED base64 encoder (vision data URLs)
+#include "applaunch.h"  // #292: THE shared launch registry (was inline here)
 #include "aitools.h"   // #469m: THE one declaration of the model-facing tool surface
 #include "photorg.h"    // #712: escrow-contract photo organiser (photos.organize)
 
@@ -64,6 +67,12 @@
 #define RESP_MAX      65536
 #define BODY_MAX      65536
 #define AITOOLS_INDEX "/AITOOLS/INDEX.yaml"
+// #peruserrows: the URL handed to the browser. KEPT AS THE LEGACY LITERAL and no
+// longer written directly: exec_web_open() writes userhome_open_write(0,
+// "STARTURL.TXT") and browser/main.c reads the per-user copy first and falls back
+// to this one, which is what keeps an offline-BAKED /STARTURL.TXT working as a
+// headless dev override. `sub = NULL` matches the file's legacy directory (the
+// filesystem root), so a root session still resolves to exactly this path.
 #define STARTURL_PATH "/STARTURL.TXT"
 #define MAX_ACTIONS   4
 #define TOOLLIST_MAX  4096
@@ -88,25 +97,12 @@ typedef ai_msg_t msg_t;
 static char g_toollist[TOOLLIST_MAX];
 static int  g_have_tools = 0;
 
-enum { LK_GUI = 0, LK_WIN16 = 1, LK_DOS = 2 };
-
-#define LAUNCH_MAX      160
-#define LAUNCH_ID_MAX   48
-#define LAUNCH_PATH_MAX 192
-#define LAUNCH_NAME_MAX 64
+// #292 launch registry: THE shared one, libc/applaunch.{h,c}. It used to live
+// right here as a block of statics no other caller could reach; Maytera Flow's
+// `launch` node was the second caller and the copy would have been the defect.
+// Only the model-facing PROSE built from it stays in this file.
 #define APPLIST_MAX     6144
-#define SM_LINE_MAX     1024   // matches startmenu.c SM_FRAG_LINE bound
 
-typedef struct {
-    char id[LAUNCH_ID_MAX];      // primary id: slug of the display name ("Game Boy" -> gameboy)
-    char alt[LAUNCH_ID_MAX];     // alternate id: slug of the exec basename ("/APPS/gbemu" -> gbemu); "" if equal
-    char path[LAUNCH_PATH_MAX];  // full exec line (may carry args for win16/dos)
-    char name[LAUNCH_NAME_MAX];  // display name
-    int  kind;                   // LK_GUI / LK_WIN16 / LK_DOS
-} launch_ent_t;
-
-static launch_ent_t g_launch[LAUNCH_MAX];
-static int  g_launch_n = 0;
 static char g_applist[APPLIST_MAX];
 static int  g_have_applist = 0;
 static char g_apikey[256];
@@ -308,39 +304,25 @@ static void add_msg(int role, const char *text) {
 // carry only /CONFIG/KIMI.KEY) keep working unchanged. Called AFTER load_key so
 // an api_key here overrides KIMI.KEY.
 static void load_aisvc(void) {
-    int fd = userconf_open_read(AISVC_NAME, 0);   // #684: no legacy fallback (secret)
-    if (fd < 0) return;
-    static char buf[1024];
-    long n = sys_read(fd, buf, sizeof(buf) - 1);
-    sys_close(fd);
-    if (n <= 0) return;
-    buf[n] = 0;
-    int i = 0;
-    while (buf[i]) {
-        char line[512]; int ll = 0;
-        while (buf[i] && buf[i] != '\n') { if (ll < (int)sizeof(line) - 1) line[ll++] = buf[i]; i++; }
-        if (buf[i] == '\n') i++;
-        line[ll] = 0;
-        int e = ll - 1;
-        while (e >= 0 && (line[e]=='\r'||line[e]==' '||line[e]=='\t')) line[e--] = 0;
-        if (line[0] == '#' || line[0] == 0) continue;
-        char *eq = 0;
-        for (char *p = line; *p; p++) if (*p == '=') { eq = p; break; }
-        if (!eq) continue;
-        *eq = 0;
-        const char *key = line; char *val = eq + 1;
-        while (*val == ' ' || *val == '\t') val++;
-        if      (!strcmp(key, "endpoint"))  { if (val[0]) strlcpy(g_endpoint, val, sizeof(g_endpoint)); }
-        else if (!strcmp(key, "model"))     { if (val[0]) strlcpy(g_model, val, sizeof(g_model)); }
-        else if (!strcmp(key, "api_style")) { g_api_style = !strcmp(val, "anthropic") ? AI_STYLE_ANTHROPIC : AI_STYLE_BEARER; }
-        else if (!strcmp(key, "api_key"))   { if (val[0]) { strlcpy(g_apikey, val, sizeof(g_apikey)); g_have_key = 1; } }
-        // #469m: tool_calls = on | off | auto (default auto). See tc_resolve().
-        else if (!strcmp(key, "tool_calls")) {
-            if      (!strcmp(val, "on"))  g_toolcalls_cfg = AI_TC_ON;
-            else if (!strcmp(val, "off")) g_toolcalls_cfg = AI_TC_OFF;
-            else                          g_toolcalls_cfg = AI_TC_AUTO;
-        }
-    }
+    // #<config-ref>: the PARSER moved to libc/aisvc.c, which is now the only
+    // reader of this file. It used to live here and be copied (wrongly) into
+    // userland/apps/paint/ai.c, which sent the literal "api_key=" prefix as the
+    // bearer token and got HTTP 401 on every request. See aisvc.h.
+    aisvc_cfg_t c;
+    strlcpy(c.endpoint, g_endpoint, sizeof(c.endpoint));
+    strlcpy(c.model,    g_model,    sizeof(c.model));
+    strlcpy(c.api_key,  g_apikey,   sizeof(c.api_key));
+    c.api_style  = (g_api_style == AI_STYLE_ANTHROPIC) ? AISVC_STYLE_ANTHROPIC : AISVC_STYLE_BEARER;
+    c.tool_calls = (g_toolcalls_cfg == AI_TC_ON)  ? AISVC_TC_ON
+                 : (g_toolcalls_cfg == AI_TC_OFF) ? AISVC_TC_OFF : AISVC_TC_AUTO;
+    c.have_key   = g_have_key;
+    if (!aisvc_load(&c)) return;
+    strlcpy(g_endpoint, c.endpoint, sizeof(g_endpoint));
+    strlcpy(g_model,    c.model,    sizeof(g_model));
+    if (c.have_key) { strlcpy(g_apikey, c.api_key, sizeof(g_apikey)); g_have_key = 1; }
+    g_api_style = (c.api_style == AISVC_STYLE_ANTHROPIC) ? AI_STYLE_ANTHROPIC : AI_STYLE_BEARER;
+    g_toolcalls_cfg = (c.tool_calls == AISVC_TC_ON)  ? AI_TC_ON
+                    : (c.tool_calls == AISVC_TC_OFF) ? AI_TC_OFF : AI_TC_AUTO;
 }
 // #294: load the build-service URL override, if present.
 static void load_buildsvc(void) {
@@ -1074,14 +1056,28 @@ static void load_tools(void) {
     g_toollist[out] = 0;
     if (out > 0) g_have_tools = 1;
 
-    // Optional diagnostic (#459 verification): if /CONFIG/AITOOLSDBG.ON exists,
-    // dump the parsed tool list to /CONFIG/AITOOLSDBG.TXT so contract loading can
-    // be confirmed on a VM. No-op in production (the flag file is not shipped).
+    // Optional diagnostic (#459 verification): dump the parsed tool list so
+    // contract loading can be confirmed on a VM. No-op in production (the flag
+    // file is not shipped).
+    //
+    // #peruserrows: BOTH HALVES WERE ROOT-ONLY. The output went to
+    // /CONFIG/AITOOLSDBG.TXT, and /CONFIG is root-owned 0711 because it holds
+    // SHADOW, MFA.DB, PERMS.DB and the consent store; it is NOT to be loosened,
+    // so the caller is what changed. The output now goes through
+    // userscratch_path() (<home>/AITOOLSDBG.TXT with an account, else /TMP), and
+    // the ARMING FLAG is read per-user first so a non-root user can arm their own
+    // diagnostic instead of needing somebody to place a file in /CONFIG. Root is
+    // unchanged on the flag: its home is "/", so the per-user candidate IS
+    // /CONFIG/AITOOLSDBG.ON.
     {
-        int chk = sys_open("/CONFIG/AITOOLSDBG.ON", O_RDONLY);
+        int chk = userhome_open_read("CONFIG", "AITOOLSDBG.ON",
+                                    "/CONFIG/AITOOLSDBG.ON");
         if (chk >= 0) {
             sys_close(chk);
-            int dfd = sys_open("/CONFIG/AITOOLSDBG.TXT", O_WRONLY | O_CREAT | O_TRUNC);
+            char dbgp[192];
+            int dfd = -1;
+            if (userscratch_path("AITOOLSDBG.TXT", dbgp, sizeof(dbgp)) == 0)
+                dfd = userconf_open_write_path(dbgp);
             if (dfd >= 0) {
                 const char *h = g_have_tools ? "HAVE_TOOLS\n" : "NONE_LOADED\n";
                 sys_write(dfd, h, strlen(h));
@@ -1516,8 +1512,32 @@ static void exec_fs_delete(const char *args, char *obs, int ocap) {
         strlcpy(obs, "{\"error\":\"missing path\"}", ocap); return;
     }
     int r = sys_unlink(path);
-    if (r < 0) { snprintf(obs, ocap, "{\"error\":\"delete-failed\",\"path\":\"%s\"}", path); return; }
-    snprintf(obs, ocap, "{\"status\":\"success\",\"deleted\":\"%s\"}", path);
+    if (r < 0) {
+        // A refusal here is no longer only a permission problem. Since
+        // 2026-10-03 the kernel REFUSES a marked process's delete when it
+        // cannot make the bytes recoverable (no usable Recycle Bin), and
+        // refuses rmdir outright for a scoped contract. Say that, so the model
+        // does not retry a delete that will never be allowed and does not tell
+        // the user the file is gone.
+        snprintf(obs, ocap,
+                 "{\"error\":\"delete-refused\",\"path\":\"%s\","
+                 "\"note\":\"nothing was removed; the file is intact. Either you "
+                 "lack permission, or the Recycle Bin could not accept it so the "
+                 "kernel refused rather than destroy it.\"}", path);
+        return;
+    }
+    // THE OBSERVATION THE MODEL SEES MUST BE TRUE. This used to say
+    // "deleted", and after the kernel change that would have been a lie the
+    // model then repeated to the user: the file is NOT destroyed, it is in the
+    // Recycle Bin, the user has already been notified by the kernel, and either
+    // of them can put it back. A model told "deleted" would answer "I have
+    // permanently removed it", which is both wrong and alarming.
+    snprintf(obs, ocap,
+             "{\"status\":\"success\",\"recycled\":\"%s\","
+             "\"note\":\"moved to the Recycle Bin, not destroyed. The user has "
+             "been notified. It can be restored from the Recycle Bin, and is "
+             "purged automatically after the retention period set in Settings "
+             "(30 days by default, or never).\"}", path);
 }
 
 // --- HIGH-risk: create a directory (#711). Gated by aicap before dispatch. ---
@@ -1719,7 +1739,7 @@ static void exec_web_open(const char *args, char *obs, int ocap) {
         snprintf(full, sizeof(full), "https://%s", url);
     else
         strlcpy(full, url, sizeof(full));
-    int fd = sys_open(STARTURL_PATH, O_WRONLY | O_CREAT | O_TRUNC);
+    int fd = userhome_open_write(0, "STARTURL.TXT");   // #peruserrows (root: /STARTURL.TXT)
     if (fd < 0) { strlcpy(obs, "{\"error\":\"cannot-write-starturl\"}", ocap); return; }
     sys_write(fd, full, strlen(full));
     sys_write(fd, "\n", 1);
@@ -1788,224 +1808,22 @@ static void exec_calc_open(const char *args, char *obs, int ocap) {
     snprintf(obs, ocap, "{\"launched\":\"/APPS/CALC\",\"pid\":%d}", pid);
 }
 
-// --- Generic app launcher (#292) -----------------------------------------
-// DYNAMIC launch registry, built at init from the SAME on-device app manifest
-// the Start menu uses: the shipped/installed .MENU fragments under
-// /CONFIG/STARTMENU/SYSTEM.D (userland/apps/compositor/startmenu.c feeds the
-// exact same files). There is now ONE list, not a hand-synced C table: adding
-// an app to the manifest (build/assets/startmenu/system.d/*.MENU, or an App
-// Store install writing a fragment via libc/startmenu_reg.c) makes it BOTH
-// visible in the Start menu AND launchable by the AI, with no code change here.
-//
-// This mirrors the compositor's .MENU line format EXACTLY (it cannot share the
-// compositor's Rust parser: that parser lives in the compositor app binary, not
-// in libc). Format, per startmenu_model.rs:
-//   item: <Display Name> | <exec path [args]> | icon=<name> [| type=native|win16|dos] ...
-// The launch KIND is the explicit `type=` field (absent => native), and the
-// exec path's prefix (/WIN16 , /DOS , /APPS) already agrees with it.
-//
-// Dispatch verb by kind, matching startmenu.c's do_launch():
-//   gui   -> sys_spawn(path)   (native ELF; DOOM, Files, gbemu, ...)
-//   win16 -> win16_run(path)   (Win16 NE .EXE: SkiFree, FreeCell, Chips, ...)
-//   dos   -> dos_run(path)     (MS-DOS .EXE/.COM: TIM, Commander Keen, ...)
-// The exec string is passed VERBATIM to win16_run/dos_run (args and all) because
-// the kernel re-splits it, exactly as the compositor does.
-// (launch registry types + globals are declared up near g_toollist)
+// --- Generic app launcher (#292), DELEGATED -------------------------------
+// The registry, the .MENU manifest parser, the slug matching, the /ROMS
+// resolver and the gui/win16/dos dispatch all live in libc/applaunch.{h,c}
+// now. They were born here, as statics, and moved out the moment a second
+// caller needed them (Maytera Flow's `launch` node). What stays here is the
+// two things that really are AI-chat concerns: the model-facing app list and
+// the JSON in/JSON out shape of the app.launch tool.
 
-// case-insensitive id match (model may say "DOOM" / "SkiFree")
-static int id_eq_ci(const char *a, const char *b) {
-    for (;; a++, b++) {
-        char ca = *a, cb = *b;
-        if (ca >= 'A' && ca <= 'Z') ca += 32;
-        if (cb >= 'A' && cb <= 'Z') cb += 32;
-        if (ca != cb) return 0;
-        if (!ca) return 1;
-    }
-}
-
-// Slugify: lowercase, keep [a-z0-9] only. "The Incredible Machine" -> theincrediblemachine
-static void slugify_ascii(const char *src, char *dst, int cap) {
-    int o = 0;
-    for (const char *s = src; *s && o < cap - 1; s++) {
-        char c = *s;
-        if (c >= 'A' && c <= 'Z') c += 32;
-        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) dst[o++] = c;
-    }
-    dst[o] = 0;
-}
-
-// Slug of the exec basename: take the FIRST whitespace-delimited token of the
-// exec line, its final path component, strip a trailing .EXT, then slugify.
-// "/GAMES/DOOM/DOOM.ELF" -> doom ; "/DOS/STUNTS/LOAD.EXE /u MCGA" -> load
-static void basename_slug(const char *path, char *dst, int cap) {
-    char tok[LAUNCH_PATH_MAX];
-    int o = 0;
-    for (const char *s = path; *s && *s != ' ' && *s != '\t' && o < (int)sizeof(tok) - 1; s++)
-        tok[o++] = *s;
-    tok[o] = 0;
-    const char *base = tok;
-    for (const char *p = tok; *p; p++) if (*p == '/' || *p == '\\') base = p + 1;
-    char stem[LAUNCH_PATH_MAX];
-    int so = 0;
-    for (const char *p = base; *p && so < (int)sizeof(stem) - 1; p++) stem[so++] = *p;
-    stem[so] = 0;
-    for (int k = so - 1; k > 0; k--) { if (stem[k] == '.') { stem[k] = 0; break; } }
-    slugify_ascii(stem, dst, cap);
-}
-
-// First whitespace-delimited token of an exec line (the bare binary path).
-static void first_token(const char *path, char *dst, int cap) {
-    int o = 0;
-    for (const char *s = path; *s && *s != ' ' && *s != '\t' && o < cap - 1; s++) dst[o++] = *s;
-    dst[o] = 0;
-}
-
-// Parse ONE manifest line. Only `item:` lines contribute a launchable app; we
-// ignore category:/rename:/hide: (the AI list is the union of launchable apps).
-// Last-write-wins by primary id, so a later fragment overriding an app updates
-// the same entry rather than duplicating it.
-static void launch_parse_line(const char *line) {
-    int p = 0; while (line[p] == ' ' || line[p] == '\t') p++;
-    if (strncmp(line + p, "item:", 5) != 0) return;
-    const char *rest = line + p + 5;
-
-    // field 0 = name, field 1 = exec line, remaining = key=value
-    char name[LAUNCH_NAME_MAX], exec[LAUNCH_PATH_MAX];
-    int kind = LK_GUI;
-
-    // split on '|'
-    const char *f = rest;
-    int fi = 0;
-    name[0] = 0; exec[0] = 0;
-    while (fi < 8) {
-        const char *bar = f;
-        while (*bar && *bar != '|') bar++;
-        // trim field [f, bar)
-        const char *a = f; const char *b = bar;
-        while (a < b && (*a == ' ' || *a == '\t')) a++;
-        while (b > a && (b[-1] == ' ' || b[-1] == '\t')) b--;
-        int len = (int)(b - a);
-        if (fi == 0) {
-            if (len > LAUNCH_NAME_MAX - 1) len = LAUNCH_NAME_MAX - 1;
-            memcpy(name, a, len); name[len] = 0;
-        } else if (fi == 1) {
-            if (len > LAUNCH_PATH_MAX - 1) len = LAUNCH_PATH_MAX - 1;
-            memcpy(exec, a, len); exec[len] = 0;
-        } else {
-            // key=value (only type= matters for the launch verb)
-            if (len >= 5 && !strncmp(a, "type=", 5)) {
-                const char *v = a + 5;
-                if      (!strncmp(v, "win16", 5)) kind = LK_WIN16;
-                else if (!strncmp(v, "dos", 3))   kind = LK_DOS;
-                else                              kind = LK_GUI; // native/anything else
-            }
-        }
-        fi++;
-        if (!*bar) break;
-        f = bar + 1;
-    }
-    if (!name[0] || !exec[0]) return;
-
-    char id[LAUNCH_ID_MAX], alt[LAUNCH_ID_MAX];
-    slugify_ascii(name, id, sizeof(id));
-    basename_slug(exec, alt, sizeof(alt));
-    if (!id[0]) { if (!alt[0]) return; strlcpy(id, alt, sizeof(id)); }
-    if (id_eq_ci(id, alt)) alt[0] = 0;   // no distinct alternate
-
-    // last-write-wins by primary id
-    launch_ent_t *e = 0;
-    for (int i = 0; i < g_launch_n; i++)
-        if (id_eq_ci(g_launch[i].id, id)) { e = &g_launch[i]; break; }
-    if (!e) {
-        if (g_launch_n >= LAUNCH_MAX) return;
-        e = &g_launch[g_launch_n++];
-    }
-    strlcpy(e->id, id, sizeof(e->id));
-    strlcpy(e->alt, alt, sizeof(e->alt));
-    strlcpy(e->path, exec, sizeof(e->path));
-    strlcpy(e->name, name, sizeof(e->name));
-    e->kind = kind;
-}
-
-// Feed one .MENU file, streamed a line at a time (no whole-file buffer, so no
-// size limit to outgrow: the games fragment is ~29KB). Mirrors sm_feed_file().
-static void launch_parse_fd(int fd) {
-    static char chunk[2048];
-    char line[SM_LINE_MAX]; int lp = 0;
-    long n;
-    while ((n = sys_read(fd, chunk, sizeof(chunk))) > 0) {
-        for (long k = 0; k < n; k++) {
-            char c = chunk[k];
-            if (c == '\n' || c == '\r') {
-                line[lp] = 0;
-                if (lp) launch_parse_line(line);
-                lp = 0;
-            } else if (lp < SM_LINE_MAX - 1) {
-                line[lp++] = c;
-            }
-        }
-    }
-    if (lp) { line[lp] = 0; launch_parse_line(line); }
-}
-
-// Scan one SYSTEM.D directory for *.MENU fragments and parse each.
-static void launch_scan_dir(const char *dir) {
-    int dfd = sys_open(dir, 0);
-    if (dfd < 0) return;
-    dirent_t e;
-    int guard = 0;
-    while (guard++ < 256) {
-        int r = (int)syscall2(SYS_READDIR, dfd, (long)&e);
-        if (r != 0 || e.name[0] == 0) break;
-        int l = 0; while (e.name[l]) l++;
-        if (l < 6) continue;
-        // ".MENU" suffix, case-tolerant (FAT 8.3 exposes uppercase)
-        const char *suf = e.name + l - 5;
-        if (!(suf[0]=='.' &&
-              (suf[1]=='M'||suf[1]=='m') && (suf[2]=='E'||suf[2]=='e') &&
-              (suf[3]=='N'||suf[3]=='n') && (suf[4]=='U'||suf[4]=='u'))) continue;
-        char path[256];
-        snprintf(path, sizeof(path), "%s/%s", dir, e.name);
-        int ffd = sys_open(path, O_RDONLY);
-        if (ffd < 0) continue;
-        launch_parse_fd(ffd);
-        sys_close(ffd);
-    }
-    sys_close(dfd);
-}
-
-// Tiny hardcoded FALLBACK, used ONLY when the manifest is unreadable (no
-// SYSTEM.D on this image). Not the source of truth: it exists so the AI is not
-// entirely unable to launch anything on a broken image, and is deliberately
-// minimal. The real list is the .MENU manifest above.
-static void launch_seed_fallback(void) {
-    static const struct { const char *nm, *pt; int k; } fb[] = {
-        { "Files",     "/APPS/FILES",          LK_GUI },
-        { "Terminal",  "/APPS/TERMINAL",       LK_GUI },
-        { "Settings",  "/APPS/SETTINGS",       LK_GUI },
-        { "Browser",   "/APPS/BROWSER",        LK_GUI },
-        { "Calculator","/APPS/CALC",           LK_GUI },
-        { "DOOM",      "/GAMES/DOOM/DOOM.ELF",  LK_GUI },
-        { "Game Boy",  "/APPS/gbemu",           LK_GUI },
-    };
-    for (unsigned i = 0; i < sizeof(fb)/sizeof(fb[0]) && g_launch_n < LAUNCH_MAX; i++) {
-        launch_ent_t *e = &g_launch[g_launch_n++];
-        slugify_ascii(fb[i].nm, e->id, sizeof(e->id));
-        basename_slug(fb[i].pt, e->alt, sizeof(e->alt));
-        if (id_eq_ci(e->id, e->alt)) e->alt[0] = 0;
-        strlcpy(e->path, fb[i].pt, sizeof(e->path));
-        strlcpy(e->name, fb[i].nm, sizeof(e->name));
-        e->kind = fb[i].k;
-    }
-}
-
-// Build the model-facing "Installed apps" list from the dynamic registry, so
-// the model is told the REAL current set by id + name. gbemu appears here the
+// Build the model-facing "Installed apps" list from the shared registry, so the
+// model is told the REAL current set by id + name. An app appears here the
 // moment its .MENU item does, with no code change (directive #292).
 static void launch_build_applist(void) {
     int o = 0;
-    for (int i = 0; i < g_launch_n; i++) {
-        launch_ent_t *e = &g_launch[i];
+    int n = applaunch_count();
+    for (int i = 0; i < n; i++) {
+        const applaunch_ent_t *e = applaunch_at(i);
         // "  <id>[ (<alt>)]: <Name>\n"
         int need = (int)strlen(e->id) + (int)strlen(e->name) +
                    (e->alt[0] ? (int)strlen(e->alt) + 4 : 0) + 8;
@@ -2015,60 +1833,15 @@ static void launch_build_applist(void) {
         o += snprintf(g_applist + o, APPLIST_MAX - o, ": %s\n", e->name);
     }
     g_applist[o] = 0;
-    g_have_applist = (g_launch_n > 0);
+    g_have_applist = (n > 0);
 }
 
 // Load the launch manifest + model-facing app list. Called from aiclient_init().
 static void load_launch_manifest(void) {
-    g_launch_n = 0;
     g_applist[0] = 0;
     g_have_applist = 0;
-    // Same directories the compositor's sm_feed_system_layer() feeds.
-    launch_scan_dir("/CONFIG/STARTMENU/SYSTEM.D");
-    launch_scan_dir("/ext2/CONFIG/STARTMENU/SYSTEM.D");
-    if (g_launch_n == 0) launch_seed_fallback();
+    applaunch_load();
     launch_build_applist();
-}
-
-// case-insensitive substring test (needle within haystack).
-static int substr_ci(const char *hay, const char *needle) {
-    if (!needle[0]) return 0;
-    for (const char *h = hay; *h; h++) {
-        const char *a = h, *b = needle;
-        for (;;) {
-            char cb = *b;
-            if (!cb) return 1;
-            char ca = *a;
-            if (!ca) break;
-            if (ca >= 'A' && ca <= 'Z') ca += 32;
-            if (cb >= 'A' && cb <= 'Z') cb += 32;
-            if (ca != cb) break;
-            a++; b++;
-        }
-    }
-    return 0;
-}
-
-// Resolve a ROM name to a /ROMS path by case-insensitive substring match.
-// "pokemon" -> "/ROMS/POKEMON_YELLOW.GB" (whatever is present). Returns 1 on hit.
-static int resolve_rom(const char *query, char *out, int cap) {
-    int dfd = sys_open("/ROMS", 0);
-    if (dfd < 0) return 0;
-    dirent_t e;
-    int hit = 0, guard = 0;
-    while (guard++ < 1024) {
-        int r = (int)syscall2(SYS_READDIR, dfd, (long)&e);
-        if (r != 0 || e.name[0] == 0) break;
-        if (!strcmp(e.name, ".") || !strcmp(e.name, "..")) continue;
-        if (DIRENT_IS_DIR(e)) continue;
-        if (substr_ci(e.name, query)) {
-            snprintf(out, cap, "/ROMS/%s", e.name);
-            hit = 1;
-            break;
-        }
-    }
-    sys_close(dfd);
-    return hit;
 }
 
 static void exec_app_launch(const char *args, char *obs, int ocap) {
@@ -2080,18 +1853,6 @@ static void exec_app_launch(const char *args, char *obs, int ocap) {
                 strlcpy(obs, "{\"error\":\"missing app_id\"}", ocap); return;
             }
     }
-    if (g_launch_n == 0) load_launch_manifest();   // lazy-load if init was skipped
-
-    // Match against the primary id (name-slug) OR the alternate (exec basename),
-    // so "gameboy" and "gbemu" both reach the Game Boy app - no per-app code.
-    const launch_ent_t *e = 0;
-    for (int i = 0; i < g_launch_n; i++)
-        if (id_eq_ci(g_launch[i].id, id) ||
-            (g_launch[i].alt[0] && id_eq_ci(g_launch[i].alt, id))) { e = &g_launch[i]; break; }
-    if (!e) {
-        snprintf(obs, ocap, "{\"error\":\"unknown-app\",\"app_id\":\"%s\"}", id);
-        return;
-    }
 
     // Optional argument: {"rom":"..."} resolves against /ROMS (Game Boy etc.);
     // {"arg":"..."} passes one argument verbatim. Both apply to NATIVE apps
@@ -2102,53 +1863,36 @@ static void exec_app_launch(const char *args, char *obs, int ocap) {
     if (!have_rom) have_rom = json_get_str(args, "game", rom, sizeof(rom)) && rom[0];
     int have_arg = json_get_str(args, "arg", arg, sizeof(arg)) && arg[0];
 
-    int rc;
-    const char *kind;
-    switch (e->kind) {
-        case LK_WIN16: kind = "win16"; rc = win16_run(e->path); break;
-        case LK_DOS:   kind = "dos";   rc = dos_run(e->path);   break;
-        default: {
-            kind = "gui";
-            char bin[LAUNCH_PATH_MAX];
-            first_token(e->path, bin, sizeof(bin));
-            if (have_rom) {
-                char rompath[160];
-                if (resolve_rom(rom, rompath, sizeof(rompath))) {
-                    char *argv[2] = { bin, rompath };
-                    rc = sys_spawn_args(bin, argv, 2);
-                    if (rc >= 0) {
-                        snprintf(obs, ocap,
-                            "{\"launched\":\"%s\",\"name\":\"%s\",\"kind\":\"gui\","
-                            "\"path\":\"%s\",\"rom\":\"%s\",\"rc\":%d}",
-                            e->id, e->name, bin, rompath, rc);
-                        return;
-                    }
-                } else {
-                    // No ROM matched: launch bare so the app shows its own picker.
-                    rc = sys_spawn(bin);
-                    if (rc >= 0) {
-                        snprintf(obs, ocap,
-                            "{\"launched\":\"%s\",\"name\":\"%s\",\"kind\":\"gui\","
-                            "\"path\":\"%s\",\"rom_query\":\"%s\",\"rom\":\"no-match\",\"rc\":%d}",
-                            e->id, e->name, bin, rom, rc);
-                        return;
-                    }
-                }
-            } else if (have_arg) {
-                char *argv[2] = { bin, arg };
-                rc = sys_spawn_args(bin, argv, 2);
-            } else {
-                rc = sys_spawn(bin);
-            }
-            break;
-        }
+    applaunch_result_t r;
+    int rc = applaunch_run(id, have_rom ? rom : 0, have_arg ? arg : 0, &r);
+    if (rc == APPLAUNCH_ERR_UNKNOWN) {
+        snprintf(obs, ocap, "{\"error\":\"unknown-app\",\"app_id\":\"%s\"}", id);
+        return;
     }
-    if (rc < 0)
-        snprintf(obs, ocap, "{\"error\":\"launch-failed\",\"app_id\":\"%s\",\"path\":\"%s\",\"rc\":%d}",
-                 e->id, e->path, rc);
-    else
-        snprintf(obs, ocap, "{\"launched\":\"%s\",\"name\":\"%s\",\"kind\":\"%s\",\"path\":\"%s\",\"rc\":%d}",
-                 e->id, e->name, kind, e->path, rc);
+    const char *kind = (r.kind == APPLAUNCH_WIN16) ? "win16" :
+                       (r.kind == APPLAUNCH_DOS)   ? "dos"   : "gui";
+    if (rc != 0) {
+        snprintf(obs, ocap,
+                 "{\"error\":\"launch-failed\",\"app_id\":\"%s\",\"path\":\"%s\",\"rc\":%d}",
+                 r.id, r.path, r.rc);
+        return;
+    }
+    if (r.rom_matched) {
+        snprintf(obs, ocap,
+            "{\"launched\":\"%s\",\"name\":\"%s\",\"kind\":\"gui\","
+            "\"path\":\"%s\",\"rom\":\"%s\",\"rc\":%d}",
+            r.id, r.name, r.path, r.rom, r.rc);
+    } else if (r.rom_requested) {
+        // No ROM matched: the app was launched bare so it shows its own picker.
+        snprintf(obs, ocap,
+            "{\"launched\":\"%s\",\"name\":\"%s\",\"kind\":\"gui\","
+            "\"path\":\"%s\",\"rom_query\":\"%s\",\"rom\":\"no-match\",\"rc\":%d}",
+            r.id, r.name, r.path, rom, r.rc);
+    } else {
+        snprintf(obs, ocap,
+            "{\"launched\":\"%s\",\"name\":\"%s\",\"kind\":\"%s\",\"path\":\"%s\",\"rc\":%d}",
+            r.id, r.name, kind, r.path, r.rc);
+    }
 }
 
 // --- Storage / disk-free (#292) -------------------------------------------
@@ -2715,51 +2459,14 @@ static void exec_build_deploy(const char *args, char *obs, int ocap) {
 // call within the granted window does not re-prompt.
 // ===========================================================================
 
-static const char *cap_err_str(long e) {
-    switch (e) {
-        case CAP_ENOINPUT:   return "no recent user input to authorize the request";
-        case CAP_EBUSY:      return "a consent prompt is already open or the screen is locked";
-        case CAP_ESCOPE:     return "the target window or scope was rejected";
-        case CAP_ENOCONSENT: return "no compositor is available to ask the user";
-        case CAP_EPOLICY:    return "refused by policy";
-        case CAP_EDENIED:    return "the user denied the request";
-        case CAP_EMAX:       return "the capability grant table is full";
-        default:             return "the request was refused";
-    }
-}
-
-static int ai_is_denial(long e) {
-    return e == (long)CAP_EDENIED   || e == (long)CAP_ESCOPE ||
-           e == (long)CAP_ENOINPUT  || e == (long)CAP_EBUSY  ||
-           e == (long)CAP_ENOCONSENT|| e == (long)CAP_EPOLICY||
-           e == (long)CAP_EMAX;
-}
-
-// Raise the trusted compositor consent prompt for a capability and wait, bounded
-// (~3 min), for the user's verdict. The compositor (not this app) draws and
-// resolves it; sys_sleep is the wait, and the wake source is a human answering a
-// modal, outside our control, so a timeout is the correct semantics rather than
-// a masked wake. Always issues a fresh request (a grant held for a DIFFERENT
-// path/window would not cover this one). Returns 0 on grant, else a negative
-// CAP_E*.
-static long ai_cap_acquire(unsigned int cap, unsigned int scope_kind,
-                           const char *scope, const char *reason) {
-    cap_req_t r; memset(&r, 0, sizeof(r));
-    r.cap = cap;
-    r.duration_ms = 120000;                 // 2 min window; unlimited uses within
-    r.scope_kind = scope_kind;
-    strlcpy(r.reason, reason, sizeof(r.reason));
-    r.reason_len = (unsigned int)strlen(r.reason);
-    strlcpy(r.scope, scope, sizeof(r.scope));
-    long seq = sys_cap_request(&r);
-    if (seq <= 0) return (seq < 0) ? seq : (long)CAP_EDENIED;
-    long stt = CAP_ST_OPEN;
-    for (int i = 0; i < 1800 && stt == (long)CAP_ST_OPEN; i++) {
-        sys_sleep(100);
-        stt = sys_cap_status((unsigned long long)seq);
-    }
-    return (stt == (long)CAP_ST_GRANTED) ? 0 : (long)CAP_EDENIED;
-}
+// #peruserrows: cap_err_str(), ai_is_denial() and ai_cap_acquire() USED TO LIVE
+// HERE as file-static copies. They are now libc/capreq.{c,h}: the same dance was
+// needed by msh's `screenshot` builtin and by Maytera Snap, and a third and a
+// fourth private copy of "ask the user for a grant and wait for the verdict" is
+// what CLAUDE.md's reuse rule exists to stop. The bodies are unchanged, only
+// their home is; ai_is_denial() is cap_is_denial().
+#define ai_is_denial(e)  cap_is_denial(e)
+#define ai_cap_acquire   cap_acquire
 
 // Wait (bounded) for a file to appear and its size to settle. The compositor
 // writes the capture asynchronously on its next frame, so a fresh request has no
@@ -3583,7 +3290,7 @@ static int run_tool_loop(char *final, int fcap, int verbose) {
         // #293/#294: capability-token + consent gate BEFORE dispatch, then audit.
         // LOW-risk tools pass straight through; HIGH-risk tools (incl. build.*)
         // need a valid token or a user consent grant. Every outcome is appended
-        // to /CONFIG/AIAUDIT.LOG inside aiclient_run_action().
+        // to the session user's AIAUDIT.LOG inside aiclient_run_action().
         unsigned long long m_d = mono_us();
         int az = aiclient_run_action(id, args, obs, sizeof(obs));
         unsigned long us_d = (unsigned long)(mono_us() - m_d);

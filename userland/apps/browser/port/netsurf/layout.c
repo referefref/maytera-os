@@ -17,7 +17,10 @@
 
 #include <libwapcaplet/libwapcaplet.h>
 
+#include <maytera-dom-limits.h>	/* MAYTERA_DOM_MAX_DEPTH (#245) */
+
 #include "layout.h"
+#include "paintorder.h"
 #include "css_select_bind.h"
 #include "cssvar.h"        /* #245 enggrad: gradient table lookup */
 #include "fontmap.h"
@@ -46,6 +49,18 @@ static int node_is(dom_node *node, const char *name);
 const char *layout_src_stamp(void) { return ENGWALK_LAYOUT_STAMP; }
 
 /*
+ * engstack (#245): the same treatment for the files layout.c's own stamp cannot
+ * see. ONE md5 over paintorder.c + paintorder.h + layout.h, because the paint
+ * order spans all three (the rules, their declarations, and the `pg` field the
+ * items carry) and a per-file stamp on any one of them would be blind to an edit
+ * in the others.
+ */
+#ifndef ENGSTACK_STAMP
+#define ENGSTACK_STAMP "unstamped"
+#endif
+const char *layout_stack_stamp(void) { return ENGSTACK_STAMP; }
+
+/*
  * engfloat2 (#245): the maximum number of CONCURRENT float bands modelled in
  * one containing block. Real pages rarely stack more than a couple of floats
  * on the same line; a small fixed cap keeps the state flat (no allocation, and
@@ -56,12 +71,37 @@ const char *layout_src_stamp(void) { return ENGWALK_LAYOUT_STAMP; }
 #define FL_MAX 8
 
 /*
- * engabspos (#245): base offset for a positioned box's paint-order key, so
- * ZORDER_BASE + z-index is always > 0 (in-flow content is 0 and paints first)
- * for any sane z-index. z-index is clamped to +/- 1e6 before the add so the
- * sum never overflows int.
+ * engstack (#245): the stacking-context tree for the page being laid out.
+ *
+ * It is a FILE-STATIC and not a field of lstate on purpose: lstate lives on
+ * layout_document()'s frame and po_table is ~10 KB, and this engine has already
+ * had to move per-item flex arrays off walk()'s frame for exactly that reason.
+ * Reset at the top of layout_document(), so nothing leaks across a page load or
+ * a resize relayout.
+ *
+ * This REPLACED ZORDER_BASE, engabspos's single global paint key. Growing that
+ * key into pseudo-nesting is the rathole BROWSER_ENGINE_STACKING_CONTEXT_PLAN.md
+ * refuses; the tree is the mechanism it asked for instead.
  */
-#define ZORDER_BASE 100000000
+static po_table g_po;
+
+int layout_stack_groups(void) { return g_po.n; }
+int layout_stack_overflowed(void) { return g_po.overflowed; }
+
+int layout_stack_group(int g, int *parent, int *z, int *is_ctx, int *own_idx)
+{
+	if (g < 0 || g >= g_po.n) return -1;
+	if (parent)  *parent  = g_po.g[g].parent;
+	if (z)       *z       = g_po.g[g].z;
+	if (is_ctx)  *is_ctx  = g_po.g[g].is_sc;
+	if (own_idx) *own_idx = g_po.g[g].own_idx;
+	return 0;
+}
+
+int layout_stack_selftest(void (*report)(const char *line))
+{
+	return po_selftest(report);
+}
 
 /* ---- layout state ---- */
 typedef struct {
@@ -157,6 +197,16 @@ typedef struct {
 	 * block, so a page with no absolutes never reads it (AE=0).
 	 */
 	int pcb_x, pcb_y, pcb_w, pcb_h;
+	/*
+	 * engstack (#245): the nearest ancestor STACKING CONTEXT (an index into
+	 * g_po), which is what a new group's z-index is scoped to. 0 is the root
+	 * context. Pushed only by a context, NOT by a z-index:auto positioned box,
+	 * because such a box is an atomic paint unit and not a context: its own
+	 * positioned descendants belong to the context ABOVE it. That one
+	 * distinction is the whole difference between scoped and global z-index.
+	 * Restored at every walk() exit via OOF_REWIND, like pcb_*.
+	 */
+	int cur_sc;
 	/*
 	 * engwalkstack (#245): walk() RECURSION DEPTH, and the flex working-set
 	 * pool. Both exist to keep the layout walk inside the 2 MB user stack.
@@ -255,6 +305,47 @@ static uint32_t blend_rgb(uint32_t fg, uint32_t bg, uint32_t a)
  * called after the child walk has returned, so at most one is ever live.
  */
 #define FLEX_MAX_ITEMS 256
+
+/*
+ * engstack (#245): open this element's paint group.
+ *
+ * Returns the group id, or -1 when the element is not promoted. A CONTEXT also
+ * becomes the current stacking context for the subtree; a UNIT does NOT, which
+ * is what keeps a z-index:auto positioned box a LEAF so that its own positioned
+ * descendants compete in the context ABOVE it. See paintorder.h.
+ *
+ * A group refused by po_group_new() (table or depth cap) comes back as the
+ * PARENT context, and this reports -1 for it rather than passing the parent id
+ * out: with the parent id the stamping loop in OOF_REWIND would claim the
+ * parent's own in-flow items as this element's, which is worse than the
+ * degradation the cap promises. -1 leaves the element painting as in-flow
+ * content, which is what the cap is documented to do.
+ */
+static int pg_open(lstate *st, int po_pos, const css_computed_style *style)
+{
+	int32_t zz = 0;   /* SEEDED: libcss getters write out-params only for some
+	                   * stored types, and an unseeded z would be stack garbage
+	                   * on every z-index:auto element. */
+	int has_z = (css_computed_z_index(style, &zz) == CSS_Z_INDEX_SET);
+	int kind = po_promote(po_pos, has_z);
+	int z, g;
+	if (kind == PO_PROMOTE_NONE) return -1;
+	/*
+	 * FIXTOINT, and it is NOT cosmetic. css_computed_z_index()'s out-param is
+	 * declared `int32_t *`, which reads as an integer, but what the parser
+	 * stored is a css_fixed: `z-index: 1` arrives as 1024. engabspos read it
+	 * raw. The error is MONOTONE, so no comparison and no level test noticed,
+	 * and the only thing it broke was the clamp, which then bit at
+	 * |z-index| >= 977 and made every larger z-index the same key. Found by
+	 * reading `z=1024` off the [BRDUMP] stacking-context dump, which is why
+	 * that dump prints the value the ordering actually uses.
+	 */
+	z = has_z ? po_zclamp((int) FIXTOINT(zz)) : 0;
+	g = po_group_new(&g_po, st->cur_sc, z, kind == PO_PROMOTE_CTX);
+	if (g == st->cur_sc) return -1;
+	if (kind == PO_PROMOTE_CTX) st->cur_sc = g;
+	return g;
+}
 
 static layout_item *item_new(lstate *st)
 {
@@ -517,7 +608,15 @@ static void flex_pool_drain(lstate *st)
  * pathological or hostile, which is exactly the case that must fail cleanly
  * instead of running the stack off its end.
  */
-#define WALK_MAX_DEPTH 256
+/*
+ * ONE NUMBER, FOUR USERS (#245 deepdom). This used to be a literal 256 here,
+ * another in duk_dom.c and nothing at all in the parser. The parser now
+ * clamps at the same depth, so the three answers cannot drift apart; see
+ * shim-include/maytera-dom-limits.h for why that number and what happens at
+ * it. The local name stays because this file uses it in a dozen places and
+ * its comment above is about this walk specifically.
+ */
+#define WALK_MAX_DEPTH MAYTERA_DOM_MAX_DEPTH
 
 /*
  * Map the container's align-items keyword into the same FLEX_SELF_* space the
@@ -4296,15 +4395,24 @@ static void walk_node(lstate *st, dom_node *node, const css_computed_style *psty
 	int rel_shift = 0, rel_dx = 0, rel_dy = 0;
 	int rel_start = st->out->n_items;
 	/*
-	 * engabspos (#245). z_layer/z_key stamp this element's own items with a
-	 * stacking key at every walk() exit (folded into OOF_REWIND, like the
-	 * relative shift), so positioned boxes paint after in-flow content ordered
-	 * by z-index. Both stay 0 for non-positioned content, so a static page is
-	 * byte-identical. pcb_s* save the inherited positioned containing block for
+	 * engstack (#245). pg_group is this element's paint group, or -1 when the
+	 * element is not promoted (see po_promote()). At every walk() exit
+	 * (OOF_REWIND, like the relative shift) it stamps the items of its own
+	 * subtree that no positioned DESCENDANT has already claimed. It stays -1
+	 * for non-positioned content, so a static page is byte-identical.
+	 * sc_save restores the enclosing stacking context, and pcb_s* save the
+	 * inherited positioned containing block for
 	 * restore on exit. abs_place_x/y and abs_box_x/y carry the resolved
 	 * top/left placement of an absolutely positioned box into the layout below.
 	 */
-	int z_layer = 0, z_key = 0;
+	int pg_group = -1;
+	/*
+	 * The item index of THIS element's own background-and-border box, CSS 2.1
+	 * appendix E step 1, or -1 if it emitted none. Set at the one site that
+	 * emits it, never inferred from position in the item array.
+	 */
+	int pg_own = -1;
+	int sc_save = st->cur_sc;
 	int is_positioned = 0;
 	int pcb_sx = st->pcb_x, pcb_sy = st->pcb_y;
 	int pcb_sw = st->pcb_w, pcb_sh = st->pcb_h;
@@ -4327,12 +4435,14 @@ static void walk_node(lstate *st, dom_node *node, const css_computed_style *psty
 			st->out->items[_ri].y += rel_dy; \
 		} \
 	} \
-	if (z_layer) { \
+	if (pg_group > 0) { \
 		int _zi; \
+		if (pg_own >= 0) po_set_own(&g_po, pg_group, pg_own); \
 		for (_zi = rel_start; _zi < st->out->n_items; _zi++) \
-			if (st->out->items[_zi].zorder == 0) \
-				st->out->items[_zi].zorder = z_key; \
+			if (st->out->items[_zi].pg == 0) \
+				st->out->items[_zi].pg = pg_group; \
 	} \
+	st->cur_sc = sc_save; \
 	st->pcb_x = pcb_sx; st->pcb_y = pcb_sy; \
 	st->pcb_w = pcb_sw; st->pcb_h = pcb_sh; \
 } while (0)
@@ -4392,34 +4502,23 @@ static void walk_node(lstate *st, dom_node *node, const css_computed_style *psty
 					abs_place_y = 1;
 				}
 			}
-			{
-				int32_t zz = 0;
-				int zc = (css_computed_z_index(style, &zz) ==
-						CSS_Z_INDEX_SET) ? (int) zz : 0;
-				if (zc > 1000000) zc = 1000000;
-				if (zc < -1000000) zc = -1000000;
-				z_key = ZORDER_BASE + zc;
-				z_layer = 1;
-			}
+			pg_group = pg_open(st, PO_POS_ABSOLUTE, style);
 		} else if (pos == CSS_POSITION_RELATIVE) {
 			is_positioned = 1;
 			/*
 			 * engabspos (#245): a relative box is a containing block for its
-			 * absolute descendants, and with an EXPLICIT z-index it also joins
-			 * the positioned paint layer. z-index:auto (the default, and what
-			 * every existing relative page uses) leaves z_layer 0, so those
-			 * pages stay byte-identical (AE=0).
+			 * absolute descendants, and with an EXPLICIT z-index it also
+			 * establishes a stacking context.
+			 *
+			 * DEFERRED (#245 engstack): with z-index:auto it is NOT promoted at
+			 * all, although CSS 2.1 appendix E paints it in step 8 above in-flow
+			 * content exactly like an absolute box. Holding that unchanged is
+			 * deliberate: it keeps every paint-order movement engstack measures
+			 * attributable to NESTING and nothing else. The boundary lives in
+			 * po_promote(), and the [STACK] selftest case "DEFERRED: relative
+			 * with z-index:auto is NOT promoted" asserts it on every launch.
 			 */
-			{
-				int32_t rzz = 0;
-				if (css_computed_z_index(style, &rzz) == CSS_Z_INDEX_SET) {
-					int rzc = (int) rzz;
-					if (rzc > 1000000) rzc = 1000000;
-					if (rzc < -1000000) rzc = -1000000;
-					z_key = ZORDER_BASE + rzc;
-					z_layer = 1;
-				}
-			}
+			pg_group = pg_open(st, PO_POS_RELATIVE, style);
 			/*
 			 * Relative offsets shift paint only (CSS 2.1 9.4.3). left wins
 			 * over right, top over bottom (LTR). left/right percentages
@@ -4903,6 +5002,16 @@ static void walk_node(lstate *st, dom_node *node, const css_computed_style *psty
 			layout_item *bx = item_new(st);
 			if (bx) {
 				box_idx = st->out->n_items - 1;
+				/*
+				 * engstack (#245): THIS box, and only this box, is the
+				 * element's own background and border, appendix E step 1. It
+				 * paints below the element's negative-z children while the
+				 * element's other content paints above them, so the two have to
+				 * be told apart, and telling them apart by "first item in the
+				 * range" is wrong for a visibility:hidden element (it emits no
+				 * box, and the first item in its range is a DESCENDANT's).
+				 */
+				pg_own = box_idx;
 				bx->kind = 1;
 				bx->x = box_x; bx->y = box_start_y;
 				bx->w = outer_w; bx->h = 0;
@@ -6739,14 +6848,14 @@ static void tbl_walk_children(lstate *st, dom_node *node,
  * the comparison key makes the order TOTAL, so the result does not depend on
  * whether the libc qsort happens to be stable.
  */
-typedef struct { int key; int idx; } zsort_ent;
-static int zsort_cmp(const void *a, const void *b)
-{
-	const zsort_ent *x = (const zsort_ent *) a;
-	const zsort_ent *y = (const zsort_ent *) b;
-	if (x->key != y->key) return x->key < y->key ? -1 : 1;
-	return x->idx < y->idx ? -1 : (x->idx > y->idx ? 1 : 0);
-}
+/*
+ * engstack (#245): engabspos's flat global z-index comparator (`zsort_ent` /
+ * `zsort_cmp`) is GONE from this file, not merely unused. The flat key is not a
+ * simpler fallback for the stacking-context tree; it is a different and wrong
+ * answer for any page that nests a context or uses a negative z-index, and a
+ * dead comparator sitting next to the live one is an invitation to call it. The
+ * old body is in git history; `git log -S zsort_cmp -- ` finds it.
+ */
 
 int layout_document(mcs_ctx *css, dom_document *doc, int content_width,
 		int (*measure)(const char *, int, int, int), layout_result *out)
@@ -6812,6 +6921,17 @@ int layout_document(mcs_ctx *css, dom_document *doc, int content_width,
 	st.pcb_w = st.width;
 	st.pcb_h = g_vp_h;
 	/*
+	 * engstack (#245): the page starts with ONE group, the root stacking
+	 * context. po_reset() is what makes the AE=0 argument structural: a page
+	 * that never promotes an element leaves g_po.n at 1, and the sort below is
+	 * skipped on that test, so the painter walks exactly the array the walk
+	 * emitted. It must be reset per LAYOUT, not per page load, because a resize
+	 * reflow re-runs the walk over the same DOM (the gradient table learned this
+	 * the expensive way: it is reset only at page load and needed dedup).
+	 */
+	po_reset(&g_po);
+	st.cur_sc = 0;
+	/*
 	 * engwalkstack (#245): lstate is field-initialised, NOT memset (see the
 	 * engfloat2 note above), so the depth counter and the pool head MUST be
 	 * zeroed here. A garbage `depth` would refuse to walk any page at all or
@@ -6869,34 +6989,40 @@ int layout_document(mcs_ctx *css, dom_document *doc, int content_width,
 		}
 	}
 	/*
-	 * engabspos (#245): CSS stacking. Positioned boxes carry a nonzero zorder
-	 * (ZORDER_BASE + z-index); in-flow content is 0. A stable sort by
-	 * (zorder, original index) paints in-flow content first, then positioned
-	 * boxes ordered by z-index with document order breaking ties, so a later
-	 * or higher-z absolute box overlaps an earlier or lower one. The whole
-	 * pass is SKIPPED unless some item is positioned, so a page with no
-	 * positioned boxes is byte-identical (AE=0).
+	 * engstack (#245): CSS paint order, from the stacking-context TREE.
+	 *
+	 * Every item carries `pg`, the paint group it belongs to (0 = the root
+	 * context), and paintorder.c turns the tree into a total order per CSS 2.1
+	 * appendix E: the context element's own background, then negative-z child
+	 * contexts, then in-flow content, then z-auto/z-0 positioned units, then
+	 * positive-z child contexts, recursively. A stable merge sort applies it.
+	 *
+	 * SKIPPED ENTIRELY when the page produced no group, and that is the AE=0
+	 * argument: no positioned box means no group, means no sort, means the item
+	 * array the painter walks IS the array the walk emitted. It is a property of
+	 * the mechanism, not a measurement that has to be repeated.
+	 *
+	 * A failed allocation leaves the items in walk order, which is exactly the
+	 * behaviour of the engine before any stacking support existed.
 	 */
-	{
-		int i, any = 0, n = out->n_items;
-		for (i = 0; i < n; i++)
-			if (out->items[i].zorder != 0) { any = 1; break; }
-		if (any && n > 1) {
-			zsort_ent *zs = malloc((size_t) n * sizeof(zsort_ent));
-			layout_item *tmp = malloc((size_t) n * sizeof(layout_item));
-			if (zs && tmp) {
-				for (i = 0; i < n; i++) {
-					zs[i].key = out->items[i].zorder;
-					zs[i].idx = i;
-				}
-				qsort(zs, (size_t) n, sizeof(zsort_ent), zsort_cmp);
-				for (i = 0; i < n; i++)
-					tmp[i] = out->items[zs[i].idx];
-				memcpy(out->items, tmp, (size_t) n * sizeof(layout_item));
+	if (g_po.n > 1 && out->n_items > 1) {
+		int n = out->n_items, i;
+		po_key *pk = malloc((size_t) n * sizeof(po_key));
+		po_key *pscratch = malloc((size_t) n * sizeof(po_key));
+		layout_item *tmp = malloc((size_t) n * sizeof(layout_item));
+		if (pk && pscratch && tmp) {
+			for (i = 0; i < n; i++) {
+				pk[i].pg = out->items[i].pg;
+				pk[i].idx = i;
 			}
-			if (zs) free(zs);
-			if (tmp) free(tmp);
+			po_sort(&g_po, pk, pscratch, n);
+			for (i = 0; i < n; i++)
+				tmp[i] = out->items[pk[i].idx];
+			memcpy(out->items, tmp, (size_t) n * sizeof(layout_item));
 		}
+		if (pk) free(pk);
+		if (pscratch) free(pscratch);
+		if (tmp) free(tmp);
 	}
 	g_lp_walk = lrdtsc() - g_lp_walk;
 

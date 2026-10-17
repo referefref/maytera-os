@@ -48,10 +48,25 @@ and the three MayteraOS objects the browser Makefile links.
   read-only browser text.
 - **`cc.sh` builds `-fno-stack-protector`.** The 141-app stack-canary rollout
   (#651) does not cover this code.
-- **These objects are not rebuilt by the golden build.** The browser Makefile
-  regenerates `main.o` and relinks, but the five `.a` files and the three
-  binding objects are only rebuilt when their own sources change, which the
-  golden build never touches. "Freshly-built BROWSER" therefore means a fresh
-  `main.o` over pre-built engine objects. `build/browser-port-drift.sh` exists
-  so that at least the SOURCE cannot silently diverge from what is committed
-  here.
+- **CORRECTED 2026-10-01 (#245 renderhang). This entry used to read "These
+  objects are not rebuilt by the golden build", and it is no longer true.** It
+  said a "Freshly-built BROWSER" meant a fresh `main.o` over pre-built engine
+  objects, which would mean a fix to `layout.c` or `cssvar.c` could be committed
+  here and never reach a golden. Since 2026-09-30 `build/build-golden.sh` copies
+  the pristine third-party trees to a PRIVATE per-build root, overlays the
+  COMMIT's glue from `userland/apps/browser/port/` on top, and then DELETES
+  every object derived from an overlaid `.c` (it derives that list from the
+  overlay directories rather than hardcoding it, so adding a file here cannot
+  leave a stale object behind). The committed copy of the MayteraOS-authored
+  glue is therefore what a golden compiles and ships. The five third-party `.a`
+  archives are still pre-built and still not rebuilt by a golden; that half of
+  the old claim stands. Verified by reading `build-golden.sh` (the overlay and
+  the object sweep) and by a browser built from this tree.
+
+  **What is still true, and bites during development:** a `make` in
+  `userland/apps/browser` compiles `$(NS)/cssvar.o` from `$(NS)/cssvar.c`, where
+  `$(NS)` is the PORT ROOT, not this repo directory. Editing the copy here alone
+  changes nothing you can run. Copy it into your port root (use a private one:
+  `cp -a <workspace> <mine>/nsport` and
+  `MAYTERA_NS_ROOT=<mine>/nsport make`) and `build/browser-port-drift.sh` keeps
+  the two from silently diverging.

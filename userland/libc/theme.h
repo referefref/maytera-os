@@ -205,7 +205,49 @@ static inline int theme_get_active(void) {
     return (int)syscall0(SYS_GET_THEME);
 }
 
-// Get a color from the current theme (real theme_t color, 0x00RRGGBB)
+// Get a color from the current theme (real theme_t color, 0x00RRGGBB).
+//
+// ===========================================================================
+// [filesui] NEVER WRITE `if (!c) c = <fallback>` ON THIS RESULT.
+// ===========================================================================
+// It looks like "if the theme did not set this, use my default". It cannot be,
+// and it is not. This returns a raw 0x00RRGGBB with NO out-of-band value, so
+// **0 means BLACK and there is no other thing it can mean.** The branch is
+// therefore not a fallback: it is a rule that silently REWRITES a theme's
+// black. retro_unix, the default theme on every shipping image, sets
+// color.on_surface=0x00000000, so that rule fires on the default theme.
+//
+// It also guards a condition that CANNOT HAPPEN, which is why it reads as
+// harmless. MEASURED in kernel/gui/themes.c on 2026-09-30:
+//   * theme_parse_buffer() begins every parse with `*out = g_fallback_theme`,
+//     deliberately, so a file that omits a key inherits Retro UNIX's colour
+//     rather than leaving the field at zero. That is the 2026-08-07 fail-closed
+//     fix, and its own comment states the principle this one repeats: "0 is a
+//     legal colour AND a legal metric, so 'unset' cannot be a sentinel value;
+//     it has to be a separate bit per field" (#711, which uses per-field seen
+//     bits internally for exactly this reason).
+//   * theme_get_color_by_id() returns a struct field in every arm, and its
+//     `default:` returns t->window_bg, so no id yields a non-colour.
+//   * theme_get_current() is never NULL (`if (!t) t = theme_get_current()`).
+// So by the time Ring 3 sees a value, every field is populated. The zero test
+// has protected nothing since that fix and can only ever corrupt.
+//
+// WHAT TO WRITE INSTEAD. A glyph does not need to know whether a colour was
+// configured; it needs to be readable on the ground it lands on. Ask for that:
+//
+//     uint32_t ink = gui_ensure_contrast(theme_color(THEME_COLOR_ON_SURFACE),
+//                                        bg, GUI_FLOOR_TEXT);
+//
+// which returns the colour UNCHANGED when it already clears the floor, and
+// repairs it when it does not, without needing to know which case it is in.
+// Floor it against the background it is ACTUALLY drawn on: a card, a white
+// list and a white sidebar are three different grounds, and an ink floored
+// against the wrong one is the same bug one layer down. For a fill rather than
+// a glyph, just use the value: it is always a real colour.
+//
+// This cost a shipped defect: the shared file chooser drew eight of its nine
+// Places rows in white on a white panel, on the default theme, and every
+// automated check was green. See blame.md, 2026-09-30.
 static inline uint32_t theme_color(theme_color_id_t id) {
     return (uint32_t)syscall2(SYS_THEME_COLOR, (uint64_t)(-1), (uint64_t)id);
 }

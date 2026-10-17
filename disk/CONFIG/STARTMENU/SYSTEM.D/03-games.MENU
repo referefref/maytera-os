@@ -24,13 +24,20 @@
 # shipped fragment, reading the limit out of startmenu.c rather than restating
 # it. Write as much explanation here as the next person needs.
 #
+# 2026-09-29 (#gamedata2): AssaultCube and Angband are NOT listed here any more.
+# Both are served as signed App Store packages, so neither binary is on a shipping
+# golden, and check 18 of build/invariant-gate.sh requires every launch target in
+# this file to RESOLVE on the image with exact case. An item here for an absent
+# binary is the FONTBOOK phantom shape, and the gate would refuse the build. The
+# App Store puts the entry back on install: startmenu_register_app() writes the
+# SYSTEM layer for an elevated install and the per-user layer otherwise, so the
+# menu entry and the binary appear and disappear together instead of one outliving
+# the other. Do not re-add a static item for either game.
 category: Games
 item: Maytera Arena | /APPS/ARENA | icon=game_arena
 item: Maytera Chess | /APPS/CHESS | icon=game_chess
 item: Maytera Squadron | /APPS/SQUADRON | icon=game_squadron
-item: AssaultCube | /APPS/ASSAULTCUBE | icon=game
 item: ClassiCube | /APPS/CLASSICUBE | icon=game
-item: Angband | /APPS/ANGBAND | icon=game | type=native
 # #537: DOOM lives at /GAMES/DOOM/DOOM.ELF (alongside its DOOM1.WAD); the old
 # /APPS/DOOM.ELF path did not exist, so that hardcoded entry launched nothing
 # for an unknown length of time. The existence check in

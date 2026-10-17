@@ -113,6 +113,34 @@ int dos_svc_allow_create(dos_svc_ctx_t *x, const char *native, int leaf_exists,
     return dos_svc_allow(x, parent, W_OK | X_OK, what);
 }
 
+// #prewrite: THE REMOVAL question, which is NOT the create question.
+//
+// This layer is a FIFTH, PARALLEL enforcement point. A DOS guest's INT 21h 41h
+// delete, 56h rename and 3Ah rmdir reach fat_delete()/fat_rename() through
+// dos_svc_allow_create(..., leaf_exists=0) and never go near sys_unlink, so
+// wiring the sticky rule into the syscalls alone would have left this a
+// complete bypass: any DOS-era program could delete any user's file in an
+// all-users directory. The RULE is not duplicated here; this asks fs/perms.c
+// the same question every other site asks.
+//
+// The identity is the LAUNCHER's, not the guest's: a guest kernel thread runs
+// with euid 0 by construction, which is the entire premise of fs/guestfs.c, so
+// svc_creator() is what makes this check mean anything at all.
+static void svc_creator(dos_svc_ctx_t *x, uint32_t *uid, uint32_t *gid);
+
+int dos_svc_allow_remove(dos_svc_ctx_t *x, const char *native, const char *what) {
+    // The create-shaped precondition first (write+search on the parent),
+    // unchanged, so the #708 guest gate still applies and still logs its own
+    // refusal.
+    if (!dos_svc_allow_create(x, native, 0, what)) return 0;
+    char parent[DOS_SVC_PATH_MAX];
+    parent_path(native, parent, sizeof(parent));
+    uint32_t uid = 0, gid = 0;
+    svc_creator(x, &uid, &gid);
+    if (uid == 0) return 1;   // launcher is root: perms_may_remove() agrees
+    return perms_may_remove(parent, native, uid, gid) == 0;
+}
+
 // ---- path resolution -----------------------------------------------------
 static const char *ctx_cwd_get(dos_svc_ctx_t *x, char drive) {
     return x->cwd_get ? x->cwd_get(x, drive) : "";
@@ -1160,7 +1188,7 @@ void dos_svc_int21(dos_svc_ctx_t *x, x86_16_cpu_t *c) {
         // POSIX, and DOS agrees: unlinking needs write+search on the DIRECTORY,
         // not on the file. dos_svc_allow_create() with leaf_exists=0 asks
         // exactly that question of the parent.
-        if (!dos_svc_allow_create(x, fp, 0, "INT21/41h delete")) { svc_err(x, c, 5); break; }
+        if (!dos_svc_allow_remove(x, fp, "INT21/41h delete")) { svc_err(x, c, 5); break; }
         if (fat_delete(&g_fat_fs, fp) != 0) { svc_err(x, c, 5); break; }
         perms_remove(fp);
         CLR_CF(c); c->ax = 0; x->last_err = 0;
@@ -1182,7 +1210,7 @@ void dos_svc_int21(dos_svc_ctx_t *x, x86_16_cpu_t *c) {
         // BOTH directories are modified, so both are checked. Checking only the
         // source would let a guest move a file it may delete into a directory
         // it may not write.
-        if (!dos_svc_allow_create(x, ofp, 0, "INT21/56h rename (source dir)") ||
+        if (!dos_svc_allow_remove(x, ofp, "INT21/56h rename (source dir)") ||
             !dos_svc_allow_create(x, nfp, 0, "INT21/56h rename (target dir)")) {
             svc_err(x, c, 5); break;
         }
@@ -1200,7 +1228,7 @@ void dos_svc_int21(dos_svc_ctx_t *x, x86_16_cpu_t *c) {
         if (!dos_path_writable_ex(dp, x->cur_drive)) { svc_err(x, c, 5); break; }
         dos_svc_resolve(x, dp, fp, sizeof(fp));
         if (fat_exists(&g_fat_fs, fp) != 1) { svc_err(x, c, 3); break; }
-        if (!dos_svc_allow_create(x, fp, 0, "INT21/3Ah rmdir")) { svc_err(x, c, 5); break; }
+        if (!dos_svc_allow_remove(x, fp, "INT21/3Ah rmdir")) { svc_err(x, c, 5); break; }
         // fat_delete() is documented to remove "a file or empty directory".
         if (fat_delete(&g_fat_fs, fp) != 0) { svc_err(x, c, 5); break; }
         perms_remove(fp);

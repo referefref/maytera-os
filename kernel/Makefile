@@ -329,6 +329,23 @@ ifeq ($(MAYTERA_SSHD),1)
 CFLAGS += -DMAYTERA_SSHD
 endif
 
+# #kfirewall: the SAME flag must also reach rustc, because the packet filter's
+# compiled-in default policy derives the sshd's inbound allowance from it (see
+# the derivation block in rustkern/fwfilter.rs). Without this line the Rust side
+# would always compile as "no server", so MAYTERA_SSHD=1 would ship a listener
+# that the default inbound DENY policy drops every SYN to.
+#
+# The `--cfg` form, not a -D: rustc has no preprocessor. Deliberately a SECOND
+# ifeq on the same variable rather than an extra line in the one above, because
+# RUSTFLAGS is not defined until ~line 1779 and a `+=` issued before that
+# definition is discarded by the later plain `=`. That is not hypothetical: it
+# is precisely what happened to RTCLKTESTFAIL, and the write-up sits beside the
+# RUSTFLAGS definition where this block has to live.
+#
+# THIS LINE IS CHECKED, not merely intended: build/testfail-knob-gate.sh fails
+# the build if a `--cfg` name used in kernel/**/*.rs has no knob here, or a knob
+# here names a cfg no Rust file reads.
+
 # #426 Phase 2 (wq_assert_may_block). DEBUG ONLY - never for a golden/shipped
 # kernel. Same append-to-CFLAGS form and same reason as SECTEST above.
 #   make NOBLOCKPANIC=1 - a no-block context that blocks kpanic()s on the FIRST
@@ -366,6 +383,18 @@ CFLAGS += -DWQ_NOBLOCK_PANIC
 endif
 ifeq ($(NOBLOCKTEST),1)
 CFLAGS += -DWQ_NOBLOCK_SELFTEST
+endif
+# #749: `make SMBSEQNORESET=1` puts the SMB2 MessageId defect BACK: a reconnect
+# re-binds the sequence to the new socket but KEEPS the old MessageId, exactly
+# as net/smb.c did before #749. Same argument and same placement as NOBLOCKTEST
+# above. A fix nobody has watched the broken version of is indistinguishable
+# from a fix that was never needed, and here the broken version is visible on
+# the SERVER: Samba logs "bad message_id N ... (granted = 1, low = 0, range =
+# 1)" and terminates the connection, after which the client reports
+# "Authentication failed: 0xC000006D". This is a REPRODUCER kernel, never a
+# golden.
+ifeq ($(SMBSEQNORESET),1)
+CFLAGS += -DSMBSEQ_NORESET
 endif
 # #745: `make EXCL_SELFTEST=1` compiles in the O_EXCL boot self-test
 # (proc/fdlayer.c), which drives sys_open_k() with O_CREAT|O_EXCL on the
@@ -617,6 +646,122 @@ endif
 # silently do nothing), and it must NEVER be set for a golden.
 ifeq ($(SPAWNRACETEST),1)
 CFLAGS += -DSPAWN_FD_RACETEST
+endif
+
+# [provetwo] #246: `make VOLAUDREVERT=1` is the NEGATIVE CONTROL for the two
+# [volaudit] permission fixes (84c9a92c). It restores the PRE-fix existence
+# oracle, fat_exists(&g_fat_fs, path), in BOTH gates:
+#
+#   pkg_write_permit()   SYS_PKG_WRITE's authorization decision
+#   open_redir_file()    shell output redirection's authorization decision
+#
+# g_fat_fs cannot see a hot-plugged removable volume, so on a stick that oracle
+# answers ABSENT for a file that is plainly there, both gates take the CREATE
+# branch, and both authorize against write+search on the PARENT DIRECTORY
+# instead of against write on the FILE. In an all-users sticky directory the
+# parent grants both, so an unprivileged caller may replace a file it has no
+# right to write.
+#
+# IT EXISTS BECAUSE A FIX THAT HAS ONLY EVER BEEN WATCHED WORKING SAYS NOTHING
+# ABOUT WHAT WAS BROKEN. Both fixes shipped in golden 2575 proven to compile
+# and to route and NOT proven by a multi-user test on a volume, and this
+# subsystem has twice produced an arm that went green on a BROKEN kernel
+# because the refusal came from a different gate ([renamevol]'s source-file
+# check, [openperm]'s read-only-stick regression). The only way to know the
+# arms can go red is to build a kernel where they must, which is this flag.
+# /APPS/PKGRDR's P1 and R1 arms must report victim-intact=no with it set.
+#
+# Same argument and same TOP-LEVEL placement as NOBLOCKTEST / CANARYTEST /
+# SMAPTEST / SPAWNRACETEST / HEAPSHADOWREVERT above (nesting one of these
+# inside another is exactly how CANARYTEST came to silently do nothing).
+# MUST NEVER be set for a golden.
+ifeq ($(VOLAUDREVERT),1)
+CFLAGS += -DVOLAUD_REVERT_TEST
+endif
+
+# #heapdbl: `make HEAPSHADOWREVERT=1` is the NEGATIVE CONTROL for the heap's
+# PMM window reservation (#aicappersist, 069121a4). It publishes the window to
+# the predicate but does NOT reserve it, which is byte-for-byte the behaviour that
+# let a user page table be cleared on top of the kernel heap. It exists because
+# the eleven `kfree() on an INVALID pointer ... magic=0x0` refusals in
+# /root/co2600-fatapps-run.log had to be REPRODUCED before the explanation could
+# be called anything but a story: a fix that has only ever been watched working
+# says nothing about what was broken. Same argument and same top-level placement
+# as NOBLOCKTEST / CANARYTEST / SMAPTEST / SPAWNRACETEST above (nesting one of
+# these inside another is exactly how CANARYTEST came to silently do nothing).
+# MUST NEVER be set for a golden.
+ifeq ($(HEAPSHADOWREVERT),1)
+CFLAGS += -DHEAPSHADOW_REVERT
+endif
+
+# #heapwin: `make HEAPWINFAULT=1` makes the [HEAPWIN] overlap detector GO RED.
+#
+# The detector answers "do any of the already-allocated pages inside the heap's
+# virtual window fall inside the part of it the heap actually uses". On every
+# machine measured it answers 0, because the firmware's write-protected blocks sit
+# ABOVE the mapped heap. A detector that has only ever been watched saying 0 is
+# indistinguishable from one that is not wired up (#514/#665), so this asks it
+# about an extent that reaches the LOWEST page it actually recorded, at that real
+# address, and then does what a heap grown that far would do: it writes a heap
+# free-block header there, exactly as heap_expand_once() writes one at heap_end.
+#
+# #procspawn measured those pages as NOT writable from Ring 0, so the write MUST
+# fault with err=0x3 at that exact address; the RED line is printed BEFORE the
+# write so it survives. Same argument and same top-level placement as NOBLOCKTEST
+# / PTROFAULTTEST / HEAPSHADOWREVERT above (nesting one of these inside another is
+# exactly how CANARYTEST came to silently do nothing). It is a deliberate kernel
+# panic: MUST NEVER be set for a golden.
+ifeq ($(HEAPWINFAULT),1)
+CFLAGS += -DHEAPWIN_FAULT_TEST
+endif
+
+# #deadpml4: `make HEAPFRAMESREVERT=1` is THE BEFORE ARM for the heap's frame
+# reclaim, and the rollback.
+#
+# heap_expand_once() used to call pmm_alloc_page() once per heap page and map the
+# frame with vmm_map_page(), which walks `kernel_pml4` - a static .bss array
+# vmm_init() zeroes and NEVER loads into CR3 (#heapwin). Those frames were
+# allocated and addressed by nothing: on a 576 MB VM, 128 MB withheld out of a
+# 506 MB managed range, on top of the 256 MB the window reservation withholds, and
+# the boot then runs the PMM to zero ("[PMM] ERROR: Out of physical memory!").
+#
+# This flag restores that loop byte for byte, so the reclaim's benefit is a
+# MEASURED difference between two kernels built from ONE source (the [HEAPFRAME]
+# lines and the PMM free count are printed in both arms), and so a rollback is one
+# make variable rather than a revert. Same argument and same top-level placement as
+# HEAPSHADOWREVERT / HEAPWINFAULT above: nesting one of these inside another is
+# exactly how CANARYTEST came to silently do nothing. NEVER for a golden.
+ifeq ($(HEAPFRAMESREVERT),1)
+CFLAGS += -DHEAPFRAMES_REVERT
+endif
+
+# #deadpml4: PROVING THE HEAP'S GROWTH CEILING IS WIRED IN, and what happens
+# without it. Both NEVER for a golden; both at top level, for the reason
+# HEAPSHADOWREVERT above spells out.
+#
+#   make HEAPFRAMECLAMPTEST=1  - after heap_init(), ask heap_expand_once() for the
+#                                whole rest of the heap's window. The arena must
+#                                stop EXACTLY at the safe ceiling and one further
+#                                page must be refused, and the pre-existing
+#                                [HEAPWIN] detector must still say LATENT. The
+#                                ceiling is otherwise unreachable on a healthy
+#                                boot (nothing asks the heap for 232 MB), so
+#                                without this the clamp could only ever be
+#                                reasoned about.
+#   make HEAPFRAMENOCLAMP=1    - THE CONTROL ARM: reclaim the frames and remove the
+#                                ceiling. With CLAMPTEST the arena then grows PAST
+#                                0x1e800000 on a 576 MB VM and [HEAPWIN] turns from
+#                                LATENT to HAZARD, naming the 1024 firmware-owned
+#                                pages now inside it. `make HEAPWINFAULT=1` has
+#                                already measured the write to one of those pages
+#                                as #PF err=0x3, so this arm shows the state that
+#                                fault lives in rather than repeating it.
+ifeq ($(HEAPFRAMECLAMPTEST),1)
+CFLAGS += -DHEAPFRAME_CLAMP_TEST
+endif
+
+ifeq ($(HEAPFRAMENOCLAMP),1)
+CFLAGS += -DHEAPFRAME_NO_CLAMP
 endif
 
 # #745 (#62): the negative controls for the redundant tick source. A redundancy
@@ -1820,6 +1965,17 @@ ifeq ($(FLTTESTFAIL),1)
 RUSTFLAGS += --cfg fltrec_test_fail
 endif
 
+# #deadpml4: `make HEAPFRAMETESTFAIL=1` makes heapframe_selftest_rs assert the
+# WRONG inert-frame count, so the [HEAPFRAME] window-safety line can be SEEN to
+# say FAIL on an otherwise healthy machine. That self-test is what stands behind
+# the heap's growth ceiling, and a ceiling that is wrong in the permissive
+# direction ends in a Ring-0 #PF on a firmware page. Same argument as
+# FLTTESTFAIL/CFGTESTFAIL/KTZTESTFAIL/RTCLKTESTFAIL above, and it must likewise
+# stay BELOW the RUSTFLAGS definition, for the reason that block spells out.
+ifeq ($(HEAPFRAMETESTFAIL),1)
+RUSTFLAGS += --cfg heapframe_test_fail
+endif
+
 # #SB: `make BLKSTAGE_UNSAFE=1` REMOVES the single-owner claim over the block
 # write staging buffer, restoring the exact pre-fix shape in which a second
 # writer could overwrite a first writer's staged payload while that first
@@ -1842,6 +1998,94 @@ endif
 # red result.
 ifeq ($(BLKSTAGE_UNSAFE),1)
 RUSTFLAGS += --cfg blkstage_unsafe
+endif
+
+# #secretuse: `make SECRETE2ETEST=1` hands the composition test's WRONG-PASSWORD
+# case (1107) the RIGHT key, so the [SECRET] boot line can be SEEN to say FAIL on an
+# otherwise healthy machine. Same argument as NOBLOCKTEST and RTCLKTESTFAIL: a
+# self-test nobody has watched go red is indistinguishable from one that is not
+# wired up (#514/#665), and cases 1100-1112 are the only place the real PBKDF2, the
+# real envelope and the real record parser are proven to COMPOSE.
+#
+# THIS BLOCK SITS AFTER THE `endif` ABOVE, AND THAT IS THE WHOLE POINT. It was first
+# written one line higher, INSIDE `ifeq ($(BLKSTAGE_UNSAFE),1)`, so it only
+# evaluated when an unrelated knob was set. The flag existed, `make SECRETE2ETEST=1`
+# was accepted, the build succeeded, and the two kernels came out BYTE-IDENTICAL
+# (same md5), which is the only reason it was caught. That is the same family as the
+# RTCLKTESTFAIL `+=`-discarded-by-`=` trap documented above, and as #514's lint that
+# could not fail: a test-fault knob that silently does nothing is worse than no knob,
+# because it makes a green run look like evidence.
+#
+# WHEN YOU ADD ANOTHER ONE: diff the two kernel.elf md5s. If they match, your flag
+# did not reach the compiler.
+ifeq ($(SECRETE2ETEST),1)
+CFLAGS += -DSECRET_E2E_TESTFAIL
+$(info >>> SECRETE2ETEST=1: the composition test's wrong-password case is FAULTED and MUST report FAIL)
+endif
+
+# #kfirewall: MAYTERA_SSHD, the rustc half. See the block beside
+# `CFLAGS += -DMAYTERA_SSHD` far above for why the flag is split in two and why
+# this half cannot live up there.
+ifeq ($(MAYTERA_SSHD),1)
+RUSTFLAGS += --cfg maytera_sshd
+$(info >>> MAYTERA_SSHD=1: sshd compiled IN; the packet filter's default policy derives `in allow tcp 22` from this)
+endif
+
+# #kfirewall: `make FWTESTFAIL=1` inverts every expectation in
+# fw_selftest_rs(), so the `[FW] selftest:` boot line can be SEEN to say FAIL on
+# an otherwise healthy machine.
+#
+# THIS BLOCK DID NOT EXIST, AND THAT IS THE DEFECT IT FIXES. #238 shipped
+# `#[cfg(fw_test_fail)]` in rustkern/fwfilter.rs, documented `make FWTESTFAIL=1`
+# in docs/PACKET_FILTER.md and recorded in CHANGELOG.md that the knob had been
+# used to watch the line go red. Nothing in this Makefile ever passed
+# `--cfg fw_test_fail`. make accepts an unknown variable silently, so
+# `make FWTESTFAIL=1` built a byte-identical kernel, the inverted `want()` arm
+# was never compiled, and the packet filter's ONLY red-proof had never run. The
+# filter itself was fine; the evidence that it was fine was not.
+#
+# That is the third instance of one family in this file, and the two earlier
+# ones are written up a few blocks above: RTCLKTESTFAIL's `+=` discarded by a
+# later plain `=`, and SECRETE2ETEST nested inside an unrelated `ifeq`. All
+# three produce the same symptom, a fault-injection knob that is accepted and
+# does nothing, and all three are invisible without checking the artifact.
+# build/testfail-knob-gate.sh now checks all of them structurally, so a fourth
+# cannot be introduced silently.
+#
+# Must stay BELOW the RUSTFLAGS definition and at the TOP ifeq level, for the
+# two reasons those earlier blocks spell out.
+ifeq ($(FWTESTFAIL),1)
+RUSTFLAGS += --cfg fw_test_fail
+$(info >>> FWTESTFAIL=1: the packet-filter self-test is FAULTED and MUST report FAIL)
+endif
+
+# #heapinvptr: `make KSTACKIDTEST=1` faults the orphan-kernel-stack predicate in
+# rustkern/kstackid.rs so every answer is FOREIGN. The [KSTACK] selftest line must
+# then report a NON-ZERO orphan_id_mask and FAILED. It is the negative control for
+# a predicate whose whole job is to say NO to most pointers, and such a predicate
+# passes its own test for free if it is simply broken in the quiet direction.
+# Must stay BELOW the RUSTFLAGS definition and at the TOP ifeq level, for the two
+# reasons the FWTESTFAIL block above spells out. NEVER for a golden.
+ifeq ($(KSTACKIDTEST),1)
+RUSTFLAGS += --cfg kstackid_test_fail
+$(info >>> KSTACKIDTEST=1: the orphan-kernel-stack predicate is FAULTED and the [KSTACK] selftest MUST report FAILED)
+endif
+
+# `make KSTACKREGTEST=1` restores the PRE-FIX kernel-stack registry claim in
+# rustkern/kstackreg.rs: a scan that returns the first free row WITHOUT reserving
+# it, which is exactly what kstack_alloc() did before this change. The [KSTACK]
+# selftest line must then report a NON-ZERO registry_mask and FAILED, with bit 0
+# set - bit 0 being the race itself, two claims handed the same row.
+#
+# This arm is the only way to show the self-test is sensitive to the thing that
+# was wrong. A race cannot be demonstrated by watching correct code behave, and a
+# test that passes on both the broken and the fixed design tests nothing; several
+# verifiers in this tree have been exactly that (#514/#665). Must stay BELOW the
+# RUSTFLAGS definition and at the TOP ifeq level, for the two reasons the
+# FWTESTFAIL block above spells out. NEVER for a golden.
+ifeq ($(KSTACKREGTEST),1)
+RUSTFLAGS += --cfg kstackreg_test_fail
+$(info >>> KSTACKREGTEST=1: the kernel-stack registry claim is FAULTED back to the pre-fix scan and the [KSTACK] selftest MUST report FAILED with registry_mask bit0 set)
 endif
 
 # #SB: `make BLKSTAGETEST=1` builds the staging-race self-test into the kernel
@@ -2273,6 +2517,62 @@ concurrency-lint:
 concurrency-lint-selftest:
 	@python3 $(CONC_LINT) --self-test
 
+# --- #246 removable-volume routing gate ------------------------------------
+# Does any call hand the ROOT filesystem handle (g_fat_fs) a path the tool
+# cannot PROVE is a fixed root path? g_fat_fs does not route a hot-plugged
+# removable volume, so such a call is told a file on a USB stick is ABSENT and
+# then does something wrong with a straight face. The same fault was found FOUR
+# separate times in two days, every time by somebody tripping over a symptom.
+#
+# Placed and invoked exactly like concurrency-lint above, and for the same
+# reason (#514): a gate travels with the Makefile that invokes it, or
+# build-golden.sh ships a kernel tree in which the gate's path does not exist
+# and `make` reports success for a check that never ran.
+#
+# This is the STATIC half. The PRIMARY defence for this class is the runtime
+# detector in fs/volblind.c + rustkern/volblind.rs, which has zero false alarms
+# by construction but only reports what is exercised. See the long argument at
+# the top of rustkern/volblind.rs for why neither half is sufficient alone.
+VOLROUTE_LINT = tools/volume-route-lint/volume-route-lint
+
+.PHONY: volume-route-lint
+volume-route-lint:
+	@if [ ! -f $(VOLROUTE_LINT) ]; then \
+	   echo "ERROR: $(VOLROUTE_LINT) is missing. The removable-volume routing"; \
+	   echo "       lint cannot run, and a gate that skips silently is how"; \
+	   echo "       instance five of #246 ships."; \
+	   exit 1; \
+	 fi
+	@python3 $(VOLROUTE_LINT) --dirs kernel
+
+# RED on the REAL pre-fix sys_mkdir taken from 716367de~1, GREEN on the fixed
+# form and on all three provable root-path shapes, plus a check that the table
+# of covered functions still matches fs/fat.h. A gate nobody has watched go red
+# is not a gate.
+.PHONY: volume-route-lint-selftest
+volume-route-lint-selftest:
+	@python3 $(VOLROUTE_LINT) --self-test
+
+# --- #245 VMA scaling gate -------------------------------------------------
+# Does per-mmap and per-page-fault cost grow with the number of mappings
+# already established? mm/tests/run_vma_scale.sh compiles the GENUINE walk
+# functions out of mm/demand.c (and the real vma_t/mm_struct_t out of
+# mm/demand.h) and drives them exactly as a growing userland heap drives them.
+# Its RED arm is the real pre-fix demand.c pulled out of git, so the gate has
+# been watched to fail. The metric is a deterministic node-visit counter, never
+# wall clock, because this host is contended.
+#
+# It is a `*-selftest` target so build/selftest-census.sh DISCOVERS it and runs
+# it on every `mwt land`. run_malloc_scale.sh, which gates the first half of
+# #245, is wired into nothing at all and has never been run by automation;
+# that is the trap this target exists to avoid repeating.
+#
+# Needs the git repo (for the RED arm) and a host-native gcc, so it is a
+# CONTAINER arm in the census policy, not something a golden build runs.
+.PHONY: vma-scale-selftest
+vma-scale-selftest:
+	@bash mm/tests/run_vma_scale.sh
+
 # --- Private-extern gate (#742, closing #693's one hole) -------------------
 # FAILS THE BUILD if a .c file re-declares a guarded persistence symbol with
 # its own `extern` instead of including the owning header. That pattern opts
@@ -2381,13 +2681,41 @@ skipgate-selftest:
 # at runtime, so boot behavior is unchanged. `-u` must precede the archive so
 # the pending undefined is satisfied when ld reaches it.
 RUST_FORCE = -u rust_marker
+
+# --- REPRODUCER PRESENCE GATE: the list ------------------------------------
+# Entry points of in-tree deterministic bug reproducers that are armed by a gate
+# FILE at runtime and are therefore referenced by nothing at build time. Checked
+# in the link recipe below. Add a name here when you add such a reproducer;
+# remove it only in the same change that removes the reproducer.
+#
+#   slotdbl_start  proc/slotdbl.c, armed by /SLOTDBL.TXT on the ESP. Drives
+#                  proc_create_user_as() four times with an environment entry
+#                  lacking '=', which setup_user_stack() refuses by design
+#                  (#112), reproducing the #heapinvptr process-slot double free.
+REPRO_SYMS = slotdbl_start
+
+# Proves the gate's detection expression DISTINGUISHES present from absent,
+# which is the only thing a one-line nm check can honestly claim. It is not a
+# proof that the reproducer still reproduces anything; that needs a VM, and the
+# rig for it is tools/kstackreg-rig/.
+.PHONY: repro-presence-selftest
+repro-presence-selftest:
+	@test -f $(DEBUG_TARGET) || { echo "build the kernel first ($(DEBUG_TARGET) is absent)"; exit 1; }
+	@if nm $(DEBUG_TARGET) | grep -qE " T maytera_no_such_reproducer_symbol$$"; then \
+	   echo ">>> SELFTEST BROKEN: a synthetic ABSENT symbol was reported present"; exit 1; \
+	 fi
+	@echo "repro-presence-selftest: RED arm OK   - an absent symbol is detected as absent"
+	@for s in $(REPRO_SYMS); do \
+	   nm $(DEBUG_TARGET) | grep -qE " T $$s$$" || { echo ">>> GREEN arm FAILED: $$s is absent"; exit 1; }; \
+	 done
+	@echo "repro-presence-selftest: GREEN arm OK - $(REPRO_SYMS) detected as present"
 # `| rust-symbol-gate` is an ORDER-ONLY prerequisite: the gate is .PHONY so it
 # runs on every build (a normal prereq would be skipped once the archive is up
 # to date, which is exactly the staleness hole that lets a deletion through),
 # but being order-only it does not mark kernel.elf out of date, so it never
 # forces a needless 15 MB relink. If the gate fails, make stops here and the
 # kernel is not linked.
-$(TARGET): $(OBJECTS) $(RUST_LIB) | increment_build dirs rust-symbol-gate syscall-dispatch-gate syscall-ptr-lint syscall-cap-lint copy-user-lint smap-uaccess-lint concurrency-lint persist-extern-gate syscall-number-lint dup-const-lint diaglog-gate skipgate
+$(TARGET): $(OBJECTS) $(RUST_LIB) | increment_build dirs rust-symbol-gate syscall-dispatch-gate syscall-ptr-lint syscall-cap-lint copy-user-lint smap-uaccess-lint concurrency-lint volume-route-lint persist-extern-gate syscall-number-lint dup-const-lint diaglog-gate skipgate
 	@echo "Linking $(DEBUG_TARGET)..."
 	$(LD) $(LDFLAGS) -o $(DEBUG_TARGET) $(OBJECTS) $(RUST_FORCE) $(RUST_LIB)
 	@# #670: the SHIPPED kernel is the stripped copy. Link once, strip into
@@ -2408,6 +2736,35 @@ $(TARGET): $(OBJECTS) $(RUST_LIB) | increment_build dirs rust-symbol-gate syscal
 	   rm -f $(TARGET); exit 1; \
 	 fi
 	@echo "#670 strip gate: shipped $(TARGET) has no .symtab / .debug_* section"
+	@# ---- REPRODUCER PRESENCE GATE --------------------------------------
+	@# MEASURED 2026-10-01: nothing in this Makefile or in build/ referred to
+	@# proc/slotdbl.c or to SLOTDBL at all. It is a deterministic reproducer for
+	@# a SEVERE defect (a failed spawn poisoning its process slot, so the next
+	@# spawn double-freed its kernel stack, its user pages and its page tables),
+	@# it is picked up only by the proc/ wildcard, and it is armed at RUNTIME by
+	@# a file on the ESP. So nothing in the build refers to its entry point:
+	@# deleting the file, renaming the function, or dropping proc/ from the
+	@# wildcard would all BUILD PERFECTLY CLEAN and the reproducer would simply
+	@# be gone, with no automated check anywhere noticing. That is the same
+	@# shape as the lint that lived outside the build container and the
+	@# increment_build.sh that was `exit 0` for months.
+	@#
+	@# This does NOT make the reproducer run (it deliberately fails four spawns,
+	@# so it must stay opt-in). It makes its DISAPPEARANCE a build failure.
+	@# Prove the check itself with `make repro-presence-selftest`.
+	@miss=""; for s in $(REPRO_SYMS); do \
+	   nm $(DEBUG_TARGET) | grep -qE " T $$s$$" || miss="$$miss $$s"; \
+	 done; \
+	 if [ -n "$$miss" ]; then \
+	   echo ">>> REPRODUCER PRESENCE GATE FAILED: absent from $(DEBUG_TARGET):$$miss"; \
+	   echo "    Each name above is the entry point of a runtime-armed, in-tree bug"; \
+	   echo "    reproducer. Nothing else in the build references it, so its loss is"; \
+	   echo "    silent. If you removed one deliberately, remove it from REPRO_SYMS"; \
+	   echo "    in the same change, and say in CHANGELOG.md why the repro is no"; \
+	   echo "    longer needed."; \
+	   rm -f $(TARGET); exit 1; \
+	 fi
+	@echo "reproducer presence gate: $(REPRO_SYMS) present in $(DEBUG_TARGET)"
 
 
 # --- CFLAGS stamp (#526): a -D change MUST rebuild -------------------------

@@ -6,8 +6,25 @@ LD = ld
 # Paths
 LIBC_DIR = ../../libc
 LIB_DIR = ../../lib
-NS = <workspace>
-DUK = <workspace>
+# THE PORT ROOTS ARE OVERRIDABLE, AND THAT IS A CORRECTNESS FEATURE, NOT A
+# CONVENIENCE. These two directories are a SINGLE LIVE TREE that every agent
+# building the browser writes into. build.sh-style rigs deliberately leave
+# patched sources there, and build-golden.sh runs browser-port-drift.sh BEFORE
+# compiling, so one agent mid-measurement aborts another agent's golden. That
+# has cost two golden builds outright and come within minutes of costing two
+# more (2026-09-25 and twice on 2026-09-29).
+#
+# Point these at a private copy and the race stops existing for that build:
+#
+#   cp -a <workspace> <workspace><id>/nsport
+#   MAYTERA_NS_ROOT=<workspace><id>/nsport make
+#
+# Defaults are the historical paths, so every existing caller is unaffected.
+# Matches the idiom cc.sh already uses for LIBC.
+MAYTERA_NS_ROOT  ?= <workspace>
+MAYTERA_DUK_ROOT ?= <workspace>
+NS = $(MAYTERA_NS_ROOT)
+DUK = $(MAYTERA_DUK_ROOT)
 
 # NetSurf core-lib include dirs + freestanding shims
 NS_INC = -I$(NS) \
@@ -52,21 +69,58 @@ CFLAGS += -DBROWSER_PERF
 NS_PERF = -DBROWSER_PERF
 endif
 
+# engwalkstack (#245): BUILD-STAMP / extra-flag passthrough.
+#
+# The stamp gate needs -DENGWALK_*_STAMP="<md5>" to reach the compiler, and
+# CFLAGS is set with `=` below, so a command-line CFLAGS= would REPLACE the
+# freestanding flag set rather than add to it. These two variables are the
+# append-only seam. They were previously done by the harness compiling objects
+# by hand outside make, which meant the stamp mechanism the project calls
+# permanent lived in a private script instead of the build.
+#   make XCFLAGS='-DENGWALK_MAIN_STAMP="<md5>"' \
+#        NS_XFLAGS='-DENGWALK_LAYOUT_STAMP="<md5>" -DENGWALK_CSSVAR_STAMP="<md5>"'
+XCFLAGS  ?=
+NS_XFLAGS ?=
+CFLAGS += $(XCFLAGS)
+
 TARGET = browser
 
 # Local objects: app + NetSurf bindings + our layout engine
 OBJS = main.o $(NS)/dom_hubbub_bind.o $(NS)/css_select_bind.o $(NS)/layout.o \
-       $(NS)/cssvar.o $(NS)/fontmap.o $(NS)/rrect.o
+       $(NS)/cssvar.o $(NS)/fontmap.o $(NS)/rrect.o $(NS)/paintorder.o
 
 CRT0 = $(LIBC_DIR)/crt0.o
 LIBC = $(LIBC_DIR)/libc.a
 
+# The libc INCLUDE root, absolute, passed to every engine-object recipe below.
+#
+# THREE THINGS MAKE THIS NECESSARY AND NONE OF THEM IS OBVIOUS.
+#
+# 1. cc.sh and duktape/build.sh run after `cd $(NS)` / `cd $(DUK)`, so a relative
+#    ../../libc means nothing to them. $(abspath) is resolved here, where the cwd
+#    is this directory.
+# 2. Their historical default is LIBC=<repo>/userland/libc: the SHARED
+#    repo WORKING TREE. A golden build materializes userland out of the commit so
+#    that no working-tree file can reach the artifact (#664); compiling the engine
+#    objects against working-tree libc headers is a hole in exactly that property,
+#    and a concurrent agent editing libc changes what the golden compiles. Passing
+#    the build tree's own libc closes it. In a normal repo checkout this resolves
+#    to the same path as the old default, so nothing changes for a developer.
+# 3. IT MUST BE PASSED PER RECIPE, NOT EXPORTED. `LIBC` above is the libc ARCHIVE
+#    and cc.sh's `LIBC` is an INCLUDE DIRECTORY: the same name for two different
+#    things. make re-exports any variable that was in its environment using the
+#    MAKEFILE's value, so a `LIBC=<dir> make` from outside reaches cc.sh as
+#    -I../../libc/libc.a and the build dies on a missing string.h. Measured, not
+#    predicted. The per-recipe assignment wins over whatever make exports, so this
+#    is correct whether or not LIBC is in the caller's environment.
+LIBC_INC := $(abspath $(LIBC_DIR))
+
 all: $(TARGET)
 
-$(TARGET): main.o $(NS)/dom_hubbub_bind.o $(NS)/css_select_bind.o $(NS)/layout.o $(NS)/cssvar.o $(NS)/fontmap.o $(NS)/rrect.o $(DUK_OBJS) $(CRT0) $(LIBC)
+$(TARGET): main.o $(NS)/dom_hubbub_bind.o $(NS)/css_select_bind.o $(NS)/layout.o $(NS)/cssvar.o $(NS)/fontmap.o $(NS)/rrect.o $(NS)/paintorder.o $(DUK_OBJS) $(CRT0) $(LIBC)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) main.o $(NS)/dom_hubbub_bind.o \
 	    $(NS)/css_select_bind.o $(NS)/layout.o $(NS)/cssvar.o \
-	    $(NS)/fontmap.o $(NS)/rrect.o \
+	    $(NS)/fontmap.o $(NS)/rrect.o $(NS)/paintorder.o \
 	    --start-group $(NS_LIBS) $(DUK_OBJS) $(LIBC) --end-group
 	@echo "Built $(TARGET)"
 	@ls -lh $(TARGET)
@@ -78,25 +132,30 @@ main.o: main.c
 # here: it hardcodes -I$(SHIM) -I$(LIBC) ahead of its own "$$@", so duktape/shim
 # could never take precedence over the NetSurf shim's competing time.h.
 $(DUK)/duktape.o $(DUK)/duk_support.o $(DUK)/duk_dom.o: $(DUK)/build.sh $(DUK)/duktape.c $(DUK)/duk_support.c $(DUK)/duk_dom.c
-	cd $(DUK) && ./build.sh
+	cd $(DUK) && LIBC=$(LIBC_INC) ./build.sh
 
 # Build the NetSurf binding/layout objects via the project cc.sh wrapper so they
 # get the exact same freestanding flags as the archives.
 $(NS)/dom_hubbub_bind.o: $(NS)/dom_hubbub_bind.c
-	cd $(NS) && ./cc.sh $(NS_PERF) $(NS_INC) -c dom_hubbub_bind.c -o dom_hubbub_bind.o
+	cd $(NS) && LIBC=$(LIBC_INC) ./cc.sh $(NS_PERF) $(NS_XFLAGS) $(NS_INC) -c dom_hubbub_bind.c -o dom_hubbub_bind.o
 $(NS)/css_select_bind.o: $(NS)/css_select_bind.c
-	cd $(NS) && ./cc.sh $(NS_PERF) $(NS_INC) -c css_select_bind.c -o css_select_bind.o
+	cd $(NS) && LIBC=$(LIBC_INC) ./cc.sh $(NS_PERF) $(NS_XFLAGS) $(NS_INC) -c css_select_bind.c -o css_select_bind.o
 $(NS)/layout.o: $(NS)/layout.c
-	cd $(NS) && ./cc.sh $(NS_PERF) $(NS_INC) -c layout.c -o layout.o
+	cd $(NS) && LIBC=$(LIBC_INC) ./cc.sh $(NS_PERF) $(NS_XFLAGS) $(NS_INC) -c layout.c -o layout.o
 $(NS)/cssvar.o: $(NS)/cssvar.c $(NS)/cssvar.h
-	cd $(NS) && ./cc.sh $(NS_PERF) $(NS_INC) -c cssvar.c -o cssvar.o
+	cd $(NS) && LIBC=$(LIBC_INC) ./cc.sh $(NS_PERF) $(NS_XFLAGS) $(NS_INC) -c cssvar.c -o cssvar.o
 # #245 font-family resolution and rounded-rect span geometry. fontmap.o is
 # platform-free (main.c supplies the three fm_plat_* hooks); rrect.o is shared
 # byte for byte with the host-side harness so the two cannot round differently.
 $(NS)/fontmap.o: $(NS)/fontmap.c $(NS)/fontmap.h
-	cd $(NS) && ./cc.sh $(NS_PERF) $(NS_INC) -c fontmap.c -o fontmap.o
+	cd $(NS) && LIBC=$(LIBC_INC) ./cc.sh $(NS_PERF) $(NS_XFLAGS) $(NS_INC) -c fontmap.c -o fontmap.o
 $(NS)/rrect.o: $(NS)/rrect.c $(NS)/rrect.h
-	cd $(NS) && ./cc.sh $(NS_PERF) $(NS_INC) -c rrect.c -o rrect.o
+	cd $(NS) && LIBC=$(LIBC_INC) ./cc.sh $(NS_PERF) $(NS_XFLAGS) $(NS_INC) -c rrect.c -o rrect.o
+# #245 engstack: CSS stacking contexts and paint order. Like rrect.o this is
+# platform-free pure logic, shared byte for byte with the host-side harness, so
+# the ordering the OS paints and the ordering the harness asserts cannot differ.
+$(NS)/paintorder.o: $(NS)/paintorder.c $(NS)/paintorder.h
+	cd $(NS) && LIBC=$(LIBC_INC) ./cc.sh $(NS_PERF) $(NS_XFLAGS) $(NS_INC) -c paintorder.c -o paintorder.o
 
 clean:
 	rm -f main.o $(TARGET)

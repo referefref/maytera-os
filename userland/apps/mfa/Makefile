@@ -12,7 +12,7 @@ CFLAGS = -ffreestanding -fstack-protector-strong -mstack-protector-guard=global 
 LDFLAGS = -pie --no-dynamic-linker -z notext -nostdlib -z max-page-size=0x1000 -T ../../user-pie.ld
 
 TARGET = mfa
-OBJS = main.o totp.o
+OBJS = main.o
 
 CRT0 = $(LIBC_DIR)/crt0.o
 LIBC = $(LIBC_DIR)/libc.a
@@ -27,12 +27,16 @@ $(TARGET): $(OBJS) $(CRT0) $(LIBC)
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Host-side unit test of the TOTP core against RFC 6238 vectors.
-hosttest: totp.c totp_test.c
-	gcc -O2 -Wall -Wextra -DMFA_HOST_TEST -o totp_test totp_test.c totp.c
-	./totp_test
+# THE HOST-SIDE RFC 6238 UNIT TEST IS GONE FROM HERE, AND IT DID NOT DIE.
+# It tested totp.c, which this app no longer has. The same vectors, and eleven
+# more, now run against the KERNEL's implementation in two places that both
+# execute: kernel/crypto/secretuse_kat.sh on the host (RFC 6238 Appendix B, SHA1
+# AND SHA256 arms, all six published times each, plus four proven RED builds) and
+# totp_selftest_rs() on EVERY BOOT. Deleting a test along with the code it covered
+# is correct; deleting it and not saying where the coverage went is how a tree ends
+# up believing it tests something it does not.
 
 clean:
-	rm -f $(OBJS) $(TARGET) totp_test
+	rm -f $(OBJS) $(TARGET)
 
-.PHONY: all clean hosttest
+.PHONY: all clean

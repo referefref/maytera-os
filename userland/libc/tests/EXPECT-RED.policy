@@ -1,0 +1,19 @@
+# userland/libc/tests/EXPECT-RED.policy  -  #deadtests
+#
+# TAB-separated, one line per host test that is KNOWN RED:
+#
+#     <run_xxx.sh><TAB><reason, which is REQUIRED>
+#
+# run-all.sh prints the reason on EVERY run, so a debt stays visible instead of
+# becoming a silent skip. Three rules make this an exemption rather than a hole:
+#   - an empty reason FAILS the run;
+#   - a line naming a file that does not exist FAILS the run;
+#   - a listed test that starts PASSING also FAILS the run, so an exemption
+#     cannot outlive the thing it exempted.
+#
+# This is the concurrency-lint allowlist discipline. Before adding a line, be
+# sure the test is red about something the TREE decided, not about something the
+# HARNESS forgot: on 2026-10-02 five of six red tests here were red for reasons
+# that had nothing to do with the code they test, and all five were fixed rather
+# than exempted.
+run_escrow.sh	NOT a regression, and NOT a harness oversight: the three failing scenarios (guards, partial, deny_ctrl) assert enforcement that MOVED TO RING 0 on purpose. userland/libc/escrow.c:26-31 says it outright - "the old userland aicap grant/deny (allowed_paths scoping + fs.delete denylist) is GONE from this file: it duplicated what the kernel now enforces" - and aicap_deny_capability() consequently has ZERO callers. A host harness has no kernel, so it can no longer observe a refusal that Ring 0 performs, and the test's OWN negative controls are now vacuous: they print "GOOD" by observing the same failure with the gate on as with it off. Three of its six scenarios (organize, tool, exif) still pass and still test real shipping logic. DO NOT "fix" this by weakening the assertions; the coverage belongs in a kernel-side test of the escrow guard, and deciding where that lives is the escrow author's call. Before 2026-10-02 this script did not even BUILD (fourteen undefined ad_* references), so the three green scenarios were not running either.

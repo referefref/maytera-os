@@ -2,13 +2,12 @@
 
 `/APPS/PYTHON.ELF` on the golden is CPython 3.11.9, cross-compiled freestanding
 for MayteraOS. This directory holds the MayteraOS-authored layer that makes
-that possible. It is 23 files and ~348 KB; the CPython source it sits on is
+that possible. It is 13 files; the CPython source it sits on is
 upstream 3.11.9 and is not vendored here.
 
 | Directory | What it is |
 |---|---|
 | `src-cpython/` | `mos_pymain.c` (the MayteraOS launcher: sys.path onto the ext2 root, script-from-disk execution, kernel-CSPRNG hash randomisation), `compat.c` and `misc.c` (trimmed supplements standing in for POSIX pieces we do not have) |
-| `src-libc/` | The libc additions CPython forced: `posixextra.c`, real `errno.c/.h`, plus the headers CPython expects (`unistd.h`, `stdlib.h`, `time.h`, `inttypes.h`, `sys/time.h`, `sys/types.h`) |
 | `src-kernel/` | The kernel-side `syscall.c/.h` state this port was built against. **Version at that time: MayteraOS 1.95.0, kernel build 686.** |
 | `diffs/` | The five diffs against libc and the kernel, kept so the delta is legible rather than having to be re-derived by comparison |
 | `scripts/relink.sh` | The exact link recipe that produced the shipping binary |
@@ -48,10 +47,31 @@ fails the build if any second definition comes back (#745, local 106).
 
 - `relink.sh` points `L` and `U` at
   `<workspace>`, the tree CLAUDE.md calls stale
-  reference only. It is recorded verbatim because it is what actually produced
-  the shipping binary, and rewriting it without rebuilding and testing would
-  substitute a guess for a fact. Repointing it at the repo libc is part of
-  #650, not of committing the source.
+  reference only. It is kept verbatim as the historical record of what produced
+  the July binary. It is NOT what builds CPython now: `scripts/relink-pie.sh`
+  (#661) is, it points at the repo userland, and `build-golden.sh` section 3h
+  runs it on every golden build.
+
+### What happened to `src-libc/` (deleted 2026-10-02)
+
+It held forked copies of `stdlib.c`, `errno.c/.h`, `posixextra.c`, `stdlib.h`,
+`inttypes.h`, `time.h`, `unistd.h`, `sys/time.h` and `sys/types.h`, described
+here as "the libc additions CPython forced". That was true when it was written.
+It stopped being true once `errno.c` and `posixextra.c` were upstreamed into
+`userland/libc` and the headers followed: MEASURED on 2026-10-02, all 292
+identifiers defined or declared across those ten files existed in the shared
+libc, and nothing in the tree used the directory as a build input.
+
+What it still did was mislead. Its `stdlib.c` was a 2026-07-07 copy of the
+shared allocator carrying the pre-#245 unbounded free-list walk, so a reader
+comparing it against the fixed `userland/libc/stdlib.c` would reasonably
+conclude that CPython does not get the #245 fix. CPython does get it:
+`relink-pie.sh` links `$U/libc/libc.a`, the shared one.
+
+`build/alloc-single-source-gate.sh` now fails the build if a second definition
+of malloc/free/realloc/calloc appears anywhere under `userland/`, so this
+cannot come back quietly. The deleted files are in git history if the July
+state is ever needed.
 - It links `user.ld`, not `user-pie.ld`, so `PYTHON.ELF` is ET_EXEC: no PIE, no
   ASLR, and outside #640's coverage. It also builds `-fno-stack-protector`, so
   #651's canary does not cover it either.

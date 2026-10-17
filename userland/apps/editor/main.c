@@ -6,37 +6,15 @@
 #include "../../libc/gui.h"
 #include "../../libc/gui_font.h"
 #include "../../libc/gui_menu.h"
+#include "../../libc/contract.h"   // task 3 (docs/CONTRACT_COVERAGE_PLAN.md): every menu item through the manifest API
 #include "../../libc/userconf.h"   // #743: checked whole-file write + per-user paths
 #include "../../libc/keys.h"   // #243: GUI_KEY_* nav codes
 #include "../../libc/theme.h"  // [no-ticket] editor uplift: theme_color()/theme_metric()
-#include "../../libc/gui_style.h" // (edglass) gui_glass_backdrop_* / gui_fill_rounded_aa / gui_soft_shadow / gui_chevron
 
 // Editor dimensions
 static int g_ed_w = 640, g_ed_h = 480;  // live content size (EVENT_RESIZE)
 #define EDITOR_WIDTH    g_ed_w
 #define EDITOR_HEIGHT   g_ed_h
-
-// ---------------------------------------------------------------------------
-// (edglass) Glass geometry: the SAME numbers the Calculator (calc/main.c) and
-// the Task Manager (taskmgr logic.rs) use, so every glass window shares one
-// geometry. Two panels sit on the frosted backdrop: a header panel holding
-// the menu bar (and the find row when it is open) and a body panel holding
-// the gutter, the document, the scrollbar and the status row. The margins
-// between and around them ARE the backdrop blit; nothing is ever cleared
-// with a flat fill (docs/UI_GLASS_DESIGN_SYSTEM.md section 11).
-// ---------------------------------------------------------------------------
-#define PAD          10      // window margin: the backdrop shows here
-#define PANEL_R      12      // panel corner radius
-#define PANEL_IN     12      // inset from a panel edge to its content
-#define PANEL_GAP    8       // vertical gap between the two panels
-#define HDR_BAR_H    36      // header panel height with the find row closed
-#define FIND_ROW_H   30      // extra header height while the find row is open
-#define MENU_BAR_H   26      // menu bar height (TAB_H everywhere else)
-#define BODY_TOP_IN  8       // body panel top edge -> first text row
-#define GUTTER_W     48      // line-number gutter width inside the body panel
-#define GUTTER_GAP   8       // gutter hairline -> first text column
-#define STATUS_ROW_H 24      // status row inside the body panel bottom
-#define SB_TRACK_W   8       // scrollbar pill width (centred in the reservation)
 // Cell metrics, derived from the SELECTED font at runtime (#351). These were
 // #define 8 / 16, hardwired to the 8x16 bitmap font, which is what made the
 // editor unable to honour a font choice at all. ed_apply_font() recomputes them.
@@ -44,6 +22,10 @@ static int g_cell_w = 8;
 static int g_cell_h = 16;
 #define CHAR_W          g_cell_w
 #define CHAR_H          g_cell_h
+#define MENU_HEIGHT     24
+#define FIND_HEIGHT     26      // search bar height (only when open)
+#define STATUS_HEIGHT   20
+#define LINE_NUM_WIDTH  48      // Space for line numbers
 
 // ---- Selected font (#351). Rendered via the shared registry; chosen via the
 // shared gui_font_dialog(), so the editor contains NO font UI of its own.
@@ -102,26 +84,9 @@ static int ed_scrollbar_w(void) {
     return theme_metric_or(THEME_METRIC_SCROLLBAR_W, 16);
 }
 
-// (edglass) Panel rects. ONE definition each: the draw path and every hit
-// test read these, so a rect cannot drift between the two (glass doc
-// section 8, "one definition for anything three places agree about").
-static bool find_open;   // defined with the find state below; needed here
-static int hdr_h(void)   { return HDR_BAR_H + (find_open ? FIND_ROW_H : 0); }
-static int hdr_x(void)   { return PAD; }
-static int hdr_y(void)   { return PAD; }
-static int hdr_w(void)   { return EDITOR_WIDTH - 2 * PAD; }
-static int body_x(void)  { return PAD; }
-static int body_y(void)  { return PAD + hdr_h() + PANEL_GAP; }
-static int body_w(void)  { return EDITOR_WIDTH - 2 * PAD; }
-static int body_h(void)  { return EDITOR_HEIGHT - PAD - body_y(); }
-static int body_bottom(void) { return body_y() + body_h(); }
-// Status row: the bottom STATUS_ROW_H of the body panel, a hairline above it.
-static int status_y(void) { return body_bottom() - STATUS_ROW_H; }
-
 // Content area dimensions (recomputed per-frame so the find bar can push it down)
-#define CONTENT_X       (body_x() + GUTTER_W + GUTTER_GAP)
-#define CONTENT_RIGHT   (body_x() + body_w() - PANEL_IN - ed_scrollbar_w())
-#define CONTENT_W       (CONTENT_RIGHT - CONTENT_X)
+#define CONTENT_X       LINE_NUM_WIDTH
+#define CONTENT_W       (EDITOR_WIDTH - LINE_NUM_WIDTH - ed_scrollbar_w())
 
 // Buffer limits
 #define MAX_BUFFER      (64 * 1024)  // 64KB text buffer
@@ -130,83 +95,77 @@ static int status_y(void) { return body_bottom() - STATUS_ROW_H; }
 #define MAX_FIND        128
 #define MAX_CLIP        (16 * 1024)
 
-// ---------------------------------------------------------------------------
-// (edglass) Colour tokens: docs/UI_GLASS_DESIGN_SYSTEM.md section 1, the
-// same names and hex the Calculator / Task Manager / Media Player / Image
-// Viewer glass restyles use. FIXED dark glass regardless of theme, as those
-// four are: the window carries its own frosted backdrop, so the theme's
-// window/menu colours never appear inside it. (The previous restyle read
-// every colour from theme_color(); that stays true of the MENU METRICS, font
-// size and row height, which still track the live theme via
-// gui_menu_sync_theme(), and of the scrollbar reservation, ed_scrollbar_w().)
-// ---------------------------------------------------------------------------
-#define C_PANEL       0x00122420   // WEL_BG_MID: panel fill, glass tint, the outer colour AA edges blend toward
-#define C_CARD        0x000E1D1B   // DK_CARD_FILL: menu popup fill, scrollbar track, find-row buttons
-#define C_EDGE        0x002C4A44   // DK_STROKE_UNSEL: panel border, hairlines, separators
-#define C_EDGE_GLASS  0x006FA99E   // DK_EDGE_GLASS: strokes on glass (popup border), scroll thumb, match outline
-#define C_INK         0x00F3FBF9   // DK_HEADLINE: document text, current line's numeral
-#define C_INK_DIM     0x00A9D9CC   // DK_BODY: menu labels, gutter numerals, status, match count
-#define C_ACCENT      0x006AE2CF   // DK_ACCENT: selection fill, caret, open menu, focused field border, bracket outline
-#define C_ACCENT_INK  0x0004231A   // text on the accent
-#define C_ERR         0x00FFAAA2   // DK_ERROR: save-failed / unbalanced-bracket cue
-#define C_BTN_TOP     0x000F8068   // DK_BTN_TOP: active find match fill (white ink, 4.9:1)
-#define C_FIELD_LABEL 0x008FCFC0   // DK_FIELD_LABEL: "Find" / "Repl" eyebrow labels
-#define C_IN_FILL     0x00213B34   // DK_INPUT_FILL
-#define C_IN_BORDER   0x004E7168   // DK_INPUT_BORDER (resting)
-#define C_IN_TEXT     0x00EAF6F2   // DK_INPUT_TEXT
-#define WEL_BG_TOP    0x000A1614   // backdrop gradient fallback, top stop
-#define WEL_BG_BOTTOM 0x00050A09   // backdrop gradient fallback, bottom stop
-#define C_WHITE       0x00FFFFFF   // DK_BTN_TEXT: ink on C_BTN_TOP
-
-// The names the draw code below has always used, now bound to the tokens
-// above so every use site reads as the role it plays. Derived fills
-// (current line, menu hover) come from gui_lighten() of C_PANEL, the same
-// way the Calculator lightens its panel for a hovered pill.
-#define TEXT_COLOR       C_INK
-#define LINE_NUM_COLOR   C_INK_DIM
-#define SELECTION_BG     C_ACCENT
-#define SELECTION_FG     C_ACCENT_INK
-#define CURSOR_COLOR     C_ACCENT
-#define MENU_HINT        C_INK_DIM
-#define STATUS_TEXT      C_INK_DIM
-#define SCROLL_TRACK     C_CARD
-#define SCROLL_THUMB     C_EDGE_GLASS
-#define MATCH_CUR_BG     C_BTN_TOP
-#define MATCH_CUR_FG     C_WHITE
-#define BRACKET_OUTLINE  C_ACCENT
-#define MATCH_OUTLINE    C_EDGE_GLASS
-#define TRAIL_WS_DOT     C_INK_DIM
-#define WARN_COLOR       C_ERR
-#define CUR_LINE_BG      gui_lighten(C_PANEL, 10)
-#define BG_COLOR         C_PANEL       // the document sits directly on the body panel
+// Colors (theme-driven at runtime; see apply_theme()). [no-ticket] editor
+// uplift: these used to be five hand-picked hex palettes (Dark/Light/Classic/
+// Ocean/Nord) baked into a switch on get_theme(). Replaced with reads from
+// the real shared theme system (theme_color()), so the editor now inherits
+// all 12 shipped themes instead of 5, and picks up any future theme with no
+// editor-side change. Initial values here are placeholders overwritten by the
+// first apply_theme() call in main(); they exist only so the file compiles
+// with sane values before that call runs.
+static uint32_t BG_COLOR       = 0x001E1E1E;  // text content background
+static uint32_t TEXT_COLOR     = 0x00D4D4D4;  // body text
+static uint32_t LINE_NUM_COLOR = 0x00858585;  // gutter line numbers (dim)
+static uint32_t LINE_NUM_BG    = 0x00252525;  // gutter/panel background
+static uint32_t SELECTION_BG   = 0x00264F78;  // selection highlight
+static uint32_t SELECTION_FG   = 0x00FFFFFF;  // text ink drawn over SELECTION_BG
+static uint32_t CURSOR_COLOR   = 0x00AEAFAD;  // caret
+static uint32_t MENU_BG        = 0x00333333;  // menu bar / find bar panel
+static uint32_t MENU_TEXT      = 0x00FFFFFF;  // menu / button text
+static uint32_t MENU_HINT      = 0x00AAAAAA;  // secondary/dim text on chrome
+static uint32_t STATUS_BG      = 0x00007ACC;  // status bar background
+static uint32_t STATUS_TEXT    = 0x00FFFFFF;  // status bar text
+static uint32_t FIND_BG        = 0x002D2D30;  // find bar background
+static uint32_t FIND_FIELD_BG  = 0x003C3C3C;  // input field background
+static uint32_t FIND_BORDER    = 0x00505050;  // field border
+static uint32_t BUTTON_BG      = 0x00505050;  // find-bar prev/next buttons
+static uint32_t SCROLL_TRACK   = 0x00303030;  // scrollbar track
+static uint32_t SCROLL_THUMB   = 0x00686868;  // scrollbar thumb
+static uint32_t CUR_LINE_BG    = 0x002A2D2E;  // current-line highlight
+static uint32_t MATCH_CUR_BG   = 0x00B58900;  // fill for the active match
+static uint32_t MATCH_CUR_FG   = 0x00000000;  // text ink drawn over MATCH_CUR_BG
+static uint32_t BRACKET_OUTLINE = 0x00405E40; // matched-bracket outline
+static uint32_t MATCH_OUTLINE  = 0x00FFCC00;  // all-matches outline
+static uint32_t TRAIL_WS_DOT   = 0x00858585;  // trailing-whitespace dot glyph
+static uint32_t WARN_COLOR     = 0x00FFCC00;  // unbalanced-bracket / save-fail warning
 
 // Live theme tracking. get_theme() returns the active theme index (0-11).
-// (edglass) Still polled, for METRICS only: the menu bar's type size and row
-// height and the scrollbar reservation come from the theme; the colours do not.
 static int g_theme_last = -1;
 
-// ---------------------------------------------------------------------------
-// (edglass) The frosted-wallpaper backdrop: the shared libc recipe
-// (userland/libc/gui_style.h gui_glass_backdrop_*, consolidated at glasslib).
-// This app owns only the two persistent pieces the API asks for.
-// ---------------------------------------------------------------------------
-static uint32_t g_bd[GUI_GLASS_BD_W * GUI_GLASS_BD_H];
-static int g_bd_wi = GUI_GLASS_BD_NEVER;   // wallpaper index the backdrop was built for
-static int g_chrome_dirty = 1;             // the ONLY thing that can make editor_redraw() blit the backdrop
-// Layout facts the last blitted frame was composed for. A change in either
-// UNCOVERS margin (the find row closing moves the body panel up and leaves
-// header-panel pixels in the new gap; a menu popup closing or switching
-// leaves popup pixels over the gap and margins it overlapped), so the next
-// frame must blit the backdrop again (blame.md audglass trap 4). Tracked at
-// the top of editor_redraw() by construction rather than at each toggle site.
-static int g_layout_find_open = -1;
-static int g_layout_menu_open = -1;
-
-// Rebuild the backdrop if the wallpaper changed; a changed index marks the
-// chrome dirty (same poll the Calculator makes every frame).
-static void sync_backdrop(void) {
-    if (gui_glass_backdrop_sync(g_bd, &g_bd_wi, C_PANEL, 158, WEL_BG_TOP, WEL_BG_BOTTOM))
-        g_chrome_dirty = 1;
+// [no-ticket] editor uplift: reads the real theme tokens instead of a bespoke
+// 5-way switch. See CHANGELOG for the full old-var -> theme_color() mapping.
+// No per-pixel alpha exists in this renderer, so the old MATCH_BG (all-
+// matches fill) / BRACKET_BG / TRAIL_WS_BG flat-fill colors were dropped
+// rather than invented as new literals that could collide with selection or
+// current-line fills under z-order: matches and bracket pairs are now drawn
+// as an OUTLINE on top of the fills (gui_draw_rect_outline), and trailing
+// whitespace as a small centered dot glyph, both reusing existing tokens.
+static void apply_theme(void) {
+    BG_COLOR        = theme_color(THEME_COLOR_TEXTBOX_BG);
+    TEXT_COLOR       = theme_color(THEME_COLOR_TEXTBOX_TEXT);
+    LINE_NUM_COLOR   = theme_color(THEME_COLOR_MUTED);
+    LINE_NUM_BG      = theme_color(THEME_COLOR_SURFACE_RAISED);
+    SELECTION_BG     = theme_color(THEME_COLOR_SELECTION);
+    SELECTION_FG     = theme_color(THEME_COLOR_SELECTION_TEXT);
+    CURSOR_COLOR     = theme_color(THEME_COLOR_TEXTBOX_CURSOR);
+    MENU_BG          = theme_color(THEME_COLOR_MENU_BG);
+    MENU_TEXT        = theme_color(THEME_COLOR_MENU_TEXT);
+    MENU_HINT        = theme_color(THEME_COLOR_MUTED);
+    STATUS_BG        = theme_color(THEME_COLOR_SURFACE_RAISED);
+    STATUS_TEXT      = theme_color(THEME_COLOR_MUTED);
+    FIND_BG          = theme_color(THEME_COLOR_SURFACE_RAISED);
+    FIND_FIELD_BG    = theme_color(THEME_COLOR_TEXTBOX_BG);
+    FIND_BORDER      = theme_color(THEME_COLOR_TEXTBOX_BORDER);
+    BUTTON_BG        = theme_color(THEME_COLOR_BUTTON_FACE);
+    SCROLL_TRACK     = theme_color(THEME_COLOR_SCROLLBAR_BG);
+    SCROLL_THUMB     = theme_color(THEME_COLOR_SCROLLBAR_THUMB);
+    CUR_LINE_BG      = theme_color(THEME_COLOR_WINDOW_BG);
+    MATCH_CUR_BG     = theme_color(THEME_COLOR_ACCENT);
+    MATCH_CUR_FG     = theme_color(THEME_COLOR_ON_ACCENT);
+    BRACKET_OUTLINE  = theme_color(THEME_COLOR_FOCUS_RING);
+    MATCH_OUTLINE    = theme_color(THEME_COLOR_WARNING);
+    TRAIL_WS_DOT     = theme_color(THEME_COLOR_MUTED);
+    WARN_COLOR       = theme_color(THEME_COLOR_WARNING);
 }
 
 // Editor state
@@ -257,8 +216,8 @@ static uint32_t clip_len = 0;
 static char filename[MAX_PATH] = "";
 static bool modified = false;
 
-// Find/Replace state (find_open itself is declared above, beside the panel
-// geometry that depends on it; false at start like every other flag here)
+// Find/Replace state
+static bool find_open = false;
 static bool replace_mode = false;      // true => show replace field too
 static int  find_field = 0;            // 0 = find field, 1 = replace field
 static char find_text[MAX_FIND] = "";
@@ -289,26 +248,114 @@ typedef enum {
     ID_FONT_CHOOSE
 } menu_action_id_t;
 
+// ---- contract actfns (defined near main(), below handle_menu_action()) ----
+// Forward-declared here so FILE_ITEMS/EDIT_ITEMS/SEARCH_ITEMS/FONT_ITEMS can
+// carry .afn pointers to them (docs/CONTRACT_COVERAGE_PLAN.md task 3): one
+// menu row, drawn by gui_menu_bar_draw(), dispatched by menu_ctl_dispatch()
+// on a click, and projected by menu_ctl_project() for the contract - the SAME
+// row, never a second table describing the same action.
+static int run_file_new(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_file_save(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_file_exit(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_edit_cut(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_edit_copy(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_edit_paste(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_edit_select_all(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_search_find_open(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_search_find_next(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_search_replace_open(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_view_font_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+
+// ---- contract terms (docs/CONTRACT_COVERAGE_PLAN.md task 2) --------------
+static const ct_terms_t k_t_new = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, 0, "doc.char_count", 0
+};
+static const ct_terms_t k_t_save = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_RC, CT_DEPTH_FS,
+    CT_FAIL_IO | CT_FAIL_NOSPACE | CT_FAIL_NEEDSLIVE, 0, 0
+};
+static const ct_terms_t k_t_exit = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_RC, CT_DEPTH_VIEW, 0, 0, 0
+};
+static const ct_terms_t k_t_clip = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_RC, CT_DEPTH_DOC, CT_FAIL_NOTFOUND, 0, 0
+};
+static const ct_terms_t k_t_select_all = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, 0, "doc.has_selection", 0
+};
+static const ct_terms_t k_t_find_arm = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_ARMED, CT_DEPTH_VIEW, 0, "find.is_open", 0
+};
+static const ct_terms_t k_t_find_next = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NOTFOUND, "find.match_index", 0
+};
+static const ct_terms_t k_t_font_dialog = {
+    CT_TIME_SLOW, CT_TF_MODAL | CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_PREF,
+    CT_FAIL_UNSUPPORTED, "view.font_family", 0
+};
+static const ct_terms_t k_t_open_path = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC,
+    CT_FAIL_NOTFOUND | CT_FAIL_IO, "doc.path", 0
+};
+static const ct_terms_t k_t_save_to = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_FS,
+    CT_FAIL_IO | CT_FAIL_NOSPACE, "doc.path", 0
+};
+
 static const gui_menu_item_t FILE_ITEMS[] = {
-    { "New",  "Ctrl+N", ID_FILE_NEW,  true },
-    { "Save", "Ctrl+S", ID_FILE_SAVE, true },
+    { "New",  "Ctrl+N", ID_FILE_NEW,  true, false,
+      .tok = "file.new", .afn = run_file_new,
+      .desc = "Discard the current document with no prompt and start a new blank one",
+      .terms = &k_t_new },
+    { "Save", "Ctrl+S", ID_FILE_SAVE, true, false,
+      .tok = "file.save", .afn = run_file_save,
+      .desc = "Save to the current path; fails with no prompt if the document has never been saved (use file.save_to)",
+      .terms = &k_t_save },
     { NULL,   NULL,     0,            false },   // separator
-    { "Exit", NULL,     ID_FILE_EXIT, true },
+    { "Exit", NULL,     ID_FILE_EXIT, true, false,
+      .tok = "file.exit", .afn = run_file_exit,
+      .desc = "Request the window close with no unsaved-changes prompt (the menu item has none either)",
+      .terms = &k_t_exit },
 };
 static const gui_menu_item_t EDIT_ITEMS[] = {
-    { "Cut",         "Ctrl+X", ID_EDIT_CUT,        true },
-    { "Copy",        "Ctrl+C", ID_EDIT_COPY,       true },
-    { "Paste",       "Ctrl+V", ID_EDIT_PASTE,      true },
+    { "Cut",         "Ctrl+X", ID_EDIT_CUT,        true, false,
+      .tok = "edit.cut", .afn = run_edit_cut,
+      .desc = "Cut the current selection to the clipboard; fails if nothing is selected",
+      .terms = &k_t_clip },
+    { "Copy",        "Ctrl+C", ID_EDIT_COPY,       true, false,
+      .tok = "edit.copy", .afn = run_edit_copy,
+      .desc = "Copy the current selection to the clipboard; fails if nothing is selected",
+      .terms = &k_t_clip },
+    { "Paste",       "Ctrl+V", ID_EDIT_PASTE,      true, false,
+      .tok = "edit.paste", .afn = run_edit_paste,
+      .desc = "Paste the clipboard at the caret, replacing the selection if any; fails if the clipboard is empty",
+      .terms = &k_t_clip },
     { NULL,          NULL,     0,                  false },   // separator
-    { "Select All",  "Ctrl+A", ID_EDIT_SELECT_ALL, true },
+    { "Select All",  "Ctrl+A", ID_EDIT_SELECT_ALL, true, false,
+      .tok = "edit.select_all", .afn = run_edit_select_all,
+      .desc = "Select the entire document buffer",
+      .terms = &k_t_select_all },
 };
 static const gui_menu_item_t SEARCH_ITEMS[] = {
-    { "Find...",     "Ctrl+F", ID_SEARCH_FIND,      true },
-    { "Find Next",   "Ctrl+G", ID_SEARCH_FIND_NEXT, true },
-    { "Replace...",  "Ctrl+H", ID_SEARCH_REPLACE,   true },
+    { "Find...",     "Ctrl+F", ID_SEARCH_FIND,      true, false,
+      .tok = "search.find_open", .afn = run_search_find_open,
+      .desc = "Open the Find bar (ARMED: only reachable inside a running window, see find.is_open)",
+      .terms = &k_t_find_arm },
+    { "Find Next",   "Ctrl+G", ID_SEARCH_FIND_NEXT, true, false,
+      .tok = "search.find_next", .afn = run_search_find_next,
+      .desc = "Advance to the next match of the current Find text; fails if there is no search text or no match",
+      .terms = &k_t_find_next },
+    { "Replace...",  "Ctrl+H", ID_SEARCH_REPLACE,   true, false,
+      .tok = "search.replace_open", .afn = run_search_replace_open,
+      .desc = "Open the Find bar in replace mode (ARMED: only reachable inside a running window, see find.is_open)",
+      .terms = &k_t_find_arm },
 };
 static const gui_menu_item_t FONT_ITEMS[] = {
-    { "Font...", NULL, ID_FONT_CHOOSE, true },
+    { "Font...", NULL, ID_FONT_CHOOSE, true, false,
+      .tok = "view.font_dialog", .afn = run_view_font_dialog,
+      .desc = "Raise the shared Font dialog and apply + persist the chosen face/size",
+      .terms = &k_t_font_dialog },
 };
 static const gui_menu_t EDITOR_MENUS[] = {
     { "File",   FILE_ITEMS,   4 },
@@ -318,59 +365,6 @@ static const gui_menu_t EDITOR_MENUS[] = {
 };
 #define EDITOR_MENU_COUNT 4
 static gui_menu_bar_t g_menu;
-
-// (edglass) The backdrop colour under content pixel (x, y): what the
-// kernel's nearest-neighbour scale put there, to within the blur. Every AA
-// edge and shadow drawn onto the backdrop takes its outer colour from here;
-// a flat guess is what produces a square halo around a round corner.
-static uint32_t bd_at(int x, int y) {
-    return gui_glass_backdrop_at(g_bd, EDITOR_WIDTH, EDITOR_HEIGHT, x, y);
-}
-
-// One glass panel: soft shadow, AA rounded fill, 1px border, 1px top
-// highlight; the layering the Calculator's and Task Manager's draw_panel()
-// use. Every outer colour is sampled from the backdrop under that edge so
-// the fringe and corners match what the blit put there. Drawn EVERY frame:
-// the same inputs give the same pixels, so the repaint is idempotent and
-// there is no static/dynamic chrome split to keep in step (section 11: only
-// the backdrop blit itself is a commit).
-static void draw_panel(int x, int y, int w, int h) {
-    uint32_t below = bd_at(x + w / 2, y + h + 3);
-    uint32_t c0 = bd_at(x + 4, y + 4),     c1 = bd_at(x + w - 4, y + 4),
-             c2 = bd_at(x + 4, y + h - 4), c3 = bd_at(x + w - 4, y + h - 4);
-    uint32_t outer = 0;
-    for (int sh = 0; sh <= 16; sh += 8) {
-        uint32_t m = (((c0 >> sh) & 0xFF) + ((c1 >> sh) & 0xFF) + ((c2 >> sh) & 0xFF) + ((c3 >> sh) & 0xFF)) / 4;
-        outer |= m << sh;
-    }
-    gui_soft_shadow(window_handle, x, y + 2, w, h, PANEL_R, below);
-    gui_fill_rounded_aa(window_handle, x, y, w, h, PANEL_R, C_PANEL, outer);
-    gui_rounded_border(window_handle, x, y, w, h, PANEL_R, C_EDGE);
-    win_draw_rect(window_handle, x + PANEL_R, y + 1, w - 2 * PANEL_R, 1, gui_lighten(C_PANEL, 16));
-}
-
-// The menu bar's colours: the glass tokens, applied AFTER every
-// gui_menu_sync_theme() so the widget keeps the theme's metrics but never
-// the theme's colours (gui_menu.h: "gui_menu_set_palette() remains the
-// override for an app with its own chrome identity"). The popup floats over
-// the backdrop, so its border is the on-glass stroke, not the panel one.
-static void apply_menu_palette(void) {
-    gui_menu_palette_t pal;
-    pal.bar_bg             = C_PANEL;
-    pal.bar_text           = C_INK_DIM;
-    pal.bar_hover_bg       = gui_lighten(C_PANEL, 18);
-    pal.bar_open_bg        = C_ACCENT;
-    pal.bar_open_text      = C_ACCENT_INK;
-    pal.popup_bg           = C_CARD;
-    pal.popup_border       = C_EDGE_GLASS;
-    pal.item_text          = C_INK;
-    pal.item_text_disabled = gui_mix(C_INK_DIM, C_CARD, 140);
-    pal.item_hover_bg      = C_ACCENT;
-    pal.item_hover_text    = C_ACCENT_INK;
-    pal.shortcut_text      = C_INK_DIM;
-    pal.separator          = C_EDGE;
-    gui_menu_set_palette(&g_menu, &pal);
-}
 
 // Lint cues
 static int bracket_balance = 0;        // net (open - close) over the whole file
@@ -389,14 +383,11 @@ static void recompute_lint(void);
 static void recompute_matches(void);
 
 // --- geometry helpers (find bar shifts content down when open) -------------
-// (edglass) The document lives inside the body panel: from BODY_TOP_IN below
-// the panel's top edge down to just above the status row's hairline.
 static int content_y(void) {
-    return body_y() + BODY_TOP_IN;
+    return MENU_HEIGHT + (find_open ? FIND_HEIGHT : 0);
 }
 static int content_h(void) {
-    int h = (status_y() - 1 - 4) - content_y();
-    return h > 0 ? h : 0;
+    return EDITOR_HEIGHT - content_y() - STATUS_HEIGHT;
 }
 static int visible_rows(void) { return content_h() / CHAR_H; }
 static int visible_cols(void) { return CONTENT_W / CHAR_W; }
@@ -788,124 +779,90 @@ static void ed_load_font(void) {
 // shortcut hints. Nothing replaces it; the right side is deliberately empty.
 // gui_menu_bar_draw() already draws TTF internally, so there is nothing
 // bitmap-drawn left in this function to convert.
+static void draw_menu_bar(void) {
+    win_draw_rect(window_handle, 0, 0, EDITOR_WIDTH, MENU_HEIGHT, MENU_BG);
+    gui_menu_bar_draw(window_handle, &g_menu);
+}
+
 // [no-ticket] editor uplift: body text size (docs/UI_STYLE_GUIDE.md 4.x
 // type.body) and caption size (type.caption), used for every TTF draw/measure
 // pair in this file so a draw call and its matching gui_ttf_width() measure
-// can never drift to different sizes. (edglass) ED_TTF_FIELD is the find
-// row's control size (glass doc section 5: labels and buttons at 12).
+// can never drift to different sizes.
 #define ED_TTF_BODY     14
 #define ED_TTF_CAPTION  11
-#define ED_TTF_FIELD    12
 
-// (edglass) Find-row geometry. ONE definition, read by draw_find_bar() AND
-// by the click handler, so the rectangles that are drawn are the rectangles
-// that are hit-tested (the old code carried a second copy of these literals
-// in the mouse handler). All relative to the header panel.
-#define FR_FIELD_H   22
-#define FR_BTN_W     26
-#define FR_FIND_W    190
-#define FR_REPL_W    150
-static int fr_y(void)        { return hdr_y() + HDR_BAR_H; }             // row top
-static int fr_ctl_y(void)    { return fr_y() + (FIND_ROW_H - FR_FIELD_H) / 2; }
-static int fr_label_x(void)  { return hdr_x() + PANEL_IN; }
-static int fr_find_x(void)   { return fr_label_x() + 36; }
-static int fr_count_x(void)  { return fr_find_x() + FR_FIND_W + 10; }
-static int fr_prev_x(void)   { return fr_count_x() + 84; }
-static int fr_next_x(void)   { return fr_prev_x() + FR_BTN_W + 4; }
-static int fr_repl_lbl_x(void) { return fr_next_x() + FR_BTN_W + 14; }
-static int fr_repl_x(void)   { return fr_repl_lbl_x() + 36; }
-static int fr_repl_w(void) {
-    int room = hdr_x() + hdr_w() - PANEL_IN - fr_repl_x();
-    return room < FR_REPL_W ? room : FR_REPL_W;
-}
-
-// (edglass) The header panel: menu bar on the top row (the shared gui_menu
-// widget, glass palette), the replace hint right-aligned beside it when the
-// replace field is up, then the find row below when it is open. The panel
-// is drawn every frame like every other panel here.
-static void draw_header(void) {
-    draw_panel(hdr_x(), hdr_y(), hdr_w(), hdr_h());
-    gui_menu_bar_draw(window_handle, &g_menu);
-    if (find_open && replace_mode) {
-        const char *hint = "Enter replaces, Ctrl+A replaces all";
-        int hw = gui_ttf_width(hint, ED_TTF_CAPTION);
-        int hx = hdr_x() + hdr_w() - PANEL_IN - hw;
-        int menu_right = g_menu.item_x[EDITOR_MENU_COUNT - 1] + g_menu.item_w[EDITOR_MENU_COUNT - 1];
-        if (hx > menu_right + 12)
-            win_draw_text_ttf(window_handle, hx, hdr_y() + 5 + (MENU_BAR_H - ED_TTF_CAPTION) / 2 - 1,
-                              hint, ED_TTF_CAPTION, MENU_HINT);
-    }
-}
-
-// One find-row input field (glass doc section 6: radius 4, DK_INPUT_FILL,
-// 1px DK_INPUT_BORDER, the accent border when focused). The AA corner blends
-// toward the panel it sits on. Caret x MUST come from the same measure
-// (gui_ttf_width at the SAME size) as the draw call, or it drifts off the
-// end of the typed glyphs.
-static void draw_field(int x, int w, const char *text, bool focused) {
-    int y = fr_ctl_y();
-    gui_fill_rounded_aa(window_handle, x, y, w, FR_FIELD_H, 4, C_IN_FILL, C_PANEL);
-    gui_rounded_border(window_handle, x, y, w, FR_FIELD_H, 4, focused ? C_ACCENT : C_IN_BORDER);
-    int ty = y + (FR_FIELD_H - ED_TTF_FIELD) / 2 - 1;
-    win_draw_text_ttf(window_handle, x + 6, ty, text, ED_TTF_FIELD, C_IN_TEXT);
-    if (focused) {
-        int cx = x + 6 + gui_ttf_width(text, ED_TTF_FIELD);
-        if (cx < x + w - 3)
-            win_draw_rect(window_handle, cx, y + 4, 1, FR_FIELD_H - 8, CURSOR_COLOR);
-    }
-}
-
-// Prev / next: a nested-card key (radius 6, C_CARD, C_EDGE border) with the
-// shared chevron, stroked not typed (glass doc section 6).
-static void draw_nav_btn(int x, int dir) {
-    int y = fr_ctl_y();
-    gui_fill_rounded_aa(window_handle, x, y, FR_BTN_W, FR_FIELD_H, 6, C_CARD, C_PANEL);
-    gui_rounded_border(window_handle, x, y, FR_BTN_W, FR_FIELD_H, 6, C_EDGE);
-    gui_chevron(window_handle, x + FR_BTN_W / 2, y + FR_FIELD_H / 2, dir, C_INK_DIM);
-}
-
-// Draw the find / replace row (inside the header panel, which draw_header()
-// has already painted).
+// Draw the find / replace bar
 static void draw_find_bar(void) {
     if (!find_open) return;
-    int ly = fr_y() + (FIND_ROW_H - ED_TTF_FIELD) / 2 - 1;
+    int y = MENU_HEIGHT;
+    win_draw_rect(window_handle, 0, y, EDITOR_WIDTH, FIND_HEIGHT, FIND_BG);
 
-    win_draw_text_ttf(window_handle, fr_label_x(), ly, "Find", ED_TTF_FIELD, C_FIELD_LABEL);
-    draw_field(fr_find_x(), FR_FIND_W, find_text, find_field == 0);
+    // Label
+    win_draw_text_ttf(window_handle, 6, y + 5, "Find:", ED_TTF_BODY, MENU_TEXT);
 
-    // Match count
+    // Find field
+    int fx = 56, fw = 200, fh = 18;
+    uint32_t fb = (find_field == 0) ? gui_lighten(FIND_FIELD_BG, 16) : FIND_FIELD_BG;
+    win_draw_rect(window_handle, fx, y + 4, fw, fh, fb);
+    gui_draw_rect_outline(window_handle, fx, y + 4, fw, fh,
+                          (find_field == 0) ? STATUS_BG : FIND_BORDER);
+    win_draw_text_ttf(window_handle, fx + 4, y + 5, find_text, ED_TTF_BODY, TEXT_COLOR);
+    if (find_field == 0) {
+        // Caret-alignment proof point: the caret x MUST come from the same
+        // measure (gui_ttf_width at the SAME size) as the draw call just
+        // above it, or the caret drifts off the end of the typed glyphs.
+        int cx = fx + 4 + gui_ttf_width(find_text, ED_TTF_BODY);
+        win_draw_rect(window_handle, cx, y + 5, 1, CHAR_H - 2, CURSOR_COLOR);
+    }
+
+    // Match count badge
     char mc[40];
     if (find_len == 0) {
         snprintf(mc, sizeof(mc), "no query");
     } else if (match_count == 0) {
         snprintf(mc, sizeof(mc), "0 matches");
-    } else if (match_index == 0) {
-        // (edglass) Reopening the row after a close, or after an edit
-        // invalidated the active match: no match is current, so "0 of 2"
-        // (what this used to print) reads as a contradiction of the 2.
-        snprintf(mc, sizeof(mc), "%d matches", match_count);
     } else {
         snprintf(mc, sizeof(mc), "%d of %d", match_index, match_count);
     }
-    win_draw_text_ttf(window_handle, fr_count_x(), ly, mc, ED_TTF_FIELD, MENU_HINT);
+    win_draw_text_ttf(window_handle, fx + fw + 10, y + 5, mc, ED_TTF_BODY, MENU_HINT);
 
-    draw_nav_btn(fr_prev_x(), GUI_CHEV_LEFT);
-    draw_nav_btn(fr_next_x(), GUI_CHEV_RIGHT);
+    // Prev / Next buttons
+    int bx = fx + fw + 110;
+    win_draw_rect(window_handle, bx, y + 4, 24, fh, BUTTON_BG);
+    win_draw_text_ttf(window_handle, bx + 8, y + 5, "<", ED_TTF_BODY, MENU_TEXT);
+    win_draw_rect(window_handle, bx + 28, y + 4, 24, fh, BUTTON_BG);
+    win_draw_text_ttf(window_handle, bx + 36, y + 5, ">", ED_TTF_BODY, MENU_TEXT);
 
-    if (replace_mode && fr_repl_w() >= 40) {
-        win_draw_text_ttf(window_handle, fr_repl_lbl_x(), ly, "Repl", ED_TTF_FIELD, C_FIELD_LABEL);
-        draw_field(fr_repl_x(), fr_repl_w(), repl_text, find_field == 1);
+    if (replace_mode) {
+        // Replace row is drawn within the same bar height by re-using vertical
+        // space is tight, so we render a second compact line just below the find
+        // field overlapping the content top is avoided because content_y already
+        // accounts for FIND_HEIGHT; for replace we expand visually via a popup
+        // line at the bottom of the bar.
+        // Simpler: show replace field to the right.
+        int rx = bx + 60;
+        win_draw_text_ttf(window_handle, rx, y + 5, "Repl:", ED_TTF_BODY, MENU_TEXT);
+        int rfx = rx + 44, rfw = 150;
+        uint32_t rb = (find_field == 1) ? gui_lighten(FIND_FIELD_BG, 16) : FIND_FIELD_BG;
+        win_draw_rect(window_handle, rfx, y + 4, rfw, fh, rb);
+        gui_draw_rect_outline(window_handle, rfx, y + 4, rfw, fh,
+                              (find_field == 1) ? STATUS_BG : FIND_BORDER);
+        win_draw_text_ttf(window_handle, rfx + 4, y + 5, repl_text, ED_TTF_BODY, TEXT_COLOR);
+        if (find_field == 1) {
+            int cx = rfx + 4 + gui_ttf_width(repl_text, ED_TTF_BODY);
+            win_draw_rect(window_handle, cx, y + 5, 1, CHAR_H - 2, CURSOR_COLOR);
+        }
+        // Replace hint (caption role: size 11)
+        win_draw_text_ttf(window_handle, rfx + rfw + 6, y + 8,
+                          "Enter=Repl  Ctrl+Enter=All", ED_TTF_CAPTION, MENU_HINT);
     }
 }
 
-// Draw line numbers: the gutter is the body panel itself (no separate fill,
-// so nothing square ever reaches the panel's rounded corners), numerals
-// right-aligned, a hairline at the gutter's right edge.
+// Draw line numbers
 static void draw_line_numbers(void) {
     int cy = content_y();
     int ch = content_h();
-    int gx = body_x() + GUTTER_W;
-    win_draw_rect(window_handle, gx, cy, 1, ch, C_EDGE);
+    win_draw_rect(window_handle, 0, cy, LINE_NUM_WIDTH, ch, LINE_NUM_BG);
 
     char num_str[8];
     int rows = visible_rows();
@@ -918,7 +875,7 @@ static void draw_line_numbers(void) {
         // Gutter numerals are caption role, right-aligned (UI_STYLE_GUIDE.md
         // 4.4: "List/table rows... numerals right-aligned").
         int text_w = gui_ttf_width(num_str, ED_TTF_CAPTION);
-        int x = gx - text_w - 8;
+        int x = LINE_NUM_WIDTH - text_w - 8;
 
         uint32_t color = (scroll_line + (uint32_t)row == cursor_line) ? TEXT_COLOR : LINE_NUM_COLOR;
         win_draw_text_ttf(window_handle, x, y, num_str, ED_TTF_CAPTION, color);
@@ -932,9 +889,7 @@ static void draw_content(void) {
     int rows = visible_rows();
     int cols = visible_cols();
 
-    // (edglass) No content fill: the document sits directly on the body
-    // panel, which draw_panel() has just repainted, so every cell already
-    // holds BG_COLOR (== C_PANEL). The fills below are the exceptions.
+    win_draw_rect(window_handle, CONTENT_X, cy, CONTENT_W, ch, BG_COLOR);
 
     // Current-line highlight when the caret line is visible.
     if (cursor_line >= scroll_line && (int)cursor_line < (int)scroll_line + rows) {
@@ -1040,31 +995,22 @@ static void draw_content(void) {
     // matching gui_scroll.c's convention (GUI_SCROLL_W - 4).
     // DISPLAY-ONLY in this pass: no click-drag, no hit-testing. That gap
     // already existed before this change; not adding real interactivity here.
-    // (edglass) The reservation is still the theme metric; the pill drawn
-    // inside it is SB_TRACK_W wide and centred, track C_CARD, thumb the
-    // on-glass stroke colour, both AA-blended toward the panel.
     if ((int)line_count > rows) {
         int sb_w = ed_scrollbar_w();
-        int sb_x = CONTENT_RIGHT + (sb_w - SB_TRACK_W) / 2;
-        gui_fill_rounded_aa(window_handle, sb_x, cy, SB_TRACK_W, ch, SB_TRACK_W / 2, SCROLL_TRACK, C_PANEL);
+        int sb_x = CONTENT_X + CONTENT_W;
+        win_draw_rect(window_handle, sb_x, cy, sb_w, ch, SCROLL_TRACK);
         int thumb_h = rows * ch / (int)line_count;
         if (thumb_h < 16) thumb_h = 16;
         int range = (int)line_count - rows;
         int thumb_y = cy + (range > 0 ? (int)scroll_line * (ch - thumb_h) / range : 0);
-        gui_fill_rounded_aa(window_handle, sb_x, thumb_y, SB_TRACK_W, thumb_h, SB_TRACK_W / 2, SCROLL_THUMB, SCROLL_TRACK);
+        win_draw_rect(window_handle, sb_x + 2, thumb_y, sb_w - 4, thumb_h, SCROLL_THUMB);
     }
 }
 
-// Draw the status row: the bottom of the body panel, under a hairline inset
-// by PANEL_R so it never meets the rounded corners. Text sits on the panel
-// (refilled every frame by draw_panel(), so a changed string never draws
-// over its predecessor).
+// Draw status bar
 static void draw_status_bar(void) {
-    int y = status_y();
-    win_draw_rect(window_handle, body_x() + PANEL_R, y - 1, body_w() - 2 * PANEL_R, 1, C_EDGE);
-    int ty = y + (STATUS_ROW_H - ED_TTF_CAPTION) / 2 - 2;
-    int left_x = body_x() + PANEL_IN;
-    int right_x = body_x() + body_w() - PANEL_IN;
+    int y = EDITOR_HEIGHT - STATUS_HEIGHT;
+    win_draw_rect(window_handle, 0, y, EDITOR_WIDTH, STATUS_HEIGHT, STATUS_BG);
 
     // Left: filename + modified flag
     char left[160];
@@ -1076,7 +1022,7 @@ static void draw_status_bar(void) {
     } else {
         snprintf(left, sizeof(left), "%s%s", f, modified ? " *" : "");
     }
-    win_draw_text_ttf(window_handle, left_x, ty, left, ED_TTF_CAPTION, STATUS_TEXT);
+    win_draw_text_ttf(window_handle, 8, y + 2, left, ED_TTF_CAPTION, STATUS_TEXT);
 
     // Center: lint cue
     char mid[64];
@@ -1097,7 +1043,7 @@ static void draw_status_bar(void) {
     if (mid[0]) {
         int mw = gui_ttf_width(mid, ED_TTF_CAPTION);
         uint32_t mc = (bracket_balance != 0 || save_failed) ? WARN_COLOR : STATUS_TEXT;
-        win_draw_text_ttf(window_handle, (EDITOR_WIDTH - mw) / 2, ty, mid, ED_TTF_CAPTION, mc);
+        win_draw_text_ttf(window_handle, (EDITOR_WIDTH - mw) / 2, y + 2, mid, ED_TTF_CAPTION, mc);
     }
 
     // Right: line:col + total lines
@@ -1106,37 +1052,13 @@ static void draw_status_bar(void) {
              (unsigned)(cursor_line + 1), (unsigned)(cursor_col + 1),
              (unsigned)line_count);
     int info_w = gui_ttf_width(info, ED_TTF_CAPTION);
-    win_draw_text_ttf(window_handle, right_x - info_w, ty, info, ED_TTF_CAPTION, STATUS_TEXT);
+    win_draw_text_ttf(window_handle, EDITOR_WIDTH - info_w - 16, y + 2, info, ED_TTF_CAPTION, STATUS_TEXT);
 }
 
-// Full redraw.
-//
-// (edglass) THE ANTI-FLASH CONTRACT (docs/UI_GLASS_DESIGN_SYSTEM.md section
-// 11). SYS_WIN_BLIT self-commits: the kernel publishes the window the
-// instant the backdrop lands, and a compositor sample taken between that
-// commit and the win_invalidate() below would show a backdrop with no
-// document on it. So the blit runs ONLY when the chrome is dirty (start,
-// EVENT_RESIZE, EVENT_REDRAW, wallpaper change, and the two layout changes
-// tracked here that uncover margin), never on a keystroke, a caret move or
-// a hover. Everything else is plain draws, which accumulate unpublished
-// until the single invalidate at the end. The window is never cleared with
-// a flat fill: the two panels cover every pixel that changes, and the
-// margins are the backdrop.
+// Full redraw
 static void editor_redraw(void) {
-    int menu_open = g_menu.open;
-    if (g_layout_find_open >= 0 && g_layout_find_open != (int)find_open) g_chrome_dirty = 1;
-    if (g_layout_menu_open >= 0 && g_layout_menu_open != menu_open) g_chrome_dirty = 1;
-    g_layout_find_open = (int)find_open;
-    g_layout_menu_open = menu_open;
-
-    sync_backdrop();
-    if (g_chrome_dirty) {
-        gui_glass_backdrop_blit(window_handle, g_bd);
-        g_chrome_dirty = 0;
-    }
-    draw_header();
+    draw_menu_bar();
     draw_find_bar();
-    draw_panel(body_x(), body_y(), body_w(), body_h());
     draw_line_numbers();
     draw_content();
     draw_status_bar();
@@ -1501,8 +1423,305 @@ static void handle_menu_action(int id, int *running) {
     }
 }
 
+// ===========================================================================
+// CONTRACT (docs/CONTRACT_COVERAGE_PLAN.md task 3): every menu item through
+// the manifest API. The 11 actions below are PROJECTED from the SAME
+// FILE_ITEMS/EDIT_ITEMS/SEARCH_ITEMS/FONT_ITEMS tables gui_menu_bar_draw()
+// and gui_menu_bar_click()/handle_menu_action() already read (menu_ctl_dispatch
+// matches on .id for the live click path; the contract reaches the same
+// .afn directly) - an item absent from those tables can neither be drawn,
+// clicked, nor described. file.open_path and file.save_to are STATIC rows
+// because there is no Open/Save-As dialog in this app to project them from
+// (editor currently opens only the path given on argv[1] at launch; see the
+// contract's own note below and blame.md 2026-10-01 [contracttail] - a real
+// gap, recorded rather than silently worked around).
+// ===========================================================================
+static int run_file_new(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    file_new();
+    kbd_sel_mode = false;
+    snprintf(out, (size_t)ocap, "ok new document");
+    return 0;
+}
+CT_CHECK_ACTFN(run_file_new);
+
+static int run_file_save(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!filename[0]) {
+        snprintf(out, (size_t)ocap,
+                 "no filename: this document has never been saved (use file.save_to)");
+        return 1;
+    }
+    file_save();
+    if (save_failed) {
+        snprintf(out, (size_t)ocap, "save failed: write error");
+        return 1;
+    }
+    snprintf(out, (size_t)ocap, "ok saved %s", filename);
+    return 0;
+}
+CT_CHECK_ACTFN(run_file_save);
+
+// Not observable out of process (the same honest limitation section 7i of
+// the plan doc records for about.check_updates): a spawned contract process
+// has no event loop to act on this flag, so on a fresh spawn the call is a
+// harmless no-op that reports success. g_want_exit is read by main()'s loop
+// for the one case where it DOES matter: a live window answering its own
+// contract in-process (which this app does not yet support; see the note).
+static int g_want_exit = 0;
+static int run_file_exit(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    g_want_exit = 1;
+    snprintf(out, (size_t)ocap, "ok exit requested");
+    return 0;
+}
+CT_CHECK_ACTFN(run_file_exit);
+
+static int run_edit_cut(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!has_selection) { snprintf(out, (size_t)ocap, "nothing selected"); return 1; }
+    uint32_t before = clip_len;
+    clip_cut();
+    recompute_lint();
+    snprintf(out, (size_t)ocap, "ok cut %u byte(s)", clip_len > before ? clip_len : clip_len);
+    return 0;
+}
+CT_CHECK_ACTFN(run_edit_cut);
+
+static int run_edit_copy(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!has_selection) { snprintf(out, (size_t)ocap, "nothing selected"); return 1; }
+    clip_copy();
+    snprintf(out, (size_t)ocap, "ok copied %u byte(s)", clip_len);
+    return 0;
+}
+CT_CHECK_ACTFN(run_edit_copy);
+
+static int run_edit_paste(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (clip_len == 0) { snprintf(out, (size_t)ocap, "clipboard empty"); return 1; }
+    clip_paste();
+    recompute_lint();
+    snprintf(out, (size_t)ocap, "ok pasted %u byte(s)", clip_len);
+    return 0;
+}
+CT_CHECK_ACTFN(run_edit_paste);
+
+static int run_edit_select_all(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    select_all();
+    snprintf(out, (size_t)ocap, "ok selected %u byte(s)", buffer_len);
+    return 0;
+}
+CT_CHECK_ACTFN(run_edit_select_all);
+
+static int run_search_find_open(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    find_open = true; replace_mode = false; find_field = 0;
+    have_cur_match = false; recompute_matches();
+    snprintf(out, (size_t)ocap, "ok find bar open");
+    return 0;
+}
+CT_CHECK_ACTFN(run_search_find_open);
+
+static int run_search_find_next(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (find_len == 0) { snprintf(out, (size_t)ocap, "no search text"); return 1; }
+    find_next(have_cur_match ? cur_match_pos + 1 : cursor_pos, true);
+    if (match_count == 0) { snprintf(out, (size_t)ocap, "no matches"); return 1; }
+    snprintf(out, (size_t)ocap, "ok match %d of %d", match_index, match_count);
+    return 0;
+}
+CT_CHECK_ACTFN(run_search_find_next);
+
+static int run_search_replace_open(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    find_open = true; replace_mode = true; find_field = 0;
+    have_cur_match = false; recompute_matches();
+    snprintf(out, (size_t)ocap, "ok replace bar open");
+    return 0;
+}
+CT_CHECK_ACTFN(run_search_replace_open);
+
+static int run_view_font_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    g_font.title = "Editor Font";
+    g_font.preview_text = "int main(void) { return 0; }";
+    if (!gui_font_dialog(&g_font)) {
+        snprintf(out, (size_t)ocap, "cancelled");
+        return 1;
+    }
+    ed_apply_font();
+    ed_save_font();
+    snprintf(out, (size_t)ocap, "ok %s %d", g_font.family, g_font.size);
+    return 0;
+}
+CT_CHECK_ACTFN(run_view_font_dialog);
+
+// ---- static primitives: no Open/Save-As dialog exists to project these ----
+static int run_file_open_path(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0] || !argv[0][0]) {
+        snprintf(out, (size_t)ocap, "usage: file.open_path <path>");
+        return 1;
+    }
+    int fd = open(argv[0], 0);
+    if (fd < 0) { snprintf(out, (size_t)ocap, "not found: %s", argv[0]); return 1; }
+    close(fd);
+    file_open(argv[0]);
+    snprintf(out, (size_t)ocap, "ok opened %s (%u bytes)", filename, buffer_len);
+    return 0;
+}
+CT_CHECK_ACTFN(run_file_open_path);
+
+static int run_file_save_to(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0] || !argv[0][0]) {
+        snprintf(out, (size_t)ocap, "usage: file.save_to <path>");
+        return 1;
+    }
+    int i = 0;
+    while (argv[0][i] && i < MAX_PATH - 1) { filename[i] = argv[0][i]; i++; }
+    filename[i] = '\0';
+    file_save();
+    if (save_failed) { snprintf(out, (size_t)ocap, "save failed: write error"); return 1; }
+    snprintf(out, (size_t)ocap, "ok saved %s", filename);
+    return 0;
+}
+CT_CHECK_ACTFN(run_file_save_to);
+
+// ---- the readable state a caller checks a control against, or a
+// success_ref names -----------------------------------------------------
+static int ct_get_dirty(void)         { return modified ? 1 : 0; }
+static int ct_get_char_count(void)    { return (int)buffer_len; }
+static int ct_get_line_count(void)    { return (int)line_count; }
+static int ct_get_cursor_line(void)   { return (int)cursor_line; }
+static int ct_get_cursor_col(void)    { return (int)cursor_col; }
+static int ct_get_has_selection(void) { return has_selection ? 1 : 0; }
+static int ct_get_match_count(void)   { return match_count; }
+static int ct_get_match_index(void)   { return match_index; }
+static int ct_get_find_open(void)     { return find_open ? 1 : 0; }
+static int ct_get_font_size(void)     { return g_font.size; }
+static int ct_str_path(char *o, int n) {
+    snprintf(o, (size_t)n, "%s", filename[0] ? filename : "(none)");
+    return 0;
+}
+static int ct_str_find_text(char *o, int n) {
+    snprintf(o, (size_t)n, "%s", find_text);
+    return 0;
+}
+static int ct_str_font_family(char *o, int n) {
+    snprintf(o, (size_t)n, "%s", g_font.family[0] ? g_font.family : "(default)");
+    return 0;
+}
+
+static const ct_item_t EDITOR_ITEMS[] = {
+    // ---- value rows: terms DERIVED (contract_terms_of), no ct_terms_t needed
+    { .name = "doc.path", .type = CT_STR, .access = CT_READ, .risk = CT_SAFE,
+      .getstrfn = ct_str_path,
+      .desc = "Absolute path of the open document, or (none) if never saved" },
+    { .name = "doc.dirty", .type = CT_BOOL, .access = CT_READ, .risk = CT_SAFE,
+      .lo = 0, .hi = 1, .getfn = ct_get_dirty,
+      .desc = "Whether the document has unsaved changes" },
+    { .name = "doc.char_count", .type = CT_INT, .access = CT_READ, .risk = CT_SAFE,
+      .lo = 0, .hi = (int)MAX_BUFFER, .getfn = ct_get_char_count,
+      .desc = "Number of characters in the document buffer" },
+    { .name = "doc.line_count", .type = CT_INT, .access = CT_READ, .risk = CT_SAFE,
+      .lo = 1, .hi = (int)MAX_LINES, .getfn = ct_get_line_count,
+      .desc = "Number of lines in the document" },
+    { .name = "doc.cursor_line", .type = CT_INT, .access = CT_READ, .risk = CT_SAFE,
+      .lo = 0, .hi = (int)MAX_LINES, .getfn = ct_get_cursor_line,
+      .desc = "0-based line the caret is on" },
+    { .name = "doc.cursor_col", .type = CT_INT, .access = CT_READ, .risk = CT_SAFE,
+      .lo = 0, .hi = (int)MAX_BUFFER, .getfn = ct_get_cursor_col,
+      .desc = "0-based column the caret is at within its line" },
+    { .name = "doc.has_selection", .type = CT_BOOL, .access = CT_READ, .risk = CT_SAFE,
+      .lo = 0, .hi = 1, .getfn = ct_get_has_selection,
+      .desc = "Whether any text is currently selected" },
+    { .name = "find.text", .type = CT_STR, .access = CT_READ, .risk = CT_SAFE,
+      .getstrfn = ct_str_find_text,
+      .desc = "Current contents of the Find field" },
+    { .name = "find.match_count", .type = CT_INT, .access = CT_READ, .risk = CT_SAFE,
+      .lo = 0, .hi = (int)MAX_BUFFER, .getfn = ct_get_match_count,
+      .desc = "Number of matches of the current Find text" },
+    { .name = "find.match_index", .type = CT_INT, .access = CT_READ, .risk = CT_SAFE,
+      .lo = 0, .hi = (int)MAX_BUFFER, .getfn = ct_get_match_index,
+      .desc = "1-based index of the active match, 0 if none" },
+    { .name = "find.is_open", .type = CT_BOOL, .access = CT_READ, .risk = CT_SAFE,
+      .lo = 0, .hi = 1, .getfn = ct_get_find_open,
+      .desc = "Whether the Find/Replace bar is open" },
+    { .name = "view.font_family", .type = CT_STR, .access = CT_READ, .risk = CT_SAFE,
+      .getstrfn = ct_str_font_family,
+      .desc = "Currently selected editor font family name" },
+    { .name = "view.font_size", .type = CT_INT, .access = CT_READ, .risk = CT_SAFE,
+      .lo = 6, .hi = 128, .getfn = ct_get_font_size,
+      .desc = "Currently selected editor font point size" },
+
+    // ---- action rows: STATIC because there is no Open/Save-As dialog to
+    // project these from (the big comment above this section explains why).
+    { .name = "file.open_path", .type = CT_ACTION, .access = CT_WRITE, .risk = CT_GUARDED,
+      .actfn = run_file_open_path, .cap = "fs.read",
+      .desc = "Open an exact path with no dialog, the same file_open() a drag-drop or launch argv[1] uses",
+      .terms = &k_t_open_path },
+    { .name = "file.save_to", .type = CT_ACTION, .access = CT_WRITE, .risk = CT_GUARDED,
+      .actfn = run_file_save_to, .cap = "fs.write",
+      .desc = "Save the buffer to an exact path with no dialog, the same userconf_write_all() Save uses",
+      .terms = &k_t_save_to },
+};
+#define EDITOR_N_ITEMS ((int)(sizeof(EDITOR_ITEMS) / sizeof(EDITOR_ITEMS[0])))
+
+// editor_project() chains the four menu tables that carry a contract token,
+// in the same order menu_ctl_count()/menu_ctl_project() can report them:
+// File, Edit, Search, Font - exactly EDITOR_MENUS' own order.
+static int editor_project(int idx, ct_item_t *out) {
+    if (idx < 0) return 0;
+    int n = menu_ctl_count(FILE_ITEMS, (int)(sizeof(FILE_ITEMS) / sizeof(FILE_ITEMS[0])));
+    if (idx < n) return menu_ctl_project(FILE_ITEMS, (int)(sizeof(FILE_ITEMS) / sizeof(FILE_ITEMS[0])), idx, out);
+    idx -= n;
+    n = menu_ctl_count(EDIT_ITEMS, (int)(sizeof(EDIT_ITEMS) / sizeof(EDIT_ITEMS[0])));
+    if (idx < n) return menu_ctl_project(EDIT_ITEMS, (int)(sizeof(EDIT_ITEMS) / sizeof(EDIT_ITEMS[0])), idx, out);
+    idx -= n;
+    n = menu_ctl_count(SEARCH_ITEMS, (int)(sizeof(SEARCH_ITEMS) / sizeof(SEARCH_ITEMS[0])));
+    if (idx < n) return menu_ctl_project(SEARCH_ITEMS, (int)(sizeof(SEARCH_ITEMS) / sizeof(SEARCH_ITEMS[0])), idx, out);
+    idx -= n;
+    n = menu_ctl_count(FONT_ITEMS, (int)(sizeof(FONT_ITEMS) / sizeof(FONT_ITEMS[0])));
+    if (idx < n) return menu_ctl_project(FONT_ITEMS, (int)(sizeof(FONT_ITEMS) / sizeof(FONT_ITEMS[0])), idx, out);
+    return 0;
+}
+
+static const ct_contract_t EDITOR_CONTRACT = {
+    "editor", "Editor",
+    "Every File/Edit/Search/Font menu item is PROJECTED from "
+    "FILE_ITEMS[]/EDIT_ITEMS[]/SEARCH_ITEMS[]/FONT_ITEMS[] (editor_project(), "
+    "below), the SAME tables gui_menu_bar_draw() and handle_menu_action() "
+    "(via menu_ctl_dispatch()) already read and dispatch from - a menu row "
+    "absent from those tables can neither be drawn nor described. "
+    "file.open_path and file.save_to stay STATIC in EDITOR_ITEMS below "
+    "because this app has no Open/Save-As dialog to project them from: it "
+    "opens only the path given on argv[1] at launch, and Save silently "
+    "no-ops on a document that was never given a path (file.save reports "
+    "that honestly rather than pretending to succeed). search.find_open/ "
+    "search.replace_open/view.font_dialog declare CT_TF_LIVE_ONLY (and "
+    "font_dialog is also CT_TF_MODAL): on a fresh spawn they either arm a "
+    "flag nothing then reads, or are refused outright, because this app does "
+    "not yet serve a live contract instance the way files/terminal/paint do "
+    "(no contract_live_poll() call). NOT covered: pointer drags, mouse "
+    "selection, hover, wheel scrolling, double-click timing, the scrollbar "
+    "pill, bracket-match highlighting and raw keyboard typing, which are "
+    "gestures rather than discrete controls.",
+    EDITOR_ITEMS, EDITOR_N_ITEMS,
+    editor_project,
+    0,   // no persisted config to load (the font preference is saved directly
+         // by run_view_font_dialog()/ed_save_font(), not through commit())
+    0
+};
+
 int main(int argc, char **argv) {
-    (void)argc;
+    // #233: a contract invocation must never open a window. Answering here,
+    // before win_create(), is what makes the API usable from a headless test
+    // harness and from the AI tool loop without a compositor.
+    if (contract_is_invocation(argc, argv))
+        return contract_cli(argc, argv, &EDITOR_CONTRACT);
 
     // g_ed_w/g_ed_h are the CONTENT size (that is what EVENT_RESIZE delivers and
     // what every layout helper below assumes), so add the chrome to get the OUTER
@@ -1528,11 +1747,9 @@ int main(int argc, char **argv) {
 
     printf("Editor window created (handle=%d)\n", window_handle);
 
-    // (edglass) The menu bar lives inside the header panel: 6px in from the
-    // panel's left edge, 5px down, MENU_BAR_H tall (the glass TAB_H).
-    gui_menu_bar_init(&g_menu, EDITOR_MENUS, EDITOR_MENU_COUNT, PAD + 6, PAD + 5, MENU_BAR_H);
-    gui_menu_sync_theme(&g_menu, -1);   // metrics from the theme...
-    apply_menu_palette();               // ...colours from the glass tokens
+    gui_menu_bar_init(&g_menu, EDITOR_MENUS, EDITOR_MENU_COUNT, 0, 0, MENU_HEIGHT);
+    apply_theme();
+    gui_menu_sync_theme(&g_menu, -1);
     g_theme_last = get_theme();
 
     file_new();
@@ -1550,18 +1767,9 @@ int main(int argc, char **argv) {
         int event_type = win_get_event(window_handle, &event, 100);
 
         // Live-apply a theme change made in Settings while we are running.
-        // (edglass) Metrics only: the menu bar's type size / row height and
-        // the scrollbar reservation follow the theme; the colours are the
-        // fixed glass palette, re-applied over the widget's theme read.
         {
             int th = get_theme();
-            if (th != g_theme_last) {
-                g_theme_last = th;
-                gui_menu_sync_theme(&g_menu, -1);
-                apply_menu_palette();
-                g_chrome_dirty = 1;
-                editor_redraw();
-            }
+            if (th != g_theme_last) { g_theme_last = th; apply_theme(); gui_menu_sync_theme(&g_menu, -1); editor_redraw(); }
         }
 
         if (event_type == 0) {
@@ -1595,17 +1803,11 @@ int main(int argc, char **argv) {
 
         switch (event.type) {
             case EVENT_REDRAW:
-                // (edglass) the compositor asked for the whole window again:
-                // chrome dirty, so the backdrop is blitted before the panels.
-                g_chrome_dirty = 1;
                 editor_redraw();
                 break;
 
             case EVENT_RESIZE:
-                // (edglass) a resize reallocates the content buffer, so the
-                // backdrop must be blitted again: chrome dirty.
                 if (event.mouse_x > 0 && event.mouse_y > 0) { g_ed_w = event.mouse_x; g_ed_h = event.mouse_y; }
-                g_chrome_dirty = 1;
                 editor_redraw();
                 break;
 
@@ -1745,7 +1947,7 @@ int main(int argc, char **argv) {
 
                     // The menu bar (gui_menu, #562/#512) gets first refusal on
                     // every click, open or closed: an open popup can extend
-                    // well below the header panel, over the find row or content.
+                    // well below MENU_HEIGHT, over the find bar or content.
                     int mid = gui_menu_bar_click(&g_menu, local_x, local_y,
                                                  EDITOR_WIDTH, EDITOR_HEIGHT);
                     if (mid != -1) {
@@ -1754,29 +1956,25 @@ int main(int argc, char **argv) {
                         break;
                     }
 
-                    // Find row (prev/next buttons, field focus) when open. The
-                    // rects are the fr_*() ones draw_find_bar() paints.
-                    if (find_open && local_y >= fr_y() && local_y < fr_y() + FIND_ROW_H) {
-                        int cy0 = fr_ctl_y(), cy1 = fr_ctl_y() + FR_FIELD_H;
-                        bool in_row = (local_y >= cy0 && local_y < cy1);
-                        if (in_row && local_x >= fr_prev_x() && local_x < fr_prev_x() + FR_BTN_W) {
+                    // Find bar buttons (prev/next) when open.
+                    if (find_open && local_y >= MENU_HEIGHT && local_y < MENU_HEIGHT + FIND_HEIGHT) {
+                        int y = MENU_HEIGHT;
+                        int bx = 56 + 200 + 110;
+                        if (local_x >= bx && local_x < bx + 24 && local_y >= y + 4 && local_y < y + 22) {
                             find_next(have_cur_match ? (cur_match_pos > 0 ? cur_match_pos : 0) : cursor_pos, false);
-                        } else if (in_row && local_x >= fr_next_x() && local_x < fr_next_x() + FR_BTN_W) {
+                        } else if (local_x >= bx + 28 && local_x < bx + 52 && local_y >= y + 4 && local_y < y + 22) {
                             find_next(have_cur_match ? cur_match_pos + 1 : cursor_pos, true);
-                        } else if (in_row && local_x >= fr_find_x() && local_x < fr_find_x() + FR_FIND_W) {
+                        } else if (local_x >= 56 && local_x < 256) {
                             find_field = 0;
-                        } else if (in_row && replace_mode && local_x >= fr_repl_x() &&
-                                   local_x < fr_repl_x() + fr_repl_w()) {
-                            find_field = 1;
                         }
                         editor_redraw();
                         break;
                     }
 
-                    if (local_y < body_y()) {
+                    if (local_y >= 0 && local_y < MENU_HEIGHT) {
                         // gui_menu_bar_click() above already owns every top-level
-                        // label; a click here landed in the header panel's blank
-                        // space or the margin and is deliberately a no-op.
+                        // label; a click here landed in blank bar space (e.g. the
+                        // hint text region) and is deliberately a no-op.
                     } else {
                         uint32_t pos;
                         if (click_to_pos(local_x, local_y, &pos)) {

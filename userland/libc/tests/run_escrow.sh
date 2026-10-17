@@ -36,7 +36,10 @@ WORK=$(mktemp -d) || exit 2
 trap 'rm -rf "$WORK"' EXIT
 
 build() {   # $1 = aicap source to use, $2 = output binary
-    for u in aiclient aicap escrow photorg exifdate; do
+    # #aiaudit: aitools (the shipping tool table aiclient.c emits from) added
+    # to the unit list. It was never in this rig, so the link has been failing
+    # on ad_aitools_* since the table was introduced.
+    for u in aiclient aicap escrow photorg exifdate aitools; do
         local src="$LIBC/$u.c"
         [ "$u" = aicap ] && src="$1"
         gcc $UUT_FLAGS -x c -c "$src" -o "$WORK/${u}_raw.o" 2>"$WORK/cc.$u.log" || {
@@ -51,7 +54,8 @@ build() {   # $1 = aicap source to use, $2 = output binary
     gcc -m64 -O1 -g -c escrow_test.c -o "$WORK/t.o" 2>"$WORK/cc.t.log" || {
         echo "  compile of harness FAILED:"; sed -n 1,25p "$WORK/cc.t.log"; return 2; }
     gcc -m64 "$WORK/t.o" "$WORK/aiclient.o" "$WORK/aicap.o" "$WORK/escrow.o" \
-        "$WORK/photorg.o" "$WORK/exifdate.o" -o "$2" 2>"$WORK/ld.log" || {
+        "$WORK/photorg.o" "$WORK/exifdate.o" "$WORK/aitools.o" \
+        -o "$2" 2>"$WORK/ld.log" || {
         echo "  link FAILED:"; sed -n 1,25p "$WORK/ld.log"; return 2; }
     return 0
 }

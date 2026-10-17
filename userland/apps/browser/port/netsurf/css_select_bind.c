@@ -758,9 +758,51 @@ css_computed_style *mcs_compute_style(mcs_ctx *c, dom_element *node,
 		if (sv) {
 			const char *sd = dom_string_data(sv);
 			size_t sl = dom_string_byte_length(sv);
-			if (sd && sl > 0)
-				inline_sheet = make_sheet(sd,
-						(unsigned long) sl, true);
+			if (sd && sl > 0) {
+				/*
+				 * #245 enggrad2: inline gradient backgrounds.
+				 *
+				 * libcss rejects `linear-gradient(...)` as an
+				 * unknown FUNCTION token and drops the WHOLE
+				 * declaration, so `<div style="background:
+				 * linear-gradient(...)">` lost its background
+				 * entirely. Author SHEETS have not had that
+				 * problem since the carrier landed, because
+				 * mcs_add_author_css() runs cssvar_preprocess()
+				 * first; this path builds its sheet straight
+				 * from the attribute and never did.
+				 *
+				 * cssvar_inline_gradients() is the NARROW pass
+				 * for it: gradient backgrounds onto the
+				 * outline-color carrier, nothing else touched.
+				 * The full preprocess is deliberately NOT used
+				 * here. It would also start resolving inline
+				 * var(), clamp(), gap and border-radius, which
+				 * is a much broader behaviour change than this
+				 * one, and would make an AE measurement of the
+				 * gradient work unable to say which half moved.
+				 *
+				 * It returns NULL whenever there is nothing to
+				 * carry, and NULL is the untouched path: every
+				 * inline style without an accepted gradient is
+				 * handed to make_sheet() as the same bytes as
+				 * before, so there is no path on which it could
+				 * behave differently.
+				 */
+				size_t gl = 0;
+				char *gs = cssvar_inline_gradients(sd, sl, &gl);
+				if (gs != NULL && gl > 0) {
+					inline_sheet = make_sheet(gs,
+							(unsigned long) gl,
+							true);
+					free(gs);
+				} else {
+					if (gs) free(gs);
+					inline_sheet = make_sheet(sd,
+							(unsigned long) sl,
+							true);
+				}
+			}
 			dom_string_unref(sv);
 		}
 	}

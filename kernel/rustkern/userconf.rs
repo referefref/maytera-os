@@ -115,6 +115,135 @@ pub extern "C" fn userconf_join_rs(home: *const u8, name: *const u8,
     w as i32
 }
 
+// ===========================================================================
+// [noaccount] THE DECISION, not the bits: WHERE DOES THIS SESSION'S
+// PER-ACCOUNT STATE LIVE.
+// ===========================================================================
+//
+// #747 recorded the lesson this function exists to apply: a shared decoder is
+// only as shared as its OUTPUT is. `userconf_join_rs` above shares the JOIN,
+// and every caller was still left to work out for itself WHICH HOME to join
+// onto - which is the part with a wrong answer in it.
+//
+// THE WRONG ANSWER, measured on golden 2564 (commit 0fe362a4) over one boot
+// with no user input: the first-boot bootstrap session (uid 1000, NO passwd
+// entry at all) resolves its home to "/", so every per-account path collapses
+// onto a root-owned location. Ring 0 never notices, because perms_check()
+// returns allow on its first line for the kernel; Ring 3 is refused -13 on all
+// of them. The Recycle Bin is the clearest case: the kernel CREATED
+// /CONFIG/RECYCLE through its own accessor and the recycler daemon could not
+// even READ it back, let alone create /CONFIG/RCYCLOG.TXT beside it.
+//
+// THE RULE, and it needs no uid special case:
+//     a session WITH a passwd entry (root's says "/")  -> that home
+//     a session with NO entry at all                   -> "/TMP" (01777)
+//
+// ASK FOR THE ENTRY, NEVER COMPARE THE STRING. "home == \"/\"" cannot tell
+// root from a bootstrap session, so a fix built on it needs an explicit uid-0
+// escape hatch bolted on, and a rule with an escape hatch is a rule somebody
+// eventually applies without it.
+//
+// WHY RUST, and it is the same answer as the join above: this is new kernel
+// code, it runs when a preference is opened and in no loop, and it is bounded
+// copying of a table-supplied string into a fixed buffer. The C side keeps
+// only the user-table lookup, which is entangled with the existing C
+// `user_entry_t`.
+//
+// THE USERLAND TWIN is `uc_state_root()` in userland/libc/userconf.c. Ring 3
+// cannot link rustkern, so the literal is spelled out there too; the self-test
+// below asserts the exact bytes, so a change on one side that is not made on
+// the other turns the boot line RED instead of silently splitting every
+// per-account file in two.
+pub const NOACCOUNT_ROOT: &[u8] = b"/TMP";
+
+/// Resolve this session's per-account STATE ROOT into `out`.
+///
+/// `has_entry` is non-zero iff the session uid has a real user-table entry.
+/// `home` is that entry's home (ignored when `has_entry` is 0; may be NULL).
+/// Returns the length written, or -1 if it does not fit or the inputs are
+/// unusable. Fails rather than truncating: a truncated path is a DIFFERENT
+/// directory, and silently writing a user's files into one is the bug.
+#[no_mangle]
+pub extern "C" fn userconf_state_root_rs(has_entry: i32, home: *const u8,
+                                         out: *mut u8, cap: u32) -> i32 {
+    if out.is_null() || cap == 0 { return -1; }
+    let capu = cap as usize;
+    // SAFETY: caller guarantees `out` spans at least `cap` writable bytes.
+    let d: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(out, capu) };
+
+    let src: &[u8] = if has_entry != 0 {
+        if home.is_null() { return -1; }
+        match unsafe { cstr_bounded(home, 256) } { Some(s) => s, None => return -1 }
+    } else {
+        NOACCOUNT_ROOT
+    };
+
+    // Trim trailing separators, but never the root itself: "" is not a path
+    // and would make every join below it relative.
+    let mut n = src.len();
+    while n > 1 && src[n - 1] == b'/' { n -= 1; }
+    if n == 0 || src[0] != b'/' { return -1; }   // empty or relative: refuse
+    if n + 1 > capu { return -1; }
+
+    let mut i = 0usize;
+    while i < n { d[i] = src[i]; i += 1; }
+    d[n] = 0;
+    n as i32
+}
+
+/// Absolute assertions over `userconf_state_root_rs`. Returns the number of
+/// failing cases, 0 = PASS. Called from main.c's boot self-test block.
+///
+/// ABSOLUTE, not a differential against the C that used to do this: the thing
+/// being removed is two sites each deciding the home for themselves, so a test
+/// that only asserted they AGREE would have passed while both were wrong.
+/// Case 1 is the whole point and is the one a naive implementation fails.
+#[no_mangle]
+pub extern "C" fn userconf_state_root_selftest_rs() -> u32 {
+    let mut bad: u32 = 0;
+    let mut buf = [0u8; 64];
+
+    fn eq(buf: &[u8], rc: i32, want: &[u8]) -> bool {
+        rc >= 0 && (rc as usize) == want.len() && &buf[..want.len()] == want
+            && buf[want.len()] == 0
+    }
+
+    // 1. NO ENTRY (the first-boot bootstrap session): /TMP, NOT "/". This is
+    //    the case that was broken, and it is also the cross-check on the
+    //    userland copy of the literal.
+    let rc = userconf_state_root_rs(0, core::ptr::null(), buf.as_mut_ptr(), 64);
+    if !eq(&buf, rc, b"/TMP") { bad += 1; }
+    { let want: &[u8] = b"/TMP"; if NOACCOUNT_ROOT != want { bad += 1; } }
+
+    // 2. ROOT: its entry says "/", and it must stay "/". A rule built on
+    //    "home != /" gets this one wrong and moves root's files.
+    let rc = userconf_state_root_rs(1, b"/\0".as_ptr(), buf.as_mut_ptr(), 64);
+    if !eq(&buf, rc, b"/") { bad += 1; }
+
+    // 3. An ordinary account: unchanged, trailing slash collapsed.
+    let rc = userconf_state_root_rs(1, b"/HOME/ADMIN\0".as_ptr(), buf.as_mut_ptr(), 64);
+    if !eq(&buf, rc, b"/HOME/ADMIN") { bad += 1; }
+    let rc = userconf_state_root_rs(1, b"/HOME/ADMIN/\0".as_ptr(), buf.as_mut_ptr(), 64);
+    if !eq(&buf, rc, b"/HOME/ADMIN") { bad += 1; }
+
+    // 4. REFUSE rather than truncate. "/HOME/ADMIN" needs 12 bytes with the
+    //    NUL; 11 must fail, not hand back "/HOME/ADMI".
+    if userconf_state_root_rs(1, b"/HOME/ADMIN\0".as_ptr(), buf.as_mut_ptr(), 11) != -1 { bad += 1; }
+
+    // 5. A relative or empty home is a configuration error, not something to
+    //    paper over by making every path below it relative.
+    if userconf_state_root_rs(1, b"HOME\0".as_ptr(), buf.as_mut_ptr(), 64) != -1 { bad += 1; }
+    if userconf_state_root_rs(1, b"\0".as_ptr(), buf.as_mut_ptr(), 64) != -1 { bad += 1; }
+
+    // 6. A no-entry session with a non-NULL home must STILL get /TMP: the home
+    //    is meaningless when there is no entry behind it, and honouring it
+    //    would reintroduce exactly the collapse this fixes.
+    let rc = userconf_state_root_rs(0, b"/\0".as_ptr(), buf.as_mut_ptr(), 64);
+    if !eq(&buf, rc, b"/TMP") { bad += 1; }
+
+    bad
+}
+
 /// Bounded scan for a C string's terminator. Returns None if unterminated
 /// within `max`, so a corrupt table entry cannot drive an unbounded read.
 unsafe fn cstr_bounded<'a>(p: *const u8, max: usize) -> Option<&'a [u8]> {

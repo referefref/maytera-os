@@ -27,6 +27,7 @@
 #include "blockdev.h"
 #include "../drivers/usb_msc.h"
 #include "../mm/pmm.h"
+#include "../mm/heapshadow.h"   // #heapdbl: ONE definition of the heap window
 #include "../mm/demand.h"   // #122 pass 3: page-fault witness inside the IF=0 window
 #include "../string.h"
 #include "../sync/spinlock.h"   // #421: canonical irqsave lock (see blk_lk below)
@@ -105,9 +106,21 @@ static int g_root_usb_index = -1;
 // spans this range, so chunks whose usable region overlaps the heap window MUST
 // be skipped, or the heap free-list is corrupted (observed as a #GP in
 // remove_from_free_list right after a "100%" copy). HEAP_MAX_SIZE is 256 MB.
-#define BLK_HEAP_WIN_LO    0x10000000ULL
-#define BLK_HEAP_WIN_HI    0x20000000ULL   // 0x10000000 + HEAP_MAX_SIZE (256 MB)
+// #heapdbl: BLK_HEAP_WIN_LO/HI USED TO BE HERE, hard-coded as 0x10000000 and
+// 0x20000000 with a comment deriving the second from HEAP_MAX_SIZE. That was a
+// PRIVATE COPY of bounds mm/heap.c owns, in the one place in the tree that depends
+// on them being right: raise HEAP_MAX_SIZE or move the heap's base and this file
+// would have gone on handing itself heap memory while believing it had checked.
+// The question is now asked of heapshadow_range_overlaps_rs(), which reads the
+// window mm/heap.c published at heap_init(), so there is ONE definition.
 #define BLK_MAX_PARKED     160u            // 256 MB window / 2 MB, + slack
+// NOTE (#heapdbl): because this parks EVERY overlapping run it is handed and
+// keeps it for the session, a boot that asks for enough chunks ends up
+// covering the whole window by side effect. That is why a kernel with the
+// heap_init() reservation deliberately removed can still come up clean on a
+// machine whose block layer requests >= 128 chunks: the parking protected the
+// window instead. Do not read such a boot as evidence that the reservation is
+// unnecessary.
 
 static uint8_t  *g_chunk[BLK_MAX_CHUNKS];        // 64 KB-aligned usable base
 static uint64_t  g_chunk_alloc[BLK_MAX_CHUNKS];  // raw pmm base (for freeing)
@@ -500,8 +513,9 @@ static uint32_t blk_alloc_chunks(uint32_t n) {
         uint64_t aligned = (raw + BLK_ALIGN64K - 1) & ~(BLK_ALIGN64K - 1);
         uint64_t use_lo = aligned;
         uint64_t use_hi = aligned + (uint64_t)BLK_CHUNK_PAGES * PMM_PAGE_SIZE; // +2 MB usable
-        // Overlaps the heap window? [use_lo,use_hi) vs [WIN_LO,WIN_HI)
-        if (use_lo < BLK_HEAP_WIN_HI && use_hi > BLK_HEAP_WIN_LO) {
+        // Overlaps the heap window? Asked of the ONE predicate that knows where
+        // the window is (mm/heapshadow.h), not of a local copy of its bounds.
+        if (heapshadow_range_overlaps_rs(use_lo, use_hi - use_lo)) {
             if (g_nparked < BLK_MAX_PARKED) { g_parked[g_nparked++] = raw; continue; }
             pmm_free_pages(raw, BLK_CHUNK_ALLOC_PAGES);   // out of park slots: stop
             break;
@@ -1234,10 +1248,13 @@ static void blk_wbounce_install_once(void) {
         if (!raw) break;
         uint64_t aligned = (raw + BLK_ALIGN64K - 1) & ~(BLK_ALIGN64K - 1);
         uint64_t hi = aligned + (uint64_t)BLK_WBOUNCE_PAGES * PMM_PAGE_SIZE;
-        // Same heap-window hazard blk_alloc_chunks documents: a PHYSICAL page in
-        // [0x10000000,0x20000000) is aliased by the heap's virtual remap, so its
+        // Same heap-window hazard blk_alloc_chunks documents: a PHYSICAL page
+        // inside the heap's virtual window is aliased by the heap's remap, so its
         // identity pointer must never be used. Park it and retry.
-        if (aligned < BLK_HEAP_WIN_HI && hi > BLK_HEAP_WIN_LO) {
+        // #heapdbl: this was the SECOND hard-coded copy of the window bounds in
+        // this file. Two copies of one constant is the argument FOR the shared
+        // predicate, not against it.
+        if (heapshadow_range_overlaps_rs(aligned, hi - aligned)) {
             if (g_nparked < BLK_MAX_PARKED) { g_parked[g_nparked++] = raw; continue; }
             pmm_free_pages(raw, BLK_WBOUNCE_PAGES + 16u);
             break;

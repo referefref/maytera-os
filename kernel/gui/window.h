@@ -332,6 +332,14 @@ typedef struct {
 } dirty_region_t;
 
 // Window structure
+
+// #791 [winopacity]: window_t::opacity_src tiers. A HIGHER tier is never
+// overwritten by a LOWER one - that single rule is the whole precedence model.
+// Values are ordered so the check is a comparison, not a table.
+#define WIN_OPACITY_SRC_DEFAULT  0   // tier 0: theme / Settings global default
+#define WIN_OPACITY_SRC_APP      1   // tier 1: the owning app declared its own
+#define WIN_OPACITY_SRC_USER     2   // tier 2: the user chose, per window
+
 typedef struct window {
     uint32_t id;                        // Unique window ID
     char title[MAX_WINDOW_TITLE];       // Window title
@@ -373,17 +381,37 @@ typedef struct window {
 
     // Transparency (0-255, 255=opaque) + lock-in-place
     uint8_t opacity;
-    // #osglass (2026-09-16): 0 = opacity is INHERITED from the OS-wide
-    // default (g_default_window_opacity, theme-driven via theme_set() ->
-    // wm_set_default_opacity() - see themes.c) and is overwritten every time
-    // that default changes; 1 = the user set THIS window's opacity
-    // explicitly via the titlebar decorator popup's Opacity stepper
-    // (winmenu_handle_click() row 3, window.c), and wm_set_default_opacity()
-    // must skip it. Without this flag a later theme switch or Settings
-    // "Window Opacity" slider move silently overwrote every per-window
-    // override - the exact footgun userland/apps/terminal/term_prefs.c
-    // documented and declined to build a control around.
-    uint8_t opacity_override;
+    // #791 (2026-10-02): WHO decided this window's opacity. Three tiers, and
+    // the ONLY rule is that a higher tier is never overwritten by a lower one.
+    // Was a single bit (opacity_override, #osglass 2026-09-16) meaning "the
+    // user set this"; renamed AND widened, because two bits of information
+    // were being stored in one bit. With only a bit, an APP-declared opacity
+    // and a USER-chosen opacity are indistinguishable, so there is no way for
+    // a later theme switch to skip BOTH while still letting the user's choice
+    // beat the app's, and nothing stops the app stomping the user on its next
+    // redraw. The rename is deliberate: a boolean name on a 3-value field is
+    // how the next reader gets it wrong, and dropping the old name makes the
+    // compiler find every reader rather than trusting a grep.
+    //
+    //   WIN_OPACITY_SRC_DEFAULT (0) - nobody chose. The OS-wide default
+    //       (g_default_window_opacity, theme-driven via theme_set() ->
+    //       wm_set_default_opacity(), see themes.c) owns this window and
+    //       overwrites it every time that default changes.
+    //   WIN_OPACITY_SRC_APP (1) - the OWNING APP declared its own opacity
+    //       (SYS_WIN_SET_OPACITY -> wm_set_window_opacity_app()). The first-run
+    //       wizard asks for 250 and full-screen DOS guests / games ask for 255,
+    //       because a game that is 95% of the screen has nothing meaningful to
+    //       show through. Beats the global default; loses to the user.
+    //   WIN_OPACITY_SRC_USER (2) - the USER chose, explicitly, for THIS window,
+    //       via the titlebar decorator popup's Opacity stepper
+    //       (winmenu_handle_click() row 3, window.c). Beats everything, for the
+    //       rest of the window's life.
+    //
+    // Without the tier distinction a theme switch or a Settings "Window
+    // Opacity" slider move silently overwrote every per-window value - the
+    // exact footgun userland/apps/terminal/term_prefs.c documented and
+    // declined to build a control around.
+    uint8_t opacity_src;
     uint8_t locked;
     // Per-window decorator state (Task A redesign).
     uint8_t theme_override;   // 0 = follow system, 1 = force dark, 2 = force light
@@ -425,7 +453,14 @@ void wm_init(void);
 
 // Create a new window
 window_t *window_create(const char *title, int32_t x, int32_t y, int32_t width, int32_t height);
-void wm_set_default_opacity(int opacity);  // USER global default (pins; survives theme apply)
+void wm_set_default_opacity(int opacity);
+// #791 [winopacity]: an APP declares its own window opacity (tier 1). Clamped
+// identically to every other opacity path (wm_clamp_opacity()). Returns the
+// window's EFFECTIVE opacity after the call, which is NOT necessarily what was
+// asked for: if the user has already chosen for this window (tier 2) the
+// request is ignored and the user's value comes back, which is how the caller
+// can tell it did not win without a second syscall.
+int wm_set_window_opacity_app(window_t *win, int opacity);  // USER global default (pins; survives theme apply)
 void wm_set_theme_default_opacity(int opacity);  // THEME default (applies only if user has not pinned)
 extern uint8_t g_default_window_opacity;
 

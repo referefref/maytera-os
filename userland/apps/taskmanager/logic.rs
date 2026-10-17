@@ -42,21 +42,17 @@ pub const PAD: i32 = 10;
 /// Tab width and the gap between tabs.
 pub const TAB_W: i32 = 96;
 pub const TAB_GAP: i32 = 6;
-/// (2026-09-16 owner fix) top-corner radius for a tab, kept smaller than the
-/// panel's own PANEL_R so a tab's rounded-then-squared extension (see
-/// draw_tabs() in main.rs) sits entirely inside the panel's own top-square
-/// strip.
-pub const TAB_R: i32 = 8;
-/// The panel: top edge, corner radius, and the inset content keeps from its
-/// border (so nothing sits on the 1px edge or the rounded corners).
+/// The panel: top edge, and the inset content keeps from its border.
 ///
-/// (2026-09-16 owner fix) PANEL_Y used to be `PAD + TAB_H + 10`: a 10px gap
-/// that made the tab strip read as pills floating above a separate box
-/// rather than a tab strip attached to it. There is now no gap at all - the
-/// panel's top edge starts exactly where the tabs end - so main.rs's
-/// draw_tabs()/draw_panel() can make the two continuous.
+/// (2026-09-16 owner fix, kept through the 2026-10-01 glass revert) PANEL_Y
+/// used to be `PAD + TAB_H + 10`: a 10px gap that made the tab strip read as
+/// pills floating above a separate box rather than a tab strip attached to
+/// it. There is now no gap at all - the panel's top edge starts exactly where
+/// the tabs end - so main.rs's draw_tabs()/draw_panel() can make the two
+/// continuous. (owner revert, 2026-10-01: PANEL_R/TAB_R, the AA corner radii
+/// the old glass pills and rounded panel needed to make that join work, are
+/// gone - square CDE/Motif chrome butts flush with no radius and no trick.)
 pub const PANEL_Y: i32 = PAD + TAB_H;
-pub const PANEL_R: i32 = 12;
 pub const PANEL_IN: i32 = 12;
 /// X of the first column / the left-aligned footer buttons: inside the panel.
 pub const CX: i32 = PAD + PANEL_IN;

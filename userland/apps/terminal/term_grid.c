@@ -29,6 +29,7 @@ void cell_break_wide(int row, int col) {
 }
 
 #include "term_scrollback.h"
+#include "term_parse.h"   // term_charset_reset(); was an IMPLICIT declaration
 
 // Cell metrics, re-derived from the selected font by term_apply_font()
 // (term_theme.c). Declared in term_grid.h.

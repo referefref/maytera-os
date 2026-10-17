@@ -6,7 +6,10 @@
 //
 // Each run it:
 //   1. Post-reboot: if /CONFIG/PENDING_UPDATE.TXT says STATUS=APPLIED and its
-//      BUILD matches the running build, show a "patched" confirmation (once).
+//      BUILD matches the running build, show a "patched" confirmation (once),
+//      naming the advisory recorded in /CONFIG/OTA_ADV.TXT by the run that
+//      applied it. The kernel marker carries STATUS/BUILD/SHA256 only, so the
+//      advisory id has to be carried across the reboot by this app.
 //   2. Fetch the signed security manifest from the update server.
 //   3. Verify the manifest's RSA signature over the kernel sha256 against the
 //      baked-in public key (SYS_OTA_VERIFY_SIG). A tampered/unsigned manifest is
@@ -263,10 +266,41 @@ static void post_reboot_confirm(unsigned rbuild) {
     if (af >= 0) { char a[32]; int an = sys_read(af, a, sizeof(a) - 1); sys_close(af);
         if (an > 0) { a[an] = 0; unsigned ab = 0; for (int i = 0; a[i] >= '0' && a[i] <= '9'; i++) ab = ab * 10 + (a[i] - '0');
             if (ab == mb) return; } }
+    // WHICH ADVISORY. This used to be the literal string MAYTERA-SEC-2026-0008,
+    // which meant every future update told the user that one advisory was fixed
+    // no matter what the manifest said. The id is userland knowledge: the
+    // kernel's marker records STATUS, BUILD and SHA256 only, and
+    // post_reboot_confirm() runs BEFORE any manifest fetch, so it cannot look it
+    // up. do_apply() therefore records it next to the ack file before rebooting.
+    //
+    // KEYED ON THE BUILD on purpose. A sidecar left behind by an earlier update
+    // would otherwise attach that update's advisory to this one, which is the
+    // same class of error as the hardcoded string, just harder to notice.
+    char adv[48]; adv[0] = 0;
+    int vf = sys_open("/CONFIG/OTA_ADV.TXT", O_RDONLY);
+    if (vf >= 0) {
+        char vb[128]; int vn = sys_read(vf, vb, sizeof(vb) - 1); sys_close(vf);
+        if (vn > 0) {
+            vb[vn] = 0;
+            char *vbp = strstr(vb, "BUILD=");
+            unsigned vbuild = 0;
+            if (vbp) { vbp += 6; while (*vbp >= '0' && *vbp <= '9') { vbuild = vbuild * 10 + (unsigned)(*vbp - '0'); vbp++; } }
+            char *ap = strstr(vb, "ADV=");
+            if (vbuild == mb && ap) {
+                ap += 4;
+                int ai = 0;
+                while (*ap && *ap != '\n' && *ap != '\r' && ai < (int)sizeof(adv) - 1) adv[ai++] = *ap++;
+                adv[ai] = 0;
+            }
+        }
+    }
     char body[96];
-    snprintf(body, sizeof(body), "Updated to build %u, MAYTERA-SEC-2026-0008 patched", mb);
+    if (adv[0])
+        snprintf(body, sizeof(body), "Updated to build %u, %s patched", mb, adv);
+    else
+        snprintf(body, sizeof(body), "Updated to build %u, a security advisory patched", mb);
     notify_post("Security update applied", body, NOTIFY_SUCCESS);
-    show_applied_window(mb, "MAYTERA-SEC-2026-0008");
+    show_applied_window(mb, adv);   // degrades to "The advisory" when unknown
     char ack[16]; int al = snprintf(ack, sizeof(ack), "%u\n", mb);
     // pkg_write is the FAT ESP writer (SYS_PKG_WRITE 301); best-effort ack.
     syscall3(301, (long)"/CONFIG/OTA_ACK.TXT", (long)ack, (long)al);
@@ -343,7 +377,7 @@ static void resolve_mode(int argc, char **argv, char *out, int cap) {
 // Download + verify + apply. Returns SELFUPD rc from the kernel (0 == OK, will
 // reboot). Negative on client-side failure.
 static int do_apply(const char *kurl, const uint8_t sha[32], unsigned newb,
-                    const uint8_t sig[256], unsigned total) {
+                    const uint8_t sig[256], unsigned total, const char *adv) {
     notify_post("Security update", "Downloading verified kernel...", NOTIFY_INFO);
     unsigned cap = 24u * 1024u * 1024u;
     if (total == 0 || total > cap) total = cap;
@@ -387,6 +421,16 @@ static int do_apply(const char *kurl, const uint8_t sha[32], unsigned newb,
     printf("[ota] SYS_KERNEL_SELFUPDATE rc=%d\n", rc);
     { char m[48]; snprintf(m, sizeof(m), "selfupdate rc=%d", rc); dlog(m); }
     if (rc == 0) {
+        // Record WHICH advisory this update closes, so the post-reboot
+        // confirmation can name it instead of a hardcoded one. Keyed on the
+        // target build. Best-effort: if it does not land, post_reboot_confirm()
+        // falls back to the generic wording rather than naming a wrong id.
+        // Written AFTER rc == 0, so a refused update never leaves a claim behind.
+        if (adv && adv[0]) {
+            char vrec[80];
+            int vl = snprintf(vrec, sizeof(vrec), "BUILD=%u\nADV=%s\n", newb, adv);
+            if (vl > 0) syscall3(301, (long)"/CONFIG/OTA_ADV.TXT", (long)vrec, (long)vl);
+        }
         notify_post("Security update", "Verified. Applying and rebooting...", NOTIFY_SUCCESS);
         for (volatile int d = 0; d < 20000000; d++) {}
         reboot();   // does not return
@@ -471,12 +515,12 @@ int main(int argc, char **argv) {
     { char m[224]; snprintf(m, sizeof(m), "kernel url=%s", kurl_use); dlog(m); }
     if (strcmp(mode, "apply") == 0) {
         // Headless auto-apply (honest test-trigger path).
-        return do_apply(kurl_use, sha, (unsigned)newb, sig, total);
+        return do_apply(kurl_use, sha, (unsigned)newb, sig, total, adv);
     }
 
     // 5. Interactive: show the Yes/No dialog.
     int yes = update_dialog((unsigned)newb, rbuild, adv, sev);
     if (!yes) { printf("[ota] user declined\n"); return 0; }
-    do_apply(kurl_use, sha, (unsigned)newb, sig, total);
+    do_apply(kurl_use, sha, (unsigned)newb, sig, total, adv);
     return 0;
 }

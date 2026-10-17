@@ -9,6 +9,52 @@
 #include <string.h>
 #include "term_damage_hostio.h"
 
+// ---------------------------------------------------------------------------
+// [deadtests] SHELL-SIDE SYMBOLS term_util.c NOW REFERENCES.
+//
+// This harness compiles the production RENDERER (term_render.c, term_util.c and
+// friends) and replaces the window syscalls with counting stubs. It deliberately
+// does NOT compile term_shell.c: that file pulls in the AI client, the layout
+// manager, the menu and __spawn_with_env, i.e. the whole application, which is
+// not what is being measured.
+//
+// The [tabcomp] change gave term_util.c an #include of term_shell.h and a
+// tab-completion redraw that reads input_line/input_pos and calls
+// print_prompt(). That broke the LINK of this harness, and because nothing in
+// the repo ever ran run_damage.sh (MEASURED 2026-10-01: zero invokers anywhere
+// outside its own directory), the harness simply stopped building and no one
+// was told. These three stubs restore the link.
+//
+// They are stubs, not a reimplementation: a trace replays terminal OUTPUT, so
+// the interactive tab-completion path is not on any trace and an empty input
+// line is the correct state for every frame this harness measures. If a trace
+// ever needs to exercise completion, term_shell.c has to be stubbed properly
+// or linked, and this comment is where to start.
+// TERM_SHELL_INPUT_MAX is 256 in ../term_shell.h. The header is NOT included
+// here: it pulls in the MayteraOS libc stdlib.h, whose div/ldiv/lldiv
+// prototypes collide with glibc's in this HOST build. The size is asserted
+// against the header below so the literal cannot drift silently.
+char input_line[256];
+int  input_pos = 0;
+void print_prompt(void) { }
+// A literal copied from a header is a value written down twice, which this
+// tree has paid for repeatedly. Check it rather than trust it.
+#include <stdio.h>
+__attribute__((constructor)) static void _tdh_check_input_max(void) {
+    FILE *f = fopen("../term_shell.h", "r");
+    if (!f) return;                 /* run from elsewhere: skip, do not fail */
+    char line[512]; int want = -1;
+    while (fgets(line, sizeof line, f))
+        if (sscanf(line, " #define TERM_SHELL_INPUT_MAX %d", &want) == 1) break;
+    fclose(f);
+    if (want > 0 && want != (int)sizeof(input_line)) {
+        fprintf(stderr, "term_damage_hostio: input_line is %d bytes but "
+                "term_shell.h says TERM_SHELL_INPUT_MAX is %d. Fix the stub.\n",
+                (int)sizeof(input_line), want);
+        _exit(2);
+    }
+}
+
 void hio_die(const char *msg) { fprintf(stderr, "term_damage_test: %s\n", msg); exit(2); }
 
 char *hio_slurp(const char *path, long *n) {

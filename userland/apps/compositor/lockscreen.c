@@ -33,6 +33,7 @@
 #include "../../libc/notify.h"   // #745: NOTIFY_WARNING for a declined lock
 #include "../../libc/syscall.h"
 #include "../../libc/stdio.h"
+#include "../../libc/userconf.h"   // #peruser2: per-user PRIVACY.CFG
 
 bool g_session_locked = false;   // #566 display cache - see compositor.h
 
@@ -104,7 +105,10 @@ static void privacy_cfg_poll(void)
     if (now - s_privacy_poll_ms < 2000) return;   // throttle: at most every 2s
     s_privacy_poll_ms = now;
 
-    int fd = sys_open(PRIVACY_CFG, 0);
+    // #peruser2: per-user first, then the system default. Settings writes
+    // <home>/CONFIG/PRIVACY.CFG in the same commit; if only one side had moved,
+    // the idle lock would have silently stopped following the setting.
+    int fd = userconf_open_read("PRIVACY.CFG", PRIVACY_CFG);
     if (fd < 0) return;
     char buf[256];
     long n = sys_read(fd, buf, sizeof(buf) - 1);

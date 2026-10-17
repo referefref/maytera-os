@@ -1,0 +1,336 @@
+=== PKG aichat
+--- MEMBERS
+aichat
+aichat/INSTALL
+aichat/PKGINFO
+aichat/files
+aichat/files/aichat
+--- INSTALL
+# INSTALL manifest for aichat
+files/aichat -> /APPS/AICHAT
+files/aichat -> /APPS/aichat
+--- END
+=== PKG audioplayer
+--- MEMBERS
+audioplayer
+audioplayer/INSTALL
+audioplayer/PKGINFO
+audioplayer/files
+audioplayer/files/audioplayer
+--- INSTALL
+# INSTALL manifest for audioplayer
+files/audioplayer -> /APPS/APLAYER
+files/audioplayer -> /APPS/audioplayer
+files/audioplayer -> /APPS/aplayer
+--- END
+=== PKG browser
+--- MEMBERS
+browser
+browser/INSTALL
+browser/PKGINFO
+browser/files
+browser/files/browser
+--- INSTALL
+# INSTALL manifest for browser
+files/browser -> /APPS/BROWSER
+files/browser -> /APPS/browser
+--- END
+=== PKG calc
+--- MEMBERS
+calc
+calc/INSTALL
+calc/PKGINFO
+calc/files
+calc/files/calc
+--- INSTALL
+# INSTALL manifest for calc
+files/calc -> /APPS/CALC
+files/calc -> /APPS/calc
+--- END
+=== PKG counter
+--- MEMBERS
+counter
+counter/INSTALL
+counter/PKGINFO
+counter/files
+counter/files/counter
+--- INSTALL
+# INSTALL manifest for counter
+files/counter -> /APPS/COUNTER
+files/counter -> /APPS/counter
+--- END
+=== PKG editor
+--- MEMBERS
+editor
+editor/INSTALL
+editor/PKGINFO
+editor/files
+editor/files/editor
+--- INSTALL
+# INSTALL manifest for editor
+files/editor -> /APPS/EDITOR
+files/editor -> /APPS/editor
+--- END
+=== PKG files
+--- MEMBERS
+files
+files/INSTALL
+files/PKGINFO
+files/files
+files/files/files
+--- INSTALL
+# INSTALL manifest for files
+files/files -> /APPS/FILES
+files/files -> /APPS/files
+--- END
+=== PKG imageviewer
+--- MEMBERS
+imageviewer
+imageviewer/INSTALL
+imageviewer/PKGINFO
+imageviewer/files
+imageviewer/files/imageviewer
+--- INSTALL
+# INSTALL manifest for imageviewer
+files/imageviewer -> /APPS/IMGVIEW
+files/imageviewer -> /APPS/imageviewer
+files/imageviewer -> /APPS/imgview
+--- END
+=== PKG irc
+--- MEMBERS
+irc
+irc/INSTALL
+irc/PKGINFO
+irc/files
+irc/files/irc
+--- INSTALL
+# INSTALL manifest for irc
+files/irc -> /APPS/IRC
+files/irc -> /APPS/irc
+--- END
+=== PKG lemmings
+--- MEMBERS
+lemmings
+lemmings/INSTALL
+lemmings/PKGINFO
+lemmings/files
+lemmings/files/lemmings
+--- INSTALL
+# INSTALL manifest for lemmings
+files/lemmings -> /APPS/LEMMINGS
+files/lemmings -> /APPS/lemmings
+--- END
+=== PKG mediaplayer
+--- MEMBERS
+mediaplayer
+mediaplayer/INSTALL
+mediaplayer/PKGINFO
+mediaplayer/files
+mediaplayer/files/mediaplayer
+--- INSTALL
+# INSTALL manifest for mediaplayer
+files/mediaplayer -> /APPS/MPLAYER
+files/mediaplayer -> /APPS/mediaplayer
+files/mediaplayer -> /APPS/mplayer
+--- END
+=== PKG notes
+--- MEMBERS
+notes
+notes/INSTALL
+notes/PKGINFO
+notes/files
+notes/files/notes
+--- INSTALL
+# INSTALL manifest for notes
+files/notes -> /APPS/NOTES
+files/notes -> /APPS/notes
+--- END
+=== PKG openarena
+--- MEMBERS
+openarena
+openarena/pak1-maps.pk3
+openarena/pak4-textures.pk3
+openarena/pak0.pk3
+openarena/pak6-misc.pk3
+openarena/ui.qvm
+openarena/cgame.qvm
+openarena/INSTALL
+openarena/OPENARENA
+openarena/qagame.qvm
+openarena/default.cfg
+--- INSTALL
+# INSTALL manifest for the OpenArena App Store package (task #568 M5 / #607).
+# Format: "src -> /dest" (one payload file per line), the convention
+# appstore/main.c install_pkg() already parses (it splits each line on "->",
+# looks up the payload entry named "<id>/<src>" inside this .mpkg, and
+# pkg_write()s it to the absolute dest path, mkdir ing parents as needed).
+#
+# fs_basepath (read-only installed game data, root-owned by the installer,
+# never created at runtime by the engine itself, see #569) vs fs_homepath (the
+# interactive user own writable profile, resolved at runtime by
+# sys_maytera.c Sys_DefaultHomePath(), NOT part of this package) is the split
+# task #568 M5 implements; this manifest only ever writes into /APPS (the
+# binary) and /GAMES/OPENARENA/baseoa (the read-only data plus the built .qvm
+# modules), matching that design.
+#
+# Pak set (#745, corrected 2026-08-11): pak0 + pak1-maps + pak6-misc +
+# pak4-textures. pak4-textures.pk3 was added because its absence was the
+# root cause of a user-reported bug (every wall/floor in oa_dm1 rendered as
+# the missing-texture white/black placeholder; ZERO of oa_dm1's 37 referenced
+# textures exist in the old 3-pak set). See build-mpkg.sh header for the full
+# measurement (both reasons the #607 comment gave for leaving pak4 out are
+# resolved by later kernel/App-Store work, re-measured live before shipping
+# this change, not assumed) rather than repeating it here.
+OPENARENA -> /APPS/OPENARENA
+ui.qvm -> /GAMES/OPENARENA/baseoa/vm/ui.qvm
+cgame.qvm -> /GAMES/OPENARENA/baseoa/vm/cgame.qvm
+qagame.qvm -> /GAMES/OPENARENA/baseoa/vm/qagame.qvm
+default.cfg -> /GAMES/OPENARENA/baseoa/default.cfg
+pak0.pk3 -> /GAMES/OPENARENA/baseoa/pak0.pk3
+pak1-maps.pk3 -> /GAMES/OPENARENA/baseoa/pak1-maps.pk3
+pak6-misc.pk3 -> /GAMES/OPENARENA/baseoa/pak6-misc.pk3
+pak4-textures.pk3 -> /GAMES/OPENARENA/baseoa/pak4-textures.pk3
+--- END
+=== PKG openarena
+--- MEMBERS
+openarena
+openarena/pak1-maps.pk3
+openarena/pak0.pk3
+openarena/pak6-misc.pk3
+openarena/ui.qvm
+openarena/cgame.qvm
+openarena/INSTALL
+openarena/OPENARENA
+openarena/qagame.qvm
+openarena/default.cfg
+--- INSTALL
+# INSTALL manifest for the OpenArena App Store package (task #568 M5 / #607).
+# Format: "src -> /dest" (one payload file per line), the convention
+# appstore/main.c install_pkg() already parses (it splits each line on "->",
+# looks up the payload entry named "<id>/<src>" inside this .mpkg, and
+# pkg_write()s it to the absolute dest path, mkdir ing parents as needed).
+#
+# fs_basepath (read-only installed game data, root-owned by the installer,
+# never created at runtime by the engine itself, see #569) vs fs_homepath (the
+# interactive user own writable profile, resolved at runtime by
+# sys_maytera.c Sys_DefaultHomePath(), NOT part of this package) is the split
+# task #568 M5 implements; this manifest only ever writes into /APPS (the
+# binary) and /GAMES/OPENARENA/baseoa (the read-only data plus the built .qvm
+# modules), matching that design.
+#
+# Pak set: the reduced 3-pak configuration (pak0 + pak1-maps + pak6-misc) that
+# docs/OPENARENA_PORT_STATE.md records as the one used for every live
+# verification of this port. See build-mpkg.sh header for why the full 9-pak
+# set is not shipped (measured FS_Startup out-of-memory + client unpack heap
+# ceiling), stated there rather than repeated here.
+OPENARENA -> /APPS/OPENARENA
+ui.qvm -> /GAMES/OPENARENA/baseoa/vm/ui.qvm
+cgame.qvm -> /GAMES/OPENARENA/baseoa/vm/cgame.qvm
+qagame.qvm -> /GAMES/OPENARENA/baseoa/vm/qagame.qvm
+default.cfg -> /GAMES/OPENARENA/baseoa/default.cfg
+pak0.pk3 -> /GAMES/OPENARENA/baseoa/pak0.pk3
+pak1-maps.pk3 -> /GAMES/OPENARENA/baseoa/pak1-maps.pk3
+pak6-misc.pk3 -> /GAMES/OPENARENA/baseoa/pak6-misc.pk3
+--- END
+=== PKG solitaire
+--- MEMBERS
+solitaire
+solitaire/INSTALL
+solitaire/PKGINFO
+solitaire/files
+solitaire/files/solitaire
+--- INSTALL
+# INSTALL manifest for solitaire
+files/solitaire -> /APPS/SOLITAIRE
+files/solitaire -> /APPS/solitaire
+--- END
+=== PKG terminal
+--- MEMBERS
+terminal
+terminal/INSTALL
+terminal/PKGINFO
+terminal/files
+terminal/files/terminal
+--- INSTALL
+# INSTALL manifest for terminal
+files/terminal -> /APPS/TERMINAL
+files/terminal -> /APPS/terminal
+--- END
+=== PKG theme-cyberpunk
+--- MEMBERS
+theme-cyberpunk
+theme-cyberpunk/PKGINFO
+theme-cyberpunk/INSTALL
+theme-cyberpunk/files
+theme-cyberpunk/files/cyberpunk.mtheme
+--- INSTALL
+# INSTALL manifest for theme-cyberpunk (#565: real palette file, not a BMP)
+files/cyberpunk.mtheme -> /THEMES/cyberpunk.mtheme
+--- END
+=== PKG theme-darkmode
+--- MEMBERS
+theme-darkmode
+theme-darkmode/INSTALL
+theme-darkmode/PKGINFO
+theme-darkmode/files
+theme-darkmode/files/DARKMODE.BMP
+--- INSTALL
+# INSTALL manifest for theme-darkmode
+files/DARKMODE.BMP -> /DARKMODE.BMP
+--- END
+=== PKG theme-ocean
+--- MEMBERS
+theme-ocean
+theme-ocean/INSTALL
+theme-ocean/PKGINFO
+theme-ocean/files
+theme-ocean/files/OCEAN.BMP
+--- INSTALL
+# INSTALL manifest for theme-ocean
+files/OCEAN.BMP -> /OCEAN.BMP
+--- END
+=== PKG wp-cyber
+--- MEMBERS
+wp-cyber/PKGINFO
+wp-cyber/INSTALL
+wp-cyber/files/CYBER.BMP
+--- INSTALL
+# INSTALL manifest for wp-cyber
+files/CYBER.BMP -> /CYBER.BMP
+--- END
+=== PKG wp-desert
+--- MEMBERS
+wp-desert/PKGINFO
+wp-desert/INSTALL
+wp-desert/files/DESERT.BMP
+--- INSTALL
+# INSTALL manifest for wp-desert
+files/DESERT.BMP -> /DESERT.BMP
+--- END
+=== PKG wp-green
+--- MEMBERS
+wp-green/PKGINFO
+wp-green/INSTALL
+wp-green/files/GREEN.BMP
+--- INSTALL
+# INSTALL manifest for wp-green
+files/GREEN.BMP -> /GREEN.BMP
+--- END
+=== PKG wp-maytera
+--- MEMBERS
+wp-maytera/PKGINFO
+wp-maytera/INSTALL
+wp-maytera/files/MAYTERA.BMP
+--- INSTALL
+# INSTALL manifest for wp-maytera
+files/MAYTERA.BMP -> /MAYTERA.BMP
+--- END
+=== PKG wp-mtnmay1
+--- MEMBERS
+wp-mtnmay1/PKGINFO
+wp-mtnmay1/INSTALL
+wp-mtnmay1/files/MTNMAY1.BMP
+--- INSTALL
+# INSTALL manifest for wp-mtnmay1
+files/MTNMAY1.BMP -> /MTNMAY1.BMP
+--- END

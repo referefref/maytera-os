@@ -58,6 +58,16 @@ int flow_plat_app_invoke(const char *a, int c, char **v, char *o, int oc) {
 }
 // #469 AI-VISION: perceive / decide / act seams. This binary never executes a
 // flow, so these exist to satisfy the link and refuse, with no message needed.
+// flow.c is linked here for its parser; nothing in this test executes a graph.
+int flow_plat_launch(const char *app, const char *rom, const char *arg,
+                     const char *wait_target, int timeout_ms,
+                     char *out_title, int tcap, int *out_already,
+                     char *err, int errcap) {
+    (void)app; (void)rom; (void)arg; (void)wait_target; (void)timeout_ms;
+    (void)out_title; (void)tcap; (void)out_already; (void)err; (void)errcap;
+    return -1;
+}
+
 int flow_plat_capture(const char *target, int rx, int ry, int rw, int rh,
                       int max_w, int max_h, int quality, const char *path,
                       int *out_w, int *out_h, char *err, int errcap) {

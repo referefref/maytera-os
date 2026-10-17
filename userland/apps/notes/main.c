@@ -9,6 +9,7 @@
 #include "stdio.h"
 #include "stdlib.h"
 #include "string.h"
+#include "../../libc/userconf.h"   // #peruser2: <home>/NOTES
 
 #undef win_draw_text
 #define win_draw_text(h, x, y, s, c) win_draw_text_ttf((h), (x), (y), (s), 14, (c))
@@ -133,24 +134,49 @@ static void derive_title(note_t *n) {
 // ---------------------------------------------------------------------------
 // Persistence: one file per note under /NOTES/
 // ---------------------------------------------------------------------------
+// #peruser2: NOTES ARE THE USER'S DOCUMENTS, so they live in the user's home.
+// NOTES_DIR was the literal "/NOTES" at the ext2 root (root-owned 0755), so
+// every note a non-root session typed was silently discarded on save: note_save()
+// unlinked, got a refused open, and returned having cleared nothing but the
+// file. Root's home is "/", so for a root session this resolves to exactly
+// "/NOTES" and nothing about the shipping root session changes.
+//
+// No legacy read fallback: a note is a RECORD, not a preference, and listing
+// another principal's notes as your own is the failure mode the AI audit trail's
+// no-fallback rule exists to prevent. A non-root user had no notes there anyway,
+// because the writes had never worked.
+static const char *notes_dir(void) {
+    static char d[256];
+    static int resolved = 0;
+    if (!resolved) {
+        if (userhome_path(0, "NOTES", d, sizeof(d)) != 0) d[0] = 0;
+        resolved = 1;
+    }
+    return d[0] ? d : NOTES_DIR;
+}
+
 static void notes_dir_ensure(void) {
-    // create dir; ignore error if it already exists
-    sys_mkdir(NOTES_DIR, 0755);
+    // create dir; ignore error if it already exists. userconf_ensure_parent_dir
+    // first, because <home> itself exists but a home on an upgraded install may
+    // not, and mkdir does not create intermediates.
+    userconf_ensure_parent_dir(notes_dir());
+    sys_mkdir(notes_dir(), 0755);
 }
 
 static void note_path(const char *file, char *out, int cap) {
-    snprintf(out, cap, "%s/%s", NOTES_DIR, file);
+    snprintf(out, cap, "%s/%s", notes_dir(), file);
 }
 
 static void note_save(note_t *n) {
     if (!n->dirty) return;
-    char path[128]; note_path(n->file, path, sizeof(path));
-    sys_unlink(path);
-    int fd = sys_open(path, O_WRONLY | O_CREAT);
-    if (fd < 0) return;
-    if (n->body && n->body_len > 0) sys_write(fd, n->body, (unsigned long)n->body_len);
-    sys_close(fd);
-    n->dirty = 0;
+    char path[256]; note_path(n->file, path, sizeof(path));
+    // #peruser2: was unlink-then-open with an unchecked write, so a refused open
+    // DELETED the note and a failed write reported success. The dirty flag is now
+    // cleared ONLY when the bytes are known to be on disk, so an unsaveable note
+    // stays dirty and is retried instead of being forgotten.
+    int fd = userconf_open_write_path(path);
+    unsigned long len = (n->body && n->body_len > 0) ? (unsigned long)n->body_len : 0;
+    if (userconf_finish_write(fd, n->body, len) == 0) n->dirty = 0;
 }
 
 static void note_save_all(void) {
@@ -226,7 +252,12 @@ static void note_new(void) {
 
 static void note_delete(int idx) {
     if (idx < 0 || idx >= g_count) return;
-    char path[128]; note_path(g_notes[idx].file, path, sizeof(path));
+    // #peruser2: 256, matching note_save(). note_path() snprintf-TRUNCATES, and
+    // a truncated path is a different file: the unlink below would then either
+    // do nothing (the likely case, since a truncated name does not exist) or,
+    // in principle, remove something that is not this note. The buffer must be
+    // large enough for <home>/NOTES/<file>, not just for the old "/NOTES/...".
+    char path[256]; note_path(g_notes[idx].file, path, sizeof(path));
     sys_unlink(path);
     if (g_notes[idx].body) free(g_notes[idx].body);
     for (int i = idx; i < g_count - 1; i++) g_notes[i] = g_notes[i + 1];

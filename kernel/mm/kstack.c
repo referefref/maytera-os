@@ -15,6 +15,7 @@
 #include "pmm.h"
 #include "heap.h"
 #include "../serial.h"
+#include "../sync/spinlock.h"   // the SHARED irqsave spinlock, never a private copy
 #include "../fs/panic.h"
 #include "../fs/bootlog.h"
 #include "../security/selftest_registry.h"   // #PERMSKIP: skips are REGISTERED
@@ -38,12 +39,113 @@ typedef struct { uint64_t usable; uint64_t block; uint64_t pages; } kstack_ent_t
 static kstack_ent_t g_ks[KSTACK_MAX];
 static uint32_t g_ks_live;
 
+// THIS TABLE HAD NO LOCK, AND THE WINDOW WAS NOT SMALL.
+//
+// kstack_alloc() scanned for the first row with usable == 0, then allocated
+// frames from the PMM and poisoned 4 KiB, and only then wrote the row. Two
+// allocators inside that window both saw the same row as free and both wrote it:
+// the second won and the first registration was GONE while its granule was live.
+// The bill arrived at that stack's kstack_free(), which missed the registry and
+// took the "not one of ours" path - the same path that used to launder a kernel
+// stack into kfree() and report it as "[HEAP] kfree() called on invalid pointer
+// ... magic=0xbaadb4dd". #heapinvptr made that path REFUSE and name itself, so a
+// lost registration now leaks a granule loudly instead of corrupting the heap
+// quietly; it did not stop the registration being lost.
+//
+// The BKL is what has been hiding this: it serialises nearly every caller, so
+// the window exists but almost nothing runs inside it. BKL narrowing is a
+// standing requirement, and every stage of it widens this window. The fix is
+// RESERVE-THEN-COMMIT (rustkern/kstackreg.rs): the scan and the reservation are
+// one critical section, so a second scan cannot see a reserved row as free. The
+// slow work still runs with no lock held.
+//
+// IRQSAVE IS NOT OPTIONAL. kstack_free() is reached from process teardown that
+// runs under cli(); a plain spinlock_acquire() here would be exactly the
+// non-irqsave hole sync/noblock.h documents as the gap its assert cannot see.
+// The lock is a LEAF: nothing inside it waits, blocks, allocates, prints or
+// takes a second lock (the PMM work and every kprintf are outside it), so it
+// cannot take part in a deadlock cycle, which is the property that makes it safe
+// to hold with interrupts masked. No wait_event is involved, so
+// wq_assert_may_block() is not implicated either way.
+_Static_assert(sizeof(kstack_ent_t) == 24,
+               "rustkern/kstackreg.rs reinterprets these rows as a #[repr(C)] "
+               "KstackEnt { u64 usable, u64 block, u64 pages }; adding a field "
+               "here would silently re-point every index it computes");
+static spinlock_t g_ks_lock = SPINLOCK_INIT_NAMED("kstackreg");
+
+// rustkern/kstackreg.rs. C owns the storage, Rust owns the decision, exactly as
+// conring.rs / procreap.rs / proc_mem.rs already do. Every one of these must be
+// called with g_ks_lock held.
+extern int32_t  kstackreg_claim_rs(kstack_ent_t *tab, uint32_t max);
+extern uint32_t kstackreg_commit_rs(kstack_ent_t *tab, uint32_t max, int32_t slot,
+                                    uint64_t usable, uint64_t block, uint64_t pages);
+extern void     kstackreg_abort_rs(kstack_ent_t *tab, uint32_t max, int32_t slot);
+extern int32_t  kstackreg_take_rs(kstack_ent_t *tab, uint32_t max, uint64_t usable,
+                                  uint64_t *block_out, uint64_t *pages_out);
+extern int32_t  kstackreg_find_rs(const kstack_ent_t *tab, uint32_t max,
+                                  uint64_t usable);
+extern uint32_t kstackreg_selftest_rs(void);
+
 // Census. Each counter is a reason a stack is NOT protected, so they are all
 // printed even when zero: "0 unguarded" is the claim worth being able to make.
 static uint64_t g_ks_guarded, g_ks_freed;
 static uint64_t g_ks_fb_toobig, g_ks_fb_nomem, g_ks_fb_full, g_ks_fb_align;
 static uint64_t g_ks_multigran;   // stacks that needed more than one granule
 static uint64_t g_ks_free_foreign;
+static uint64_t g_ks_free_orphan;   // a GUARDED stack freed with no registry row
+// A commit that found the same usable pointer ALREADY in another row, or a
+// commit on a row nothing had reserved. Either means a registration went
+// astray, which is the thing the lock exists to make impossible; it is
+// counted and reported rather than assumed away, because a fix that cannot
+// say "this never happened" is only a belief.
+static uint64_t g_ks_reg_anomaly;
+
+// #heapinvptr: WHAT THE LAST FEW FREES WERE, so a second free of the same stack
+// is identifiable even after the frames have gone back to the PMM and been
+// re-issued with the poison overwritten.
+//
+// The alternative, testing the shape of the block alone (granule-aligned base
+// plus a poisoned band), is in rustkern/kstackid.rs and is the other half of the
+// same answer. Neither is sufficient alone: the shape test goes blind once the
+// frames are reused, and this ring goes blind once an entry rotates out. 32 is
+// chosen to comfortably outlive one process-creation cycle, which is the window
+// the measured defect lived in; it is a diagnostic aid and not a correctness
+// mechanism, so there is nothing to size exactly.
+#define KSTACK_FREE_HIST 32
+static uint64_t g_ks_hist[KSTACK_FREE_HIST];
+static uint32_t g_ks_hist_next;
+
+// #heapinvptr CONTROL ARM. Default 1: an orphaned kernel stack is REPORTED and
+// REFUSED. /NOKSTKORPH.TXT on the ESP clears it, restoring the pre-fix behaviour
+// exactly (fall straight through to kfree(), which then reads the poisoned guard
+// band as a block header and prints "[HEAP] ERROR: kfree() called on invalid
+// pointer 0x... magic=0xbaadb4dd").
+//
+// IT EXISTS SO THE ORIGINAL SYMPTOM CAN STILL BE PRODUCED ON DEMAND from the same
+// kernel bytes, which is how the reproducer in proc/slotdbl.c was tied to the
+// reported message rather than merely to a counter of my own invention. Same
+// one-binary-two-arms shape as /NOSTACKGUARD.TXT and /NOWAKEFIX.TXT.
+int g_kstack_orphan_refuse = 1;
+
+static void kstack_hist_record(uint64_t usable) {
+    g_ks_hist[g_ks_hist_next % KSTACK_FREE_HIST] = usable;
+    g_ks_hist_next++;
+}
+
+static int kstack_hist_has(uint64_t usable) {
+    for (uint32_t i = 0; i < KSTACK_FREE_HIST; i++)
+        if (g_ks_hist[i] == usable) return 1;
+    return 0;
+}
+
+// The verdict lives in Rust (2026-07-16 policy: new kernel code is Rust unless
+// there is a stated performance or entanglement reason, and a pure predicate over
+// six integers has neither). See rustkern/kstackid.rs.
+extern int32_t kstack_foreign_verdict_rs(uint64_t usable, uint64_t gran,
+                                         uint64_t band, uint64_t below,
+                                         uint64_t poison, int32_t recent);
+extern uint32_t kstackid_selftest_rs(void);
+#define KSTACK_VERDICT_ORPHAN 1
 
 void *kstack_alloc(size_t size) {
     if (size == 0) return NULL;
@@ -69,9 +171,16 @@ void *kstack_alloc(size_t size) {
     if (grans > KSTACK_MAX_GRAN) { g_ks_fb_toobig++; return kmalloc(size); }
     if (grans > 1) g_ks_multigran++;
 
-    uint32_t slot;
-    for (slot = 0; slot < KSTACK_MAX; slot++) if (g_ks[slot].usable == 0) break;
-    if (slot == KSTACK_MAX) { g_ks_fb_full++; return kmalloc(size); }
+    // RESERVE the row here, in the same critical section as the scan, BEFORE the
+    // PMM allocation and the poison loop below. That is the whole fix: the old
+    // code returned an index and wrote it much later, so two callers could both
+    // be told the same index was free. kstackreg_claim_rs() marks the row
+    // RESERVED as it finds it, so the second caller cannot see it as free.
+    int32_t slot;
+    { uint64_t __fl = spinlock_acquire_irqsave(&g_ks_lock);
+      slot = kstackreg_claim_rs(g_ks, KSTACK_MAX);
+      spinlock_release_irqrestore(&g_ks_lock, __fl); }
+    if (slot < 0) { g_ks_fb_full++; return kmalloc(size); }
 
     // pmm_alloc_pages() guarantees 4 KiB alignment, not KSTACK_GRAN.
     // Over-allocate by one granule minus one page so a KSTACK_GRAN-aligned run
@@ -81,7 +190,16 @@ void *kstack_alloc(size_t size) {
     uint64_t need = grans * KSTACK_PAGES;
     uint64_t want = need + (KSTACK_PAGES - 1);
     uint64_t raw = pmm_alloc_pages(want);
-    if (raw == 0) { g_ks_fb_nomem++; return kmalloc(size); }
+    if (raw == 0) {
+        // Release the reservation. A reservation leaked on a failure path would
+        // be invisible: the census would still read the same live count and the
+        // table would simply run out one row earlier after every failed
+        // allocation.
+        uint64_t __fl = spinlock_acquire_irqsave(&g_ks_lock);
+        kstackreg_abort_rs(g_ks, KSTACK_MAX, slot);
+        spinlock_release_irqrestore(&g_ks_lock, __fl);
+        g_ks_fb_nomem++; return kmalloc(size);
+    }
 
     uint64_t rawend = raw + want * KSTACK_PAGE;
     uint64_t block = (raw + KSTACK_GRAN - 1) & ~((uint64_t)KSTACK_GRAN - 1);
@@ -89,6 +207,9 @@ void *kstack_alloc(size_t size) {
         // Cannot happen with the over-allocation above; counted rather than
         // asserted so a future change to KSTACK_GRAN cannot fail silently.
         pmm_free_pages(raw, want);
+        { uint64_t __fl = spinlock_acquire_irqsave(&g_ks_lock);
+          kstackreg_abort_rs(g_ks, KSTACK_MAX, slot);
+          spinlock_release_irqrestore(&g_ks_lock, __fl); }
         g_ks_fb_align++;
         return kmalloc(size);
     }
@@ -105,40 +226,126 @@ void *kstack_alloc(size_t size) {
     __asm__ volatile("" ::: "memory");
     w[0] = KSTACK_MAGIC;
 
-    g_ks[slot].usable = block + KSTACK_BAND;
-    g_ks[slot].block  = block;
-    g_ks[slot].pages  = need;
-    g_ks_live++; g_ks_guarded++;
-    return (void *)(block + KSTACK_BAND);
+    uint64_t usable = block + KSTACK_BAND;
+    uint32_t anom;
+    { uint64_t __fl = spinlock_acquire_irqsave(&g_ks_lock);
+      anom = kstackreg_commit_rs(g_ks, KSTACK_MAX, slot, usable, block, need);
+      g_ks_live++; g_ks_guarded++;
+      if (anom) g_ks_reg_anomaly++;
+      spinlock_release_irqrestore(&g_ks_lock, __fl); }
+    // OUTSIDE the lock, deliberately: kprintf takes the console lock, and taking
+    // a second lock inside this one would destroy the leaf-lock property that is
+    // the whole deadlock-freedom argument above.
+    if (anom)
+        kprintf("[KSTACK] REGISTRY ANOMALY committing %p (mask=0x%x): bit0=the "
+                "same pointer was ALREADY in another row, bit1=the row was not "
+                "reserved by this allocation. Either means a registration went "
+                "astray, which this table's lock is supposed to make impossible. "
+                "The block IS recorded (its frames are live), so nothing is "
+                "orphaned by the report itself.\n",
+                (void *)usable, (unsigned)anom);
+    return (void *)usable;
 }
 
 void kstack_free(void *base, size_t size) {
     (void)size;
     if (!base) return;
     uint64_t u = (uint64_t)base;
-    for (uint32_t i = 0; i < KSTACK_MAX; i++) {
-        if (g_ks[i].usable != u) continue;
+    // FIND AND REMOVE ARE ONE OPERATION, for the same reason the scan and the
+    // reservation are: two concurrent frees of the same pointer must not both be
+    // told "yes, that row is yours", or the same frames go back to the PMM twice
+    // and the second return silently hands live memory to a second owner. The
+    // recent-free history ring is written in the same critical section, because
+    // kstack_hist_has() in the orphan path below is what tells a double free
+    // apart from a kmalloc fallback once the poison has been overwritten.
+    uint64_t blk = 0, pgs = 0;
+    int32_t  mine;
+    { uint64_t __fl = spinlock_acquire_irqsave(&g_ks_lock);
+      mine = kstackreg_take_rs(g_ks, KSTACK_MAX, u, &blk, &pgs);
+      if (mine) {
+          kstack_hist_record(u);   // #heapinvptr: with the row, not after it
+          if (g_ks_live) g_ks_live--;
+          g_ks_freed++;
+      }
+      spinlock_release_irqrestore(&g_ks_lock, __fl); }
+    if (mine) {
+        // Both of these are OUTSIDE the lock, and safely so: the row is gone, so
+        // no other caller can be handed this block. Keeping pmm_free_pages()
+        // outside is also what keeps g_ks_lock a leaf lock.
+        //
         // Clear the magic BEFORE the frames go back to the PMM. Skip this and a
         // reallocated frame still says "I am a kernel stack" to the check in
         // isr_handler(), which would then police an unrelated allocation and
         // could panic a perfectly healthy machine.
-        *(volatile uint64_t *)g_ks[i].block = 0;
-        pmm_free_pages(g_ks[i].block, g_ks[i].pages);
-        g_ks[i].usable = 0; g_ks[i].block = 0; g_ks[i].pages = 0;
-        if (g_ks_live) g_ks_live--;
-        g_ks_freed++;
+        *(volatile uint64_t *)blk = 0;
+        pmm_free_pages(blk, pgs);
         return;
     }
-    // Not ours: a fallback allocation from kmalloc. kfree() validates its own
-    // magic, so a genuinely foreign pointer is caught there rather than here.
+    // Not in the registry. THAT HAS TWO MEANINGS AND THEY ARE NOT THE SAME BUG.
+    //
+    // This used to assume only the benign one, "a fallback allocation from
+    // kmalloc", and act on it by calling kfree(). The other meaning is that the
+    // block WAS a guarded kernel stack whose row is already gone: a second free,
+    // or a lost registration. kfree() then gets a pointer that is not in the heap
+    // at all, reads the poisoned guard band at base-32 as a block header, and
+    // prints
+    //     [HEAP] ERROR: kfree() called on invalid pointer 0x... (magic=0xbaadb4dd)
+    // which names the HEAP for a defect in the PROCESS LIFECYCLE. 0xbaadb4dd is
+    // KSTACK_POISON, 32 lines up this very file, and that message nevertheless
+    // sent an investigation at the allocator. MEASURED verbatim on golden 2600,
+    // /root/co2600-fatapps-run.log, pointer 0x0fdb1000 = 0x0fdb0000 + KSTACK_BAND
+    // with 0x0fdb0000 granule-aligned, i.e. unambiguously a kstack_alloc() result.
+    //
+    // So ask which it is, and REFUSE the orphan rather than laundering it through
+    // the heap allocator. Refusing leaks the granule, which is the correct trade:
+    // the pointer has already been freed once, so freeing it again would hand
+    // live memory to a second owner. The report names the caller for addr2line.
+    {
+        // base-8 is the top word of what would be this block's guard band. It is
+        // at least as safe to read as base-32, which is what kfree() reads on the
+        // very next line of the old code, so this adds no new fault risk.
+        uint64_t below = (u >= 8) ? *(volatile uint64_t *)(u - 8) : 0;
+        int recent;
+        { uint64_t __fl = spinlock_acquire_irqsave(&g_ks_lock);
+          recent = kstack_hist_has(u) ? 1 : 0;   // the ring is shared state
+          spinlock_release_irqrestore(&g_ks_lock, __fl); }
+        int32_t v = kstack_foreign_verdict_rs(u, KSTACK_GRAN, KSTACK_BAND, below,
+                                              KSTACK_POISON, recent);
+        if (v == KSTACK_VERDICT_ORPHAN && g_kstack_orphan_refuse) {
+            g_ks_free_orphan++;
+            kprintf("[KSTACK] ORPHAN FREE of kernel stack %p from ra=%p: a guarded "
+                    "stack with NO registry row, i.e. freed twice or its "
+                    "registration was lost. REFUSED (the granule leaks; freeing it "
+                    "again would give live memory a second owner). This is the "
+                    "defect that used to present as '[HEAP] kfree() on an INVALID "
+                    "pointer ... magic=0xbaadb4dd'. addr2line the ra against "
+                    "kernel.dbg.elf.\n",
+                    base, __builtin_return_address(0));
+            bootlog_fault_write("[KSTACK] ORPHAN FREE base=0x%lx ra=0x%lx "
+                                "(kernel stack freed twice)",
+                                u, (uint64_t)__builtin_return_address(0));
+            return;
+        }
+    }
+    // Genuinely foreign: a counted kmalloc fallback. kfree() validates its own
+    // magic, so a wild pointer is still caught there rather than here.
     g_ks_free_foreign++;
     kfree(base);
 }
 
+// #heapinvptr: the fallback census, readable by a self-test.
+uint64_t kstack_free_foreign_count(void) { return g_ks_free_foreign; }
+uint64_t kstack_free_orphan_count(void)  { return g_ks_free_orphan; }
+uint64_t kstack_guarded_count(void)      { return g_ks_guarded; }
+uint64_t kstack_freed_count(void)        { return g_ks_freed; }
+uint64_t kstack_reg_anomaly_count(void)  { return g_ks_reg_anomaly; }
+
 int kstack_is_guarded(const void *base) {
     uint64_t u = (uint64_t)base;
-    for (uint32_t i = 0; i < KSTACK_MAX; i++) if (g_ks[i].usable == u) return 1;
-    return 0;
+    uint64_t __fl = spinlock_acquire_irqsave(&g_ks_lock);
+    int r = (kstackreg_find_rs(g_ks, KSTACK_MAX, u) >= 0) ? 1 : 0;
+    spinlock_release_irqrestore(&g_ks_lock, __fl);
+    return r;
 }
 
 void kstack_overflow_panic(uint64_t rsp, uint64_t rip) {
@@ -207,15 +414,47 @@ void kstack_selftest(void) {
     int fires_in_band   = kstack_rsp_in_band(block + KSTACK_BAND - 8) ? 1 : 0;
     int quiet_above     = kstack_rsp_in_band(usable + 64) ? 0 : 1;
 
-    int ok = aligned && magic_ok && poison_ok && fires_in_band && quiet_above;
+    // #heapinvptr: and prove the orphan-identification predicate on THIS build,
+    // including its negative controls. A non-zero mask names which arm broke.
+    uint32_t idmask = kstackid_selftest_rs();
+
+    // And prove the REGISTRY ARBITRATION on this build, including its negative
+    // controls. Case 0 is the defect itself: two claims with no commit between
+    // them must get different rows, which the pre-fix scan does not do.
+    // `make KSTACKREGTEST=1` compiles that pre-fix scan back in and this mask
+    // must then be non-zero.
+    uint32_t regmask = kstackreg_selftest_rs();
+
+    // Two independent claims, reported separately. The guard-band claim is
+    // "kernel stacks are protected"; the predicate claim is "an orphaned kernel
+    // stack is identified rather than laundered into kfree()". Collapsing them
+    // into one word would make `make KSTACKIDTEST=1` print that the guard band is
+    // broken, which it is not, and a self-test that misattributes its own failure
+    // sends the next reader to the wrong file.
+    int guard_ok = aligned && magic_ok && poison_ok && fires_in_band && quiet_above;
+    int ok = guard_ok && (idmask == 0) && (regmask == 0);
     kprintf("[KSTACK] selftest %s: block=0x%lx gran=%u band=%u aligned=%d "
-            "magic=%d poison=%d fires_in_band=%d quiet_above_band=%d\n",
+            "magic=%d poison=%d fires_in_band=%d quiet_above_band=%d "
+            "orphan_id_mask=0x%x registry_mask=0x%x\n",
             ok ? "PASS" : "FAILED", (unsigned long)block,
             (unsigned)KSTACK_GRAN, (unsigned)KSTACK_BAND,
-            aligned, magic_ok, poison_ok, fires_in_band, quiet_above);
-    if (!ok)
-        kprintf("[KSTACK] selftest FAILED means kernel stacks are NOT protected. "
-                "Treat the guard claim as false until this reads PASS.\n");
+            aligned, magic_ok, poison_ok, fires_in_band, quiet_above,
+            (unsigned)idmask, (unsigned)regmask);
+    if (!guard_ok)
+        kprintf("[KSTACK] selftest FAILED on the GUARD BAND: kernel stacks are NOT "
+                "protected. Treat the guard claim as false until this reads PASS.\n");
+    if (regmask != 0)
+        kprintf("[KSTACK] selftest FAILED on the REGISTRY ARBITRATION (mask=0x%x, "
+                "rustkern/kstackreg.rs): bit0 is the race itself (two claims got "
+                "the SAME row, so one registration would be lost and that "
+                "stack's free would be reported as an orphan). EXPECTED only "
+                "under `make KSTACKREGTEST=1`.\n", (unsigned)regmask);
+    if (idmask != 0)
+        kprintf("[KSTACK] selftest FAILED on the ORPHAN PREDICATE (mask=0x%x, "
+                "rustkern/kstackid.rs): the guard band is fine, but a kernel stack "
+                "freed twice would be handed to kfree() again and reported as a bad "
+                "HEAP pointer. EXPECTED only under `make KSTACKIDTEST=1`.\n",
+                (unsigned)idmask);
     kstack_free(b, KSTACK_USABLE);
 }
 
@@ -309,10 +548,11 @@ void kstack_overflow_selftest(void) {
 void kstack_report(void) {
     kprintf("[KSTACK] guarded=%lu live=%u freed=%lu gran=%u band=%u | "
             "multigran=%lu | fallback: toobig=%lu nomem=%lu full=%lu align=%lu "
-            "| free_foreign=%lu\n",
+            "| free_foreign=%lu free_orphan=%lu reg_anomaly=%lu\n",
             (unsigned long)g_ks_guarded, (unsigned)g_ks_live,
             (unsigned long)g_ks_freed, (unsigned)KSTACK_GRAN, (unsigned)KSTACK_BAND,
             (unsigned long)g_ks_multigran, (unsigned long)g_ks_fb_toobig, (unsigned long)g_ks_fb_nomem,
             (unsigned long)g_ks_fb_full, (unsigned long)g_ks_fb_align,
-            (unsigned long)g_ks_free_foreign);
+            (unsigned long)g_ks_free_foreign, (unsigned long)g_ks_free_orphan,
+            (unsigned long)g_ks_reg_anomaly);
 }

@@ -19,6 +19,9 @@
 #define MSH_PATH "/APPS/MSH"
 #include "term_shell.h"
 #include "term_layout.h"
+#include "term_contract.h"   // the live guard and the derived-risk rule the
+                             // builtin projection below shares with the menu
+#include "term_menu.h"       // term_menu_quit: the ONE "close this window" flag
 
 // Input handling
 char input_line[TERM_SHELL_INPUT_MAX];
@@ -633,25 +636,170 @@ static void builtin_cd(const char *args);
 static void builtin_exit(const char *args);
 static void builtin_termstat(const char *args);
 
+// ---- the contract terms, declared beside the handler they belong to --------
+//
+// A THIRD reader of this table (the tool contract's projection, see
+// term_shell_ct_project() below) joins execute_command() and builtin_help(), so
+// a builtin cannot be dispatchable and describable without also being INVOCABLE
+// by name, and cannot be any of the three without being in these braces.
+//
+// EVERY ONE IS CT_TF_LIVE_ONLY, and that is the honest classification rather
+// than a hedge: a builtin's whole effect is on THIS window's shell - it writes
+// into the cell grid, moves the shell's own cwd, edits this session's history or
+// environment. A windowless `--contract` process has no grid to write into and
+// exits immediately afterwards, so running one there would achieve nothing and
+// would touch uninitialised render state on the way. Delivered to a RUNNING
+// instance (contract_invoke_live, which main.c now polls) they do exactly what
+// typing them does, because they ARE what typing them does.
+//
+// Timing is the class each builtin can honestly claim, not a uniform guess:
+// `fsck` walks every inode and group descriptor of the ext2 root (LONG), `dos`
+// spawns an interpreter and hands the pane to it (SLOW), `help` lists /APPS off
+// the filesystem (FAST), and the rest are a few string operations (INSTANT).
+static const ct_terms_t k_t_sh_cwd = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NOTFOUND | CT_FAIL_NEEDSLIVE, "shell.cwd", 0
+};
+static const ct_terms_t k_t_sh_pwd = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, "shell.cwd", 0
+};
+// CT_SUCC_RC, said in as many words rather than implied: what these produce is
+// TEXT IN THE PANE, and this app exposes no readable contract item that holds
+// the pane's text, so there is nothing a caller could go and check. "Returned 0"
+// is the whole claim, which is weak, and saying so is the point of the term.
+static const ct_terms_t k_t_sh_out = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_RC, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, 0, 0
+};
+static const ct_terms_t k_t_sh_list = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_RC, CT_DEPTH_VIEW,
+    CT_FAIL_IO | CT_FAIL_NEEDSLIVE, 0, 0
+};
+static const ct_terms_t k_t_sh_clear = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, "scrollback.lines", 0
+};
+static const ct_terms_t k_t_sh_export = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_RC, CT_DEPTH_VIEW,
+    CT_FAIL_RANGE | CT_FAIL_NOSPACE | CT_FAIL_NEEDSLIVE, 0, 0
+};
+// DEPTH_SYSTEM: it starts another program. The projection DERIVES risk from
+// depth, so this row is CT_GUARDED and goes to the aicap gate without anybody
+// marking it by hand.
+static const ct_terms_t k_t_sh_dos = {
+    CT_TIME_SLOW, CT_TF_LIVE_ONLY | CT_TF_ASYNC, 0, CT_SUCC_RC, CT_DEPTH_SYSTEM,
+    CT_FAIL_NOTFOUND | CT_FAIL_DENIED | CT_FAIL_UNSUPPORTED | CT_FAIL_NEEDSLIVE, 0, 0
+};
+static const ct_terms_t k_t_sh_fsck = {
+    CT_TIME_LONG, CT_TF_LIVE_ONLY, 0, CT_SUCC_RC, CT_DEPTH_VIEW,
+    CT_FAIL_IO | CT_FAIL_UNSUPPORTED | CT_FAIL_NEEDSLIVE, 0, 0
+};
+static const ct_terms_t k_t_sh_exit = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_RC, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, 0, 0
+};
+
 typedef struct {
-    const char   *name;
-    const char   *desc;   // one line, shown by builtin_help()
-    builtin_fn_t  fn;
+    const char       *name;
+    const char       *desc;   // one line, shown by builtin_help() AND by the
+                              // contract projection. ONE description, three
+                              // readers, so a builtin added tomorrow is
+                              // described automatically and identically in both.
+    builtin_fn_t      fn;
+    const ct_terms_t *terms;  // the contract terms, in the SAME braces as the
+                              // handler whose consequences they describe
 } builtin_t;
 
 static const builtin_t g_builtins[] = {
-    { "cd",      "change directory (bare = /)",                          builtin_cd },
-    { "pwd",     "print the working directory",                          builtin_pwd },
-    { "clear",   "clear the visible screen (scrollback keeps the history)", builtin_clear },
-    { "history", "list commands typed this session",                     builtin_history },
-    { "export",  "export VAR=VALUE into the environment",                builtin_export },
-    { "dos",     "launch a DOS/Win3.x program: dos <path>",              builtin_dos },
-    { "fsck",    "check the ext2 root filesystem (read-only, never repairs)", builtin_fsck },
-    { "help",    "show this list",                                       builtin_help },
-    { "exit",    "close the terminal session",                           builtin_exit },
-    { "termstat","repaint counters for this window (termstat reset to zero them)", builtin_termstat },
+    { "cd",      "change directory (bare = /)",                          builtin_cd,      &k_t_sh_cwd },
+    { "pwd",     "print the working directory",                          builtin_pwd,     &k_t_sh_pwd },
+    { "clear",   "clear the visible screen (scrollback keeps the history)", builtin_clear, &k_t_sh_clear },
+    { "history", "list commands typed this session",                     builtin_history, &k_t_sh_out },
+    { "export",  "export VAR=VALUE into the environment",                builtin_export,  &k_t_sh_export },
+    { "dos",     "launch a DOS/Win3.x program: dos <path>",              builtin_dos,     &k_t_sh_dos },
+    { "fsck",    "check the ext2 root filesystem (read-only, never repairs)", builtin_fsck, &k_t_sh_fsck },
+    { "help",    "show this list",                                       builtin_help,    &k_t_sh_list },
+    { "exit",    "close the terminal session",                           builtin_exit,    &k_t_sh_exit },
+    { "termstat","repaint counters for this window (termstat reset to zero them)", builtin_termstat, &k_t_sh_out },
 };
 #define NUM_BUILTINS ((int)(sizeof(g_builtins) / sizeof(g_builtins[0])))
+
+// ---------------------------------------------------------------------------
+// The builtins, PROJECTED into the tool contract (task 3 of
+// docs/CONTRACT_COVERAGE_PLAN.md).
+//
+// The table already carried the three things a contract row needs - a name, a
+// one-line description and a handler - which is why this is a projection and
+// not a second list. Nothing here writes out a builtin's name or its text: the
+// token is "shell." + the table's own verb and the description IS the table's
+// own `desc` pointer, so `shell.<verb>` appears in `describe` for exactly the
+// verbs execute_command() dispatches, with the words `help` prints.
+// ---------------------------------------------------------------------------
+int term_shell_ct_count(void) { return NUM_BUILTINS; }
+
+// ONE actfn for the whole table, reading the row it was projected from through
+// it->ctx (contract.h calls that the identity payload). A per-builtin wrapper
+// would be a token-to-handler translation table, i.e. a new place to drift.
+static int ct_builtin_run(const ct_item_t *it, int argc, char **argv,
+                          char *out, int ocap) {
+    const builtin_t *b = (const builtin_t *)it->ctx;
+    if (!b || !b->fn) return -1;
+    if (term_ct_no_live(out, ocap)) return -1;
+    // A BUILTIN TAKES ONE RAW REMAINDER, not an argv. That is
+    // execute_command()'s own convention for them ("everything after the verb,
+    // already whitespace-trimmed and never NULL, no quote stripping and no
+    // splitting"), and builtin_cd() relies on it: it never looks for a quote
+    // character, so a quote inserted here would become part of the path. Joining
+    // argv with single spaces reproduces exactly what the typed line would have
+    // handed it.
+    char args[TERM_SHELL_INPUT_MAX];
+    int o = 0;
+    for (int i = 0; i < argc && argv && argv[i]; i++) {
+        if (o > 0 && o < (int)sizeof(args) - 1) args[o++] = ' ';
+        for (const char *p = argv[i]; *p && o < (int)sizeof(args) - 1; p++) args[o++] = *p;
+    }
+    args[o] = '\0';
+
+    // Framed exactly the way the menu's own "run this as if it had been typed"
+    // rows are: erase the half-typed echo, run, then reprint the prompt AND
+    // whatever the user had half-typed. The prompt is GUARDED on
+    // term_layout_pane_busy() for the same reason tm_run_command() guards it -
+    // `dos` hands the pane to a child and the pump prints the prompt when that
+    // child reports EOF, so printing one here would put it above the child's own
+    // output.
+    term_begin_output();
+    b->fn(args);                      // the SAME function execute_command() calls
+    if (!term_layout_pane_busy()) term_end_output();
+    term_redraw();
+    // The reply is an OBSERVATION, not an echo of the request: it reports state
+    // a caller can go and read, so a call that did nothing is visible in the
+    // answer rather than only in the return code.
+    snprintf(out, (size_t)ocap, "ran=%s cwd=%s history=%d", b->name, cwd, history_count);
+    return 0;
+}
+
+int term_shell_ct_project(int idx, ct_item_t *out) {
+    if (idx < 0 || idx >= NUM_BUILTINS) return 0;
+    const builtin_t *b = &g_builtins[idx];
+    // The token is DERIVED from the table's verb. Static storage because a
+    // projected row must own its strings for the life of the call.
+    static char tok[NUM_BUILTINS][CT_NAME_MAX];
+    snprintf(tok[idx], sizeof(tok[idx]), "shell.%s", b->name);
+
+    ct_item_t it;
+    __builtin_memset(&it, 0, sizeof(it));
+    it.name   = tok[idx];
+    it.type   = CT_ACTION;
+    it.access = CT_WRITE;
+    it.actfn  = ct_builtin_run;
+    it.ctx    = b;
+    it.desc   = b->desc;
+    it.terms  = b->terms;
+    term_ct_apply_risk(&it, b->terms);
+    *out = it;
+    return 1;
+}
 
 // ============================================================================
 // [tabcomp] Tab completion.
@@ -1171,6 +1319,16 @@ static void builtin_cd(const char *args) {
 static void builtin_exit(const char *args) {
     (void)args;
     term_puts("Goodbye!\n");
+    // IT NOW ACTUALLY CLOSES THE SESSION, which is what the table has always
+    // said it does. main.c intercepts a TYPED bare "exit" with its own string
+    // compare and closes the window itself, so this function was reached only
+    // from the OTHER routes into execute_command() - a pipeline, a bookmark
+    // command, and now the `shell.exit` contract action - where it printed
+    // "Goodbye!" and did nothing. A row whose description outruns its handler is
+    // the #235 fault at the scale of one command, and the fix is to use the flag
+    // File > Close Window already sets rather than to invent a second one:
+    // main.c's idle branch is the single place that notices it.
+    term_menu_quit = 1;
 }
 
 // qsort() comparator for the external-app listing.

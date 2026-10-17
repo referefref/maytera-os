@@ -8,6 +8,10 @@
 # llm node fails cleanly with  FLOWRUN-FAIL AI unavailable...  and a non-zero
 # exit (never a fake success).
 name: llmdemo
+# The Library catalog in /APPS/FLOW shows this line. It is part of the
+# additive optional schema: flow.c skips unknown top-level keys, so the
+# runner ignores it.
+description: "One LLM prompt with a substituted subject, written to a file"
 nodes:
   - id: t1
     type: trigger

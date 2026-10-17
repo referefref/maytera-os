@@ -246,3 +246,22 @@ _Static_assert(sizeof(cap_approve_info_t) == 88,
 // bytes than the handler writes and the tail of each row would go unchecked.
 _Static_assert(sizeof(serial_pub_t) == 24,
                "Stage 2 argtab: SZ_SERIAL_PUB in rustkern/argtab.rs is stale");
+
+#include "../fs/vfs.h"   // #747: the open-plan policy's FFI structs
+
+// #747: rustkern/fdopenpolicy.rs reads an `open_mode_t` the C side decoded and
+// writes an `fd_open_plan_t` the C side acts on. Both are #[repr(C)] mirrors
+// with their own const size assertions in that module, so a drift in EITHER
+// direction fails a build rather than silently reading the wrong offsets.
+//
+// WHY THIS PAIR IS WORTH LOCKING MORE THAN MOST. The plan decides whether an
+// open PRESERVES or DESTROYS a file's contents. A field appended to
+// open_mode_t without updating OpenMode would shift nothing (Rust would read
+// the first 7 ints correctly), but a field INSERTED in the middle would make
+// Rust read `trunc` out of `rdwr`, and the failure mode of that is a file
+// emptied by an open that never asked for it. That is the #747 defect
+// reintroduced by layout, with no code change anywhere to point at.
+_Static_assert(sizeof(open_mode_t) == 28,
+               "#747: OpenMode in rustkern/fdopenpolicy.rs is stale");
+_Static_assert(sizeof(fd_open_plan_t) == 20,
+               "#747: FdOpenPlan in rustkern/fdopenpolicy.rs is stale");

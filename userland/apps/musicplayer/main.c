@@ -29,6 +29,9 @@
 #include "../../libc/stdio.h"
 #include "arc.h"            // archiver: ZIP extraction for WinAmp .wsz skins
 #include "viz.h"            // MilkDrop-style TinyGL audio visualizer window
+#include "../../libc/userconf.h"   // #peruser2: per-user library cache, skin, art cache, playlist
+#include "../../libc/places.h"     // [filesui] places_have_home()
+#include "../../libc/contract.h"    // docs/CONTRACT_COVERAGE_PLAN.md task 3
 
 // open() flag bits (libc fcntl, not pulled in by maytera.h)
 #ifndef O_WRONLY
@@ -235,7 +238,20 @@ static int   g_ntracks = 0;
 static int   g_sel = -1;
 static int   g_cur = -1;          // currently playing index
 static int   g_pl_scroll = 0;
+// [filesui] WAS "/HOME", the parent of every home, which holds no music at
+// all. This app's LIBRARY scanner already resolves properly (it reads
+// /CONFIG/MPLIB.CFG, then /MEDIA/MUSIC, then userhome_music_dir()); this is the
+// separate flat playlist directory, which was never reassigned anywhere, so
+// "/HOME" was its permanent value. Resolved in main() through the same
+// accessor the library scanner uses.
 static char  g_dir[128] = "/HOME";
+static void mp_start_dir(void) {
+    char b[128];
+    if (places_have_home() && userhome_music_dir(b, sizeof(b)) == 0)
+        snprintf(g_dir, sizeof(g_dir), "%s", b);
+    else if (media_music_dir(b, sizeof(b)) == 0)
+        snprintf(g_dir, sizeof(g_dir), "%s", b);
+}
 static char  g_now[128] = "";   // "Artist - Title" marquee text
 
 // offscreen framebuffer
@@ -886,7 +902,19 @@ static void play_index(int idx) {
     set_volume(g_vol);
 }
 
-static void do_stop(void)  { g_state = ST_STOPPED; g_elapsed = 0; g_seek = 0; }
+// #contracttail2: Stop previously only reset the DISPLAY (g_state/g_elapsed/
+// g_seek) and never touched g_play_pid, so the spawned "--play" decode
+// helper kept streaming to the DAC until the file finished on its own - the
+// Stop button looked like it worked and did not. Fixed with the identical
+// kill+waitpid idiom spawn_play() already uses when switching tracks.
+static void do_stop(void) {
+    if (g_play_pid > 0) {
+        syscall2(SYS_KILL, g_play_pid, 9);
+        int st; sys_waitpid(g_play_pid, &st, 0);
+        g_play_pid = -1;
+    }
+    g_state = ST_STOPPED; g_elapsed = 0; g_seek = 0;
+}
 static void do_pause(void) { if (g_state == ST_PLAYING) g_state = ST_PAUSED; else if (g_state == ST_PAUSED) g_state = ST_PLAYING; }
 static void play_neighbor(int d) {
     if (g_ntracks == 0) return;
@@ -1458,8 +1486,18 @@ static void art_selftest(void) {
     }
     free(buf);
     g_art_path[0] = 0;
-    int fd = sys_open("/CONFIG/ARTDBG.TXT", O_WRCREAT);
-    if (fd >= 0) { sys_write(fd, out, (unsigned long)pos); sys_close(fd); }
+    // #peruserrows: was /CONFIG/ARTDBG.TXT. /CONFIG is root-owned 0711 (it holds
+    // SHADOW, MFA.DB, PERMS.DB and the consent store, and is NOT to be loosened),
+    // so a uid-1000 music player could never write this trace: the one diagnostic
+    // that says which cover-art encodings decode was unavailable to everyone who
+    // needed it. userscratch_path() is the session's own writable location
+    // (<home>/ARTDBG.TXT with an account, /TMP/ARTDBG.TXT without, root included
+    // since root's home is "/"). Still one whole rewrite per run, now O_TRUNC via
+    // userconf_open_write_path(), which also drops any stale tail.
+    char dbgp[192];
+    if (userscratch_path("ARTDBG.TXT", dbgp, sizeof dbgp) != 0) return;
+    int fd = userconf_open_write_path(dbgp);
+    if (fd >= 0) { sys_write(fd, out, (unsigned long)pos); sys_close(fd); userconf_protect(dbgp); }
 }
 
 // ============================================================================
@@ -1479,8 +1517,17 @@ static void of_log(const char *s) {
     if (g_of_logpos + n + 1 >= (int)sizeof g_of_log) g_of_logpos = 0;
     for (int i = 0; i < n; i++) g_of_log[g_of_logpos++] = s[i];
     g_of_log[g_of_logpos++] = '\n';
-    int fd = sys_open("/CONFIG/MP2CLOG.TXT", O_WRCREAT);
-    if (fd >= 0) { sys_write(fd, g_of_log, (unsigned long)g_of_logpos); sys_close(fd); }
+    // #peruserrows: was /CONFIG/MP2CLOG.TXT, refused for every non-root session
+    // for the same reason as ARTDBG.TXT above. Resolved ONCE, because this runs on
+    // every logged fetch event, not once a run. It carries the artist/album the
+    // user is playing, so it is chmod 0600 after the write (/TMP is 01777).
+    static char logp[192];
+    static int  logp_state = 0;   // 0 unresolved, 1 ok, -1 failed
+    if (logp_state == 0)
+        logp_state = (userscratch_path("MP2CLOG.TXT", logp, sizeof logp) == 0) ? 1 : -1;
+    if (logp_state < 0) return;
+    int fd = userconf_open_write_path(logp);
+    if (fd >= 0) { sys_write(fd, g_of_log, (unsigned long)g_of_logpos); sys_close(fd); userconf_protect(logp); }
 }
 
 enum { OF_IDLE = 0, OF_MB_WAIT, OF_CAA_WAIT };
@@ -1535,10 +1582,25 @@ static int of_parse_mbid(const char *json, char *mbid) {
     return 1;
 }
 
+// #peruser2: the cover-art cache. It was /CONFIG/MPART/<key>.<ext>, i.e. an app
+// CREATING NAMES INSIDE THE SYSTEM CONFIGURATION DIRECTORY once per album - the
+// single clearest example of why the fix is to move the files and not to relax
+// /CONFIG. It is now <home>/CONFIG/MPART/, which the user owns. Root's home is
+// "/", so a root session still uses exactly /CONFIG/MPART.
+static void mp_art_path(char *out, unsigned long cap, const char *key, const char *suffix) {
+    char name[64];
+    snprintf(name, sizeof name, "MPART/%s.%s", key, suffix);
+    if (userconf_path(name, out, cap) != 0)
+        snprintf(out, cap, "/CONFIG/MPART/%s.%s", key, suffix);
+}
 static void of_save_blob(const char *suffix, const char *key, const void *buf, int n) {
-    char p[64]; snprintf(p, sizeof p, "/CONFIG/MPART/%s.%s", key, suffix);
-    int fd = sys_open(p, O_WRCREAT); if (fd < 0) return;
-    sys_write(fd, buf, (unsigned long)n); sys_close(fd);
+    char p[256]; mp_art_path(p, sizeof p, key, suffix);
+    // userconf_open_write_path() makes <home>/CONFIG/MPART, checks the write, the
+    // fsync and the close, and reports a refusal; the old form discarded all three.
+    int fd = userconf_open_write_path(p);
+    if (userconf_finish_write(fd, buf, (unsigned long)n) != 0) {
+        // A cache miss next time is the only consequence; reported via sys_bootlog.
+    }
 }
 static void of_mark_notfound(const char *key) { of_save_blob("NF", key, "x", 1); }
 
@@ -1548,10 +1610,10 @@ static void of_mark_notfound(const char *key) { of_save_blob("NF", key, "x", 1);
 //  -1  = raw cover bytes cached but the decoder rejected them (JPEG pre-#332)
 //   0  = nothing cached -> caller should fetch
 static int of_load_cache(const char *key) {
-    char p[64];
-    snprintf(p, sizeof p, "/CONFIG/MPART/%s.NF", key);
+    char p[256];
+    mp_art_path(p, sizeof p, key, "NF");     // #peruser2
     int fd = sys_open(p, 0); if (fd >= 0) { sys_close(fd); return 2; }
-    snprintf(p, sizeof p, "/CONFIG/MPART/%s.IMG", key);
+    mp_art_path(p, sizeof p, key, "IMG");
     size_t len = 0; uint8_t *buf = read_file(p, &len);
     if (!buf) return 0;
     int dims[2] = {0, 0};
@@ -1747,19 +1809,37 @@ static void lib_build_rows(void) {
     if (g_lib_sel >= g_nrows) g_lib_sel = g_nrows - 1;
     if (g_lib_sel < 0) g_lib_sel = 0;
 }
+// #peruser2: the scanned-library cache is a per-user CACHE of the user's own
+// media, so <home>/CONFIG/MPLIBRARY.DAT. Root's home is "/", so root still uses
+// exactly /CONFIG/MPLIBRARY.DAT. Before this, a non-root session rescanned every
+// launch because the cache write was refused and nothing said so.
+//
+// O_WRCREAT here had NO O_TRUNC, so a library that had SHRUNK left a stale tail
+// of old rows that lib_load() then parsed back in as real tracks. Fixed by
+// userconf_open_write_path(), which truncates only after a successful open.
 static void lib_save(void) {
-    int fd = sys_open("/CONFIG/MPLIBRARY.DAT", O_WRCREAT); if (fd < 0) return;
+    char lp[256];
+    if (userconf_path("MPLIBRARY.DAT", lp, sizeof lp) != 0) return;
+    int fd = userconf_open_write_path(lp);
+    if (fd < 0) return;                      // reported by the open
     char line[480];
-    for (int i = 0; i < g_nlib; i++) {
+    int rc = 0;
+    for (int i = 0; i < g_nlib && rc == 0; i++) {
         track_t *t = &g_lib[i];
         int n = snprintf(line, sizeof line, "%s|%s|%s|%s|%s|%d|%d|%d\n",
                          t->path, t->title, t->artist, t->album, t->genre, t->year, t->track_no, t->duration);
-        sys_write(fd, line, (unsigned long)n);
+        if (n > 0 && sys_write(fd, line, (unsigned long)n) != (long)n) rc = -1;
     }
-    sys_close(fd);
+    if (userconf_finish_write(fd, "", 0) != 0) rc = -1;   // fsync + checked close
+    if (rc != 0) uc_report_write_refusal("mp_lib_save", lp, rc);
 }
 static int lib_load(void) {
-    size_t len = 0; uint8_t *buf = read_file("/CONFIG/MPLIBRARY.DAT", &len);
+    // #peruser2: per-user cache first, then the legacy/system copy, so an
+    // upgraded root install keeps its scanned library.
+    char lp[256];
+    size_t len = 0; uint8_t *buf = 0;
+    if (userconf_path("MPLIBRARY.DAT", lp, sizeof lp) == 0) buf = read_file(lp, &len);
+    if (!buf) buf = read_file("/CONFIG/MPLIBRARY.DAT", &len);
     if (!buf) return 0;
     g_nlib = 0; size_t i = 0; char line[480];
     while (i < len && g_nlib < MAX_LIB) {
@@ -1796,7 +1876,30 @@ static void lib_load_dirs(char dirs[][128], int *ndir) {
             }
         }
     }
-    if (*ndir == 0) { mp_cpy(dirs[0], "/HOME", 128); mp_cpy(dirs[1], "/HOME/MUSIC", 128); *ndir = 2; }
+    if (*ndir == 0) {
+        // #prewrite: THE SHIPPED SAMPLES MOVED OUT OF THE /HOME ROOT.
+        //
+        // /HOME is the parent of every user's home AND was also a flat media
+        // folder, so a user named `music` collided with /HOME/MUSIC. The
+        // samples are now /MEDIA/MUSIC (root-owned, one shared copy, the same
+        // treatment the wallpapers get), and the user's OWN music is
+        // <home>/MUSIC, which users_make_home_skeleton() already creates empty
+        // at account creation owned by the account.
+        //
+        // THE OLD PATHS STAY IN THE LIST, and that is the migration. An
+        // already-installed machine that takes a new kernel without re-imaging
+        // still has its music at /HOME and /HOME/MUSIC; scanning a directory
+        // that does not exist costs one failed open, while dropping it would
+        // silently empty somebody's library. Ordered new-first so a machine
+        // with both does not list every track twice in the wrong order.
+        int k = 0;
+        mp_cpy(dirs[k++], "/MEDIA/MUSIC", 128);
+        char home[128];
+        if (userhome_music_dir(home, sizeof home) == 0) mp_cpy(dirs[k++], home, 128);
+        mp_cpy(dirs[k++], "/HOME", 128);          // legacy, pre-#prewrite
+        mp_cpy(dirs[k++], "/HOME/MUSIC", 128);    // legacy, pre-#prewrite
+        *ndir = k;
+    }
 }
 static void lib_rescan(void) {
     g_nlib = 0;
@@ -2090,20 +2193,28 @@ static void add_wsz_dir(const char *dir) {
 static void scan_skins(void) {
     g_nwsz = 0;
     add_wsz_dir("/SKINS");
+    // #prewrite: /MEDIA is where loose shared media lives now; /HOME/SKINS and
+    // /HOME are kept so an upgraded install does not lose its skins.
+    add_wsz_dir("/MEDIA/MUSIC");
     add_wsz_dir("/HOME/SKINS");
     add_wsz_dir("/HOME");
 }
 
 // --- persistence: /CONFIG/MPSKIN.CFG --------------------------------------
+// #peruser2: the chosen skin is a PREFERENCE -> <home>/CONFIG/MPSKIN.CFG, with a
+// fallback read of the system copy below. O_WRCREAT had no O_TRUNC, so switching
+// from a long skin path to the short "*N" builtin form left the tail of the old
+// path behind and load_skin_cfg() read the wrong skin back.
 static void save_skin_cfg(void) {
-    int fd = sys_open("/CONFIG/MPSKIN.CFG", O_WRCREAT);
-    if (fd < 0) return;
     char buf[176];
     int n;
     if (g_bitmap_active) n = snprintf(buf, sizeof(buf), "%s\n", g_wsz[g_sel_skin - NUM_SKINS]);
     else                 n = snprintf(buf, sizeof(buf), "*%d\n", g_skin);
-    sys_write(fd, buf, (unsigned long)n);
-    sys_close(fd);
+    if (n <= 0) return;
+    int fd = userconf_open_write("MPSKIN.CFG");
+    if (userconf_finish_write(fd, buf, (unsigned long)n) != 0) {
+        // Reported through sys_bootlog by the shared helpers.
+    }
 }
 
 // --- apply a unified skin index (builtin 0..NUM_SKINS-1, then wsz) ---------
@@ -2305,7 +2416,7 @@ static void close_all_windows(void) {
 }
 
 static void load_skin_cfg(void) {
-    int fd = sys_open("/CONFIG/MPSKIN.CFG", 0);
+    int fd = userconf_open_read("MPSKIN.CFG", "/CONFIG/MPSKIN.CFG");   // #peruser2
     if (fd < 0) return;
     char buf[176];
     long n = sys_read(fd, buf, sizeof(buf) - 1);
@@ -2321,19 +2432,36 @@ static void load_skin_cfg(void) {
 }
 
 // --- playlist save / load (M3U / PLS) --------------------------------------
-#define PLAYLIST_FILE "/HOME/PLAYLIST.M3U"
+// #peruser2: THE ONE SITE IN THIS PASS WHERE ROOT'S WRITE PATH CHANGES, and it
+// is called out rather than buried. The literal was "/HOME/PLAYLIST.M3U": /HOME
+// is the PARENT of all homes, root-owned 0755, and is nobody's home. There is no
+// choice of `sub` that makes "<home>/..." reproduce it, because it was never a
+// path derived from a home in the first place - it was a guess at "the user's
+// space". So the playlist becomes <home>/PLAYLIST.M3U, which for root is
+// "/PLAYLIST.M3U", and the READ below falls back to the old location so an
+// existing root playlist is still loaded and is re-saved to the new path on the
+// next change. Nothing is lost; the file moves once, on first save.
+// #prewrite: TWO legacy locations now, tried newest-first. The build relocates
+// the shipped playlist to /MEDIA/MUSIC and rewrites its entries; /HOME is where
+// it was before that, on any machine imaged earlier.
+#define PLAYLIST_SHIPPED "/MEDIA/MUSIC/PLAYLIST.M3U"
+#define PLAYLIST_LEGACY "/HOME/PLAYLIST.M3U"
+#define PLAYLIST_NAME   "PLAYLIST.M3U"
 static void playlist_save(void) {
-    int fd = sys_open(PLAYLIST_FILE, O_WRCREAT);
-    if (fd < 0) return;
+    int fd = userhome_open_write(0, PLAYLIST_NAME);
+    if (fd < 0) return;                      // reported by the open
     const char *hdr = "#EXTM3U\n";
-    sys_write(fd, hdr, (unsigned long)strlen(hdr));
+    int rc = 0;
+    unsigned long hl = strlen(hdr);
+    if ((unsigned long)sys_write(fd, hdr, hl) != hl) rc = -1;
     char line[200];
-    for (int i = 0; i < g_ntracks; i++) {
+    for (int i = 0; i < g_ntracks && rc == 0; i++) {
         const char *p = g_tracks[i].path[0] ? g_tracks[i].path : g_tracks[i].name;
         int n = snprintf(line, sizeof(line), "%s\n", p);
-        sys_write(fd, line, (unsigned long)n);
+        if (n > 0 && sys_write(fd, line, (unsigned long)n) != (long)n) rc = -1;
     }
-    sys_close(fd);
+    if (userconf_finish_write(fd, "", 0) != 0) rc = -1;   // fsync + checked close
+    if (rc != 0) uc_report_write_refusal("mp_playlist_save", "<home>/" PLAYLIST_NAME, rc);
 }
 static void add_track_path(const char *full) {
     if (g_ntracks >= MAX_TRACKS) return;
@@ -2347,7 +2475,12 @@ static void add_track_path(const char *full) {
 }
 static void playlist_load(void) {
     size_t len = 0;
-    uint8_t *buf = read_file(PLAYLIST_FILE, &len);
+    // #peruser2: per-user first, then the pre-migration /HOME location.
+    char plp[256];
+    uint8_t *buf = 0;
+    if (userhome_path(0, PLAYLIST_NAME, plp, sizeof plp) == 0) buf = read_file(plp, &len);
+    if (!buf) buf = read_file(PLAYLIST_SHIPPED, &len);   // #prewrite: the relocated shipped copy
+    if (!buf) buf = read_file(PLAYLIST_LEGACY, &len);    // pre-#prewrite images
     if (!buf) return;
     g_ntracks = 0; g_sel = -1; g_cur = -1; g_pl_scroll = 0;
     size_t i = 0;
@@ -2968,6 +3101,239 @@ static void poll_lib(void) {
 // ----------------------------------------------------------------------------
 // main (dual mode: UI or --play helper)
 // ----------------------------------------------------------------------------
+
+// ===========================================================================
+// Contract (docs/CONTRACT_COVERAGE_PLAN.md task 3). STATIC: transport and
+// shuffle/repeat/EQ/show-remaining are hit-tested by literal pixel rects in
+// on_click_skin()/the procedural-skin click handler (two parallel copies, one
+// per skin mode) against bare integer coordinates, not a struct table with a
+// function pointer field, so contract-lint check 5 cannot find a table to
+// project from - the same STATIC verdict Browser's chrome and the
+// pre-phase-4 office apps are in (docs/CONTRACT_COVERAGE_PLAN.md section
+// 11a). Every row below was matched by hand against the exact function each
+// hit-test calls (play_index/play_neighbor/do_pause/do_stop/scan_dir), so it
+// cannot silently drift from what the two click handlers do, but a NEW
+// transport control could in principle be added to either skin's hit-test
+// without a matching row here and nothing would catch it - the same honest
+// limitation every other STATIC contract in the tree records.
+//
+// NOT covered, named rather than silently dropped: the EQ/Playlist/Album-Art
+// auxiliary windows and their own controls, WinAmp .wsz skin loading/cycling,
+// the seek and balance sliders (both already cosmetic-only in the existing
+// UI - clicking them moves g_seek/g_balance but neither is wired to an actual
+// seek/pan syscall, a pre-existing gap this does not newly introduce or
+// paper over), and window minimise/close (no observable effect from a
+// stateless spawn, the same shape as Editor's file.exit).
+//
+// library.select is a NEW primitive, the same shape as Sheets' nav.select_cell:
+// a non-interactive caller has no mouse to click a playlist row.
+// ===========================================================================
+static int ct_get_now_playing(char *o, int n) {
+    snprintf(o, (size_t)n, "%s", g_now[0] ? g_now : "(none)");
+    return 0;
+}
+static int ct_get_dir(char *o, int n) {
+    snprintf(o, (size_t)n, "%s", g_dir[0] ? g_dir : "/");
+    return 0;
+}
+static int ct_get_volume(void) { return g_vol; }
+static int ct_set_volume_item(int v) {
+    if (v < 0 || v > 100) return -1;
+    g_vol = v;
+    set_volume(g_vol);
+    return 0;
+}
+
+static int run_playback_play_selected(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (g_sel < 0 || g_sel >= g_ntracks) {
+        snprintf(out, (size_t)ocap, "no track selected (library.track_count=%d)", g_ntracks);
+        return 1;
+    }
+    play_index(g_sel);
+    snprintf(out, (size_t)ocap, "ok playing index=%d %s", g_cur, g_now);
+    return 0;
+}
+CT_CHECK_ACTFN(run_playback_play_selected);
+
+static int run_playback_pause_toggle(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    do_pause();
+    snprintf(out, (size_t)ocap, "ok state=%d", g_state);
+    return 0;
+}
+CT_CHECK_ACTFN(run_playback_pause_toggle);
+
+static int run_playback_stop(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    do_stop();
+    snprintf(out, (size_t)ocap, "ok state=%d", g_state);
+    return 0;
+}
+CT_CHECK_ACTFN(run_playback_stop);
+
+static int run_playback_next(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (g_ntracks == 0) {
+        snprintf(out, (size_t)ocap, "library is empty");
+        return 1;
+    }
+    play_neighbor(+1);
+    snprintf(out, (size_t)ocap, "ok playing index=%d %s", g_cur, g_now);
+    return 0;
+}
+CT_CHECK_ACTFN(run_playback_next);
+
+static int run_playback_prev(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (g_ntracks == 0) {
+        snprintf(out, (size_t)ocap, "library is empty");
+        return 1;
+    }
+    play_neighbor(-1);
+    snprintf(out, (size_t)ocap, "ok playing index=%d %s", g_cur, g_now);
+    return 0;
+}
+CT_CHECK_ACTFN(run_playback_prev);
+
+static int run_library_rescan(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    scan_dir(g_dir);
+    snprintf(out, (size_t)ocap, "ok track_count=%d", g_ntracks);
+    return 0;
+}
+CT_CHECK_ACTFN(run_library_rescan);
+
+static int run_library_select(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0] || !argv[0][0]) {
+        snprintf(out, (size_t)ocap, "usage: library.select <index>");
+        return 1;
+    }
+    int idx = atoi(argv[0]);
+    if (idx < 0 || idx >= g_ntracks) {
+        snprintf(out, (size_t)ocap, "index out of range: 0..%d", g_ntracks - 1);
+        return 1;
+    }
+    g_sel = idx;
+    snprintf(out, (size_t)ocap, "ok selected index=%d", g_sel);
+    return 0;
+}
+CT_CHECK_ACTFN(run_library_select);
+
+static const ct_terms_t k_t_play = {
+    CT_TIME_FAST, CT_TF_ASYNC, 0, CT_SUCC_ARMED, CT_DEPTH_SYSTEM,
+    CT_FAIL_NOTFOUND, "playback.state", 0
+};
+// CT_TF_LIVE_ONLY on every CT_SUCC_ITEM row, for the measured reason recorded
+// in imageviewer's own terms block: contract_invoke() spawns a FRESH PROCESS
+// per verb and this app does not serve a live instance, so playback.state /
+// library.track_count / library.current_index are gone by the next call. The
+// flag declares that; it does not refuse the call (ct_timing_refusal() gates
+// only CT_TF_MODAL and CT_TIME_UNBOUNDED). k_t_play deliberately keeps
+// CT_SUCC_ARMED with NO live-only flag, because its effect genuinely does
+// outlive the process: spawn_play() launches /APPS/MUSICPLR as a SEPARATE
+// decode process that keeps streaming after this one exits.
+static const ct_terms_t k_t_transport = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, 0, "playback.state", 0
+};
+static const ct_terms_t k_t_rescan = {
+    CT_TIME_SLOW, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, 0, "library.track_count", 0
+};
+static const ct_terms_t k_t_select = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, CT_FAIL_RANGE | CT_FAIL_NOTFOUND,
+    "library.current_index", 0
+};
+
+static const ct_item_t MUSICPLAYER_ITEMS[] = {
+    // ---- value rows: terms DERIVED (contract_terms_of) ----
+    { .name = "playback.state", .type = CT_ENUM, .access = CT_READ, .risk = CT_SAFE,
+      .lo = 0, .hi = 2, .options = "stopped|playing|paused", .var = &g_state,
+      .desc = "Transport display state, the same state the LCD/buttons reflect" },
+    { .name = "playback.now_playing", .type = CT_STR, .access = CT_READ, .risk = CT_SAFE,
+      .getstrfn = ct_get_now_playing,
+      .desc = "\"Artist - Title\" of the current track, or (none)" },
+    { .name = "playback.volume", .type = CT_INT, .access = CT_RW, .risk = CT_SAFE,
+      .lo = 0, .hi = 100, .getfn = ct_get_volume, .setfn = ct_set_volume_item,
+      .desc = "Output volume 0-100, the same value the volume slider sets" },
+    { .name = "playback.shuffle", .type = CT_BOOL, .access = CT_RW, .risk = CT_SAFE,
+      .lo = 0, .hi = 1, .var = &g_shuffle,
+      .desc = "Shuffle-on-advance toggle" },
+    { .name = "playback.repeat", .type = CT_BOOL, .access = CT_RW, .risk = CT_SAFE,
+      .lo = 0, .hi = 1, .var = &g_repeat,
+      .desc = "Repeat-all toggle" },
+    { .name = "playback.eq_on", .type = CT_BOOL, .access = CT_RW, .risk = CT_SAFE,
+      .lo = 0, .hi = 1, .var = &g_eq_on,
+      .desc = "Equalizer-enabled toggle" },
+    { .name = "playback.show_remaining", .type = CT_BOOL, .access = CT_RW, .risk = CT_SAFE,
+      .lo = 0, .hi = 1, .var = &g_show_remaining,
+      .desc = "Whether the time readout shows remaining instead of elapsed" },
+    { .name = "library.track_count", .type = CT_INT, .access = CT_READ, .risk = CT_SAFE,
+      .lo = 0, .hi = MAX_TRACKS, .var = &g_ntracks,
+      .desc = "Number of tracks in the currently scanned library directory" },
+    { .name = "library.current_index", .type = CT_INT, .access = CT_READ, .risk = CT_SAFE,
+      .lo = -1, .hi = MAX_TRACKS, .var = &g_cur,
+      .desc = "Index of the currently playing track, -1 if none" },
+    { .name = "library.dir", .type = CT_STR, .access = CT_READ, .risk = CT_SAFE,
+      .getstrfn = ct_get_dir,
+      .desc = "Directory the library was last scanned from" },
+
+    // ---- action rows: STATIC (see the big comment above) ----
+    { .name = "playback.play_selected", .type = CT_ACTION, .access = CT_WRITE, .risk = CT_SAFE,
+      .actfn = run_playback_play_selected,
+      .desc = "Play the selected library track, the Play transport button",
+      .terms = &k_t_play },
+    { .name = "playback.pause_toggle", .type = CT_ACTION, .access = CT_WRITE, .risk = CT_SAFE,
+      .actfn = run_playback_pause_toggle,
+      .desc = "Toggle playing/paused display state, the Pause transport button "
+              "(does not itself message the decode helper, the same limitation "
+              "the real button has)",
+      .terms = &k_t_transport },
+    { .name = "playback.stop", .type = CT_ACTION, .access = CT_WRITE, .risk = CT_SAFE,
+      .actfn = run_playback_stop,
+      .desc = "Stop playback and reset the transport, the Stop button",
+      .terms = &k_t_transport },
+    { .name = "playback.next", .type = CT_ACTION, .access = CT_WRITE, .risk = CT_SAFE,
+      .actfn = run_playback_next,
+      .desc = "Advance to the next track (wraps), the Next transport button",
+      .terms = &k_t_play },
+    { .name = "playback.prev", .type = CT_ACTION, .access = CT_WRITE, .risk = CT_SAFE,
+      .actfn = run_playback_prev,
+      .desc = "Go back to the previous track (wraps), the Prev transport button",
+      .terms = &k_t_play },
+    { .name = "library.rescan", .type = CT_ACTION, .access = CT_WRITE, .risk = CT_GUARDED,
+      .actfn = run_library_rescan, .cap = "fs.read",
+      .desc = "Rescan library.dir for playable files, the Eject/rescan button",
+      .terms = &k_t_rescan },
+    { .name = "library.select", .type = CT_ACTION, .access = CT_WRITE, .risk = CT_SAFE,
+      .actfn = run_library_select,
+      .desc = "Select a library row by index with no click, a new primitive "
+              "(no mouse to click a playlist row)",
+      .terms = &k_t_select },
+};
+#define MUSICPLAYER_N_ITEMS ((int)(sizeof(MUSICPLAYER_ITEMS) / sizeof(MUSICPLAYER_ITEMS[0])))
+
+// THE APP ID IS "musicplr", NOT "musicplayer", to match this app's real
+// 8.3 installed name (userland/apps/musicplayer/Makefile's TARGET is
+// musicplr; files/main.c's launcher list already names it /APPS/MUSICPLR).
+// contract_app_path() (libc/ctinvoke.c) derives the spawn path from THIS
+// STRING, either via the generated /AITOOLS/CONTRACTS.YML index or, failing
+// that, by literally upper-casing it - using the directory name instead
+// would have shipped the exact /APPS/COMPOSITOR-vs-/APPS/COMPOSIT phantom
+// ctinvoke.c's own header comment warns about.
+static const ct_contract_t MUSICPLAYER_CONTRACT = {
+    "musicplr", "Music Player",
+    "STATIC: transport/shuffle/repeat/EQ controls are hit-tested by literal "
+    "pixel rects in two parallel skin-mode click handlers, not a struct "
+    "table with a function pointer field, so contract-lint check 5 cannot "
+    "find a table to project from (docs/CONTRACT_COVERAGE_PLAN.md section "
+    "11a's STATIC verdict, same reason). EQ/Playlist/Album-Art windows, skin "
+    "loading, and the seek/balance sliders (already cosmetic-only in the "
+    "existing UI) are NOT covered.",
+    MUSICPLAYER_ITEMS, MUSICPLAYER_N_ITEMS,
+    0, 0, 0
+};
+
 int main(int argc, char **argv) {
     // Helper mode: perform the blocking kernel decode/play, then exit. This is
     // spawned by the UI so the main window keeps animating.
@@ -2976,8 +3342,27 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    // THE APP'S OWN STARTUP STATE MUST BE SET BEFORE THE CONTRACT ANSWERS, and
+    // getting this order wrong made three rows report values the running app
+    // never has. MEASURED on golden 2532 / VM 2604 with the contract branch
+    // ABOVE these three lines: `get library.dir` answered /HOME - g_dir's bare
+    // static initialiser - on an image whose /MEDIA/MUSIC holds 15 tracks, so
+    // `library.rescan` honestly found 0 and `playback.repeat` answered 0 where
+    // a launched instance has 1. A contract that describes the app's
+    // UNINITIALISED globals is the #235 fault in a new shape: not a declared
+    // feature that does not exist, but a declared VALUE that is not the one the
+    // app uses. All three are startup-cheap and window-free (pure variable
+    // writes, plus mp_start_dir()'s places_init(), which places.h says to call
+    // from startup and not from a draw path), so they belong above the branch.
     for (int i = 0; i < NUM_EQ; i++) g_eq[i] = 32;
     g_repeat = 1;   // #335 repeat-all so playback loops continuously
+    mp_start_dir();  // [filesui] the user's own MUSIC, not the parent of all homes
+
+    // #233: a contract invocation must never open a window. win stays -1,
+    // which every actfn above is safe against: none of them touch `win`.
+    if (contract_is_invocation(argc, argv)) {
+        return contract_cli(argc, argv, &MUSICPLAYER_CONTRACT);
+    }
 
     // #160: discover .wsz skins and restore the last chosen skin BEFORE
     // creating any window (moved up from below win_create() - neither
@@ -3012,7 +3397,14 @@ int main(int argc, char **argv) {
 
     // Phase 2c: ensure the online cover-art cache dir exists, and honour an
     // opt-out flag (/CONFIG/MPONLINE.CFG containing "0" disables online lookups).
-    sys_mkdir("/CONFIG/MPART", 0755);
+    // #peruser2: make <home>/CONFIG/MPART, never /CONFIG/MPART. of_save_blob()
+    // also creates it via userconf_open_write_path(), so this is belt and braces
+    // for the first-launch ordering, not the only creator.
+    { char ap[256];
+      if (userconf_path("MPART", ap, sizeof ap) == 0) {
+          userconf_ensure_parent_dir(ap);
+          sys_mkdir(ap, 0755);
+      } }
     { int fd = sys_open("/CONFIG/MPONLINE.CFG", 0);
       if (fd >= 0) { char c = 0; if (sys_read(fd, &c, 1) > 0 && c == '1') g_online_enabled = 1; sys_close(fd); } }
 

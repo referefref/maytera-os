@@ -140,6 +140,14 @@ void term_profile_apply(const term_profile_t *p);   // *p -> live appearance
 // (table full for new/duplicate; last remaining profile for delete).
 int  term_profile_new(const char *name, const term_profile_t *seed);
 int  term_profile_delete(int idx);
+// Rename profile idx, applying THIS file's uniqueness and '['/']' rules (see
+// the implementation for why they cannot live in the caller). 0 on success, -1
+// on a bad index or an empty name. The caller still has to save.
+int  term_profile_rename(int idx, const char *name);
+// The starting directory / command. "" (or NULL) is the documented "none", so
+// clearing one is expressible. 0 on success, -1 on a bad index.
+int  term_profile_set_start_dir(int idx, const char *dir);
+int  term_profile_set_start_cmd(int idx, const char *cmd);
 
 // Startup wiring, called from main() exactly once.
 //   term_profile_startup(): apply the DEFAULT profile to live state and, if it

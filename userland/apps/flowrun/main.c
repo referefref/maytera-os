@@ -100,6 +100,8 @@
 #include "flow.h"
 #include "aiclient.h"
 #include "aicap.h"
+#include "applaunch.h"   // #469: THE shared launch registry
+#include "wfpath.h"      // #flowperm: THE one answer to "where do workflows live"
 #include "contract.h"
 #include "userconf.h"
 
@@ -196,7 +198,7 @@ int flow_plat_llm(const char *system, const char *prompt,
 // input in the last few seconds, and only a real keypress can approve the
 // prompt (a synthetic event is INPUT_SRC_SYNTHETIC and never stamps the input
 // credit, by construction - see kernel/SECURITY_ADVISORIES.md
-// MAYTERA-SEC-2026-0022/0023). So the code below CREATES A WINDOW AND ASKS,
+// MAYTERA-SEC-2026-0037/0038). So the code below CREATES A WINDOW AND ASKS,
 // on the serial console and on screen, and fails with a clear reason if nobody
 // answers. There is no auto-approve path here and there must never be one.
 
@@ -813,6 +815,90 @@ int flow_plat_input_key(const char *target, int keycode,
     return 0;
 }
 
+// ---- #469 launch seam: start an app and WAIT for its window ---------------
+// The registry is the shared one (libc/applaunch.h), which reads the SAME
+// .MENU manifest the Start menu and the AI's app.launch read. There is no
+// second name table here, deliberately: a hardcoded map is the phantom that
+// shipped /APPS/COMPOSITOR while the kernel launched /APPS/COMPOSIT.
+//
+// POLICY. `app.launch` is classified process.launch / AICAP_RISK_LOW in
+// libc/aicap.c: it runs freely and is AUDITED. A flow's launch node is the same
+// act by the same principal under launch-consent (the user ran this named
+// workflow), so it gets the same treatment and the same audit trail, rather than
+// a second, quietly different policy for the same capability.
+//
+// THE WAIT. A bounded poll of wm_get_windows() at the same 100ms cadence, and
+// for the same reason, as flow_wait_for_bmp() above: the thing being waited for
+// is produced by ANOTHER process (the compositor mapping a window), there is no
+// wake source we could arm from here, and the correct semantics really is "give
+// it this long and then say so". It is bounded, it reports the timeout as itself,
+// and it never reports success for a window that is not there.
+int flow_plat_launch(const char *app, const char *rom, const char *arg,
+                     const char *wait_target, int timeout_ms,
+                     char *out_title, int tcap, int *out_already,
+                     char *err, int errcap) {
+    if (tcap > 0) out_title[0] = 0;
+    if (out_already) *out_already = 0;
+
+    // ALREADY OPEN is success, and launching a second copy would be the bug.
+    flow_target_t t;
+    char ignored[FLOW_ERR_MAX];
+    if (flow_resolve_target(wait_target, &t, ignored, (int)sizeof(ignored)) == 0) {
+        if (out_already) *out_already = 1;
+        snprintf(out_title, tcap, "%s", t.title);
+        aicap_audit("flow.launch", "process.launch", app, "ok", "already-running");
+        return 0;
+    }
+
+    aicap_init();
+    applaunch_result_t r;
+    int rc = applaunch_run(app, rom, arg, &r);
+    if (rc == APPLAUNCH_ERR_UNKNOWN) {
+        // Name what it COULD have been asked for: an unknown id is almost always
+        // a typo or a drifted name, and the manifest knows the real list.
+        char have[512]; int o = 0; have[0] = 0;
+        int n = applaunch_count();
+        for (int i = 0; i < n && o < (int)sizeof(have) - 24; i++) {
+            const applaunch_ent_t *e = applaunch_at(i);
+            o += snprintf(have + o, sizeof(have) - (unsigned)o, "%s%s",
+                          i ? ", " : "", e->alt[0] ? e->alt : e->id);
+        }
+        aicap_audit("flow.launch", "process.launch", app, "error", "unknown-app");
+        snprintf(err, errcap,
+                 "launch: no app '%s' in the launch manifest "
+                 "(/CONFIG/STARTMENU/SYSTEM.D). %d known: %s",
+                 app, n, have);
+        return -1;
+    }
+    if (rc != 0) {
+        aicap_audit("flow.launch", "process.launch", app, "error", "spawn-failed");
+        snprintf(err, errcap, "launch: starting %s (%s) failed (rc=%d)",
+                 r.id, r.path, r.rc);
+        return -1;
+    }
+    // A requested ROM that matched nothing is NOT a failure and must not be
+    // silent either: the app is up with its own picker and the log says why.
+    if (r.rom_requested && !r.rom_matched)
+        fprintf(stderr, "flowrun: launch %s: no /ROMS entry matches \"%s\"; "
+                        "started bare so the app shows its own picker\n", r.id, rom);
+
+    int tenths = timeout_ms / 100;
+    if (tenths < 1) tenths = 1;
+    for (int i = 0; i < tenths; i++) {
+        sys_sleep(100);
+        if (flow_resolve_target(wait_target, &t, ignored, (int)sizeof(ignored)) == 0) {
+            snprintf(out_title, tcap, "%s", t.title);
+            aicap_audit("flow.launch", "process.launch", app, "ok", "launched");
+            return 0;
+        }
+    }
+    aicap_audit("flow.launch", "process.launch", app, "error", "no-window");
+    snprintf(err, errcap,
+             "launch: started %s (%s, rc=%d) but no visible window matched '%s' "
+             "within %dms", r.id, r.path, r.rc, wait_target, timeout_ms);
+    return -1;
+}
+
 // ---- "app" node seam, wired to the real contract API + capability gate -----
 //
 // Read the target action's DECLARED risk from the app's own contract (the
@@ -909,7 +995,12 @@ static int flow_run_one(const char *name, char *reason, int rcap, long *bytes) {
     if (strchr(name, '/')) {
         snprintf(path, sizeof(path), "%s", name);   // an explicit path
     } else {
-        snprintf(path, sizeof(path), "/CONFIG/WORKFLOWS/%s.yml", name);
+        // #flowperm: this was the literal "/CONFIG/WORKFLOWS/<name>.yml", which
+        // a uid-1000 session (the only account a fresh install has) can neither
+        // write nor have anything written into. wf_resolve searches this
+        // session's own directory first and falls back to the legacy system one,
+        // so root is unchanged and the editor's Run button finds what it saved.
+        wf_resolve(name, path, (int)sizeof(path));
     }
 
     static flow_graph_t g;   // large; static, and calls here are sequential
@@ -985,8 +1076,11 @@ static int run_all(void) {
     static char names[FLOWALL_MAX][FLOW_ID_MAX];
     int n = 0;
     dirent_t e;
+    // #flowperm: THIS SESSION's workflow directory, not the root-owned literal.
+    char wfall_dir[192];
+    wf_dir(wfall_dir, (int)sizeof(wfall_dir));
     for (int idx = 0; n < FLOWALL_MAX; idx++) {
-        if (sys_readdir("/CONFIG/WORKFLOWS", idx, &e) != 0) break;  // end/err
+        if (sys_readdir(wfall_dir, idx, &e) != 0) break;  // end/err
         if (e.type == 1) continue;                     // skip subdirs (examples/)
         int L = (int)strlen(e.name);
         if (L < 5 || strcmp(e.name + L - 4, ".yml") != 0) continue;
@@ -1011,7 +1105,7 @@ static int run_all(void) {
 
     // Create/truncate the log up front so a readback reflects exactly THIS run.
     flowall_log("", 0);
-    fprintf(stderr, "flowrun: run-all found %d workflow(s) in /CONFIG/WORKFLOWS\n", n);
+    fprintf(stderr, "flowrun: run-all found %d workflow(s) in %s\n", n, wfall_dir);
 
     int ok = 0, fail = 0;
     for (int i = 0; i < n; i++) {

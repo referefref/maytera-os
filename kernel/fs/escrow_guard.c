@@ -35,7 +35,7 @@
 //   2. it is best-effort and NEVER changes the verdict. gfs_journal_append can
 //      refuse (single-writer re-entrancy) or fail (I/O); either way the DENY
 //      still denies and the ALLOW still allows, and the plaintext
-//      /CONFIG/AIAUDIT.LOG remains the belt-and-braces record.
+//      the per-user AIAUDIT.LOG (#aiaudit) remains the belt-and-braces record.
 //   3. the append is called with NO lock held (gfs_grant_check already released
 //      the fold spinlock) from the FS-mutation syscall path, which is inherently
 //      a may-block context (it already does fat/ext2 I/O), so it is the same
@@ -50,6 +50,7 @@
 #include "../security/escrow_core.h"  // Stage 5A: immutable security core (principal source + tamper check)
 #include "graphfs/fold.h"
 #include "graphfs/journal.h"      // Stage 3: gfs_journal_append + GFSJ_OP_ESCROW_DECISION
+#include "recycle_fs.h"        // the Recycle Bin: an AI delete is a REDIRECT, not a refusal
 #include "../proc/process.h"
 #include "../proc/syscall_path.h"   // sc_path_from_user, SC_PATH_MAX
 #include "../proc/elevate.h"        // elev_path_covered_rs (reused primitive)
@@ -60,6 +61,25 @@
 
 extern process_t *proc_current(void);
 extern int elf_validate(const void *data, uint32_t size);   // Stage 2 spawner
+extern uint32_t escmark_delete_disposition_rs(uint8_t active, uint32_t is_dir,
+                                              uint32_t recoverable);
+extern uint32_t escmark_may_self_exit_rs(uint8_t active);
+extern uint32_t escmark_write_scoped_rs(uint8_t active);
+// #246 pkgwrite: the FULL-FILE REPLACEMENT disposition (SYS_PKG_WRITE). New
+// policy, so Rust per the 2026-07-16 rule; see rustkern/escrowmark.rs for the
+// rule and escmark_policy_selftest_rs for the 15 assertions that cover it.
+extern uint32_t escmark_replace_disposition_rs(uint8_t active, uint32_t exists,
+                                               uint32_t is_dir, uint32_t cur_len,
+                                               uint32_t recoverable);
+// #246 partialwrite: the PARTIAL-OVERWRITE disposition (a plain write() that
+// lands on bytes that already exist). New policy, so Rust per the 2026-07-16
+// rule; see rustkern/escrowmark.rs for the rule and escmark_policy_selftest_rs
+// for the 19 assertions that cover it.
+extern uint32_t escmark_overwrite_disposition_rs(uint8_t active, uint64_t orig_len,
+                                                 uint64_t pos, uint64_t count,
+                                                 uint32_t already_kept,
+                                                 uint32_t recoverable);
+extern uint32_t escmark_is_ai_program_rs(const unsigned char *path);
 extern fat_fs_t g_fat_fs;                                     // Stage 2 spawner
 
 // A kernel-only monotonic counter for the per-contract GraphFS node locals.
@@ -125,6 +145,7 @@ static uint32_t g_deny_logged = 0;
 // Verdicts and reasons carried in the record payload.
 #define ESCROW_DEC_ALLOW        0
 #define ESCROW_DEC_DENY         1
+#define ESCROW_DEC_RECYCLED     2   // a delete was REDIRECTED into the Recycle Bin
 #define ESCROW_DEC_R_ALLOWED    0   // an in-scope mutation was permitted
 #define ESCROW_DEC_R_NO_DELETE  1   // delete refused: no-delete invariant
 #define ESCROW_DEC_R_NO_GRANT   2   // write refused: no live grant (revoked/expired/degraded)
@@ -137,9 +158,16 @@ static uint32_t g_deny_logged = 0;
                                     // device this grant is scoped to, or that
                                     // device's identity changed (BadUSB) -> fail closed
 
+#define ESCROW_DEC_R_RECYCLED   7   // delete REDIRECTED: the file is in the user's
+                                    // Recycle Bin, restorable by the user or by
+                                    // the AI, and the user was notified
+#define ESCROW_DEC_R_NO_BIN     8   // delete REFUSED: no usable Recycle Bin, so
+                                    // the bytes could not be made recoverable
+#define ESCROW_DEC_R_NO_RMDIR   9   // rmdir REFUSED: a directory has no
+                                    // recoverable form in a flat bin
 // How much of each path is carried verbatim in the record. Paths beyond this are
 // truncated in the journal record (a truncation flag is set and the full path
-// stays in /CONFIG/AIAUDIT.LOG); the record's payload_hash binds exactly what is
+// stays in the per-user AIAUDIT.LOG); the record's payload_hash binds exactly what is
 // stored. 256 covers essentially every real path while keeping the (noinline)
 // helper's stack frame small, so the non-actor fast path in escrow_fs_guard()
 // carries none of this buffer.
@@ -297,26 +325,109 @@ int escrow_fs_guard(int op, const char *path, const char *path2) {
     // GraphFS grant, never anything Ring 3 said. gfs_grant_check() fails closed
     // (0 unless a live, unrevoked, unexpired, in-scope grant exists) and denies
     // outright when the fold is degraded.
-    if (op == ESCROW_OP_DELETE) {
-        // No delete-scope grant is ever issued, so this is always 0: the
-        // no-delete invariant, enforced by the substrate rather than a branch.
-        if (gfs_grant_check(p->escrow_task_node, p->escrow_obj_node,
-                            ESCROW_SCOPE_DELETE) != 1) {
-            if (g_deny_logged < ESCROW_DENY_LOG_CAP) {
-                g_deny_logged++;
-                kprintf("[ESCROW] DENY delete pid=%u path=%s "
-                        "(no-delete invariant; kernel-enforced)\n",
-                        (unsigned)p->pid, path ? path : "(null)");
-            }
-            escrow_journal_decision(p, ESCROW_DEC_DENY, ESCROW_OP_DELETE,
-                                    ESCROW_DEC_R_NO_DELETE, path, 0);
-            return -1;
+    // --- REMOVING A DIRECTORY -------------------------------------------
+    // The NAMED EXCEPTION. The Recycle Bin is a flat store of files, one index
+    // row each; it has no representation for a directory tree, so there is no
+    // recoverable form to redirect an rmdir into, and the honest answer is to
+    // refuse. In practice this costs an actor very little: ext2's rmdir already
+    // refuses a non-empty directory, so the only thing refused here is removing
+    // an EMPTY one.
+    if (op == ESCROW_OP_RMDIR) {
+        // RECYCLE mode is permitted to remove an EMPTY directory: ext2's rmdir
+        // refuses a non-empty one, so nothing recoverable is at stake, and
+        // refusing would break ordinary tidying the user asked for. A SCOPED
+        // contract is still refused. The reasoning lives in
+        // rustkern/escrowmark.rs beside the rule.
+        if (escmark_delete_disposition_rs(p->escrow_active, 1 /* is_dir */,
+                                          0 /* recoverable: n/a */) == 2 /* DISP_ALLOW */)
+            return ESCROW_ALLOW;
+        if (g_deny_logged < ESCROW_DENY_LOG_CAP) {
+            g_deny_logged++;
+            kprintf("[ESCROW] DENY rmdir pid=%u path=%s (a directory has no "
+                    "recoverable form in the Recycle Bin; kernel-enforced)\n",
+                    (unsigned)p->pid, path ? path : "(null)");
         }
-        return 0;   // unreachable in Stage 1: a delete grant is never minted
+        escrow_journal_decision(p, ESCROW_DEC_DENY, (uint8_t)ESCROW_OP_RMDIR,
+                                ESCROW_DEC_R_NO_RMDIR, path, 0);
+        return -1;
     }
 
-    // A write / create / mkdir / rename. Require the live WRITE grant AND every
-    // path the operation touches inside the granted scope.
+    // --- DELETING A FILE --------------------------------------------------
+    //
+    // WHAT CHANGED HERE, 2026-10-03, and why it is not a weakening.
+    //
+    // This branch used to REFUSE outright: no DELETE-scope grant is ever
+    // minted, so gfs_grant_check(...DELETE) is always 0 and every delete by a
+    // marked actor failed. That satisfied "the AI cannot destroy your files"
+    // by also making it unable to delete them, which the owner has since
+    // clarified is not what was wanted: "AI can delete files but it must be
+    // announced to the user AND they can be undeleted by AI or the user".
+    //
+    // So the delete now SUCCEEDS from Ring 3's point of view and the bytes are
+    // redirected into the user's Recycle Bin. The binding property is no longer
+    // "an actor cannot delete" but the stronger and more useful "an actor
+    // cannot DESTROY": there is no path from a marked process to an
+    // unrecoverable unlink, because this chokepoint is on every delete syscall
+    // and the capture happens in Ring 0, not in the AI tool layer that a raw
+    // syscall bypasses.
+    //
+    // THE ABSENCE OF A DELETE GRANT IS STILL THE SUBSTRATE-LEVEL INVARIANT. It
+    // is checked first and still never fires. If some future stage DOES mint a
+    // delete-scope grant, that contract gets a real hard delete, deliberately
+    // and visibly, and everything else keeps the redirect.
+    if (op == ESCROW_OP_DELETE) {
+        // A RECYCLE-mode process holds NO grant at all, so asking the graph
+        // whether it has a delete-scope grant is meaningless; the disposition
+        // below is the whole rule for it.
+        if (p->escrow_active != ESCROW_ACTIVE_RECYCLE &&
+            gfs_grant_check(p->escrow_task_node, p->escrow_obj_node,
+                            ESCROW_SCOPE_DELETE) == 1) {
+            return ESCROW_ALLOW;   // never, in any shipping stage
+        }
+
+        uint32_t disp = escmark_delete_disposition_rs(
+                            p->escrow_active, 0 /* a file, not a directory */,
+                            (uint32_t)recycle_available());
+        if (disp == 1 /* DISP_RECYCLE */) {
+            // The DECISION is recorded here, beside every other enforcement
+            // decision, so one file holds what the guard did. The capture
+            // itself happens in escrow_delete_redirect(), called by the
+            // syscall AFTER its own permission checks: a marked actor must not
+            // be able to relocate a file it has no right to remove.
+            escrow_journal_decision(p, ESCROW_DEC_RECYCLED, ESCROW_OP_DELETE,
+                                    ESCROW_DEC_R_RECYCLED, path, 0);
+            return ESCROW_REDIRECT;
+        }
+
+        // No usable bin. FAIL CLOSED: refuse rather than destroy. The user sees
+        // the AI report that it could not delete the file, which is far better
+        // than it reporting success over bytes that are gone.
+        if (g_deny_logged < ESCROW_DENY_LOG_CAP) {
+            g_deny_logged++;
+            kprintf("[ESCROW] DENY delete pid=%u path=%s (no usable Recycle "
+                    "Bin: the bytes could not be made recoverable, so the "
+                    "delete is refused; kernel-enforced, fail closed)\n",
+                    (unsigned)p->pid, path ? path : "(null)");
+        }
+        escrow_journal_decision(p, ESCROW_DEC_DENY, ESCROW_OP_DELETE,
+                                ESCROW_DEC_R_NO_BIN, path, 0);
+        return -1;
+    }
+
+    // A write / create / mkdir / rename.
+    //
+    // RECYCLE mode stops here. It is NOT a scoped contract: it carries no grant
+    // and no path scope, because the general AI assistant is asked to write
+    // wherever the user wants. The ONE thing RECYCLE changes is what a DELETE
+    // becomes, handled above. Its writes are governed by ordinary filesystem
+    // permissions, exactly like any other process, which the syscall checks for
+    // itself further down. The rule has one home
+    // (rustkern/escrowmark.rs escmark_write_scoped_rs) so that a future fifth
+    // mark state cannot be added to one branch and forgotten in the other.
+    if (!escmark_write_scoped_rs(p->escrow_active)) return ESCROW_ALLOW;
+
+    // A SCOPED CONTRACT. Require the live WRITE grant AND every path the
+    // operation touches inside the granted scope.
     if (gfs_grant_check(p->escrow_task_node, p->escrow_obj_node,
                         ESCROW_SCOPE_WRITE) != 1) {
         if (g_deny_logged < ESCROW_DENY_LOG_CAP) {
@@ -387,6 +498,509 @@ int escrow_fs_guard(int op, const char *path, const char *path2) {
     escrow_journal_decision(p, ESCROW_DEC_ALLOW, ESCROW_OP_WRITE,
                             ESCROW_DEC_R_ALLOWED, path, path2);
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// ONE PLACE WHERE A MARKED ACTOR'S PRE-IMAGE IS KEPT.
+//
+// Four routes destroy the bytes at a path without ever looking like a delete:
+// an O_TRUNC open, an ftruncate shrink, a rename over an existing file, and
+// (added 2026-10-03) a full-file replacement via SYS_PKG_WRITE, and a PARTIAL
+// OVERWRITE by a plain write() into existing bytes (#246 partialwrite, the
+// FIFTH route and the reason this helper's `pre` parameter exists). Before this
+// helper existed, three of them each carried their OWN copy of the same five
+// blocks: the no-bin refusal, the lazy AI_TASK identity mint, the capture call,
+// the success journal line and the failure journal line. The fourth route was
+// about to become a fourth copy, which is exactly the hand-rolled-duplicate
+// failure mode CLAUDE.md's reuse rule exists to stop, so the five blocks moved
+// here instead and the routes got SHORTER rather than longer.
+//
+// WHAT STAYS WITH EACH CALLER, deliberately: the decision about whether this
+// path is at risk at all. Those decisions genuinely differ (an already-empty
+// file matters to one route and not another; a directory destination is a
+// refusal for rename and a no-op for the rest), and collapsing them into flags
+// on this function would have turned four readable policies into one function
+// with five booleans. The route's own policy is the route's own business; what
+// is shared is the MECHANISM for keeping the bytes.
+//
+// `move_ok` chooses between a MOVE (recycle_capture: the file is going away
+// anyway, so a move leaves no duplicate) and a COPY (recycle_snapshot: the
+// caller expects the file to still be there afterwards, or the operation can
+// still fail). `route` is a short label that goes on the serial line and makes
+// an audit line say which of the four routes produced it.
+//
+// Returns 0 if the bytes are safely recoverable (the caller proceeds), -1 if
+// they are not (the caller must REFUSE and change nothing).
+//
+// Blocking (filesystem I/O + a journal append). Process context only, which
+// every one of the four callers is: they are all on an FS-mutation syscall
+// path that already does fat/ext2 I/O. No loop, so concurrency-lint is unmoved.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// [usbescrow] #246: THE VICTIM LOOKUP THE FOUR LOOK-FIRST ROUTES SHARE.
+//
+// escrow_shrink_victim, escrow_trunc_victim, escrow_rename_victim and
+// escrow_replace_victim all have to answer "is there a file at this path, how
+// big is it, and is it a directory" before their own rule can say anything.
+// All four asked `fat_exists(&g_fat_fs, path)` and `fat_read_file(&g_fat_fs,
+// path, &sz)` directly, and g_fat_fs does NOT route a hot-plugged removable
+// volume, so on a plugged-in USB stick all four read ABSENT and concluded
+// "nothing to capture". MEASURED on a booted VM: four destructions on a
+// synthetic stick, four files' bytes gone, not one [ESCROW] line printed.
+//
+// This replaces the three hand-rolled questions with the ONE volume-aware
+// lookup (fs/recycle_fs.c recycle_victim_stat, built on the same rcy_victim_fs
+// the Recycle Bin capture itself uses) and the ONE Rust rule for what its
+// result means (rustkern/escrowmark.rs escmark_victim_disposition_rs).
+//
+// Returns ESCROW_VIC_*. On UNREACHABLE it has ALREADY logged and journalled the
+// refusal, so the caller's whole job is `return -1`.
+// ---------------------------------------------------------------------------
+static uint32_t escrow_victim_look(process_t *p, const char *path,
+                                   const char *route, uint32_t *len_out,
+                                   int *isdir_out) {
+    int st = recycle_victim_stat(path, len_out, isdir_out);
+    extern uint32_t escmark_victim_disposition_rs(uint8_t active, int32_t stat_rc);
+    uint32_t disp = escmark_victim_disposition_rs(p->escrow_active, (int32_t)st);
+    if (disp == ESCROW_VIC_UNREACHABLE) {
+        if (g_deny_logged < ESCROW_DENY_LOG_CAP) {
+            g_deny_logged++;
+            kprintf("[ESCROW] DENY %s pid=%u path=%s (this path is on a mounted "
+                    "removable volume the kernel cannot read files from, so the "
+                    "pre-image could not be kept; NOTHING was changed; "
+                    "kernel-enforced, fail closed)\n",
+                    route, (unsigned)p->pid, path);
+        }
+        escrow_journal_decision(p, ESCROW_DEC_DENY, ESCROW_OP_DELETE,
+                                ESCROW_DEC_R_NO_BIN, path, 0);
+    }
+    return disp;
+}
+
+static int escrow_preimage_keep(process_t *p, const char *path, int move_ok,
+                                const char *route, const void *pre,
+                                uint32_t prelen) {
+    if (!recycle_available()) {
+        if (g_deny_logged < ESCROW_DENY_LOG_CAP) {
+            g_deny_logged++;
+            kprintf("[ESCROW] DENY %s pid=%u path=%s (no usable Recycle Bin, so "
+                    "the pre-image could not be kept; kernel-enforced, fail "
+                    "closed)\n", route, (unsigned)p->pid, path);
+        }
+        escrow_journal_decision(p, ESCROW_DEC_DENY, ESCROW_OP_DELETE,
+                                ESCROW_DEC_R_NO_BIN, path, 0);
+        return -1;
+    }
+
+    // Mint the AI_TASK IDENTITY on first use, exactly as escrow_delete_redirect
+    // does, and for the same reason: escrow_recycle_bind() runs under
+    // preemption-disable and could not do journal I/O there.
+    if (p->escrow_task_node == 0 && p->escrow_active == ESCROW_ACTIVE_RECYCLE &&
+        gfs_fold_ready()) {
+        uint32_t cand = GFS_NODE_ID(GFS_KIND_AI_TASK, escrow_next_local());
+        if (gfs_node_create(cand, GFS_KIND_AI_TASK, GFS_NODE_ESCROW) == 0)
+            p->escrow_task_node = cand;
+    }
+
+    // #246 partialwrite: a caller that ALREADY HOLDS the pristine bytes hands
+    // them over instead of making this read them back. The ext2 preserving
+    // descriptor is that caller: its open filled a whole-file buffer from the
+    // file, so the pre-image is already in kernel memory and a re-read would
+    // be a second read of the same bytes. `pre` NULL keeps the original
+    // behaviour for the four routes that do not have them.
+    int rc = pre ? recycle_snapshot_bytes(path, pre, prelen, RCY_ACTOR_AI,
+                                          p->escrow_task_node)
+                 : (move_ok ? recycle_capture(path, RCY_ACTOR_AI, p->escrow_task_node)
+                            : recycle_snapshot(path, RCY_ACTOR_AI, p->escrow_task_node));
+    if (rc == RCY_OK) {
+        escrow_journal_decision(p, ESCROW_DEC_RECYCLED, ESCROW_OP_DELETE,
+                                ESCROW_DEC_R_RECYCLED, path, 0);
+        kprintf("[ESCROW] PRE-IMAGE kept pid=%u route=%s path=%s (%s into the "
+                "Recycle Bin; the bytes survive and can be restored)\n",
+                (unsigned)p->pid, route, path, move_ok ? "MOVED" : "COPIED");
+        return 0;
+    }
+
+    if (g_deny_logged < ESCROW_DENY_LOG_CAP) {
+        g_deny_logged++;
+        kprintf("[ESCROW] DENY %s pid=%u path=%s (could not keep the pre-image: "
+                "%s [rc=%d]; NOTHING was changed; kernel-enforced, fail "
+                "closed)\n", route, (unsigned)p->pid, path,
+                recycle_strresult(rc), rc);
+    }
+    escrow_journal_decision(p, ESCROW_DEC_DENY, ESCROW_OP_DELETE,
+                            ESCROW_DEC_R_NO_BIN, path, 0);
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// An ftruncate() that shrinks a file destroys the bytes past the new length.
+// The LAST deterministic destruction path that is not a delete: it arrives on
+// an already-open fd, so the open-time check could not have seen it coming.
+// ---------------------------------------------------------------------------
+int escrow_shrink_victim(const char *path, uint64_t newlen) {
+    process_t *p = proc_current();
+    if (!p || !p->escrow_active) return 0;
+    if (!path || !path[0]) return 0;
+
+    // A NETWORK path has no local recoverable form (the bin is local), and the
+    // one thing that must not happen is a destructive path staying destructive
+    // because it was out of reach. Refuse, as sys_unlink and sys_rename do.
+    if (path[0] == '/' && (path[1] == 'S' || path[1] == 'N' || path[1] == 'M')) {
+        if (!strncmp(path, "/SMB/", 5) || !strncmp(path, "/NFS/", 5) ||
+            !strncmp(path, "/MNT/", 5)) {
+            kprintf("[ESCROW] DENY ftruncate pid=%u path=%s (not a local path, "
+                    "so the pre-image could not be kept; kernel-enforced)\n",
+                    (unsigned)p->pid, path);
+            return -1;
+        }
+    }
+
+    uint32_t sz = 0; int isdir = 0;
+    uint32_t vd = escrow_victim_look(p, path, "ftruncate", &sz, &isdir);
+    if (vd == ESCROW_VIC_UNREACHABLE) return -1;   // already logged + journalled
+    if (vd != ESCROW_VIC_PRESENT) return 0;
+    if (isdir) return 0;                   // ftruncate of a directory is not a thing
+    if (sz == 0) return 0;                 // nothing to lose
+    if (newlen >= (uint64_t)sz) return 0;  // not a shrink: no bytes are dropped
+
+    // A SNAPSHOT, never a MOVE: the caller holds the fd open and the file must
+    // stay exactly where it is. The old/new lengths ride along in the route
+    // label so the one serial line still says what was about to be dropped;
+    // newlen < sz here, and sz is a uint32, so the narrowing cannot lose a bit.
+    char rt[56];
+    snprintf(rt, sizeof(rt), "ftruncate shrink %u -> %u",
+             (unsigned)sz, (unsigned)newlen);
+    return escrow_preimage_keep(p, path, 0, rt, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// An O_TRUNC open of an existing file destroys every byte in it. See the
+// contract on the declaration in escrow_guard.h, including the precise
+// statement of what this does NOT cover.
+// ---------------------------------------------------------------------------
+int escrow_trunc_victim(const char *path, int flags) {
+    // O_TRUNC is 0x200 and O_CREAT is 0x40 in BOTH fs/vfs.h and
+    // userland/libc/fcntl.h (checked, not assumed). Compared numerically rather
+    // than by pulling a flags header into this file.
+    if (!(flags & 0x200)) return 0;
+    process_t *p = proc_current();
+    if (!p || !p->escrow_active) return 0;
+    if (!path || !path[0]) return 0;
+    uint32_t sz = 0; int isdir = 0;
+    uint32_t vd = escrow_victim_look(p, path, "truncating open", &sz, &isdir);
+    if (vd == ESCROW_VIC_UNREACHABLE) return -1;   // already logged + journalled
+    if (vd != ESCROW_VIC_PRESENT) return 0;        // nothing to lose
+    // Truncating a directory is not a thing. Let the FS refuse it as it
+    // already would, and do not manufacture a bin entry for it.
+    if (isdir) return 0;
+    // An ALREADY-EMPTY file has no pre-image worth keeping, and capturing one
+    // would drop a zero-byte entry into the user's bin every time an app
+    // reopened a fresh file with O_TRUNC, which is most of them.
+    if (sz == 0) return 0;
+
+    // WITH O_CREAT the file is about to be recreated, so a MOVE is correct and
+    // leaves no duplicate. WITHOUT it the caller expects the file to still be
+    // there, so the pre-image has to be a COPY: moving it would make the open
+    // fail with ENOENT and turn a destructive operation into a confusing one.
+    return escrow_preimage_keep(p, path, (flags & 0x40) != 0, "truncating open",
+                                0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// A rename over an existing file is a delete of that file. See the contract on
+// the declaration in escrow_guard.h for why this is separate from the DELETE
+// branch of the guard: by the time a rename reaches the filesystem, nothing in
+// the call looks like a deletion, so the delete chokepoint never sees it.
+// ---------------------------------------------------------------------------
+int escrow_rename_victim(const char *newpath) {
+    process_t *p = proc_current();
+    if (!p || !p->escrow_active) return 0;        // not our business
+    if (!newpath || !newpath[0]) return 0;
+    int isdir = 0;
+    uint32_t vd = escrow_victim_look(p, newpath, "rename", 0, &isdir);
+    if (vd == ESCROW_VIC_UNREACHABLE) return -1;   // already logged + journalled
+    if (vd != ESCROW_VIC_PRESENT) return 0;        // nothing to displace
+
+    // A DIRECTORY at the destination is not recyclable (the flat-bin
+    // exception), and a rename over a directory is not something any contract
+    // issued today needs. Refuse rather than destroy.
+    { if (isdir) {
+          if (g_deny_logged < ESCROW_DENY_LOG_CAP) {
+              g_deny_logged++;
+              kprintf("[ESCROW] DENY rename pid=%u over DIRECTORY %s (a "
+                      "directory has no recoverable form in the Recycle Bin; "
+                      "kernel-enforced)\n", (unsigned)p->pid, newpath);
+          }
+          escrow_journal_decision(p, ESCROW_DEC_DENY, (uint8_t)ESCROW_OP_RMDIR,
+                                  ESCROW_DEC_R_NO_RMDIR, newpath, 0);
+          return -1;
+      } }
+
+    // [renamevol] 2026-10-04: THE REMOVABLE-DESTINATION REFUSAL THAT USED TO
+    // BE HERE IS GONE, AND THE PRECONDITION IT WAS WAITING FOR IS NOW MET.
+    //
+    // WHAT IT SAID AND WHY. A MOVE capture is only safe where the rename is
+    // CERTAIN to replace the destination. On 2026-10-03 sys_rename performed
+    // every rename with fat_rename(&g_fat_fs, ...), which cannot reach a
+    // hot-plugged volume, so a rename on a stick ALWAYS failed. Once the
+    // victim lookup below could SEE a destination on a stick, this route
+    // captured it as a MOVE and the rename then failed: the file left the
+    // stick and was not replaced. MEASURED at the time: "rename over a file on
+    // the bound device rc=-1 victim-intact=no". The bytes were recoverable
+    // from the bin, so it was not data loss, but a file vanished for an
+    // operation that did not happen. The answer then was a REFUSAL, and the
+    // comment named the condition for removing it: "WHEN sys_rename IS MADE TO
+    // REACH REMOVABLE VOLUMES ... the question to ask then is whether the
+    // rename is certain to replace the destination on that volume. If it is,
+    // delete this branch and the MOVE below is correct again."
+    //
+    // IT IS, AND THERE ARE NOW TWO INDEPENDENT REASONS, not one:
+    //   1. sys_rename routes BOTH ends through hotplug_volume_for_path() and
+    //      performs the rename on the volume that serves them, so a
+    //      same-volume rename reaches the medium and replaces the destination
+    //      exactly as it does on the root filesystem. Proven end to end by
+    //      /APPS/USBRNT and by ESCROW4T's rename arm, which now asserts a
+    //      CAPTURE rather than a non-destruction.
+    //   2. sys_rename refuses a cross-volume or unreachable pair BEFORE it
+    //      calls this function, and requires the SOURCE to exist before
+    //      calling it. So by the time this runs, the rename's preconditions
+    //      have been checked and the only remaining failure is the filesystem
+    //      operation itself - the same residual risk the root path has always
+    //      carried and has been proven on.
+    //
+    // Both conditions live in sys_rename, not here, and that is the ordering
+    // this function depends on. If a future caller reaches this without them,
+    // the vanish is back.
+
+    // A MOVE: the destination is about to be overwritten by the rename, so the
+    // displaced file is going away whatever happens and a copy would leave a
+    // duplicate behind.
+    return escrow_preimage_keep(p, newpath, 1, "rename over", 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// A FULL-FILE REPLACEMENT IS A DELETE OF EVERY BYTE THAT WAS THERE. See the
+// contract on the declaration in escrow_guard.h, including why a COPY and not
+// a MOVE.
+// ---------------------------------------------------------------------------
+int escrow_replace_victim(const char *path) {
+    process_t *p = proc_current();
+    if (!p || !p->escrow_active) return 0;     // not our business: one PCB byte
+    if (!path || !path[0]) return 0;
+
+    // A NETWORK path has no local recoverable form (the bin is local), refused
+    // exactly as escrow_shrink_victim refuses one. SYS_PKG_WRITE's own writers
+    // do not reach these mounts today, so this is a guard against a future
+    // widening rather than a live route: the one thing that must not happen is
+    // a destructive path staying destructive because it was out of reach.
+    if (path[0] == '/' && (path[1] == 'S' || path[1] == 'N' || path[1] == 'M')) {
+        if (!strncmp(path, "/SMB/", 5) || !strncmp(path, "/NFS/", 5) ||
+            !strncmp(path, "/MNT/", 5)) {
+            kprintf("[ESCROW] DENY package write pid=%u path=%s (not a local "
+                    "path, so the pre-image could not be kept; kernel-enforced)\n",
+                    (unsigned)p->pid, path);
+            return -1;
+        }
+    }
+
+    // Gather the three facts the policy needs, through the ONE volume-aware
+    // lookup so this sees the real target of the write on the ext2 root, the
+    // FAT ESP, a mounted disk image OR a removable volume. It used to ask
+    // g_fat_fs directly, which is blind to a removable volume and therefore
+    // reported every file on a plugged-in stick as absent.
+    uint32_t cur_len = 0; int isdir_i = 0;
+    uint32_t vd = escrow_victim_look(p, path, "package write", &cur_len, &isdir_i);
+    if (vd == ESCROW_VIC_UNREACHABLE) return -1;   // already logged + journalled
+    uint32_t exists = (vd == ESCROW_VIC_PRESENT) ? 1u : 0u;
+    uint32_t isdir = isdir_i ? 1u : 0u;
+
+    // THE DECISION IS RUST (rustkern/escrowmark.rs). This function gathers
+    // facts and performs I/O; it does not decide.
+    uint32_t disp = escmark_replace_disposition_rs(p->escrow_active, exists,
+                                                   isdir, cur_len,
+                                                   recycle_available() ? 1u : 0u);
+    if (disp == ESCROW_REPL_SKIP) return 0;
+    if (disp == ESCROW_REPL_DENY) {
+        if (g_deny_logged < ESCROW_DENY_LOG_CAP) {
+            g_deny_logged++;
+            kprintf("[ESCROW] DENY package write pid=%u path=%s (no usable "
+                    "Recycle Bin, so the %u bytes about to be replaced could "
+                    "not be kept; kernel-enforced, fail closed)\n",
+                    (unsigned)p->pid, path, (unsigned)cur_len);
+        }
+        escrow_journal_decision(p, ESCROW_DEC_DENY, ESCROW_OP_DELETE,
+                                ESCROW_DEC_R_NO_BIN, path, 0);
+        return -1;
+    }
+
+    // A COPY, never a MOVE, and this is the ONE place this route differs from
+    // the O_TRUNC|O_CREAT one it otherwise matches exactly. An O_TRUNC|O_CREAT
+    // open has already committed to recreating the file by the time the check
+    // runs, so a move leaves no duplicate and loses nothing. A package write
+    // can still fail AFTER this point (a kmalloc for the payload, a
+    // copy_from_user of the caller's buffer, an ext2 or FAT write error), and
+    // today a failed SYS_PKG_WRITE leaves the target file untouched. Moving
+    // the pre-image out would turn a failed install into a destroyed file:
+    // that would be a NEW destruction route introduced by the protection
+    // against destruction. A duplicate in the bin is the cheaper mistake, and
+    // it is the behaviour the bin already has (no de-duplication: see the note
+    // on escrow_trunc_victim in the header).
+    return escrow_preimage_keep(p, path, 0, "package write", 0, 0);
+}
+
+// ---------------------------------------------------------------------------
+// A PLAIN write() INTO BYTES THAT ALREADY EXIST. See the contract on the
+// declaration in escrow_guard.h for the route, who calls it and why the
+// decision is possible at write time when it was not possible at open time.
+// ---------------------------------------------------------------------------
+int escrow_overwrite_victim(const char *path, uint64_t pos, uint64_t count,
+                            uint64_t orig_len, const void *pre,
+                            uint32_t prelen) {
+    process_t *p = proc_current();
+    if (!p || !p->escrow_active) return 0;   // not our business: one PCB byte
+    if (!path || !path[0]) return 0;
+
+    // THE DECISION IS RUST (rustkern/escrowmark.rs). Asked BEFORE any I/O, so
+    // an append, a create, an empty original or an already-captured descriptor
+    // costs exactly this call and nothing else.
+    uint32_t disp = escmark_overwrite_disposition_rs(
+        p->escrow_active, orig_len, pos, count,
+        0u /* the caller tracks per-descriptor state and does not ask twice */,
+        recycle_available() ? 1u : 0u);
+    if (disp == ESCROW_OVW_SKIP) return 0;
+    if (disp == ESCROW_OVW_DENY) {
+        if (g_deny_logged < ESCROW_DENY_LOG_CAP) {
+            g_deny_logged++;
+            kprintf("[ESCROW] DENY partial write pid=%u path=%s (%llu bytes at "
+                    "offset %llu would overwrite part of a %llu-byte file and "
+                    "there is no usable Recycle Bin to keep the pre-image in; "
+                    "kernel-enforced, fail closed)\n",
+                    (unsigned)p->pid, path, (unsigned long long)count,
+                    (unsigned long long)pos, (unsigned long long)orig_len);
+        }
+        escrow_journal_decision(p, ESCROW_DEC_DENY, ESCROW_OP_WRITE,
+                                ESCROW_DEC_R_NO_BIN, path, 0);
+        return -1;
+    }
+
+    // A NETWORK OR AUX-MOUNT path has no local recoverable form (the bin is
+    // local and /MNT has no fat_fs_t handle to read through), refused exactly
+    // as escrow_shrink_victim and escrow_replace_victim refuse one. Checked
+    // AFTER the policy so an append to a file on such a mount is still allowed:
+    // the refusal is for DESTRUCTION, not for the mount.
+    if (path[0] == '/' && (path[1] == 'S' || path[1] == 'N' || path[1] == 'M')) {
+        if (!strncmp(path, "/SMB/", 5) || !strncmp(path, "/NFS/", 5) ||
+            !strncmp(path, "/MNT/", 5)) {
+            if (g_deny_logged < ESCROW_DENY_LOG_CAP) {
+                g_deny_logged++;
+                kprintf("[ESCROW] DENY partial write pid=%u path=%s (not a "
+                        "local path, so the pre-image could not be kept; "
+                        "kernel-enforced, fail closed)\n",
+                        (unsigned)p->pid, path);
+            }
+            escrow_journal_decision(p, ESCROW_DEC_DENY, ESCROW_OP_WRITE,
+                                    ESCROW_DEC_R_NO_BIN, path, 0);
+            return -1;
+        }
+    }
+
+    // A COPY, never a MOVE: the caller holds the descriptor open and the file
+    // must stay exactly where it is. `pre`, when the caller has it, is the
+    // pristine original still sitting in the descriptor's own whole-file
+    // buffer, so this costs NO read; without it the bytes are read back from
+    // the filesystem.
+    char rt[72];
+    snprintf(rt, sizeof(rt), "partial write %llu bytes at %llu of %llu",
+             (unsigned long long)count, (unsigned long long)pos,
+             (unsigned long long)orig_len);
+    if (escrow_preimage_keep(p, path, 0, rt, pre, prelen) != 0) return -1;
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// RECYCLE-ONLY binding. See the contract on the declaration in escrow_guard.h.
+//
+// Called from proc_create_user_as() BEFORE the new process is enqueued, so the
+// restriction is in place from its first instruction and the program has no
+// opportunity to decline it.
+// ---------------------------------------------------------------------------
+void escrow_recycle_bind(void *pv, const char *program_path) {
+    process_t *p = (process_t *)pv;
+    if (!p || !program_path) return;
+    // Never downgrade an existing mark. A process the trusted spawner already
+    // marked with a scoped contract must keep it.
+    if (p->escrow_active != ESCROW_ACTIVE_NONE) return;
+    if (!escmark_is_ai_program_rs((const unsigned char *)program_path)) return;
+
+    // NO I/O HERE, DELIBERATELY, and this is not a style preference.
+    // proc_create_user_as() is called by spawn_impl() with PREEMPTION DISABLED
+    // across the whole call. gfs_node_create() appends a journal record, which
+    // is blocking filesystem I/O, so minting the graph identity here would be
+    // a may-block operation in a no-block window. It would NOT be caught by
+    // wq_assert_may_block() either, because preemption-disable leaves RFLAGS.IF
+    // set, which is precisely what makes this class of mistake ship. So the
+    // mark, which is three stores and a byte, happens here; the IDENTITY is
+    // minted lazily on the first capture, in escrow_delete_redirect(), which
+    // runs in ordinary syscall context.
+    p->escrow_task_node  = 0;    // minted on first use (see below)
+    p->escrow_obj_node   = 0;    // no contract object: nothing is scoped
+    p->escrow_grant_edge = 0;    // no grant: no authority is conferred
+    p->escrow_scope_prefix[0] = '\0';
+    p->escrow_active = ESCROW_ACTIVE_RECYCLE;
+
+    kprintf("[ESCROW] RECYCLE-BIND pid=%u program=%s "
+            "(kernel-applied at launch, irrevocable, inherited: this process "
+            "can delete but cannot destroy)\n",
+            (unsigned)p->pid, program_path);
+}
+
+// ---------------------------------------------------------------------------
+// The redirect itself. See the contract on the declaration in escrow_guard.h:
+// guard FIRST, the syscall's own permission checks SECOND, this THIRD.
+// ---------------------------------------------------------------------------
+int escrow_delete_redirect(const char *path) {
+    process_t *p = proc_current();
+    if (!p || !p->escrow_active) return -1;   // only ever for a marked actor
+
+    // Mint the AI_TASK IDENTITY on first use, for a RECYCLE-mode process that
+    // was bound at launch (see escrow_recycle_bind: it could not do this
+    // itself, under preemption-disable). An IDENTITY, with NO grant edge: an
+    // identity says who did something and is what the journal records and the
+    // object edges are keyed on; a grant says what they may do, and RECYCLE
+    // mode confers nothing.
+    //
+    // If the graph is not up, or the mint fails, the task node stays 0 and the
+    // capture proceeds anyway with an unattributed "ai" actor token. The
+    // ENFORCEMENT must never depend on the audit layer being available: a
+    // degraded graph turning a recoverable delete into a destructive one would
+    // be the worst possible failure mode for this feature.
+    if (p->escrow_task_node == 0 && p->escrow_active == ESCROW_ACTIVE_RECYCLE &&
+        gfs_fold_ready()) {
+        uint32_t cand = GFS_NODE_ID(GFS_KIND_AI_TASK, escrow_next_local());
+        if (gfs_node_create(cand, GFS_KIND_AI_TASK, GFS_NODE_ESCROW) == 0)
+            p->escrow_task_node = cand;
+    }
+
+    int rc = recycle_capture(path, RCY_ACTOR_AI, p->escrow_task_node);
+    if (rc == RCY_OK) return 0;
+
+    // The capture failed AFTER the guard said it could proceed, which means
+    // something changed underneath (the bin went away, the volume filled, the
+    // index would not take another row). Nothing has been removed. Record the
+    // real outcome rather than leaving the earlier RECYCLED record as the last
+    // word, because an audit trail that says a file was recycled when it was
+    // not is worse than one that says nothing.
+    if (g_deny_logged < ESCROW_DENY_LOG_CAP) {
+        g_deny_logged++;
+        kprintf("[ESCROW] DENY delete pid=%u path=%s (Recycle Bin capture "
+                "failed: %s [rc=%d]; NOTHING was removed; kernel-enforced, "
+                "fail closed)\n", (unsigned)p->pid, path ? path : "(null)",
+                recycle_strresult(rc), rc);
+    }
+    escrow_journal_decision(p, ESCROW_DEC_DENY, ESCROW_OP_DELETE,
+                            ESCROW_DEC_R_NO_BIN, path, 0);
+    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -542,7 +1156,12 @@ int64_t sys_escrow_exit(void) {
     // boundary that turns "enforced WHILE marked" into "enforced for the whole
     // life of the AI task": a Ring-3 uid-0 actor issuing SYS_ESCROW_EXIT to
     // unshackle itself is refused BY THE KERNEL and stays enforced.
-    if (p->escrow_active == ESCROW_ACTIVE_LOCKED) {
+    // ONE DEFINITION OF THE RULE. This used to test ESCROW_ACTIVE_LOCKED
+    // directly; it now asks rustkern/escrowmark.rs, which is the same function
+    // the SPAWN inheritance rule consults. Two copies of "who may leave a
+    // contract" in two files is exactly how an escape gets reintroduced by
+    // someone fixing one of them.
+    if (!escmark_may_self_exit_rs(p->escrow_active)) {
         kprintf("[ESCROW] REFUSED self-exit pid=%u task=%08x (mandatory actor: "
                 "only the trusted owner may close this contract)\n",
                 (unsigned)p->pid, (unsigned)p->escrow_task_node);

@@ -9,7 +9,7 @@
 #include "../../libc/fcntl.h"
 #include "../../libc/string.h"
 #include "../../libc/stdio.h"
-#include "../../libc/pwd.h"
+#include "../../libc/userconf.h"   // #peruserrows: userscratch_path() - THE session-writable join
 #include "../../libc/unistd.h"
 
 // ---------------------------------------------------------------------------
@@ -200,20 +200,20 @@ static void ip_write_all(int fd, const char *s) {
     if (n) sys_write(fd, s, n);
 }
 
-// Per-user path first, root as a fallback: the same order profile.c and
-// stickies.c use, and for the same reason (the compositor is uid 1000 and the
-// ext2 root is not writable by it).
+// #peruserrows: ONE implementation of "where can this session write". This
+// hand-rolled the getpwuid()/home join that libc/userconf.c already owns, and
+// then fell back to the /COMPIDLE.TXT literal at the root-owned ext2 root, which
+// the compositor (uid 1000) cannot write - so on a stock golden this profile
+// could not be produced at all, which is exactly when it is wanted.
+//
+// userscratch_path() answers the same question for all three session shapes:
+// <home>/COMPIDLE.TXT when there is an account, and /TMP/COMPIDLE.TXT (01777)
+// when there is not, which includes a root session because root's home is "/".
+// THE ROOT PATH THEREFORE MOVES, from /COMPIDLE.TXT to /TMP/COMPIDLE.TXT; that
+// is deliberate, and the [COMPIDLE] bootlog mirror is unaffected.
 static void ip_path(char *out, int cap) {
-    struct passwd *pw = getpwuid(getuid());
-    const char *d = (pw && pw->pw_dir && pw->pw_dir[0]) ? pw->pw_dir : "/";
-    int i = 0;
-    if (!(d[0] == '/' && d[1] == '\0')) {
-        while (d[i] && i < cap - 20) { out[i] = d[i]; i++; }
-        if (i > 0 && out[i-1] == '/') i--;
-    }
-    const char *f = "/COMPIDLE.TXT"; int j = 0;
-    while (f[j] && i < cap - 1) out[i++] = f[j++];
-    out[i] = '\0';
+    if (cap < 2) return;
+    if (userscratch_path("COMPIDLE.TXT", out, (unsigned long)cap) != 0) out[0] = '\0';
 }
 
 static void ip_dump(void) {
@@ -324,13 +324,14 @@ static void ip_dump(void) {
 
     // The file is a convenience on top of that: the whole bounded ring,
     // rewritten in place, so it can never grow without bound on a machine left
-    // running for days. Per-user path first (see ip_path); the ext2 root is
-    // tried second and BOTH failing is survivable, because the bootlog above
-    // already carries the record.
+    // running for days. ONE destination now (see ip_path): the second open of the
+    // root-owned literal is gone, because it could only ever succeed for the one
+    // uid for which the first open already succeeded. Failing is survivable: the
+    // bootlog above already carries the record.
     char path[128];
     ip_path(path, sizeof(path));
-    int fd = sys_open(path, O_WRONLY | O_CREAT | O_TRUNC);
-    if (fd < 0) fd = sys_open("/COMPIDLE.TXT", O_WRONLY | O_CREAT | O_TRUNC);
+    if (!path[0]) return;
+    int fd = userconf_open_write_path(path);
     if (fd < 0) return;
     ip_write_all(fd,
         "MayteraOS compositor idle profile (#COMPIDLE). Newest record last.\n"
@@ -359,10 +360,16 @@ void idleprof_dirty_pin_report(int n, const wm_window_info_t *wins) {
     snprintf(line, sizeof(line), "[COMPIDLE] dirty-pin: %d window(s) open", n);
     sys_bootlog(line);
     for (int i = 0; i < n; i++) {
+        // #idleclock: BOUNDS, not just the flags. "visible=1" alone cannot
+        // tell a window you are looking at from one parked off-screen or
+        // collapsed to nothing, and that distinction was the whole question
+        // when an apparently empty desktop reported a window open.
         snprintf(line, sizeof(line),
-                 "[COMPIDLE] dirty-pin win#%d id=%d vis=%d min=%d app='%s' title='%s'",
+                 "[COMPIDLE] dirty-pin win#%d id=%d vis=%d min=%d at %d,%d %dx%d "
+                 "op=%d app='%s' title='%s'",
                  i, wins[i].id, wins[i].visible, wins[i].minimized,
-                 wins[i].app_id, wins[i].title);
+                 wins[i].x, wins[i].y, wins[i].width, wins[i].height,
+                 wins[i].opacity, wins[i].app_id, wins[i].title);
         sys_bootlog(line);
     }
 }

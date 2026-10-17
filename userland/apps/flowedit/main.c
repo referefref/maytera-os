@@ -46,7 +46,8 @@
 #include "theme.h"
 #include "contract.h"     // CT_SAFE/CT_GUARDED, CT_READ/CT_WRITE vocabulary
 #include "flow.h"         // the runner's node+edge model (reused, not reinvented)
-#include "flowfeed.h"     // #153: flows-feed manifest model (network-independent)
+#include "flowfeed.h"
+#include "wfpath.h"   // #flowperm: THE one answer to "where do workflows live"     // #153: flows-feed manifest model (network-independent)
 #include "pkgsig.h"       // #153: App Store / updater trust anchor (SAME verify)
 
 // ===========================================================================
@@ -96,20 +97,34 @@ typedef struct {
     int         risk;     // CT_SAFE / CT_GUARDED (badge)
 } cat_t;
 
+// THE `runnable` COLUMN IS A CLAIM ABOUT flow.c's g_registry[], AND IT WAS WRONG.
+// It said agent, subloop, foreach, capture, input and app were "editor-only",
+// which the editor renders as a pink EDITOR-ONLY badge on the node. Every one of
+// those has had a handler in the runner since M2/M3. The visible effect was that
+// the Game Boy AI-vision example, opened in Flow, showed five of its seven nodes
+// badged as not executable, which reads as "this cannot run" to anyone looking at
+// it. The honest list of types with NO handler is exactly flow.c's own stated
+// one: device, service, merge, branch, variable. If you add a handler there, flip
+// the flag here; the pairing is the thing to keep true.
 static const cat_t g_cats[] = {
     { "trigger",   "Trigger",        0xF59E0B, 1, CT_SAFE    },
-    { "agent",     "Agent Loop",     0xF43F5E, 0, CT_GUARDED },
-    { "subloop",   "Async Sub-Loop", 0x14B8A6, 0, CT_GUARDED },
-    { "foreach",   "For Each",       0x6366F1, 0, CT_SAFE    },
+    { "agent",     "Agent Loop",     0xF43F5E, 1, CT_GUARDED },
+    { "subloop",   "Async Sub-Loop", 0x14B8A6, 1, CT_GUARDED },
+    { "foreach",   "For Each",       0x6366F1, 1, CT_SAFE    },
     // #469 AI-VISION. capture is GUARDED because photographing the screen needs
     // a consented screen.capture grant; input is GUARDED because driving
     // another app's window needs a consented input.inject grant naming it.
-    { "capture",   "Capture Screen", 0x0EA5E9, 0, CT_GUARDED },
-    { "input",     "Send Keys",      0xEF4444, 0, CT_GUARDED },
+    // launch is SAFE: starting an app is process.launch / low risk in
+    // libc/aicap.c, the same class as the assistant's app.launch, and is audited
+    // rather than gated. It is the step that lets a vision flow start from a
+    // cold desktop instead of requiring a human to open the target first.
+    { "launch",    "Launch App",     0x22D3EE, 1, CT_SAFE    },
+    { "capture",   "Capture Screen", 0x0EA5E9, 1, CT_GUARDED },
+    { "input",     "Send Keys",      0xEF4444, 1, CT_GUARDED },
     { "branch",    "Branch",         0xD946EF, 0, CT_SAFE    },
     { "transform", "Transform",      0xEAB308, 1, CT_SAFE    },
     { "merge",     "Merge",          0x84CC16, 0, CT_SAFE    },
-    { "app",       "App",            0x06B6D4, 0, CT_GUARDED },
+    { "app",       "App",            0x06B6D4, 1, CT_GUARDED },
     { "device",    "Device",         0x8B5CF6, 0, CT_GUARDED },
     { "service",   "Service",        0x3B82F6, 0, CT_GUARDED },
     { "llm",       "LLM Prompt",     0xEC4899, 1, CT_GUARDED },
@@ -121,7 +136,12 @@ static const cat_t g_cats[] = {
 static const cat_t *cat_of(const char *type) {
     for (int i = 0; i < NCATS; i++)
         if (strcmp(g_cats[i].type, type) == 0) return &g_cats[i];
-    return &g_cats[5]; // fall back to Transform styling for an unknown type
+    // Fall back to Transform styling for an unknown type. Looked up BY NAME: this
+    // was a hardcoded g_cats[5] index, which silently became "Capture Screen"
+    // the moment a row was inserted above it.
+    for (int i = 0; i < NCATS; i++)
+        if (strcmp(g_cats[i].type, "transform") == 0) return &g_cats[i];
+    return &g_cats[0];
 }
 
 // ===========================================================================
@@ -169,10 +189,11 @@ static float g_zoom = 1.0f;
 static int   g_pan_x = 0, g_pan_y = 0;
 
 // interaction
-enum { IDLE = 0, DRAG_NODE, PAN, WIRE };
+enum { IDLE = 0, DRAG_NODE, PAN, WIRE, PALETTE_DRAG };
 static int   g_mode = IDLE;
 static int   g_drag_node = -1;
 static int   g_grab_ox = 0, g_grab_oy = 0;       // grab offset (world) for DRAG_NODE
+static int   g_palette_drag_idx = -1;            // which g_pal[] entry is being dragged in
 static int   g_wire_src = -1, g_wire_port = -1;   // WIRE: source node + output-port index
 static int   g_lastmx = 0, g_lastmy = 0;
 static int   g_curmx = 0, g_curmy = 0;
@@ -185,6 +206,7 @@ static pal_row_t g_pal[] = {
     { "CONTROL",    0,          1, 0,0,0,0 },
     { "Branch",     "branch",   0, 0,0,0,0 },
     { "For Each",   "foreach",  0, 0,0,0,0 },
+    { "Launch App", "launch",   0, 0,0,0,0 },
     { "Capture",    "capture",  0, 0,0,0,0 },
     { "Send Keys",  "input",    0, 0,0,0,0 },
     { "Merge",      "merge",    0, 0,0,0,0 },
@@ -401,6 +423,15 @@ static int add_node(const char *type, int wx, int wy) {
     // #469 AI-VISION. Seeded with the params the runner actually reads, and
     // with a path in the session home rather than /HOME (which is root-owned,
     // so a uid-1000 run could capture and silently never write the file).
+    // #469 START. `app` is a launch id from the system app manifest, the same list
+    // the Start menu shows (libc/applaunch.h). wait_for defaults to "app:<app>"
+    // in the runner when left empty, so an unedited node still works.
+    else if (strcmp(type, "launch") == 0) {
+        param_set(n, "app", "");
+        param_set(n, "rom", "");
+        param_set(n, "wait_for", "");
+        param_set(n, "timeout_ms", "20000");
+    }
     else if (strcmp(type, "capture") == 0) {
         param_set(n, "target", "screen");
         param_set(n, "rect", "");
@@ -571,6 +602,14 @@ static void get_ports(const flow_node_t *n, port_t *in, int *nin, port_t *out, i
         // would silently not draw.
         AO("goal_met", PT_BOOL);
         llm_schema_outputs(n, out, nout);
+    }
+    // #469 START. Mirrors h_launch EXACTLY. draw_canvas drops any edge whose port
+    // name get_ports does not list, so an omission here makes a saved workflow's
+    // wires silently vanish from the canvas rather than error.
+    else if (strcmp(t, "launch") == 0)    {
+        AI("in", PT_ACTION); AI("app", PT_STRING); AI("rom", PT_STRING);
+        AO("out", PT_STRING); AO("target", PT_STRING); AO("title", PT_STRING);
+        AO("already_running", PT_BOOL);
     }
     // #469 AI-VISION. These mirror h_capture / h_input in the runner EXACTLY.
     else if (strcmp(t, "capture") == 0)   {
@@ -870,37 +909,65 @@ static int path_exists(const char *p) {
 // additive optional schema READ path: flow.c already skips unknown top-level
 // keys, so this never breaks the runner parse; the editor reads it here for the
 // Library catalog and round-trips it on save. Absent -> out[0] = 0.
+//
+// STREAMED, line by line, to the END of the file. It used to read the first
+// 4096 bytes into a buffer and scan only those, which is fine for a terse
+// workflow and wrong for a documented one: examples/visiongame.yml opens with a
+// ~4.6 KB comment block explaining the consent model and the crop rect, so its
+// `description:` sat past the window and the Library listed the flagship
+// example as "(no description)". A scan with a size limit that nothing checks
+// is a scan that silently stops being true as a file grows.
 static void read_description(const char *path, char *out, int cap) {
     if (cap > 0) out[0] = 0;
     int fd = open(path, O_RDONLY);
     if (fd < 0) return;
-    static char buf[4096];
-    int total = 0, k;
-    while (total < (int)sizeof(buf) - 1 &&
-           (k = (int)read(fd, buf + total, sizeof(buf) - 1 - total)) > 0)
-        total += k;
-    close(fd);
-    buf[total] = 0;
-    int i = 0;
-    while (i < total) {
-        if (strncmp(buf + i, "description:", 12) == 0) {
-            const char *v = buf + i + 12;
+    char chunk[1024], line[512];
+    int lp = 0;
+    long n;
+    int done = 0;
+    while (!done && (n = read(fd, chunk, sizeof(chunk))) > 0) {
+        for (long k = 0; k < n && !done; k++) {
+            char c = chunk[k];
+            if (c != '\n' && c != '\r') {
+                if (lp < (int)sizeof(line) - 1) line[lp++] = c;
+                continue;
+            }
+            line[lp] = 0;
+            lp = 0;
+            if (strncmp(line, "description:", 12) != 0) continue;
+            const char *v = line + 12;
             while (*v == ' ' || *v == '\t') v++;
             char q = 0;
             if (*v == '"' || *v == '\'') { q = *v; v++; }
             int o = 0;
-            while (*v && *v != '\n' && *v != '\r' && o < cap - 1) {
+            while (*v && o < cap - 1) {
                 if (q && *v == q) break;
                 if (!q && *v == '#') break;
                 out[o++] = *v++;
             }
             while (o > 0 && (out[o - 1] == ' ' || out[o - 1] == '\t')) o--;
             out[o] = 0;
-            return;
+            done = 1;
         }
-        while (i < total && buf[i] != '\n') i++;
-        if (i < total) i++;
     }
+    if (!done && lp > 0) {          // a final line with no trailing newline
+        line[lp] = 0;
+        if (strncmp(line, "description:", 12) == 0) {
+            const char *v = line + 12;
+            while (*v == ' ' || *v == '\t') v++;
+            char q = 0;
+            if (*v == '"' || *v == '\'') { q = *v; v++; }
+            int o = 0;
+            while (*v && o < cap - 1) {
+                if (q && *v == q) break;
+                if (!q && *v == '#') break;
+                out[o++] = *v++;
+            }
+            while (o > 0 && (out[o - 1] == ' ' || out[o - 1] == '\t')) o--;
+            out[o] = 0;
+        }
+    }
+    close(fd);
 }
 
 // Byte-for-byte copy (Library Fork), preserving every field the parser does not
@@ -922,12 +989,14 @@ static int copy_file_raw(const char *src, const char *dst) {
 
 static void wf_path(const char *name, char *out, int cap) {
     if (name && strchr(name, '/')) snprintf(out, cap, "%s", name);
-    else snprintf(out, cap, "/CONFIG/WORKFLOWS/%s.yml", name ? name : "workflow");
+    // #flowperm: the writable, per-session directory (wfpath.h). This was the
+    // root-owned literal, so Save and Run were refused for every non-root user.
+    else wf_save_path(name ? name : "workflow", out, cap);
 }
 
 static int save_workflow(void) {
-    sys_mkdir("/CONFIG", 0755);
-    sys_mkdir("/CONFIG/WORKFLOWS", 0755);
+    char wd[192];
+    wf_dir(wd, sizeof(wd));            // #flowperm: creates it if needed
     build_yaml();
     char path[256]; wf_path(g_name, path, sizeof(path));
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -973,166 +1042,61 @@ static void auto_layout(void) {
     }
 }
 
-// ---- example workflow seeds (bundled, forkable copies of the runner's
-// examples/*.yml). Embedded so the OS binary is self-contained, exactly like the
-// original hello seed. Each carries an additive top-level `description:` so the
-// Library shows one and the read path is exercised end to end. ----
-static const char *SEED_HELLO =
-    "name: hello\n"
-    "description: \"Manual trigger, constant, file write (the M1 hello example)\"\n"
-    "nodes:\n"
-    "  - id: t1\n"
-    "    type: trigger\n"
-    "    params: { kind: manual }\n"
-    "  - id: x1\n"
-    "    type: transform\n"
-    "    params: { op: constant, text: \"Maytera Flow M1 OK\" }\n"
-    "  - id: f1\n"
-    "    type: file\n"
-    "    params: { op: write, path: /HOME/FLOWOUT.TXT }\n"
-    "edges:\n"
-    "  - from: [t1, out]\n"
-    "    to:   [x1, in]\n"
-    "  - from: [x1, out]\n"
-    "    to:   [f1, text]\n";
-static const char *SEED_LOOPDEMO =
-    "name: loopdemo\n"
-    "description: \"For-each loop that upper-cases a constant list into a file\"\n"
-    "nodes:\n"
-    "  - id: t1\n"
-    "    type: trigger\n"
-    "    params: { kind: manual }\n"
-    "  - id: lp\n"
-    "    type: foreach\n"
-    "    params: { items: \"alpha,beta,gamma\", max_iters: 100 }\n"
-    "  - id: up\n"
-    "    type: transform\n"
-    "    params: { op: upper, loop: lp }\n"
-    "  - id: sink\n"
-    "    type: file\n"
-    "    params: { op: write, path: /HOME/LOOPOUT.TXT }\n"
-    "edges:\n"
-    "  - from: [t1, out]\n"
-    "    to:   [lp, in]\n"
-    "  - from: [lp, item]\n"
-    "    to:   [up, in]\n"
-    "  - from: [up, out]\n"
-    "    to:   [lp, collect]\n"
-    "  - from: [lp, results]\n"
-    "    to:   [sink, text]\n";
-static const char *SEED_AGENTDEMO =
-    "name: agentdemo\n"
-    "description: \"Bounded agent-promise loop terminating on objective\"\n"
-    "nodes:\n"
-    "  - id: t1\n"
-    "    type: trigger\n"
-    "    params: { kind: manual }\n"
-    "  - id: ag\n"
-    "    type: agent\n"
-    "    objective: reach the goal within budget\n"
-    "    success: \"metric >= 5\"\n"
-    "    max_iters: 12\n"
-    "    max_minutes: 5\n"
-    "    max_tokens: 100\n"
-    "  - id: perceive\n"
-    "    type: transform\n"
-    "    params: { op: concat, loop: ag }\n"
-    "  - id: decide\n"
-    "    type: transform\n"
-    "    params: { op: gte, value: 2, loop: ag }\n"
-    "  - id: act\n"
-    "    type: transform\n"
-    "    params: { op: constant, text: \"act: step taken\", loop: ag }\n"
-    "  - id: report\n"
-    "    type: file\n"
-    "    params: { op: write, path: /HOME/AGENTOUT.TXT }\n"
-    "edges:\n"
-    "  - from: [t1, out]\n"
-    "    to:   [ag, in]\n"
-    "  - from: [ag, index]\n"
-    "    to:   [perceive, in]\n"
-    "  - from: [perceive, out]\n"
-    "    to:   [ag, metric]\n"
-    "  - from: [ag, index]\n"
-    "    to:   [decide, in]\n"
-    "  - from: [decide, out]\n"
-    "    to:   [ag, goal_met]\n"
-    "  - from: [ag, done]\n"
-    "    to:   [report, text]\n";
-static const char *SEED_SUBLOOPDEMO =
-    "name: subloopdemo\n"
-    "description: \"Async sub-loop in await mode writing its body result\"\n"
-    "nodes:\n"
-    "  - id: t1\n"
-    "    type: trigger\n"
-    "    params: { kind: manual }\n"
-    "  - id: sl\n"
-    "    type: subloop\n"
-    "    mode: await\n"
-    "    every_ms: 500\n"
-    "    params: { max_conc: 2 }\n"
-    "  - id: work\n"
-    "    type: transform\n"
-    "    params: { op: constant, text: \"sub-body result\", loop: sl }\n"
-    "  - id: sink\n"
-    "    type: file\n"
-    "    params: { op: write, path: /HOME/SUBLOOPOUT.TXT }\n"
-    "edges:\n"
-    "  - from: [t1, out]\n"
-    "    to:   [sl, in]\n"
-    "  - from: [work, out]\n"
-    "    to:   [sl, collect]\n"
-    "  - from: [sl, result]\n"
-    "    to:   [sink, text]\n";
-static const char *SEED_APPDEMO =
-    "name: appdemo\n"
-    "description: \"App node driving the Convert app tool contract\"\n"
-    "nodes:\n"
-    "  - id: t1\n"
-    "    type: trigger\n"
-    "    params: { kind: manual }\n"
-    "  - id: amount\n"
-    "    type: transform\n"
-    "    params: { op: constant, text: \"100\" }\n"
-    "  - id: conv\n"
-    "    type: app\n"
-    "    params: { app: convert, feature: value, verb: call }\n"
-    "  - id: sink\n"
-    "    type: file\n"
-    "    params: { op: write, path: /HOME/APPOUT.TXT }\n"
-    "edges:\n"
-    "  - from: [t1, out]\n"
-    "    to:   [conv, in]\n"
-    "  - from: [amount, out]\n"
-    "    to:   [conv, arg]\n"
-    "  - from: [conv, out]\n"
-    "    to:   [sink, text]\n";
+// ---- example workflow seeds -----------------------------------------------
+// The bundled catalog is GENERATED from userland/apps/flowrun/examples/*.yml by
+// mkseeds.sh into seeds.h, which the Makefile builds. It used to be hand-copied
+// SEED_* literals here, and the two copies drifted exactly as you would expect:
+// examples/visiongame.yml (the Game Boy AI-vision demo) had no seed at all, so it
+// was in the repo, was covered by the runner's host test, and WAS NOT ON ANY
+// SHIPPED IMAGE. Measured on golden 2539: no /CONFIG/WORKFLOWS existed, and this
+// list is what creates it, so an example missing from the list was an example a
+// user could not open. Generating it means adding a .yml ships it, and the seeded
+// copy is byte-for-byte the repo file, comments included.
+#include "seeds.h"
 
 // Write `content` to `path` only if it does not already exist. The single
 // generalized seeder used for hello AND every bundled example (no duplicated
 // per-file seeding logic).
-static void seed_if_missing(const char *path, const char *content) {
-    if (path_exists(path)) return;
+// Returns 1 when it wrote the file, 0 when it was already there, -1 when the
+// write was REFUSED or short. It used to return void and swallow both failure
+// modes; see seed_workflows() for what that cost.
+static int seed_if_missing(const char *path, const char *content) {
+    if (path_exists(path)) return 0;
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return;
+    if (fd < 0) return -1;
     int len = (int)strlen(content), w = 0;
     while (w < len) { int k = (int)write(fd, content + w, (unsigned)(len - w)); if (k <= 0) break; w += k; }
     close(fd);
+    return (w == len) ? 1 : -1;
 }
 
 // Seed the top-level default (hello) and the bundled, forkable examples set into
 // /CONFIG/WORKFLOWS/examples/ on first run. Generalizes the old
 // seed_hello_if_missing to the whole example catalog.
 static void seed_workflows(void) {
-    sys_mkdir("/CONFIG", 0755);
-    sys_mkdir("/CONFIG/WORKFLOWS", 0755);
-    sys_mkdir("/CONFIG/WORKFLOWS/examples", 0755);
-    seed_if_missing("/CONFIG/WORKFLOWS/hello.yml", SEED_HELLO);
-    seed_if_missing("/CONFIG/WORKFLOWS/examples/hello.yml", SEED_HELLO);
-    seed_if_missing("/CONFIG/WORKFLOWS/examples/loopdemo.yml", SEED_LOOPDEMO);
-    seed_if_missing("/CONFIG/WORKFLOWS/examples/agentdemo.yml", SEED_AGENTDEMO);
-    seed_if_missing("/CONFIG/WORKFLOWS/examples/subloopdemo.yml", SEED_SUBLOOPDEMO);
-    seed_if_missing("/CONFIG/WORKFLOWS/examples/appdemo.yml", SEED_APPDEMO);
+    char wd[192], ed[200], path[256];
+    wf_dir(wd, sizeof(wd));
+    wf_examples_dir(ed, sizeof(ed));
+    int wrote = 0, failed = 0;
+    for (int i = 0; i < FLOW_NSEEDS; i++) {
+        snprintf(path, sizeof(path), "%s/%s.yml", ed, FLOW_SEEDS[i].name);
+        int r = seed_if_missing(path, FLOW_SEEDS[i].yml);
+        if (r > 0) wrote++; else if (r < 0) failed++;
+        // hello is ALSO the top-level default workflow the editor opens.
+        if (strcmp(FLOW_SEEDS[i].name, "hello") == 0) {
+            snprintf(path, sizeof(path), "%s/hello.yml", wd);
+            if (seed_if_missing(path, FLOW_SEEDS[i].yml) < 0) failed++;
+        }
+    }
+    // SAY SO WHEN IT DOES NOT WORK. This used to swallow every failure, which
+    // is how Flow came to be completely non-functional for a uid-1000 session
+    // (no catalog, no Save, no Run) while reporting nothing but an unrelated
+    // "cannot open ...hello.yml" in the status bar.
+    if (failed)
+        snprintf(g_status, sizeof(g_status),
+                 "WARNING: %d example(s) could not be written to %s", failed, ed);
+    else if (wrote)
+        snprintf(g_status, sizeof(g_status), "Seeded %d example(s) in %s", wrote, ed);
 }
 
 static void load_workflow(const char *name) {
@@ -1374,6 +1338,16 @@ static void draw_canvas(void) {
         draw_wire(x0, y0, g_curmx, g_curmy, C_WIRE_HOT);
     }
 
+    // ghost preview of a node being dragged in from the palette (#flowfix):
+    // without this, pressing a palette entry and dragging gave no feedback
+    // at all until release, which read as "nothing is happening".
+    if (g_mode == PALETTE_DRAG && g_palette_drag_idx >= 0) {
+        int gx = g_curmx + 14, gy = g_curmy + 14, gw = 132, gh = 34;
+        gui_fill_rounded(g_win, gx, gy, gw, gh, 6, gui_lighten(C_NODE_BG, 10));
+        gui_rounded_border(g_win, gx, gy, gw, gh, 6, C_ACCENT);
+        ttf(gx + 8, gy + 10, g_pal[g_palette_drag_idx].label, 12, C_INK);
+    }
+
     for (int i = 0; i < g_g.nnodes; i++) draw_node(i, i == g_sel);
 }
 
@@ -1402,19 +1376,28 @@ static void lib_add_dir(const char *dir, int is_example) {
 }
 static void lib_refresh(void) {
     g_lib_n = 0;
-    lib_add_dir("/CONFIG/WORKFLOWS", 0);
-    lib_add_dir("/CONFIG/WORKFLOWS/examples", 1);
+    char wd[192], ed[200];
+    wf_dir(wd, sizeof(wd));
+    wf_examples_dir(ed, sizeof(ed));
+    lib_add_dir(wd, 0);
+    lib_add_dir(ed, 1);
+    // #flowperm: the legacy system-wide catalog is still LISTED (read-only for
+    // a non-root session), so workflows an admin put there remain reachable.
+    if (strcmp(wd, WF_SYSTEM_DIR) != 0) {
+        lib_add_dir(WF_SYSTEM_DIR, 0);
+        lib_add_dir(WF_SYSTEM_DIR "/examples", 1);
+    }
     if (g_lib_sel >= g_lib_n) g_lib_sel = g_lib_n - 1;
     if (g_lib_sel < 0) g_lib_sel = 0;
 }
 static void unique_wf_name(const char *base, char *out, int cap) {
-    char cand[FLOW_ID_MAX], path[176];
+    char cand[FLOW_ID_MAX], path[256];
     snprintf(cand, sizeof(cand), "%s-copy", base);
-    snprintf(path, sizeof(path), "/CONFIG/WORKFLOWS/%s.yml", cand);
+    wf_save_path(cand, path, sizeof(path));
     int n = 2;
     while (path_exists(path) && n < 1000) {
         snprintf(cand, sizeof(cand), "%s-copy%d", base, n++);
-        snprintf(path, sizeof(path), "/CONFIG/WORKFLOWS/%s.yml", cand);
+        wf_save_path(cand, path, sizeof(path));
     }
     scpy(out, cand, cap);
 }
@@ -1438,7 +1421,7 @@ static void library_open_workflow(int i) {
     if (i < 0 || i >= g_lib_n) return;
     lib_ent_t *e = &g_lib[i];
     load_workflow(e->path);                 // wf_path passes a '/'-bearing path through
-    scpy(g_name, e->name, sizeof(g_name));  // saves go to /CONFIG/WORKFLOWS/<name>.yml
+    scpy(g_name, e->name, sizeof(g_name));  // saves go to this session's own workflow dir
     snprintf(g_status, sizeof(g_status), "Opened %s", e->name);
     g_lib_open = 0; g_lib_confirm_del = 0;
 }
@@ -1446,8 +1429,7 @@ static void library_fork(int i) {
     if (i < 0 || i >= g_lib_n) return;
     lib_ent_t *e = &g_lib[i];
     char nn[FLOW_ID_MAX]; unique_wf_name(e->name, nn, sizeof(nn));
-    char dst[176]; snprintf(dst, sizeof(dst), "/CONFIG/WORKFLOWS/%s.yml", nn);
-    sys_mkdir("/CONFIG", 0755); sys_mkdir("/CONFIG/WORKFLOWS", 0755);
+    char dst[256]; wf_save_path(nn, dst, sizeof(dst));
     if (copy_file_raw(e->path, dst) != 0) { snprintf(g_status, sizeof(g_status), "Fork FAILED: %s", nn); return; }
     load_workflow(dst);
     scpy(g_name, nn, sizeof(g_name)); scpy(g_g.name, nn, sizeof(g_g.name));
@@ -1503,7 +1485,8 @@ static void draw_library(void) {
     win_draw_rect(g_win, 0, 0, WIN_W, 46, C_PANEL);
     win_draw_rect(g_win, 0, 46, WIN_W, 1, C_EDGE);
     ttf(16, 12, "Flow Library", 18, C_INK);
-    char sub[80]; snprintf(sub, sizeof(sub), "%d workflow%s in /CONFIG/WORKFLOWS", g_lib_n, g_lib_n == 1 ? "" : "s");
+    char lwd[192]; wf_dir(lwd, sizeof(lwd));
+    char sub[280]; snprintf(sub, sizeof(sub), "%d workflow%s in %s", g_lib_n, g_lib_n == 1 ? "" : "s", lwd);
     ttf(150, 17, sub, 12, C_INK_DIM);
     LB_editor.x = WIN_W - 96; LB_editor.y = 10; LB_editor.w = 84; LB_editor.h = 26;
     gui_button(g_win, LB_editor.x, LB_editor.y, LB_editor.w, LB_editor.h, "Editor", GUI_BTN_SECONDARY, GUI_ST_NORMAL);
@@ -1632,6 +1615,19 @@ static void on_library_key(gui_event_t *ev) {
 
 static int  g_feed_open = 0;
 static int  g_feed_abort = 0;
+// Set the moment the user tries to close the WINDOW (not just abort the
+// current fetch) while a nested event-pump loop below (feed_fetch /
+// feed_load_manifest) owns the event queue. Those loops cannot call
+// win_destroy()/return from here (they are many frames deep under
+// on_toolbar_click -> on_mouse_down -> main()), so they only set this flag;
+// main()'s own loop checks it every iteration and does the real exit. Mirrors
+// appstore/main.c's g_close_requested, which this feed code was modelled on
+// but had not actually copied (#flowfix): without this, a window-close click
+// during "Get More Flows" only cancelled the download and the app kept
+// running invisibly, so reopening Flow created a SECOND process while the
+// first sat idle on the feed screen, and the owner reasonably reported Flow
+// as "cannot do anything" after reopening it.
+static int  g_close_requested = 0;
 static flowfeed_entry_t g_feed[FLOWFEED_MAX];
 static int  g_feed_n = 0;
 static int  g_feed_sel = 0;
@@ -1700,7 +1696,7 @@ static int feed_fetch(const char *url, void *buf, int cap, const char *what) {
         draw_feed();
         gui_event_t ev;
         int et = win_get_event(g_win, &ev, 50);
-        if (et == EVENT_WINDOW_CLOSE) g_feed_abort = 1;
+        if (et == EVENT_WINDOW_CLOSE) { g_feed_abort = 1; g_close_requested = 1; }
     }
     http_fetch_cancel(job);
     return -1;
@@ -1717,7 +1713,7 @@ static int feed_load_manifest(void) {
         draw_feed();
         gui_event_t ev;
         int et = win_get_event(g_win, &ev, 300);
-        if (et == EVENT_WINDOW_CLOSE) g_feed_abort = 1;
+        if (et == EVENT_WINDOW_CLOSE) { g_feed_abort = 1; g_close_requested = 1; }
     }
     if (g_feed_abort) return -1;
 
@@ -1756,12 +1752,12 @@ static int feed_path_exists(const char *path) {
 // <base>.yml, else <base>-1.yml, -2, ... Returns 1 if it had to rename, 0 if
 // <base>.yml was free, -1 if no free name after 1000 tries.
 static int feed_unique_path(const char *base, char *out, int cap, char *finalname, int fncap) {
-    snprintf(out, cap, "/CONFIG/WORKFLOWS/%s.yml", base);
+    wf_save_path(base, out, cap);
     if (!feed_path_exists(out)) { scpy(finalname, base, fncap); return 0; }
     for (int k = 1; k < 1000; k++) {
         char cand[FLOW_ID_MAX + 8];
         snprintf(cand, sizeof(cand), "%s-%d", base, k);
-        snprintf(out, cap, "/CONFIG/WORKFLOWS/%s.yml", cand);
+        wf_save_path(cand, out, cap);
         if (!feed_path_exists(out)) { scpy(finalname, cand, fncap); return 1; }
     }
     return -1;
@@ -1802,8 +1798,7 @@ static void feed_install_one(int i) {
     }
 
     // 4. install to a unique path (never overwrite a user flow).
-    sys_mkdir("/CONFIG", 0755);
-    sys_mkdir("/CONFIG/WORKFLOWS", 0755);
+    { char fwd[192]; wf_dir(fwd, sizeof(fwd)); }
     char path[224], finalname[FLOW_ID_MAX];
     int renamed = feed_unique_path(base, path, sizeof(path), finalname, sizeof(finalname));
     if (renamed < 0) { g_feed_stat[i] = 3; scpy(g_status, "Too many name collisions", sizeof(g_status)); return; }
@@ -1998,16 +1993,22 @@ static void on_toolbar_click(int mx, int my) {
         return;
     }
 }
+// Pressing a palette entry used to ADD THE NODE IMMEDIATELY at a fixed
+// one-third-of-the-canvas position, with no drag tracking at all: a press,
+// drag, release gesture onto the canvas (the natural "drag and drop a node"
+// motion for a flow builder) created the node in the wrong place and then
+// ignored every mouse-move, so the node never followed the cursor. That is
+// what the owner reported as "dragging and dropping nodes isn't working"
+// (#flowfix). This now only ARMS a drag: the node is created on mouse-up,
+// at the drop position if released over the canvas, or at the old default
+// position if released back over the palette (so a plain click still works
+// exactly as before).
 static void on_palette_click(int mx, int my) {
     for (int i = 0; i < NPAL; i++) {
         if (g_pal[i].is_header) continue;
         if (!in_rect(mx, my, g_pal[i].rx, g_pal[i].ry, g_pal[i].rw, g_pal[i].rh)) continue;
-        int wx = wx_of(CANVAS_X + CANVAS_W / 3), wy = wy_of(CANVAS_Y + CANVAS_H / 3);
-        int idx = add_node(g_pal[i].type, wx, wy);
-        if (idx >= 0) {
-            g_sel = idx; build_inspector();
-            snprintf(g_status, sizeof(g_status), "Added %s node", g_pal[i].label);
-        }
+        g_mode = PALETTE_DRAG; g_palette_drag_idx = i;
+        snprintf(g_status, sizeof(g_status), "Drop to add %s node", g_pal[i].label);
         return;
     }
 }
@@ -2082,8 +2083,25 @@ static void on_mouse_up(int mx, int my) {
         } else {
             scpy(g_status, "Wire cancelled", sizeof(g_status));
         }
+    } else if (g_mode == PALETTE_DRAG && g_palette_drag_idx >= 0) {
+        int i = g_palette_drag_idx;
+        int wx, wy;
+        // Same canvas-area test on_mouse_down uses to dispatch to the canvas
+        // (not the toolbar/palette/inspector): drop it exactly where released.
+        if (my >= TOOLBAR_H && mx >= PALETTE_W && mx < WIN_W - INSPECTOR_W) {
+            wx = wx_of(mx); wy = wy_of(my);
+        } else {
+            // Released back over the palette/toolbar/inspector: this was a
+            // plain click, not a drag. Keep the old default placement.
+            wx = wx_of(CANVAS_X + CANVAS_W / 3); wy = wy_of(CANVAS_Y + CANVAS_H / 3);
+        }
+        int idx = add_node(g_pal[i].type, wx, wy);
+        if (idx >= 0) {
+            g_sel = idx; build_inspector();
+            snprintf(g_status, sizeof(g_status), "Added %s node", g_pal[i].label);
+        }
     }
-    g_mode = IDLE; g_drag_node = -1; g_wire_src = -1; g_wire_port = -1;
+    g_mode = IDLE; g_drag_node = -1; g_wire_src = -1; g_wire_port = -1; g_palette_drag_idx = -1;
 }
 
 static void on_scroll(int mx, int my, int delta) {
@@ -2114,6 +2132,18 @@ static void on_key(gui_event_t *ev) {
         if (g_sel >= 0) { delete_node(g_sel); build_inspector(); scpy(g_status, "Deleted node", sizeof(g_status)); }
     } else if (ev->key_char == 's' || ev->key_char == 'S') {
         save_workflow();
+    } else if (ev->key_char == 'l' || ev->key_char == 'L') {
+        // Open the Library. It was already fully keyboard-drivable once open
+        // (UP/DOWN/ENTER/ESC in on_library_key) but there was NO way to open it
+        // without the mouse, so the whole "pick an example and run it" path was
+        // mouse-only. QEMU pointer injection does not reliably land clicks on
+        // this project's VMs (#334), which means that path could not be tested
+        // at all, which is how the Game Boy example came to be missing from the
+        // catalog without anything noticing.
+        g_lib_open = 1; g_lib_confirm_del = 0; g_lib_input = LIN_NONE;
+        lib_refresh();
+    } else if (ev->key_char == 'r' || ev->key_char == 'R') {
+        run_workflow();
     } else if (ev->key_char == '+' || ev->key_char == '=') {
         on_scroll(CANVAS_X + CANVAS_W / 2, CANVAS_Y + CANVAS_H / 2, 1);
     } else if (ev->key_char == '-' || ev->key_char == '_') {
@@ -2152,6 +2182,21 @@ int flow_plat_app_invoke(const char *app, int argc, char **argv,
 // capturing a window, asking a model about the picture, and pressing a key in
 // another app's window are all privileged, consented operations that belong to
 // the RUNNER. Refused here with a reason, never faked.
+// The editor never EXECUTES a graph; Run launches /APPS/FLOWRUN on the saved
+// file. This stub exists only so flow.c links here, and it must stay a refusal:
+// an editor that quietly launched apps while you dragged nodes around would be a
+// surprise, not a feature.
+int flow_plat_launch(const char *app, const char *rom, const char *arg,
+                     const char *wait_target, int timeout_ms,
+                     char *out_title, int tcap, int *out_already,
+                     char *err, int errcap) {
+    (void)app; (void)rom; (void)arg; (void)wait_target; (void)timeout_ms;
+    if (tcap > 0) out_title[0] = 0;
+    if (out_already) *out_already = 0;
+    snprintf(err, errcap, "editor does not execute nodes; use Run (/APPS/FLOWRUN)");
+    return -1;
+}
+
 int flow_plat_capture(const char *target, int rx, int ry, int rw, int rh,
                       int max_w, int max_h, int quality, const char *path,
                       int *out_w, int *out_h, char *err, int errcap) {
@@ -2194,6 +2239,11 @@ int main(int argc, char **argv) {
     load_workflow(g_name);
 
     for (;;) {
+        // A window-close click can land while a nested fetch loop (feed_fetch
+        // / feed_load_manifest) owns the event queue several frames below us;
+        // those loops can only set g_close_requested, so this is where the
+        // real exit actually happens (see g_close_requested's declaration).
+        if (g_close_requested) { win_destroy(g_win); return 0; }
         if (g_dirty) { render(); g_dirty = 0; }
         gui_event_t ev;
         int et = win_get_event(g_win, &ev, 100);   // blocks up to 100ms (no busy-wait)

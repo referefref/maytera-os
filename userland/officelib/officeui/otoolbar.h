@@ -25,6 +25,7 @@
 #define OFFICE_OTOOLBAR_H
 
 #include "ocombo.h"
+#include "../../libc/contract.h"
 
 typedef enum { OTB_BUTTON = 0, OTB_TOGGLE, OTB_SEPARATOR, OTB_COMBO, OTB_SPACER } otb_kind_t;
 
@@ -35,6 +36,28 @@ typedef struct {
     const char *tooltip;     // also the fallback letter source; NULL for SEPARATOR
     int         w;           // OTB_COMBO/OTB_SPACER width in px; 0 = default (120 / 8)
     int         group;       // toggles sharing a group>0 behave as radio buttons
+
+    // ---- contract exposure (docs/CONTRACT_COVERAGE_PLAN.md task 3 phase 4) --
+    // TRAILING FIELDS, deliberately, matching gui_menu_item_t's own precedent
+    // (the `checked` field, #307): every existing brace initialiser in the
+    // tree is POSITIONAL and shorter than this, so adding fields here leaves
+    // every pre-existing row with tok == 0 / afn == 0, which reads as "not
+    // exposed" and is exactly right - nothing that does not opt in changes.
+    //
+    // This is the SAME table otb_draw()/otb_press() already read, not a
+    // second one: draw keeps reading icon/tooltip/kind exactly as before,
+    // and an app's on_tool() now reads these five fields through
+    // otb_ctl_dispatch()/otb_ctl_project() instead of switching on id. A
+    // control added here without a tok is simply not exposed; one added
+    // with a tok and no afn is a contract-lint-caught mistake (an action row
+    // with no handler), not a silent gap.
+    const char        *tok;   // dotted contract item name, 0 = not exposed
+    int               (*afn)(const struct ct_item *it, int argc, char **argv,
+                             char *out, int ocap);   // required when tok != 0
+    const char        *desc;  // one-line contract description (>=12 chars)
+    unsigned char       risk; // CT_SAFE or CT_GUARDED; meaningless if tok==0
+    const char         *cap;  // aicap capability id; set iff risk==CT_GUARDED
+    const struct ct_terms *terms; // timing/success/depth/promise; set if tok
 } otb_item_t;
 
 #define OTB_MAX_ITEMS   40
@@ -92,5 +115,19 @@ int  otb_popup_open(const otb_toolbar_t *tb);
 // Milliseconds until the tooltip timer fires, or -1 when no timer is armed
 // (the shell uses this as its event-wait timeout: no polling).
 int  otb_timer_ms(const otb_toolbar_t *tb, unsigned long long now_ms);
+
+
+// ---- contract projection + generic dispatch (task 3 phase 4) --------------
+// See otoolbar.c for the full rationale. Three calls replace a hand-rolled
+// switch for every row that opts in (tok != 0): the app's project() chains
+// otb_ctl_count()/otb_ctl_project() across its tables the same way
+// files/main.c's g_flat chains fctl_t tables, and on_tool() calls
+// otb_ctl_dispatch() instead of switching on id for every row that has an
+// afn, keeping only genuinely special controls (a combo needing its own
+// live text, say) as actual switch cases.
+int otb_ctl_count(const otb_item_t *items, int n);
+int otb_ctl_project(const otb_item_t *items, int n, int idx, ct_item_t *out);
+int otb_ctl_dispatch(const otb_item_t *items, int n, int id, int value,
+                     char *out, int ocap, int *outcode);
 
 #endif // OFFICE_OTOOLBAR_H

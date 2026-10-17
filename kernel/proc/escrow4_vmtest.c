@@ -31,6 +31,7 @@ extern void kprintf(const char *fmt, ...);
 extern void proc_sleep(uint32_t ms);
 extern int escrow_spawn_marked(const char *path, const char *scope,
                                uint32_t ttl_ms, uint32_t uid);
+extern int recycle_available(void);
 
 static void escrow4_vmtest_worker(void *arg) {
     (void)arg;
@@ -72,6 +73,25 @@ static void escrow4_vmtest_worker(void *arg) {
     int wrc = fat_write_file(&g_fat_fs, "/CONFIG/ESCROW4.SCOPE", scope, (uint32_t)strlen(scope));
     if (wrc != 0)
         kprintf("[ESCROW4-TEST] warn: could not publish scope to /CONFIG/ESCROW4.SCOPE (rc=%d)\n", wrc);
+
+    // THE PRECONDITION THIS ARM GREW ON 2026-10-03, REPORTED RATHER THAN
+    // ASSUMED. ESCROW4T's delete arm used to assert "refused", which needs
+    // nothing from the environment. It now asserts "succeeded and was
+    // redirected", which needs a usable Recycle Bin, and the bin lives in the
+    // session user's home on the ROOT volume, never on the removable device.
+    // Without this line a red delete arm is ambiguous between a kernel bug and
+    // an environment with no bin.
+    //
+    // tools/escrow-vmtest/run-escrow-vmtests.sh has REQUIRED this exact line
+    // under --require-recycle since it was written, and blame.md records that
+    // "the launcher now prints recycle_available=". IT DID NOT: only
+    // escrvt_vmtest.c printed it, so --require-recycle could never go green on
+    // ESCROW4T and the matching FORBID was inert. An assertion naming a line
+    // no code emits is not a check, it is a guaranteed red that teaches
+    // whoever meets it to stop using the flag.
+    kprintf("[ESCROW4-TEST] recycle_available=%d (0 means the delete arm would "
+            "fail closed for an ENVIRONMENT reason, not a kernel one)\n",
+            recycle_available());
 
     int pid = escrow_spawn_marked("/APPS/ESCROW4T", scope, 3600000u, 0);
     kprintf("[ESCROW4-TEST] escrow_spawn_marked rc/pid=%d scope=%s "

@@ -15,8 +15,21 @@
 #include "stdlib.h"
 #include "fcntl.h"
 #include "unistd.h"
+#include "userconf.h"   // #peruser2: the per-user UI-font selection
 
+// #peruser2: /FONTS IS A SYSTEM REGISTRY AND IS DELIBERATELY NOT RELOCATED.
+// The installed-font store is read by the KERNEL (kernel/gui/ttf.c) to register
+// faces, and font_rescan() below asks the kernel to re-read it. A font installed
+// into a home directory would be invisible to the rasteriser that has to
+// rasterise it, so "install a font" is a system action that legitimately needs
+// authority over a system directory; gui_font_install() already returns -3 when
+// it is refused. The per-user datum here is the SELECTION, not the catalogue.
 #define FONTS_DIR    "/FONTS"
+// ...and the SELECTION does move: <home>/CONFIG/UIFONT.CFG, reads falling back
+// to the system copy so an administrator's default still applies to a user who
+// has never chosen a font. Root's home is "/", so root still reads and writes
+// exactly /CONFIG/UIFONT.CFG.
+#define UIFONT_NAME  "UIFONT.CFG"
 #define UIFONT_CFG   "/CONFIG/UIFONT.CFG"
 
 #define MAX_FACES     64
@@ -167,7 +180,7 @@ void gui_font_sel_default(gui_font_sel_t *sel) {
     memset(sel, 0, sizeof(*sel));
     sel->size = 14;
 
-    int fd = open(UIFONT_CFG, O_RDONLY);
+    int fd = userconf_open_read(UIFONT_NAME, UIFONT_CFG);   // #peruser2
     if (fd >= 0) {
         char buf[160];
         int n = read(fd, buf, sizeof(buf) - 1);
@@ -201,11 +214,12 @@ int gui_font_set_system(const gui_font_sel_t *sel) {
              sel->style[0] ? sel->style : "Regular",
              sel->size > 0 ? sel->size : 14);
 
-    int fd = open(UIFONT_CFG, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return -1;
+    // #peruser2: was a write to root-owned /CONFIG, so choosing a UI font did
+    // nothing for a non-root session and reported -1 with no trace of why.
+    int fd = userconf_open_write(UIFONT_NAME);
+    if (fd < 0) return -1;                      // already reported by the open
     int n = (int)strlen(buf);
-    int w = write(fd, buf, n);
-    close(fd);
+    int wrc = userconf_finish_write(fd, buf, (unsigned long)n);
 
     // Apply live. Every legacy text path draws with the active face, so this
     // restyles the running desktop without a reboot; the file above only makes
@@ -213,7 +227,7 @@ int gui_font_set_system(const gui_font_sel_t *sel) {
     int face = 0, bits = 0;
     gui_font_resolve(sel->family, sel->style, &face, &bits);
     font_set_ui(face);
-    return (w == n) ? 0 : -1;
+    return wrc;
 }
 
 // ---------------------------------------------------------------------------

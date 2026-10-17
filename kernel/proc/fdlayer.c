@@ -45,6 +45,7 @@
 #include "../fs/perms.h"
 #include "../fs/bootlog.h"   // #appwrite: a refused create must survive a reboot
 #include "../fs/vfs.h"
+#include "../fs/fsenoent.h"   // #aicappersist: which cause made this -2
 #include "../fs/escrow_guard.h"   // #246/#305 AI escrow kernel enforcement
 #include "../net/smb.h"
 #include "../net/nfs.h"
@@ -128,6 +129,20 @@ static int fd_used[LEGACY_MAX_FDS];
 // slot. A slot cannot become live by any other route, so a recycled fd can
 // never inherit a previous file's error.
 static int fd_werr[LEGACY_MAX_FDS];
+// [noaccount] #246 partialwrite for the FAT family. ext2 keeps these two facts
+// INSIDE ext2_fd_t (esc_orig_len / esc_pre); the FAT family's row IS a
+// fat_file_t, which is also used as a standalone handle all over the kernel
+// where neither fact means anything, so they live beside fd_werr[] instead -
+// the parallel array this table already uses for a per-slot fact that is not
+// the file's business. Cleared in the ONE place a slot becomes live.
+//
+// fat_esc_orig is the file's length AS THIS DESCRIPTOR FOUND IT, after any
+// O_TRUNC at open: a descriptor that truncated has nothing original left to
+// lose, and one that appended a megabyte still has only its original extent to
+// protect. fat_esc_pre is "a pre-image for this descriptor is already in the
+// bin", so an editor's many writes keep one copy.
+static uint32_t fat_esc_orig[LEGACY_MAX_FDS];
+static int      fat_esc_pre[LEGACY_MAX_FDS];
 
 // #708 AI SAFE-EJECT BUSY CHECK. The AI device-manifest eject executor
 // (userland aiclient.c exec_device_eject) must REFUSE to eject a removable
@@ -266,9 +281,15 @@ static uint32_t g_fdguard_audits = 0;
 static void legacy_owner_refused(int slot, uint32_t me, const char *op) {
     if (g_fdguard_audits < FDGUARD_AUDIT_MAX) {
         uint32_t owner = fdown_owner_rs((uint32_t)slot);
-        char d[64];
-        snprintf(d, sizeof(d), "fd op=%s slot=%d owner=%u cross-proc refused",
-                 op, slot, owner);
+        // #fdreclaim: a refusal now has three shapes (live and someone else's,
+        // dead and awaiting reclaim, mid-reclaim) and they mean different
+        // things to whoever reads the audit trail. fdown_owner_rs() masks the
+        // state bits off, so the owner is still the tgid in all three.
+        int st = fdown_state_rs((uint32_t)slot);
+        char d[96];
+        snprintf(d, sizeof(d), "fd op=%s slot=%d owner=%u state=%s cross-proc refused",
+                 op, slot, owner,
+                 st == 3 ? "reaping" : (st == 2 ? "dead" : "live"));
         seclog_report_io_boundary(me, d);
         if (++g_fdguard_audits == FDGUARD_AUDIT_MAX)
             seclog_report_io_boundary(me,
@@ -371,6 +392,22 @@ typedef struct {
     int      noread;
     int      rw_append;   // O_APPEND on an rw fd: every write lands at wlen
     uint32_t rwpos;       // the ONE position an rw fd reads and writes at
+    // #246 partialwrite: the length this file had BEFORE this descriptor wrote
+    // anything, and whether a pre-image for it has already been kept.
+    //
+    // THE REASON IT IS THE *ORIGINAL* LENGTH AND NOT wlen. A plain write() is
+    // the one FS mutation whose name does not mention destruction, which is
+    // why it was the last escrow hole open: at OPEN time an overwriting writer
+    // cannot be told from an appending one. At WRITE time it can, and the test
+    // is `rwpos < esc_orig_len`. wlen moves as the descriptor appends;
+    // esc_orig_len does not, so a descriptor that has appended a megabyte
+    // still has only its original extent to protect.
+    //
+    // esc_pre makes the pre-image ONE PER DESCRIPTOR rather than one per
+    // write(): an editor saving a file issues many writes, and a bin with one
+    // entry per write would be unusable as well as expensive.
+    uint32_t esc_orig_len;
+    int      esc_pre;
 } ext2_fd_t;
 static ext2_fd_t e2fd[LEGACY_MAX_FDS];
 
@@ -380,6 +417,20 @@ static ext2_fd_t e2fd[LEGACY_MAX_FDS];
 // <path>" through the SMB2 client (net/smb.c). Reads cache the whole file (like
 // ext2); writes buffer and flush-on-close as an SMB upload (smb_vfs_write_whole);
 // directory fds hold an smb dir-handle. FAT/ext2 paths never touch this code.
+//
+// #747: whole-file bound for a PRESERVING write open on a share. A descriptor
+// that must keep the file's existing bytes has to hold them in kernel RAM, so
+// there has to be a number, and a refusal at open is the only honest answer
+// above it: the alternative is to serve the open in a mode that silently
+// destroys the file, which is the defect being fixed. 16 MiB covers documents,
+// configs and source files, which is what a share is used for from this OS
+// today.
+//
+// STATED LIMIT, not a claim of safety: the READ-ONLY path has no bound at all
+// (smb_vfs_read_whole kmallocs the file size, capped only at 0xF0000000), so a
+// huge file can still exhaust the heap through a read open. That is
+// pre-existing and is not changed here.
+#define NETFS_RW_MAX_BYTES (16u * 1024u * 1024u)
 typedef struct {
     int      used;
     int      is_dir;
@@ -389,6 +440,22 @@ typedef struct {
     uint8_t *rbuf; uint32_t rsize, rpos;            // file read cache
     uint8_t *wbuf; uint32_t wcap, wlen; int writing; // upload-on-close buffer
     int      wdirty;           // #695: buffered bytes not yet on the server
+    // #747 PRESERVING WRITE MODE, the same shape the ext2 family has carried
+    // since #746/"#745 local 109". `rw` means "wbuf holds the WHOLE file and
+    // both read() and write() act at rwpos", which is what makes
+    // read-modify-write on a share mean what POSIX says it means.
+    //
+    // Before this, EVERY write-ish open took the append-only branch: wlen
+    // started at 0, so the upload on close was the entire new file contents. A
+    // plain O_RDWR open of an existing 1 MB file, with no truncation asked for
+    // anywhere, left a 4-byte file after a 4-byte write, and read() on that
+    // descriptor returned -1 because rbuf was NULL. Both halves of the standard
+    // POSIX read-modify-write idiom were broken and the open still returned
+    // success.
+    int      rw;          // 1 = whole-file positioned descriptor
+    int      noread;      // 1 = that descriptor was opened O_WRONLY: read() refused
+    int      rw_append;   // O_APPEND on an rw fd: every write lands at wlen
+    uint32_t rwpos;       // the ONE position an rw fd reads and writes at
 } smb_fd_t;
 static smb_fd_t smbfd[LEGACY_MAX_FDS];
 
@@ -418,8 +485,77 @@ typedef struct {
     uint8_t  *rbuf; uint32_t rsize, rpos;             // file read cache
     uint8_t  *wbuf; uint32_t wcap, wlen; int writing; // create/replace buffer
     int       wdirty;
+    // #747: the same preserving write mode as smb_fd_t above, for the same
+    // reason. This family was the worse of the two: it set wdirty at OPEN, so
+    // on an ext2 aux mount merely opening an existing file for writing and
+    // closing it again, with no write at all, committed a zero-length file.
+    int       rw;
+    int       noread;
+    int       rw_append;
+    uint32_t  rwpos;
 } aux_fd_t;
 static aux_fd_t auxfd[LEGACY_MAX_FDS];
+
+// ===========================================================================
+// #fdreclaim: ONE definition of "hand this legacy slot's memory back".
+//
+// This is the body sys_close() repeated four times, once per fd family: free
+// whatever heap buffers the slot owns and zero its family struct, which is what
+// clears the family's `used` tag. It COMMITS NOTHING to any medium. Every caller
+// that owes the medium a flush must do it BEFORE calling this, while it is still
+// in a context that may block.
+//
+// It exists because the on-exit reclaim below needs exactly this, and a second
+// copy would be a second place to forget a buffer. e2fd alone owns THREE: rbuf
+// (the #572 bounded read window, up to EXT2_RWIN_BYTES = 128 KiB), wbuf, and
+// sbuf. Forgetting rbuf is precisely the leak this change removes.
+//
+// The families are tested independently rather than as an if/else chain: a slot
+// is only ever populated by one of them, so the result is identical, and an
+// independent test cannot be silently skipped if the population rules change.
+static void legacy_fd_free_buffers(int fd) {
+    if (fd < 0 || fd >= LEGACY_MAX_FDS) return;
+
+    if (auxfd[fd].used) {
+        aux_fd_t *a = &auxfd[fd];
+        if (a->rbuf) kfree(a->rbuf);
+        if (a->wbuf) kfree(a->wbuf);
+        for (uint64_t z = 0; z < sizeof(*a); z++) ((uint8_t *)a)[z] = 0;
+    }
+    if (smbfd[fd].used) {
+        smb_fd_t *s = &smbfd[fd];
+        if (s->rbuf) kfree(s->rbuf);
+        if (s->wbuf) kfree(s->wbuf);
+        for (uint64_t z = 0; z < sizeof(*s); z++) ((uint8_t *)s)[z] = 0;
+    }
+    if (e2fd[fd].used) {
+        ext2_fd_t *e = &e2fd[fd];
+        if (e->rbuf) kfree(e->rbuf);
+        if (e->wbuf) kfree(e->wbuf);
+        if (e->sbuf) kfree(e->sbuf);
+        for (uint64_t z = 0; z < sizeof(*e); z++) ((uint8_t *)e)[z] = 0;
+    }
+    // The legacy FAT family owns no heap: a fat_file_t is a fixed struct with a
+    // back-pointer to its fat_fs_t. fd_used[fd] is cleared by
+    // legacy_fd_release(), which every caller of this function also calls.
+}
+
+// #fdreclaim: how many legacy fd slots are free RIGHT NOW. fd_used[] is the one
+// allocation bitmap behind all four families (the locked scan in sys_open_k()
+// claims it; every family then tags its own row), so this is the pool's true
+// headroom. Read-only and bounded; it is the instrument the gated boot oracle
+// (proc/fdreclaim_test.c) samples across process deaths, because "the ceiling
+// fell and never came back" is the only direct evidence of a slot leak.
+// Justified C, not Rust, for the same reason hotplug_vol_busy() above is: it
+// reads the fd_used[] static that exists only in this file.
+int legacy_fd_free_slots(void) {
+    int n = 0;
+    uint64_t fl = spinlock_acquire_irqsave(&g_legacy_fd_lock);
+    for (int i = 3; i < LEGACY_MAX_FDS; i++)
+        if (!fd_used[i]) n++;
+    spinlock_release_irqrestore(&g_legacy_fd_lock, fl);
+    return n;
+}
 
 
 /* #359 Phase 2: POSIX errno values so libc open() can set errno correctly
@@ -461,11 +597,16 @@ int advlock_resolve_fd(int fd, char *pathbuf, int cap, int *slot_out,
         { int l = (int)strlen(pathbuf);
           strncpy(pathbuf + l, auxfd[idx].rel, cap - 1 - l); pathbuf[cap - 1] = 0; }
         sz = auxfd[idx].rbuf ? auxfd[idx].rsize : auxfd[idx].wlen;
-        pos = auxfd[idx].rbuf ? auxfd[idx].rpos : auxfd[idx].wlen;
+        // #747: a preserving (rw) fd has a real position that is NOT the end of
+        // the file. Reporting wlen for it would make SEEK_END-relative lock
+        // ranges resolve against the wrong offset.
+        pos = auxfd[idx].rbuf ? auxfd[idx].rpos
+              : (auxfd[idx].rw ? auxfd[idx].rwpos : auxfd[idx].wlen);
     } else if (fd >= 3 && smbfd[idx].used) {
         strncpy(pathbuf, smbfd[idx].path, cap - 1); pathbuf[cap - 1] = 0;
         sz = smbfd[idx].rbuf ? smbfd[idx].rsize : smbfd[idx].wlen;
-        pos = smbfd[idx].rbuf ? smbfd[idx].rpos : smbfd[idx].wlen;
+        pos = smbfd[idx].rbuf ? smbfd[idx].rpos
+              : (smbfd[idx].rw ? smbfd[idx].rwpos : smbfd[idx].wlen);
     } else if (fd >= 3 && e2fd[idx].used) {
         ext2_fd_t *e = &e2fd[idx];
         strncpy(pathbuf, e->path, cap - 1); pathbuf[cap - 1] = 0;
@@ -473,7 +614,20 @@ int advlock_resolve_fd(int fd, char *pathbuf, int cap, int *slot_out,
         else if (e->writing)  { sz = e->wlen; pos = e->wlen; }
         else                  { sz = e->rsize; pos = e->rpos; }
     } else if (fd_used[idx]) {
-        strncpy(pathbuf, fd_table[idx].name, cap - 1); pathbuf[cap - 1] = 0;
+        // [noaccount] THE FAT FAMILY NOW ANSWERS LIKE THE OTHER THREE. This
+        // read fd_table[idx].name, which was the BASENAME, so this function
+        // answered "LETTER.TXT" for a file that might be at
+        // /USB0/DOCS/LETTER.TXT. Every caller treats the result as an absolute
+        // path: the advisory-lock layer keys locks on it (so two unrelated
+        // files sharing a basename on different volumes collided as ONE lock,
+        // a false conflict), and the escrow hooks file a pre-image under it.
+        //
+        // AN EMPTY PATH IS A REFUSAL, NOT AN ANSWER. fat_set_handle_path()
+        // leaves the field empty rather than truncating, and handing back ""
+        // here would let a caller lock or recycle under a meaningless key.
+        // Failing is what the FAT family effectively did before this change.
+        if (!fd_table[idx].path[0]) return -1;
+        strncpy(pathbuf, fd_table[idx].path, cap - 1); pathbuf[cap - 1] = 0;
         sz = fd_table[idx].file_size;
         pos = fd_table[idx].position;
     } else {
@@ -523,6 +677,19 @@ int64_t sys_fcntl(int fd, int cmd, long arg) {
 // so the core keeps a plain kernel-pointer contract and never sees a user
 // pointer. copy-user-lint traces one call level from a case, so the core (a
 // second level down) is out of scope; only this clean wrapper is analyzed.
+// #747: a NON-INLINE face for open_mode_decode(), which is a static inline in
+// fs/vfs.h and therefore has no symbol to link against.
+//
+// It exists for ONE caller: fd_open_plan_selftest_rs() in
+// rustkern/fdopenpolicy.rs, which must test the policy against the REAL
+// decoding. The alternative was to re-implement the flag arithmetic in Rust,
+// and a second implementation of the decoder is precisely the drift #746 and
+// #747 exist to end: the self-test would then be asserting agreement between
+// two copies of Rust rather than agreement with the kernel.
+void open_mode_decode_c(int flags, open_mode_t *out) {
+    if (out) *out = open_mode_decode(flags);
+}
+
 int64_t sys_open(const char *upath, int flags) {
     char kpath[SC_PATH_MAX];
     if (upath) {
@@ -533,7 +700,13 @@ int64_t sys_open(const char *upath, int flags) {
         // kernel paths, so the core is deliberately NOT changed: resolution
         // belongs at the user boundary, once, or it happens twice.
         int prc = sc_path_from_user(upath, kpath, sizeof(kpath));
-        if (prc != 0) return (prc == -14) ? -14 : -MOS_ENOENT;
+        if (prc != 0) {
+            // #aicappersist: a refused path bounce is returned as -MOS_ENOENT, so
+            // from Ring 3 it is INDISTINGUISHABLE from "the parent directory does
+            // not exist". Say which it was. Nothing about the refusal changes.
+            if (prc != -14) fsenoent_report(FSE_SITE_PATHCOPY, 0, (uint32_t)prc);
+            return (prc == -14) ? -14 : -MOS_ENOENT;
+        }
         // #246 escrow: a write/create/truncate-intent open by an escrow actor
         // must land inside the granted scope. A read-only open is not a
         // mutation and is left alone; a non-escrow process is unaffected either
@@ -543,6 +716,18 @@ int64_t sys_open(const char *upath, int flags) {
         if ((flags & (O_ACCMODE | O_CREAT | O_TRUNC)) &&
             escrow_fs_guard(ESCROW_OP_WRITE, kpath, 0) != 0)
             return -MOS_EACCES;
+        // #246: AN O_TRUNC OPEN OF AN EXISTING FILE DESTROYS EVERY BYTE IN IT,
+        // and it is not a delete at any layer, so the delete chokepoint never
+        // sees it. For a MARKED process the pre-image goes to the Recycle Bin
+        // first. This is the ONE sub-case of the overwrite family that is
+        // deterministic at open time: the flag IS the declaration of intent. A
+        // plain writable open with NO O_TRUNC is NOT captured, and that limit
+        // is written on the declaration rather than left to be discovered. A
+        // non-marked process reads one process_t byte and returns.
+        {
+            extern int escrow_trunc_victim(const char *p, int f);
+            if (escrow_trunc_victim(kpath, flags) != 0) return -MOS_EACCES;
+        }
     }
     return sys_open_k(upath ? kpath : (const char *)0, flags);
 }
@@ -798,16 +983,89 @@ int64_t sys_open_k(const char *path, int flags) {
         int access = R_OK;
         if (flags & 1)  access = W_OK;          // O_WRONLY
         if (flags & 2)  access = R_OK | W_OK;   // O_RDWR
+        // #prewrite: O_TRUNC IS A WRITE, and this derivation did not say so.
+        //
+        // fs/vfs.h open_mode_decode() forces `can_write = 1` whenever O_TRUNC
+        // is set, deliberately ("POSIX leaves O_TRUNC on a read-only fd
+        // undefined. This kernel has always treated it as a request to empty
+        // the file"). But the ACCESS derived here read only O_WRONLY and
+        // O_RDWR, so open(path, O_RDONLY|O_TRUNC) == open(path, 0x200) asked
+        // perms_check() for R_OK alone. Every world-readable file in the
+        // system, including every other user's, could therefore be emptied to
+        // zero bytes by any Ring-3 process that could merely read it. The
+        // truncation then lands at the O_TRUNC arms below (the ext2 write-back
+        // path, fat_truncate on the ESP, and the removable arm).
+        //
+        // Emptying a file is REPLACING it, which is exactly the other half of
+        // the owner-only-delete property the sticky bit gives an all-users
+        // directory: a rule that stops you unlinking somebody's file but lets
+        // you blank it is not a rule. Independent of sticky, it was a live
+        // integrity hole on every path in the filesystem.
+        if (flags & 0x200) access |= W_OK;       // O_TRUNC
         // #317: SMB/NFS shares enforce access server-side (NTLM/RPC auth + share
         // ACLs); local POSIX perms (which default-deny W_OK to non-root) don't apply.
-        // #250: a removable volume carries no POSIX ownership. perms_check()'s
-        // no-entry default is root-owned, which denies W_OK to every non-root
-        // process, so leaving removable paths in would make a USB stick
-        // read-only to the user who plugged it in. Same carve-out, and the
-        // same reasoning, as the SMB/NFS one it joins: access on those media
-        // is decided by the medium, not by our permission table.
-        if (!path_is_smb(path) && !path_is_nfs(path) &&
-            hotplug_resolve_path(path, 0) < 0) {
+        //
+        // [openperm] #246: THE #250 REMOVABLE-VOLUME CARVE-OUT IS GONE, AND
+        // THIS IS THE LINE IT LIVED ON. It read:
+        //
+        //     if (!path_is_smb(path) && !path_is_nfs(path) &&
+        //         hotplug_resolve_path(path, 0) < 0) {
+        //
+        // so for a path on a mounted removable volume this ENTIRE block was
+        // skipped and perms_check() was never called at all. Its reasoning was
+        // that a FAT stick carries no POSIX ownership, which was true when it
+        // was written and is now false about this system: [renamevol]'s CREATE
+        // POINT 3 gives a file created on a stick a real /CONFIG/PERMS.DB row,
+        // and sys_unlink / sys_rmdir / sys_rename have enforced against those
+        // rows on a volume since 716367de.
+        //
+        // The result was that the two paths disagreed, in the same boot, about
+        // the same file. MEASURED on kernel 940001 with /APPS/USBOPN, one
+        // unprivileged uid, one all-users sticky directory on a synthetic FAT16
+        // stick, against an identical fixture on the root filesystem that was
+        // correct on all ten of its arms:
+        //
+        //   unlink ANOTHER user's file         rc=-1  victim intact     REFUSED
+        //   O_RDONLY|O_TRUNC on such a file    fd=259 len-now=0         BLANKED
+        //   O_WRONLY, no O_TRUNC, write 8      fd=259 attack bytes in   DEFACED
+        //   read ANOTHER user's 0600 file      64 bytes read            DISCLOSED
+        //
+        // So the delete protection on removable media was decorative, and the
+        // hole was wider than the truncation it was reported as: skipping the
+        // whole block skipped R_OK too, which made it a confidentiality failure
+        // and not only an integrity one. sys_open_k()'s own #prewrite comment,
+        // thirty lines above, had already stated the principle it was
+        // breaking: a rule that stops you unlinking somebody's file but lets
+        // you blank it is not a rule.
+        //
+        // REMOVING THIS ALONE WOULD HAVE BEEN THE WRONG FIX, and that is
+        // measured too, not reasoned: perms_check()'s no-entry default is
+        // root-owned 0755 and nothing gave the mount point a row
+        // ("[USBOPN-TEST] mount-point row /USB0: ABSENT"), so enforcement on
+        // its own makes a stick READ-ONLY to the person who plugged it in.
+        // That is #250's concern and it was correct. drivers/hotplug.c now
+        // stamps a mounted volume's mount point root:root 01777, the /tmp
+        // contract: anyone may create, your own files are yours to empty and
+        // remove, and S_ISVTX stops you touching somebody else's name. Both
+        // halves are in one change because either alone is a regression.
+        //
+        // THE TWO PATHS NOW AGREE BY CONSTRUCTION, not by coincidence. There
+        // is no removable special case left in either of them: both read the
+        // same table through the same canonicalizer and each applies the rule
+        // POSIX gives its own verb. Nothing here invents a third answer.
+        //
+        // rustkern/volperm.rs owns the decision (new kernel policy, so Rust per
+        // the 2026-07-16 rule) with an exhaustive self-test over its whole
+        // input space, so a future exemption means adding a vector rather than
+        // extending a boolean nobody reviews. is_removable is passed in and
+        // deliberately ignored, so that re-introducing the carve-out means
+        // changing that function and facing its vectors.
+        extern int openperm_gate_rs(uint32_t is_smb, uint32_t is_nfs,
+                                    uint32_t is_removable);
+        if (openperm_gate_rs(path_is_smb(path) ? 1u : 0u,
+                             path_is_nfs(path) ? 1u : 0u,
+                             hotplug_resolve_path(path, 0) >= 0 ? 1u : 0u)
+            == OPENPERM_ENFORCE) {
             // #676: O_CREAT was not part of the access derivation at all, so
             // open(path, O_RDONLY|O_CREAT) asked for R_OK on a path that does
             // not exist, was answered by perms_check()'s permissive no-entry
@@ -823,7 +1081,45 @@ int64_t sys_open_k(const char *path, int flags) {
             // when the target does not already exist (O_CREAT on an existing
             // file needs no directory write). This is the same parent-W_OK
             // pattern sys_mkdir, sys_rmdir and sys_unlink already use.
-            if ((flags & 0x40) && !fat_exists(&g_fat_fs, path)) {
+            // [openperm] #246: ASKED OF THE RIGHT FILESYSTEM. This read
+            // `!fat_exists(&g_fat_fs, path)`, and g_fat_fs routes the ext2
+            // root, the FAT ESP, /SMB, /NFS and a mounted disk image but NOT a
+            // hot-plugged removable volume. So for a path on a stick it
+            // answered ABSENT for a file that is plainly there, and this gate
+            // would take the CREATE branch (may I write the parent directory?)
+            // for an open of an EXISTING file, which is the weaker question and
+            // the wrong one.
+            //
+            // It had no consequence while the carve-out above returned before
+            // reaching here. It acquires one the instant that carve-out is
+            // removed, which is this change, so it is fixed in the same change.
+            // That is the [renamevol] lesson one gate over: it built a kernel
+            // with only half its fix on purpose and watched an unprivileged
+            // process destroy another user's file.
+            //
+            // MEASURED on the same boot, same live file, both oracles:
+            //   oracle-compare path=/USB0/PM/OVIC1.TXT
+            //     fat_exists(g_fat_fs)=0  fat_exists(hotplug_fs_or_root)=1
+            // fs/volblind.c also reported it as a BLIND ASK unprompted.
+            //
+            // hotplug_fs_or_root() is the ONE root-or-volume resolver
+            // (drivers/hotplug.h). For every non-volume path it returns
+            // &g_fat_fs with the path unchanged, so behaviour on the root
+            // filesystem is identical to before. A NULL return is a mounted
+            // medium that cannot serve files: fail CLOSED rather than ask the
+            // root filesystem instead, because the root may hold a DIFFERENT
+            // file at the same spelling.
+            //
+            // The O_CREAT short-circuit is preserved: this costs nothing on an
+            // open that is not creating.
+            int op_exists = 1;   /* only consulted under O_CREAT */
+            if (flags & 0x40) {
+                const char *crel = path;
+                fat_fs_t *cfs = hotplug_fs_or_root(path, &crel);
+                if (!cfs) return -MOS_EACCES;
+                op_exists = fat_exists(cfs, crel);
+            }
+            if ((flags & 0x40) && op_exists == 0) {
                 char parent[SC_PATH_MAX];
                 sc_parent_of(path, parent, sizeof(parent));
                 if (perms_check(parent, p->euid, p->egid, W_OK | X_OK) != 0) {
@@ -995,6 +1291,8 @@ int64_t sys_open_k(const char *path, int flags) {
                 fd = i;
                 fd_used[i] = 1;
                 fd_werr[i] = 0;   // #746: the ONE place a slot becomes live
+                fat_esc_orig[i] = 0;  // [noaccount] stamped after the open below
+                fat_esc_pre[i] = 0;
                 break;
             }
         }
@@ -1025,23 +1323,31 @@ int64_t sys_open_k(const char *path, int flags) {
     // path is a candidate for ext2 resolution, and /USB0 is not an ext2 path.
     {
         const char *vrel = 0;
-        int vslot = hotplug_resolve_path(path, &vrel);
-        if (vslot >= 0) {
-            fat_fs_t *vfs = hotplug_volume_fat(vslot);
-            // NULL means mounted-but-not-readable (exFAT) or not mounted.
-            // Refusing here is what keeps a volume the UI labels
-            // "not browsable" from half-opening.
+        int vmatched = 0;
+        // hotplug_volume_for_path() is the resolve+open-the-volume pair this
+        // block used to spell out inline. It moved into drivers/hotplug.c when
+        // fs/recycle_fs.c needed the same answer (#246): a second copy of
+        // "which volume serves this path" is how one of them comes to disagree
+        // with the other about where a file is, and the recycle-bin capture was
+        // doing exactly that against g_fat_fs.
+        fat_fs_t *vfs = hotplug_volume_for_path(path, &vrel, &vmatched);
+        if (vmatched) {
+            // vfs NULL with vmatched set means mounted-but-not-readable
+            // (exFAT). Refusing here is what keeps a volume the UI labels
+            // "not browsable" from half-opening, and stops the path falling
+            // through to the root filesystem.
             if (!vfs) FD_FAIL(-MOS_ENOENT);
             // #745: O_CREAT|O_EXCL must fail if the target exists.
             // Atomic w.r.t. other opens: the syscall body is not
             // preempted between this test and the create below.
             if (om.create && om.excl && fat_exists(vfs, vrel))
                 FD_FAIL(-MOS_EEXIST);
+            int vol_created = 0;
             if (fat_open(vfs, vrel, &fd_table[fd]) != 0) {
                 extern int fat_create(fat_fs_t *fs, const char *path);
                 if (om.create && fat_create(vfs, vrel) == 0 &&
                     fat_open(vfs, vrel, &fd_table[fd]) == 0) {
-                    // created
+                    vol_created = 1;    // [renamevol] see CREATE POINT 3 below
                 } else {
                     FD_FAIL(-MOS_ENOENT);
                 }
@@ -1052,6 +1358,60 @@ int64_t sys_open_k(const char *path, int flags) {
                     FD_FAIL(-1);
                 }
             }
+            // [usbescrow] #246: THE TWO LINES THIS EARLY RETURN SKIPPED, AND
+            // WHY THEIR ABSENCE WAS A SILENT DESTRUCTION HOLE.
+            //
+            // This branch returns here, well above the common tail, so a
+            // descriptor on a removable volume never reached the tail's
+            // `fat_esc_orig[fd] = file_size` stamp. fat_esc_orig stayed 0, and
+            // the partial-write pre-image hook in sys_write is gated on it
+            // being non-zero, so a marked AI actor writing into the middle of a
+            // file on a USB stick kept NO pre-image: the hook never ran.
+            //
+            // And fat_open() above was handed `vrel`, the VOLUME-relative path,
+            // so the handle's own path said "/UT.TXT" when the file is at
+            // "/MEDIA/USB0/UT.TXT". Both readers of that field decide where a
+            // user's data goes, so that was not a missing path but a WRONG one,
+            // naming a file in the root directory.
+            //
+            // Stamped in the same ORDER the common tail uses, and for the same
+            // reasons stated there: the path first so the extent is recorded
+            // against a nameable handle, the extent AFTER the O_TRUNC above so
+            // a truncating open correctly has nothing original to protect (its
+            // pre-image is escrow_trunc_victim's job) and BEFORE the O_APPEND
+            // seek so the number is a length and not a position. Written for
+            // every opener, not just a marked one: for an unmarked process
+            // neither field is ever read.
+            // [renamevol] #246 CREATE POINT 3 of 3, THE REMOVABLE VOLUME, and
+            // the same early-return story as the two stamps above.
+            //
+            // The common tail and the ext2 branch each call perms_on_create()
+            // and the comment there says why: "Without this the new path has no
+            // entry and falls into perms_check()'s root-owned default, which
+            // denies W_OK to every non-root process, in its own home
+            // included." It also says "These are two independent create paths
+            // and this codebase's recurring fault is fixing only the one you
+            // were looking at." There were THREE, and this was the third.
+            //
+            // MEASURED 2026-10-04: an unprivileged prover (uid 1000) created a
+            // file on a mounted stick inside a sticky directory and then could
+            // not rename it, because the kernel judged the file it had just
+            // created to be root's. The serial line is unambiguous:
+            // "[STICKY-DENY] DENY remove: ... uid=1000 may not remove
+            // /USB0/SH/S1.TXT (owner default root, no row: 0)". That is a
+            // permission rule enforced against a user on the basis of a fact
+            // that was never recorded.
+            //
+            // Only when this open CREATED the file (om.create and it was not
+            // there before), for the same reason the other two sites are on
+            // their create paths: stamping an existing file would overwrite an
+            // owner. The ABSOLUTE path, because that is what perms_check() will
+            // be given; perms_on_create() canonicalizes either way.
+            if (vol_created && p && p->privilege == PRIV_USER) {
+                perms_on_create(path, p->euid, p->egid, 0);
+            }
+            fat_handle_set_abs_path(&fd_table[fd], path);
+            fat_esc_orig[fd] = fd_table[fd].file_size;
             if (om.append) fd_table[fd].position = fd_table[fd].file_size;
             fd_used[fd] = 1;
             return lfd_ext(fd);
@@ -1080,6 +1440,14 @@ int64_t sys_open_k(const char *path, int flags) {
             else if (a->rel[0]) { erel[0]='/'; int i=0; while (a->rel[i] && i<258){erel[i+1]=a->rel[i];i++;} erel[i+1]=0; }
             else { erel[0]='/'; erel[1]=0; }
 
+            // #747: ask the ONE policy (rustkern/fdopenpolicy.rs) what this
+            // mode requires of the descriptor, instead of re-deriving it from
+            // `om.can_write` here. native_append = 0: every aux backend commits
+            // by replacing the whole file, so for this family an append-only
+            // buffer is itself a destructive rewrite.
+            fd_open_plan_t aux_plan = { 0, 0, 0, 0, 0 };
+            fd_open_plan_rs(&om, 0, &aux_plan);
+
             if (mi.fstype == MNT_FS_EXT2) {
                 if (ext2_mount_into(&a->efs, mi.kind, mi.index, (uint32_t)mi.pstart) != 0)
                     FD_FAIL(-MOS_ENOENT);
@@ -1090,8 +1458,63 @@ int64_t sys_open_k(const char *path, int flags) {
                     if (ext2_read_inode_on(&a->efs, ino, &in) != 0) FD_FAIL(-1);
                     if ((in.i_mode & 0xF000) == 0x4000) {          // directory
                         a->is_dir = 1; a->dir_ino = ino; a->dir_pos = 0;
+                    } else if (aux_plan.whole_file) {
+                        // #747 PRESERVING OPEN. The aux backends commit by
+                        // REPLACING the whole file (ext2_write_file_on /
+                        // blkmgr_aux_fat_write_c), so the only descriptor shape
+                        // that can modify PART of an existing file without
+                        // losing the rest is one that holds all of it. See the
+                        // aux_plan comment above for what this branch used to
+                        // do instead.
+                        uint32_t sz = aux_plan.preload ? in.i_size : 0;
+                        if (sz > AUX_FILE_MAX) {
+                            // REFUSE LOUDLY rather than fall back to a mode
+                            // that would destroy the file. Same decision, and
+                            // the same reason, as the ext2 root family's
+                            // EXT2_WSPILL_BYTES refusal.
+                            kprintf("[AUX-RW] refusing a preserving write open on "
+                                    "%s%s: %u bytes exceeds the %u-byte whole-file "
+                                    "bound\n", a->mnt, a->rel, sz,
+                                    (unsigned)AUX_FILE_MAX);
+                            FD_FAIL(-MOS_EFBIG);
+                        }
+                        uint32_t cap = 4096;
+                        while (cap < sz) cap <<= 1;
+                        a->wbuf = (uint8_t *)kmalloc(cap);
+                        if (!a->wbuf) FD_FAIL(-MOS_ENOMEM);
+                        a->wcap = cap;
+                        a->wlen = 0;
+                        if (sz) {
+                            int64_t g = ext2_read_file_range_on(&a->efs, ino, 0,
+                                                                sz, a->wbuf);
+                            if (g != (int64_t)sz) {
+                                // A SHORT PRELOAD MUST NOT BECOME A SHORT FILE.
+                                // If the fd were handed back now, the first
+                                // write and close would commit only the part
+                                // that happened to read.
+                                kprintf("[AUX-RW] short preload of %s%s: %d of %u "
+                                        "bytes; refusing the open\n",
+                                        a->mnt, a->rel, (int)g, sz);
+                                kfree(a->wbuf); a->wbuf = 0; a->wcap = 0;
+                                FD_FAIL(-1);
+                            }
+                            a->wlen = sz;
+                        }
+                        a->writing = 1;
+                        a->rw = 1;
+                        a->noread = aux_plan.noread;
+                        a->rw_append = aux_plan.at_end;
+                        a->rwpos = aux_plan.at_end ? a->wlen : 0;
+                        // WHAT THE MEDIUM IS OWED: nothing, unless O_TRUNC
+                        // asked for an empty file. This one line is what makes
+                        // open-then-close a no-op instead of a truncation.
+                        a->wdirty = aux_plan.owes_empty;
+                        a->rsize = a->wlen;   // keep stat/seek-END consistent
                     } else if (om.can_write) {
                         // Create/replace: buffer, commit whole file on close.
+                        // Reached only when the open ITSELF asked for an empty
+                        // file (O_TRUNC), so starting at length 0 is what the
+                        // caller requested rather than data loss.
                         a->writing = 1; a->wcap = 4096; a->wlen = 0; a->wdirty = 1;
                         a->wbuf = (uint8_t *)kmalloc(a->wcap);
                         if (!a->wbuf) FD_FAIL(-MOS_ENOMEM);
@@ -1117,7 +1540,21 @@ int64_t sys_open_k(const char *path, int flags) {
                 if (a->rel[0] == 0) {                              // the mount root dir
                     a->is_dir = 1; a->dir_pos = 0;
                 } else if (om.can_write) {
-                    // The Rust FAT layer refuses overwrite, so create-only here.
+                    // #747: UNCHANGED, AND IT IS NOT THE SAME DEFECT. The Rust
+                    // FAT layer (blkmgr.rs fat_write_file) returns
+                    // BLKMGR_E_INUSE for a name that already exists, so the
+                    // close-time commit of this branch FAILS on an existing
+                    // file and the file on the medium is never touched. This
+                    // family therefore cannot lose data the way the ext2 aux,
+                    // SMB and NFS families could: the write fails instead.
+                    //
+                    // That is a real defect of its own (a write open that
+                    // reports success and can never commit), and it is NOT
+                    // fixed here: fixing it needs an overwrite path in the Rust
+                    // FAT layer, which is a change to a different subsystem
+                    // with its own free-cluster bookkeeping. Giving this branch
+                    // a preserving buffer would only move the failure later
+                    // without making the write work.
                     a->writing = 1; a->wcap = 4096; a->wlen = 0; a->wdirty = 1;
                     a->wbuf = (uint8_t *)kmalloc(a->wcap);
                     if (!a->wbuf) FD_FAIL(-MOS_ENOMEM);
@@ -1150,15 +1587,80 @@ int64_t sys_open_k(const char *path, int flags) {
 
         smb_dirent_t info;
         int have = (smb_stat(path, &info) == 0);
-        int want_write = (flags & 0x1) || (flags & 0x2) || (flags & 0x40) || (flags & 0x200);
+        // #747: THE RAW-BIT TEST THAT WAS HERE IS THE BUG.
+        //
+        //   int want_write = (flags & 0x1) || (flags & 0x2) ||
+        //                    (flags & 0x40) || (flags & 0x200);
+        //
+        // It was true for O_WRONLY, O_RDWR, O_CREAT or O_TRUNC and the branch
+        // it selected started an EMPTY buffer for all four, which close()
+        // uploaded as the file's entire new contents. A plain O_RDWR open of an
+        // existing 1 MB file, with no truncation requested anywhere, left a
+        // 4-byte file after a 4-byte write. The question is now asked ONCE, of
+        // the one policy (rustkern/fdopenpolicy.rs), over the one decoding
+        // (open_mode_decode). native_append = 0: smb_vfs_write_whole REPLACES
+        // the file, so for this family an append-only buffer is itself a
+        // destructive rewrite.
+        fd_open_plan_t pl = { 0, 0, 0, 0, 0 };
+        fd_open_plan_rs(&om, 0, &pl);
+        int want_write = om.can_write || om.create;
 
         if (have && info.is_directory) {
             int dh = smb_opendir(path);
             if (dh < 0) FD_FAIL(-1);
             s->is_dir = 1; s->dirh = dh;
+        } else if (have && pl.whole_file) {
+            // #747 PRESERVING OPEN: wbuf holds the WHOLE file and both read()
+            // and write() act at rwpos, so opening and closing without writing
+            // leaves the file untouched (wdirty starts CLEAR), a read returns
+            // the existing bytes, and a partial overwrite keeps the tail.
+            if (info.size > (uint64_t)NETFS_RW_MAX_BYTES) {
+                // REFUSE LOUDLY rather than serve the open in a mode that would
+                // destroy the file. The read-only path has no bound of its own
+                // (it kmallocs the file size); that is a pre-existing exposure
+                // and is NOT changed here.
+                kprintf("[NETFS-RW] refusing a preserving write open on %s: "
+                        "%u bytes exceeds the %u-byte whole-file bound\n",
+                        path, (unsigned)info.size, (unsigned)NETFS_RW_MAX_BYTES);
+                FD_FAIL(-MOS_EFBIG);
+            }
+            uint32_t sz = 0;
+            if (pl.preload) {
+                // The production whole-file reader, the same one a read open
+                // uses. It returns a kmalloc'd buffer of (size + 1) bytes, so
+                // it IS the write buffer; there is no second copy.
+                s->wbuf = (uint8_t *)smb_vfs_read_whole(path, &sz);
+                if (!s->wbuf) FD_FAIL(-1);
+                if (sz != (uint32_t)info.size) {
+                    // A SHORT PRELOAD MUST NOT BECOME A SHORT FILE.
+                    kprintf("[NETFS-RW] short preload of %s: %u of %u bytes; "
+                            "refusing the open\n", path, sz,
+                            (unsigned)info.size);
+                    kfree(s->wbuf); s->wbuf = 0;
+                    FD_FAIL(-1);
+                }
+                s->wcap = sz + 1;
+            } else {
+                s->wcap = 4096;
+                s->wbuf = (uint8_t *)kmalloc(s->wcap);
+                if (!s->wbuf) FD_FAIL(-1);
+            }
+            s->wlen = sz;
+            s->writing = 1;
+            s->rw = 1;
+            s->noread = pl.noread;
+            s->rw_append = pl.at_end;
+            s->rwpos = pl.at_end ? s->wlen : 0;
+            s->wdirty = pl.owes_empty;   // nothing owed unless O_TRUNC asked
+            s->rsize = s->wlen;
         } else if (want_write) {
-            // O_WRONLY/O_RDWR/O_CREAT/O_TRUNC: buffer writes, upload on close.
+            // Create (the file is not there), or O_TRUNC on one that is: the
+            // file is empty either way, so an append-only buffer destroys
+            // nothing. `wdirty = pl.owes_empty` is what makes an O_TRUNC open
+            // actually empty the file even if nothing is then written, which
+            // the raw-bit version never did.
             s->writing = 1; s->wcap = 4096; s->wlen = 0;
+            s->wdirty = pl.owes_empty;
             s->wbuf = (uint8_t *)kmalloc(s->wcap);
             if (!s->wbuf) FD_FAIL(-1);
         } else if (have) {
@@ -1187,14 +1689,51 @@ int64_t sys_open_k(const char *path, int flags) {
 
         nfs_fattr3_t attrs;
         int have = (nfs_getattr(path, &attrs) == 0);
-        int want_write = (flags & 0x1) || (flags & 0x2) || (flags & 0x40) || (flags & 0x200);
+        // #747: identical defect, identical fix, ONE policy. See the SMB branch
+        // above for the raw-bit test this replaces and what it cost.
+        fd_open_plan_t pl = { 0, 0, 0, 0, 0 };
+        fd_open_plan_rs(&om, 0, &pl);
+        int want_write = om.can_write || om.create;
 
         if (have && attrs.type == NF3DIR) {
             int dh = nfs_opendir(path);
             if (dh < 0) FD_FAIL(-1);
             s->is_dir = 1; s->dirh = dh;
+        } else if (have && pl.whole_file) {
+            if (attrs.size > (uint64_t)NETFS_RW_MAX_BYTES) {
+                kprintf("[NETFS-RW] refusing a preserving write open on %s: "
+                        "%u bytes exceeds the %u-byte whole-file bound\n",
+                        path, (unsigned)attrs.size, (unsigned)NETFS_RW_MAX_BYTES);
+                FD_FAIL(-MOS_EFBIG);
+            }
+            uint32_t sz = 0;
+            if (pl.preload) {
+                s->wbuf = (uint8_t *)nfs_vfs_read_whole(path, &sz);
+                if (!s->wbuf) FD_FAIL(-1);
+                if (sz != (uint32_t)attrs.size) {
+                    kprintf("[NETFS-RW] short preload of %s: %u of %u bytes; "
+                            "refusing the open\n", path, sz,
+                            (unsigned)attrs.size);
+                    kfree(s->wbuf); s->wbuf = 0;
+                    FD_FAIL(-1);
+                }
+                s->wcap = sz + 1;
+            } else {
+                s->wcap = 4096;
+                s->wbuf = (uint8_t *)kmalloc(s->wcap);
+                if (!s->wbuf) FD_FAIL(-1);
+            }
+            s->wlen = sz;
+            s->writing = 1;
+            s->rw = 1;
+            s->noread = pl.noread;
+            s->rw_append = pl.at_end;
+            s->rwpos = pl.at_end ? s->wlen : 0;
+            s->wdirty = pl.owes_empty;
+            s->rsize = s->wlen;
         } else if (want_write) {
             s->writing = 1; s->wcap = 4096; s->wlen = 0;
+            s->wdirty = pl.owes_empty;
             s->wbuf = (uint8_t *)kmalloc(s->wcap);
             if (!s->wbuf) FD_FAIL(-1);
         } else if (have) {
@@ -1241,6 +1780,13 @@ int64_t sys_open_k(const char *path, int flags) {
         ext2_fd_t *e = &e2fd[fd];
         for (uint64_t z = 0; z < sizeof(*e); z++) ((uint8_t *)e)[z] = 0;
         { int z = 0; while (rel[z] && z < 255) { e->path[z] = rel[z]; z++; } e->path[z] = 0; }
+        // #747: native_append = 1. This family alone HAS a real append
+        // primitive (ext2_append_file), so an O_WRONLY|O_APPEND fd may keep an
+        // append-only buffer here; on a replace-only backend that same buffer
+        // would be a destructive rewrite. The capability is the backend's, so
+        // it is a parameter, not a preference.
+        fd_open_plan_t e2_plan = { 0, 0, 0, 0, 0 };
+        fd_open_plan_rs(&om, 1, &e2_plan);
         uint32_t ino = ext2_resolve_path(rel);
         // #745: O_CREAT|O_EXCL fails EEXIST if the name already
         // exists on ext2. Checked before the create branch below,
@@ -1252,7 +1798,17 @@ int64_t sys_open_k(const char *path, int flags) {
             if (ext2_read_inode(ino, &in) != 0) FD_FAIL(-1);
             if ((in.i_mode & 0xF000) == 0x4000) {       // directory
                 e->is_dir = 1; e->dir_ino = ino; e->dir_pos = 0;
-            } else if (om.rdwr || (om.can_write && !om.trunc && !om.append)) {
+            } else if (e2_plan.whole_file) {
+                // #747: THE CONDITION MOVED, THE BEHAVIOUR DID NOT. This read
+                //     om.rdwr || (om.can_write && !om.trunc && !om.append)
+                // and it was right; it was also the FOURTH hand-written answer
+                // to the same question, and the other three were wrong (see
+                // rustkern/fdopenpolicy.rs). fd_open_plan_rs(&om, 1, ...) with
+                // native_append = 1 reproduces that expression EXACTLY - the
+                // module's self-test asserts the whole ext2 column row by row -
+                // so this is a single-sourcing change on this family and a
+                // correctness change on the other three.
+                //
                 // #745 local 109: THE CONDITION IS THE FIX. This branch used to
                 // read `om.rdwr` alone, so a plain O_WRONLY open with NEITHER
                 // O_TRUNC NOR O_APPEND fell into the write-only branch below,
@@ -1291,7 +1847,8 @@ int64_t sys_open_k(const char *path, int flags) {
                 // writing leaves the file untouched (wdirty starts CLEAR, so
                 // close has nothing to flush), a read returns the existing
                 // bytes, and a partial overwrite keeps the tail.
-                uint32_t sz = om.trunc ? 0 : in.i_size;
+                // #747: the plan's fields, not a second reading of `om`.
+                uint32_t sz = e2_plan.preload ? in.i_size : 0;
                 // BOUND, STATED HONESTLY. wbuf is the whole file, so an rw fd
                 // cannot exceed the buffered-write bound. The #572 streaming
                 // writer is not an option: ext2_wstream_begin() truncates its
@@ -1339,15 +1896,21 @@ int64_t sys_open_k(const char *path, int flags) {
                 // read": an O_WRONLY fd reaching this branch would otherwise
                 // start serving read(), which POSIX forbids and which would
                 // hand a caller bytes its own open said it could not have.
-                e->noread = !om.can_read;
+                e->noread = e2_plan.noread;
                 e->writing = 1;
                 e->rwpos = 0;
-                e->rw_append = om.append;
+                e->rw_append = e2_plan.at_end;
                 // WHAT THE MEDIUM IS OWED. Nothing, unless O_TRUNC asked for an
                 // empty file. This one line is what makes open-then-close a
                 // no-op instead of a destructive rewrite.
-                e->wdirty = om.trunc ? 1 : 0;
+                e->wdirty = e2_plan.owes_empty;
                 e->rsize = e->wlen;   // keep stat/seek-END answers consistent
+                // #246 partialwrite: THE ORIGINAL EXTENT. `sz` is already 0
+                // under O_TRUNC, which is correct and not a special case: an
+                // O_TRUNC open's pre-image is kept by escrow_trunc_victim() at
+                // the open itself, so there is nothing left for the write hook
+                // to protect and nothing it could capture twice.
+                e->esc_orig_len = sz;
             } else if (om.can_write) {
                 // Existing regular file opened for writing: buffer the new
                 // contents; ext2_write_file() truncates the inode in place on
@@ -1391,7 +1954,14 @@ int64_t sys_open_k(const char *path, int flags) {
             // fd and an invisible file (kescrow2fix in blame.md). Same parent
             // resolution the write path uses; "/" and bare names resolve to the
             // ext2 root, so ordinary creates under an existing dir are unchanged.
-            if (!ext2_parent_dir_exists(rel)) FD_FAIL(-MOS_ENOENT);
+            if (!ext2_parent_dir_exists(rel)) {
+                // #aicappersist: REPORT, then refuse exactly as before. The report
+                // re-resolves the parent, so the log says whether this refusal was
+                // RIGHT (parent really absent: fix the caller) or WRONG (parent is
+                // there: fix the lookup). The refusal itself is untouched.
+                fsenoent_report(FSE_SITE_PARENTGUARD, rel, 0);
+                FD_FAIL(-MOS_ENOENT);
+            }
             e->writing = 1; e->wcap = 4096; e->wlen = 0; e->wdirty = 1;
             e->wbuf = (uint8_t *)kmalloc(e->wcap);
             if (!e->wbuf) FD_FAIL(-1);
@@ -1418,6 +1988,11 @@ int64_t sys_open_k(const char *path, int flags) {
                 perms_on_create(path, p->euid, p->egid, 0);
             }
         } else {
+            // #aicappersist: an ordinary "not found" on a read-only open, reported
+            // at the same chokepoint so a vanished filesystem is distinguishable
+            // from a genuinely absent file. The rate limit makes this at most one
+            // line per verdict per boot.
+            fsenoent_report(FSE_SITE_NOCREATE, rel, 0);
             FD_FAIL(-MOS_ENOENT);
         }
         e->used = 1;
@@ -1474,6 +2049,14 @@ int64_t sys_open_k(const char *path, int flags) {
             FD_FAIL(-1);
         }
     }
+    // [noaccount] #246 partialwrite: the extent this descriptor must protect,
+    // recorded AFTER the O_TRUNC above so a truncating open correctly has
+    // nothing original to protect (its pre-image is escrow_trunc_victim's job)
+    // and BEFORE the O_APPEND seek so the number is the file's length, not a
+    // position. Written for every opener, not just a marked one: for an
+    // unmarked process it is never read.
+    fat_esc_orig[fd] = fd_table[fd].file_size;
+
     if (om.append) fd_table[fd].position = fd_table[fd].file_size;
 
     fd_used[fd] = 1;
@@ -1510,6 +2093,28 @@ int64_t sys_open_k(const char *path, int flags) {
 int64_t sys_ftruncate(int fd, int64_t length) {
     if (fd < 0 || length < 0) return -1;
 
+    // #246: AN ftruncate() THAT SHRINKS A FILE DESTROYS THE BYTES PAST THE NEW
+    // LENGTH, and it is the last deterministic destruction path that is not a
+    // delete. It arrives on an ALREADY-OPEN fd, so the O_TRUNC check at open
+    // time could not have seen it coming: the open may have carried no O_TRUNC
+    // at all. For a MARKED process the current on-disk contents are COPIED into
+    // the Recycle Bin first (a copy, not a move: the fd stays open and the file
+    // must stay where it is). A non-marked process reads one process_t byte.
+    //
+    // advlock_resolve_fd() is reused rather than a fourth copy of the
+    // fd-to-path mapping being written here; it already walks the aux, smb,
+    // ext2 and FAT tables in the right order and enforces #fdguard ownership.
+    {
+        process_t *mp = proc_current();
+        if (mp && mp->escrow_active) {
+            char fpath[260];
+            if (advlock_resolve_fd(fd, fpath, (int)sizeof(fpath), 0, 0, 0) != 0)
+                return -1;    // cannot name it, so cannot protect it: refuse
+            extern int escrow_shrink_victim(const char *path, uint64_t newlen);
+            if (escrow_shrink_victim(fpath, (uint64_t)length) != 0) return -1;
+        }
+    }
+
     // Per-process descriptions (pipes, PTYs, devices, the shell-redirect file
     // objects). file_ops_t has no truncate op, so there is nothing to route to
     // and nothing to pretend about.
@@ -1521,8 +2126,41 @@ int64_t sys_ftruncate(int fd, int64_t length) {
     if (!legacy_owner_ok(fd, "ftruncate")) return -1;   // #fdguard
     if (fd < 3) return -1;
 
-    if (smbfd[fd].used) return -1;      // whole-file upload on close
-    if (auxfd[fd].used) return -1;      // #404 Stage 4b: whole-file commit on close
+    // #747: THESE TWO REFUSALS BECAME LOAD-BEARING THE MOMENT THE OPEN STOPPED
+    // EMPTYING THE FILE. Before this change, "save a shortened file" worked on
+    // a share BY ACCIDENT: the open truncated it to zero, so the editor's
+    // ftruncate() was never needed and its failure never mattered. With the
+    // open now preserving the file, an ftruncate that returns -1 would leave a
+    // stale tail behind the new, shorter contents. busybox vi is exactly that
+    // caller: it opens O_WRONLY|O_CREAT deliberately WITHOUT O_TRUNC and then
+    // calls ftruncate(). So this lands in the same change as the open fix, not
+    // as a bonus, for the same reason SYS_FTRUNCATE landed with the ext2 fix.
+    //
+    // It is a shortening of the DESCRIPTION's buffer: the commit is still the
+    // whole-file replace at close/fsync, so there is nothing to shorten on the
+    // medium until then, and the medium then receives exactly `length` bytes.
+    if (smbfd[fd].used) {
+        smb_fd_t *s = &smbfd[fd];
+        if (s->is_dir || !s->writing || !s->wbuf) return -1;
+        if (!s->rw) return -1;          // append-only buffer: no extent to cut
+        if ((uint64_t)length > (uint64_t)s->wlen) return -1;   // grow: refused
+        s->wlen = (uint32_t)length;
+        if (s->rwpos > s->wlen) s->rwpos = s->wlen;
+        s->rsize = s->wlen;
+        s->wdirty = 1;                  // the medium is owed the shorter file
+        return 0;
+    }
+    if (auxfd[fd].used) {
+        aux_fd_t *a = &auxfd[fd];
+        if (a->is_dir || !a->writing || !a->wbuf) return -1;
+        if (!a->rw) return -1;
+        if ((uint64_t)length > (uint64_t)a->wlen) return -1;
+        a->wlen = (uint32_t)length;
+        if (a->rwpos > a->wlen) a->rwpos = a->wlen;
+        a->rsize = a->wlen;
+        a->wdirty = 1;
+        return 0;
+    }
 
     if (e2fd[fd].used) {
         ext2_fd_t *e = &e2fd[fd];
@@ -1534,6 +2172,11 @@ int64_t sys_ftruncate(int fd, int64_t length) {
         if (e->rwpos > e->wlen) e->rwpos = e->wlen;
         e->rsize = e->wlen;
         e->wdirty = 1;                  // the medium is owed the shorter file
+        // #246 partialwrite: escrow_shrink_victim() above has ALREADY kept this
+        // descriptor's pre-image, so a later overwriting write must not keep a
+        // second copy of the same bytes. Set for every caller, not just a
+        // marked one: for an unmarked process the flag is never read.
+        e->esc_pre = 1;
         return 0;
     }
 
@@ -1577,9 +2220,7 @@ int64_t sys_close(int fd) {
                 rc = (w == (int64_t)a->wlen) ? 0 : -1;
             }
         }
-        if (a->rbuf) kfree(a->rbuf);
-        if (a->wbuf) kfree(a->wbuf);
-        for (uint64_t z = 0; z < sizeof(*a); z++) ((uint8_t *)a)[z] = 0;
+        legacy_fd_free_buffers(fd);   // #fdreclaim: ONE teardown, shared
         legacy_fd_release(fd);
         return rc;
     }
@@ -1599,9 +2240,7 @@ int64_t sys_close(int fd) {
         } else if (s->writing && s->wbuf && s->wdirty) {
             rc = smb_vfs_write_whole(s->path, s->wbuf, s->wlen);
         }
-        if (s->rbuf) kfree(s->rbuf);
-        if (s->wbuf) kfree(s->wbuf);
-        for (uint64_t z = 0; z < sizeof(*s); z++) ((uint8_t *)s)[z] = 0;
+        legacy_fd_free_buffers(fd);   // #fdreclaim: ONE teardown, shared
         legacy_fd_release(fd);
         return rc;
     }
@@ -1648,10 +2287,7 @@ int64_t sys_close(int fd) {
                         (uint32_t)g_wstream_ms, (uint32_t)g_wstream_calls);
             if (_cs) { g_wstream_ms = 0; g_wstream_calls = 0; }
         }
-        if (e->rbuf) kfree(e->rbuf);
-        if (e->wbuf) kfree(e->wbuf);
-        if (e->sbuf) kfree(e->sbuf);
-        for (uint64_t z = 0; z < sizeof(*e); z++) ((uint8_t *)e)[z] = 0;
+        legacy_fd_free_buffers(fd);   // #fdreclaim: ONE teardown, shared
         legacy_fd_release(fd);
         return rc;
     }
@@ -1861,6 +2497,20 @@ int64_t sys_read(int fd, void *buf, size_t count) {
     // #404 Stage 4b: aux-mount fd (/MNT/<name>): serve from the whole-file cache.
     if (fd >= 3 && fd < LEGACY_MAX_FDS && auxfd[fd].used) {
         aux_fd_t *a = &auxfd[fd];
+        // #747: a preserving (rw) fd reads out of the SAME whole-file buffer it
+        // writes into, at the same position. Before this it fell through to the
+        // `!a->rbuf` refusal below, so every read on an O_RDWR fd returned -1
+        // and a caller could not read back its own file.
+        if (a->rw) {
+            if (a->is_dir || !a->wbuf) return -1;
+            if (a->noread) return -1;          // O_WRONLY cannot read
+            uint32_t avail = (a->rwpos < a->wlen) ? (a->wlen - a->rwpos) : 0;
+            uint32_t n = (count < avail) ? (uint32_t)count : avail;
+            if (n) { uaccess_ac_t __ac = uaccess_begin();
+                     memcpy(buf, a->wbuf + a->rwpos, n);
+                     uaccess_end(__ac); a->rwpos += n; }
+            return (int64_t)n;
+        }
         if (a->is_dir || !a->rbuf) return -1;
         uint32_t avail = (a->rpos < a->rsize) ? (a->rsize - a->rpos) : 0;
         uint32_t n = (count < avail) ? (uint32_t)count : avail;
@@ -1873,6 +2523,17 @@ int64_t sys_read(int fd, void *buf, size_t count) {
     // #317: SMB-backed fd: serve from the cached file image.
     if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
         smb_fd_t *s = &smbfd[fd];
+        // #747: see the aux branch above. Same mode, same reason.
+        if (s->rw) {
+            if (s->is_dir || !s->wbuf) return -1;
+            if (s->noread) return -1;          // O_WRONLY cannot read
+            uint32_t avail = (s->rwpos < s->wlen) ? (s->wlen - s->rwpos) : 0;
+            uint32_t n = (count < avail) ? (uint32_t)count : avail;
+            if (n) { uaccess_ac_t __ac = uaccess_begin();
+                     memcpy(buf, s->wbuf + s->rwpos, n);
+                     uaccess_end(__ac); s->rwpos += n; }
+            return (int64_t)n;
+        }
         if (s->is_dir || !s->rbuf) return -1;
         uint32_t avail = (s->rpos < s->rsize) ? (s->rsize - s->rpos) : 0;
         uint32_t n = (count < avail) ? (uint32_t)count : avail;
@@ -1891,6 +2552,12 @@ int64_t sys_read(int fd, void *buf, size_t count) {
     // memory is safe. Bounded kernel RAM regardless of file size.
     if (fd >= 3 && fd < LEGACY_MAX_FDS && e2fd[fd].used) {
         ext2_fd_t *e = &e2fd[fd];
+        // #e2rdio: a device retry, an exhausted retry or a laundering event
+        // cannot print where it happens (e2_dev_read runs inside the block read
+        // path, where bootlog's flush re-enters blk_write). It sets a flag; this
+        // is a safe context, so print it here. One relaxed load per read when
+        // nothing is pending, which is always.
+        if (e2rdio_pending_rs()) e2rdio_report("runtime");
         // #746: an O_RDWR fd reads out of the SAME whole-file buffer it writes
         // into, at the same position. Before this it fell through to the
         // `!e->rbuf` refusal below and every read on it returned -1.
@@ -1945,7 +2612,40 @@ int64_t sys_read(int fd, void *buf, size_t count) {
                                 "rsize=%u rpos=%u produced=%u\n",
                                 e->rino, base, want, (long)got, e->rsize, e->rpos, produced);
                     }
-                    break;                              // read error / short: stop
+                    // =======================================================
+                    // #e2rdio THE FIX. THIS SITE WAS THE DEFECT.
+                    //
+                    // It used to `break` and fall through to
+                    // `return (int64_t)produced;`, and `produced` is 0 whenever
+                    // the FIRST refill failed. So a hard device error became
+                    // read() == 0, which userland/libc/stdio_file.c's refill()
+                    // reads as end-of-file - correctly, because that IS what
+                    // read() == 0 means. The caller then concluded the file was
+                    // truncated. A transient disk fault was thereby laundered
+                    // into "this file is corrupt", with the one line above as
+                    // the only trace anywhere.
+                    //
+                    // The kernel KNOWS this is not EOF: control only reaches
+                    // here with n > 0, and n = rsize - rpos, so the read
+                    // position is provably still inside the file.
+                    //
+                    // got == 0 is left alone and still returns EOF: that means
+                    // ext2_read_file_range() found off >= i_size, i.e. the file
+                    // really did shrink under us, and EOF is the honest answer.
+                    // Only got < 0 is an error, and it is reported as one.
+                    //
+                    // A PARTIAL read (produced > 0) still returns the bytes it
+                    // has, which is exactly what read(2) requires; the NEXT
+                    // read() re-attempts the same refill, fails again with
+                    // produced == 0, and reports the error then.
+                    // =======================================================
+                    e2rdio_note_launder_rs(produced, (int64_t)got, e->rino);
+                    if (got < 0 && produced == 0) {
+                        // -3 is the refill's kmalloc failure, which is ENOMEM
+                        // and not an I/O error; everything else is EIO.
+                        return (got == -3) ? -12 : -5;
+                    }
+                    break;                              // partial: hand back what we have
                 }
                 e->rwin_base = base; e->rwin_len = (uint32_t)got;
             }
@@ -2001,6 +2701,35 @@ static int64_t sys_write_inner(int fd, const void *buf, size_t count) {
         aux_fd_t *a = &auxfd[fd];
         if (!a->writing || !a->wbuf) return -1;
         a->wdirty = 1;
+        // #747 PRESERVING fd: overwrite IN PLACE at the shared position,
+        // extending only when the write runs past the current end. The
+        // append-only path below has no concept of position at all, so a
+        // seek-then-write appended instead of overwriting, and the first write
+        // on a freshly opened fd replaced the whole file.
+        if (a->rw) {
+            if (a->rw_append) a->rwpos = a->wlen;   // O_APPEND: always at the end
+            if ((uint64_t)a->rwpos + count > AUX_FILE_MAX) return -1;
+            uint32_t end = a->rwpos + (uint32_t)count;
+            if (end > a->wcap) {
+                uint32_t ncap = a->wcap ? a->wcap : 4096;
+                while (ncap < end) ncap *= 2;
+                uint8_t *nb = (uint8_t *)kmalloc(ncap);
+                if (!nb) return -1;
+                memcpy(nb, a->wbuf, a->wlen);
+                kfree(a->wbuf); a->wbuf = nb; a->wcap = ncap;
+            }
+            // A SEEK PAST THE END THEN A WRITE leaves a gap. POSIX says those
+            // bytes read as zero; without this they would be whatever the heap
+            // happened to hold, which would publish kernel memory into a file.
+            if (a->rwpos > a->wlen)
+                for (uint32_t z = a->wlen; z < a->rwpos; z++) a->wbuf[z] = 0;
+            if (count && copy_from_user(a->wbuf + a->rwpos, buf, count) != 0)
+                return -14;
+            a->rwpos = end;
+            if (end > a->wlen) a->wlen = end;
+            a->rsize = a->wlen;
+            return (int64_t)count;
+        }
         if ((uint64_t)a->wlen + count > AUX_FILE_MAX) return -1;   // bounded aux file
         if (a->wlen + count > a->wcap) {
             uint32_t ncap = a->wcap ? a->wcap : 4096;
@@ -2020,6 +2749,28 @@ static int64_t sys_write_inner(int fd, const void *buf, size_t count) {
         smb_fd_t *s = &smbfd[fd];
         if (!s->writing || !s->wbuf) return -1;
         s->wdirty = 1;   // #695: not on the server until a flush says so
+        // #747: see the aux branch above. Same mode, same reason.
+        if (s->rw) {
+            if (s->rw_append) s->rwpos = s->wlen;
+            if ((uint64_t)s->rwpos + count > (uint64_t)NETFS_RW_MAX_BYTES) return -1;
+            uint32_t end = s->rwpos + (uint32_t)count;
+            if (end > s->wcap) {
+                uint32_t ncap = s->wcap ? s->wcap : 4096;
+                while (ncap < end) ncap *= 2;
+                uint8_t *nb = (uint8_t *)kmalloc(ncap);
+                if (!nb) return -1;
+                memcpy(nb, s->wbuf, s->wlen);
+                kfree(s->wbuf); s->wbuf = nb; s->wcap = ncap;
+            }
+            if (s->rwpos > s->wlen)
+                for (uint32_t z = s->wlen; z < s->rwpos; z++) s->wbuf[z] = 0;
+            if (count && copy_from_user(s->wbuf + s->rwpos, buf, count) != 0)
+                return -14;
+            s->rwpos = end;
+            if (end > s->wlen) s->wlen = end;
+            s->rsize = s->wlen;
+            return (int64_t)count;
+        }
         if (s->wlen + count > s->wcap) {
             uint32_t ncap = s->wcap ? s->wcap : 4096;
             while (ncap < s->wlen + count) ncap *= 2;
@@ -2051,6 +2802,38 @@ static int64_t sys_write_inner(int fd, const void *buf, size_t count) {
             if (e->wsealed) return -1;
             if (!e->wbuf) return -1;
             if (e->rw_append) e->rwpos = e->wlen;   // O_APPEND: always at the end
+
+            // #246 partialwrite: A WRITE THAT LANDS ON BYTES THAT ALREADY
+            // EXIST IS A DESTRUCTION, and it is the last route in the escrow
+            // family that kept no pre-image. The decision is made HERE, after
+            // the O_APPEND position fix-up so the offset is the real one, and
+            // BEFORE the copy_from_user below touches the buffer, because
+            // wbuf[0, esc_orig_len) still holds the PRISTINE file contents at
+            // this instant: the open filled it from the file and nothing has
+            // overwritten any of it yet (an earlier append wrote only past
+            // esc_orig_len). So the pre-image is handed over from memory and
+            // costs NO READ. A non-escrow process reads one process_t byte and
+            // an append by a marked one is decided without any I/O at all.
+            if (e->esc_orig_len && !e->esc_pre) {
+                process_t *ep = proc_current();
+                if (ep && ep->escrow_active) {
+                    extern int escrow_overwrite_victim(const char *path,
+                                                       uint64_t pos,
+                                                       uint64_t count,
+                                                       uint64_t orig_len,
+                                                       const void *pre,
+                                                       uint32_t prelen);
+                    int erc = escrow_overwrite_victim(e->path, (uint64_t)e->rwpos,
+                                                      (uint64_t)count,
+                                                      (uint64_t)e->esc_orig_len,
+                                                      e->wbuf, e->esc_orig_len);
+                    // Fail closed: the bytes could not be made recoverable, so
+                    // the write does not happen and nothing is changed.
+                    if (erc < 0) return -MOS_EACCES;
+                    if (erc > 0) e->esc_pre = 1;   // one copy per descriptor
+                }
+            }
+
             uint64_t end = (uint64_t)e->rwpos + count;
             if (end > EXT2_WSPILL_BYTES) {
                 // The rw fd holds the whole file, so it cannot grow past the
@@ -2217,6 +3000,62 @@ static int64_t sys_write_inner(int fd, const void *buf, size_t count) {
     // for size == 0, which would arm the sticky error below on a call POSIX
     // defines as a successful no-op.
     if (count == 0) return 0;
+
+    // #246 partialwrite / [noaccount]: THE IN-PLACE FAT FAMILY, NOW CAPTURED
+    // INSTEAD OF REFUSED.
+    //
+    // A FAT descriptor writes STRAIGHT THROUGH to blk_write at a real file
+    // position: there is no buffer, so a write that lands inside the file
+    // destroys those bytes at THIS call, not at close. That is the same hole
+    // as the ext2 one above, on the ESP and on removable volumes.
+    //
+    // IT USED TO BE A REFUSAL, and the stated reason was exactly right: the
+    // Recycle Bin index is keyed on the file's ABSOLUTE path and this
+    // descriptor did not have one, because fat_file_t carried the BASENAME.
+    // Recycling under that would have filed a user's thumbdrive document as a
+    // root-directory file, so failing closed was the correct call and the note
+    // said what it would take to close it properly. The handle now carries the
+    // absolute path (fat.c, fat_set_handle_path), so this is that change.
+    //
+    // THE SAME FUNCTION THE ext2 FAMILY USES, not a FAT-shaped variant of it.
+    // escrow_overwrite_victim() takes the pre-image bytes when the caller
+    // already has them in a whole-file buffer and READS THEM BACK FROM THE
+    // FILESYSTEM when it does not; a FAT descriptor has no buffer, so it
+    // passes NULL and pays one read. One policy, one journal, one bin.
+    //
+    // esc_orig IS THE LENGTH THIS DESCRIPTOR FOUND, NOT THE CURRENT ONE, for
+    // the reason the ext2 side records: file_size grows as the descriptor
+    // appends, so comparing against it would treat a write into bytes THIS
+    // descriptor just appended as a destruction of original data. esc_pre
+    // makes it one copy per descriptor rather than one per write(), because an
+    // editor saving a file issues many writes and a bin with an entry per
+    // write is unusable as well as expensive.
+    //
+    // STILL FAIL CLOSED when the pre-image cannot be kept (no usable bin, a
+    // network path, an unnameable handle): the write does not happen.
+    {
+        process_t *fp = proc_current();
+        if (fp && fp->escrow_active && !fat_esc_pre[fd] &&
+            fat_esc_orig[fd] && fd_table[fd].position < fat_esc_orig[fd]) {
+            extern int escrow_overwrite_victim(const char *path, uint64_t pos,
+                                               uint64_t count, uint64_t orig_len,
+                                               const void *pre, uint32_t prelen);
+            if (!fd_table[fd].path[0]) {
+                kprintf("[ESCROW] DENY partial write pid=%u fd=%d (this FAT "
+                        "descriptor has no absolute path: its open path did "
+                        "not fit or was not absolute, so the pre-image could "
+                        "not be filed; kernel-enforced, fail closed)\n",
+                        (unsigned)fp->pid, fd);
+                return -MOS_EACCES;
+            }
+            int erc = escrow_overwrite_victim(fd_table[fd].path,
+                                              (uint64_t)fd_table[fd].position,
+                                              (uint64_t)count,
+                                              (uint64_t)fat_esc_orig[fd], 0, 0);
+            if (erc < 0) return -MOS_EACCES;
+            if (erc > 0) fat_esc_pre[fd] = 1;   // one copy per descriptor
+        }
+    }
     {
         int64_t w = fat_write(&fd_table[fd], buf, count);
         // #746 REMEMBER THE FAILURE, so close() can report it (see fd_werr).
@@ -2251,6 +3090,20 @@ int64_t sys_seek(int fd, int64_t offset, int whence) {
     if (fd >= 3 && fd < LEGACY_MAX_FDS && auxfd[fd].used) {
         aux_fd_t *a = &auxfd[fd];
         int64_t np;
+        // #747: a preserving fd has ONE position, and SEEK_END means the end of
+        // what it currently holds (wlen), which a write may have moved. The
+        // branch below seeks rpos, which an rw fd does not use, so a seek on
+        // one of these used to be silently ignored.
+        if (a->rw) {
+            if (whence == 0) np = offset;
+            else if (whence == 1) np = (int64_t)a->rwpos + offset;
+            else if (whence == 2) np = (int64_t)a->wlen + offset;
+            else return -1;
+            if (np < 0) np = 0;
+            if (np > (int64_t)a->wlen) np = a->wlen;
+            a->rwpos = (uint32_t)np;
+            return np;
+        }
         if (whence == 0) np = offset;
         else if (whence == 1) np = (int64_t)a->rpos + offset;
         else if (whence == 2) np = (int64_t)a->rsize + offset;
@@ -2265,6 +3118,17 @@ int64_t sys_seek(int fd, int64_t offset, int whence) {
     if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
         smb_fd_t *s = &smbfd[fd];
         int64_t np;
+        // #747: see the aux branch above. Same mode, same reason.
+        if (s->rw) {
+            if (whence == 0) np = offset;
+            else if (whence == 1) np = (int64_t)s->rwpos + offset;
+            else if (whence == 2) np = (int64_t)s->wlen + offset;
+            else return -1;
+            if (np < 0) np = 0;
+            if (np > (int64_t)s->wlen) np = s->wlen;
+            s->rwpos = (uint32_t)np;
+            return np;
+        }
         if (whence == 0) np = offset;
         else if (whence == 1) np = (int64_t)s->rpos + offset;
         else if (whence == 2) np = (int64_t)s->rsize + offset;
@@ -2511,10 +3375,10 @@ int fd_legacy_stat_src(int fd, const fat_file_t **fat_out,
 }
 
 // #fdguard: proc_exit backstop. Poison every legacy slot the exiting group
-// still owns to DEAD, so a future process handed the same pid cannot inherit
-// a leaked slot. This does NOT flush or free the slot's buffers: that is a
-// separate pre-existing on-exit leak, and an ext2 flush would block, which
-// proc_exit() under cli() cannot do. It only makes a leaked slot unreachable.
+// still owns, so a future process handed the same pid cannot inherit a leaked
+// slot. This does NOT flush the slot's buffers: an ext2 flush would block,
+// which proc_exit() under cli() cannot do. It makes a leaked slot unreachable;
+// fdown_proc_reclaim() below is what hands it back.
 // One compare_exchange per slot, no allocation, no block.
 void fdown_proc_exit(uint32_t owner) {
     if (!owner) return;
@@ -2524,6 +3388,104 @@ void fdown_proc_exit(uint32_t owner) {
     if (n)
         kprintf("[FDGUARD] exit owner=%u poisoned %d leaked legacy fd(s); "
                 "refusals so far=%u\n", owner, n, fdown_refusals_rs());
+}
+
+// ===========================================================================
+// #fdreclaim: DEV-ONLY switch that puts the leak BACK for one boot.
+//
+// Armed only by /CONFIG/FDRECLAIM.OFF, read once at boot by the gated oracle
+// worker, never per-exit. It ships on no production golden. It exists for the
+// same reason FDGUARD.BYPASS above and the NOBLOCKTEST build knob do: a fix
+// nobody has watched NOT work is indistinguishable from no fix, and the
+// measurement that proves this one is a BEFORE/AFTER on the same kernel. With
+// it armed, fdown_proc_reclaim() is a no-op and the behaviour is byte-for-byte
+// what it was before this change: poison, never reclaim.
+// ===========================================================================
+static int g_fdreclaim_off = 0;
+void fdreclaim_set_disabled(int off) {
+    g_fdreclaim_off = off ? 1 : 0;
+    if (g_fdreclaim_off) {
+        kprintf("[FDRECLAIM] *** RECLAIM DISABLED (/CONFIG/FDRECLAIM.OFF) - "
+                "legacy fd slots LEAK on process death - DEV IMAGE ***\n");
+        bootlog_write("[FDRECLAIM] RECLAIM DISABLED (/CONFIG/FDRECLAIM.OFF): "
+                      "legacy fd slots leak on process death (dev image)");
+    }
+}
+
+// ===========================================================================
+// #fdreclaim: THE CHOKEPOINT. Hand back every legacy fd slot this thread group
+// leaked, and free the heap its read/write windows hold.
+//
+// THE DEFECT, confirmed by reading every caller before changing anything.
+// fd_used[] is the one allocation bitmap behind all four legacy families, and
+// legacy_fd_release() (the only thing that clears it) was reached from exactly
+// two places: FD_FAIL() inside sys_open_k(), and sys_close(). Nothing else
+// cleared fd_used[i] or e2fd[i].used, and nothing kfree'd e2fd[i].rbuf. So a
+// process that died without close()ing burned its slots for the rest of the
+// boot and took up to 128 KiB of kernel heap per slot with them, which is
+// exactly what any fatal()/abort path does. The pool is SYSTEM-WIDE, so the
+// cost lands on every other process: the failure looks like "this file is
+// broken", on a perfectly good file, more often on each successive launch.
+//
+// WHY IT IS SAFE TO FREE HERE, which is the whole question, because kfree()ing
+// a buffer another context is reading is a use-after-free and this tree fixed
+// one of those today. Three independent conditions, all required:
+//
+//   1. NO OTHER PROCESS can be inside a legacy-fd syscall on these slots. Every
+//      consumer calls legacy_owner_ok() immediately after lfd_idx(fd) and
+//      BEFORE it touches any table row, and the slot's owner word holds this
+//      dying group's tgid, so every other process was already refused. That is
+//      the #fdguard guard doing a second job, and it is why this is gated on
+//      the guard being ENFORCED: with /CONFIG/FDGUARD.BYPASS armed the guard
+//      passes everyone, so reclaim would no longer be sound and we leak
+//      instead, exactly as before this change.
+//   2. NO THREAD OF THIS GROUP can be inside one either, because we only reclaim
+//      when the group has NO live member left. proc_group_live_count() counts
+//      members that are neither UNUSED nor ZOMBIE; a zombie has already run
+//      proc_exit() and will never return into sys_read(). This is why the hook
+//      runs on EVERY exit rather than only the group leader's: a worker thread
+//      can outlive its leader, and a leader-only reclaim would have left every
+//      multithreaded process (the compositor, CPython, AssaultCube) leaking.
+//   3. EXACTLY ONE caller frees a given slot, enforced by the single
+//      compare_exchange in fdown_take_for_reap_rs(). Two threads of one group
+//      can reach this concurrently on two cores and both see a live count of 0;
+//      only one can win the CAS per slot, and the loser skips it.
+//
+// WHAT THIS DELIBERATELY DOES NOT DO, stated because the absence is a choice:
+//   * It does not FLUSH. Buffered ext2 writes of a process that died without
+//     closing are LOST, exactly as they are today. Flushing needs disk I/O,
+//     which blocks, and proc_exit() runs under cli() where blocking is banned
+//     (#426). A crashed writer's file is therefore in the same state it is in
+//     today; the slot is the only thing that changes hands.
+//   * It does not call fat_close(), ext2_wstream_abort() or smb_closedir(), for
+//     the same reason: all three touch the medium or the network. A spilled
+//     ext2 stream leaves the same on-disk state it leaves today, and an SMB
+//     directory handle still leaks on the server side. Those are separate
+//     tickets; neither is made worse here.
+//
+// Cost: one bounded sweep of 128 atomics plus, for the slots it does reclaim, a
+// kfree per buffer. kfree() takes the heap spinlock with irqsave and never
+// sleeps, so it is cli()-safe, and proc_exit() already calls fd_close_all()
+// under the same cli() a few lines earlier.
+// ===========================================================================
+void fdown_proc_reclaim(uint32_t owner) {
+    if (!owner) return;
+    if (g_fdreclaim_off) return;          // dev-only: prove the before/after
+    if (g_fdguard_bypass) return;         // safety condition 1 is not in force
+    if (proc_group_live_count(owner) != 0) return;   // condition 2
+
+    int n = 0;
+    for (int i = 0; i < LEGACY_MAX_FDS; i++) {
+        if (!fdown_take_for_reap_rs((uint32_t)i, owner)) continue;   // condition 3
+        legacy_fd_free_buffers(i);
+        legacy_fd_release(i);             // clears fd_used[i] AND the ownership
+        n++;
+    }
+    if (n)
+        kprintf("[FDRECLAIM] group %u gone: reclaimed %d leaked legacy fd slot(s); "
+                "free=%d/%d reaped-this-boot=%u\n",
+                owner, n, legacy_fd_free_slots(), LEGACY_MAX_FDS - 3,
+                fdown_reaped_rs());
 }
 
 // #fdguard: boot check. Run the self-test and prove the Rust slot count matches

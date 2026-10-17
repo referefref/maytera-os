@@ -315,6 +315,42 @@ int term_profile_delete(int idx) {
     return idx < g_term_profile_count ? idx : g_term_profile_count - 1;
 }
 
+// RENAME lives HERE, beside the store, and not in the caller, because the two
+// rules a name has to satisfy are this file's: it must be unique (the file names
+// the default BY NAME, so two profiles called the same thing make `default=`
+// ambiguous) and it must not contain '[' or ']' (which delimit a section on
+// disk, so a name carrying one would be written as [x]y] and silently rename
+// itself on the next load). tp_unique_name()/tp_sanitise_name() are the ONE
+// place those rules live; a caller that copied the string itself would be a
+// second, weaker copy of them.
+int term_profile_rename(int idx, const char *name) {
+    if (idx < 0 || idx >= g_term_profile_count) return -1;
+    if (!name || !name[0]) return -1;
+    char uniq[TERM_PROFILE_NAME_MAX];
+    tp_unique_name(uniq, TERM_PROFILE_NAME_MAX, name, idx);
+    str_copy(g_term_profiles[idx].name, uniq, TERM_PROFILE_NAME_MAX);
+    tp_sanitise_name(g_term_profiles[idx].name);
+    return 0;
+}
+
+// The starting directory and command. NOT validated against the filesystem
+// here: term_profile_startup() already checks the directory with chdir's own
+// result at the moment it is used and leaves the shell where it was on failure,
+// so refusing a path here that may well exist by the next launch would be a
+// stricter rule than the one the value is actually read under. An EMPTY string
+// is the documented "none", so clearing is expressible.
+int term_profile_set_start_dir(int idx, const char *dir) {
+    if (idx < 0 || idx >= g_term_profile_count) return -1;
+    str_copy(g_term_profiles[idx].start_dir, dir ? dir : "", TERM_PROFILE_DIR_MAX);
+    return 0;
+}
+
+int term_profile_set_start_cmd(int idx, const char *cmd) {
+    if (idx < 0 || idx >= g_term_profile_count) return -1;
+    str_copy(g_term_profiles[idx].start_cmd, cmd ? cmd : "", TERM_PROFILE_CMD_MAX);
+    return 0;
+}
+
 // --- startup ----------------------------------------------------------------
 void term_profile_startup(char *cwd_buf, int cap) {
     if (g_term_profile_count <= 0) return;

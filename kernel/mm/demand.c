@@ -482,20 +482,36 @@ int vma_split(mm_struct_t *mm, vma_t *vma, uint64_t addr) {
 
 // CALLER MUST HOLD mm_lock(mm).
 //
-// DANGER, and the reason this has no callers: on the merge-with-previous path
-// this function kfree()s the vma_t THE CALLER PASSED IN and returns 0. The
-// caller's pointer is dangling on return. Any future caller must treat `vma` as
-// consumed and re-look-up whatever it needs. Left as-is rather than "improved"
-// into returning the survivor, because changing the signature of an
-// exported-but-unused function is churn; the contract is now at least written
-// down where a caller will read it.
+// DANGER: on the merge-with-previous path this function kfree()s the vma_t THE
+// CALLER PASSED IN and returns 0. The caller's pointer is dangling on return.
+// Every caller must treat `vma` as CONSUMED and re-look-up whatever it needs.
+// do_mmap() is written that way (it nulls its local immediately), and that
+// contract is the reason this function is not "improved" into returning the
+// survivor: the one caller does not need the survivor.
+//
+// #245: THIS USED TO HAVE ZERO CALLERS, and that was the whole second half of
+// the ticket. Because nothing coalesced, a userland heap growing one page-gap
+// mmap at a time (userland/libc/stdlib.c ensure_mapped()) produced one vma_t
+// PER PAGE, and vma_add_nolock()/vma_find_range_nolock()/vma_find() all walk
+// that list from the head, so both mmap and every first-touch page fault became
+// linear in heap size and the whole thing quadratic. Measured on this exact code
+// by kernel/mm/tests/run_vma_scale.sh. do_mmap() calls it now.
+//
+// #245: the merge predicate also now requires `prot` and `ref_count` to match,
+// not just `flags`. Two ranges can carry identical VMA_* flags with different
+// prot words (prot 0 and PROT_READ|PROT_WRITE both yield VMA_WRITE), and the
+// survivor would then report one range's prot for both, which do_mprotect() and
+// every /proc-style reader would believe. ref_count is required to be 1 on both
+// sides because a shared VMA's extent is described to more than one mm.
 int vma_merge(mm_struct_t *mm, vma_t *vma) {
     MM_REQUIRE_LOCK(mm, "vma_merge");
     if (!mm || !vma) return -1;
 
     // Try to merge with next VMA
     vma_t *next = vma->next;
-    if (next && vma->end == next->start && vma->flags == next->flags) {
+    if (next && vma->end == next->start && vma->flags == next->flags &&
+        vma->prot == next->prot &&
+        vma->ref_count == 1 && next->ref_count == 1) {
         // Check file backing compatibility
         if ((vma->flags & VMA_FILE) && (next->flags & VMA_FILE)) {
             if (vma->file != next->file) return 0;  // Different files
@@ -517,7 +533,9 @@ int vma_merge(mm_struct_t *mm, vma_t *vma) {
 
     // Try to merge with previous VMA
     vma_t *prev = vma->prev;
-    if (prev && prev->end == vma->start && prev->flags == vma->flags) {
+    if (prev && prev->end == vma->start && prev->flags == vma->flags &&
+        prev->prot == vma->prot &&
+        prev->ref_count == 1 && vma->ref_count == 1) {
         if ((vma->flags & VMA_FILE) && (prev->flags & VMA_FILE)) {
             if (vma->file != prev->file) return 0;
             if (prev->file_offset + (prev->end - prev->start) != vma->file_offset) {
@@ -967,6 +985,40 @@ uint64_t do_mmap(mm_struct_t *mm, uint64_t addr, uint64_t length,
         return (uint64_t)-1;
     }
 
+    // #245: COALESCE. This is the fix for the second superlinear term in #245,
+    // and it is one call because the work was already written and had never been
+    // invoked (see the block comment on vma_merge()).
+    //
+    // WHY IT MATTERS: userland/libc/stdlib.c ensure_mapped() grows the heap by
+    // mmap()ing ONLY the page-aligned gap it needs, at an EXPLICIT address equal
+    // to the end of the previous mapping. So a 96 MB heap arrived here ~24000
+    // times with adjacent, same-protection ranges and left ~24000 separate
+    // vma_t's behind. vma_find_range_nolock() above, vma_add_nolock() above and
+    // vma_find() on EVERY first-touch page fault each walk that list from the
+    // head, so per-page cost grew with heap size: measured on the real code,
+    // 1534 node visits per page at 1024 pages and 6142 at 4096 pages, i.e. 16x
+    // the total work for 4x the heap (kernel/mm/tests/run_vma_scale.sh).
+    // Coalescing turns that heap into ONE vma_t and every one of those walks
+    // into O(1). It also removes the same quadratic from mm_dup()/mm_clone_cow(),
+    // which copy the list one vma_add_nolock() at a time on every fork.
+    //
+    // `node` is CONSUMED: vma_merge() kfree()s it on the merge-with-previous
+    // path. Nothing below may touch it, hence the immediate null. `start` and
+    // `len` are locals and remain the authoritative answer to this call.
+    uint32_t vmas_before = mm->vma_count;
+    vma_merge(mm, node);
+    node = NULL;
+    uint32_t coalesced = (mm->vma_count < vmas_before) ? 1u : 0u;
+
+    // #245: and SAY SO if it ever stops working. rustkern/vmascale.rs returns a
+    // power-of-two threshold the first time any address space's VMA list reaches
+    // it, or 0. After this fix a heap-growing process never reaches 256, so a
+    // healthy boot is silent; a regression announces itself instead of just
+    // being slow. Printed AFTER the lock is dropped: kprintf is a serial write
+    // and this critical section runs with interrupts masked.
+    extern uint32_t vmascale_note_mmap(uint32_t vma_count, uint32_t merged);
+    uint32_t vma_report = vmascale_note_mmap(mm->vma_count, coalesced);
+
     // #511: strip identity backing so the first touch (from Ring 3 OR from a
     // Ring-0 copy_to_user) takes a real fault and gets a real USER page.
     vmm_punch_demand_range(pml4, start, len);
@@ -983,6 +1035,15 @@ uint64_t do_mmap(mm_struct_t *mm, uint64_t addr, uint64_t length,
     }
 
     mm_unlock(mm, irq);
+
+    if (vma_report) {
+        kprintf("[VMASCALE] pid %u address space has reached %u VMAs. Every mmap "
+                "and every first-touch fault in it now walks that list from the "
+                "head, so cost grows with the number of mappings (#245). A "
+                "heap-growing process should coalesce to one VMA; if this line "
+                "appears, do_mmap()'s vma_merge() is not taking effect.\n",
+                cur ? (unsigned)cur->pid : 0u, vma_report);
+    }
     return start;
 }
 
@@ -1820,6 +1881,21 @@ void demand_print_stats(void) {
     kprintf("  Major faults: %lu\n", stat_major_faults);
     kprintf("  COW faults: %lu\n", stat_cow_faults);
     kprintf("  Lazy allocations: %lu\n", stat_lazy_allocs);
+
+    // #245: how much of the anonymous-mmap traffic coalesced into an existing
+    // neighbour instead of lengthening a VMA list, and the longest list any
+    // address space reached this boot. Before do_mmap() coalesced, a
+    // heap-growing app reached tens of thousands and paid a walk of it on every
+    // mmap AND every first-touch fault. `high` is the number to watch: it should
+    // stay in the low tens.
+    {
+        extern void vmascale_totals_rs(uint64_t *mmaps, uint64_t *merged,
+                                       uint32_t *high);
+        uint64_t vs_mmaps = 0, vs_merged = 0; uint32_t vs_high = 0;
+        vmascale_totals_rs(&vs_mmaps, &vs_merged, &vs_high);
+        kprintf("  Anon mmap inserts: %lu (coalesced %lu), longest VMA list %u\n",
+                vs_mmaps, vs_merged, vs_high);
+    }
 
     if (swap_state.enabled) {
         kprintf("[SWAP] Statistics:\n");

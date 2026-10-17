@@ -18,6 +18,7 @@
 #include "term_layout.h"
 #include "term_search.h"
 #include "term_menu.h"
+#include "term_contract.h"
 #include "../../libc/gui_menu.h"
 #include "../../libc/spawn.h"
 
@@ -317,7 +318,13 @@ static void tm_rebuild_bookmark_items(void) {
 // ===========================================================================
 // Settings: the colour-scheme and profile radio lists
 // ===========================================================================
-static void tm_rebuild_settings_items(void) {
+// The colour-scheme list, built from /PALETTES and NOTHING else. Split out of
+// tm_rebuild_settings_items() (of which it was the first ten lines) because the
+// contract projection needs the SAME list in a process that has no menu, no
+// window and no SETTINGS_ITEMS[] to write into: a projection that built its own
+// list would be a second enumeration of the installed schemes, which is the
+// stale-copy fault this whole pass is against. Touches no GUI state.
+static void tm_rebuild_schemes(void) {
     // Row 0 of the scheme list is the "Follow system theme" pseudo-scheme.
     // gui_palette.h is explicit that "system" is NOT a file and that callers
     // add it to their own picker, which is what term_prefs_dialog() already
@@ -331,6 +338,10 @@ static void tm_rebuild_settings_items(void) {
     int n = gui_palette_list(ents, GUI_PALETTE_MAX_ENTRIES);
     for (int i = 0; i < n && g_scheme_count < TM_MAX_SCHEMES; i++)
         g_schemes[g_scheme_count++] = ents[i];
+}
+
+static void tm_rebuild_settings_items(void) {
+    tm_rebuild_schemes();
 
     int r = TM_SET_FIXED_HEAD;
     for (int i = 0; i < g_scheme_count; i++) {
@@ -576,12 +587,16 @@ static void tm_new_window(void) {
     // would break for a per-user install (#745 put <home>/APPS first).
     char *const argv[] = { (char *)"terminal", NULL };
     pid_t pid = 0;
-    if (posix_spawnp(&pid, "terminal", NULL, NULL, argv, NULL) != 0) {
-        tm_begin_output();
-        term_puts("\033[31mNew Window: could not launch terminal\033[0m\r\n");
-        tm_end_output();
-        term_redraw();
-    }
+    if (posix_spawnp(&pid, "terminal", NULL, NULL, argv, NULL) == 0) return;
+    // GATED ON term_ct_live(): this is the one menu command that also works from
+    // a WINDOWLESS contract process (spawning a terminal needs no grid), and a
+    // process with no grid must not try to write an error into one. In the
+    // interactive process term_ct_live() is 1, so the message is unchanged.
+    if (!term_ct_live()) return;
+    tm_begin_output();
+    term_puts("\033[31mNew Window: could not launch terminal\033[0m\r\n");
+    tm_end_output();
+    term_redraw();
 }
 
 static void tm_bookmark_add(void) {
@@ -665,60 +680,592 @@ static void tm_prefs(void) {
     term_layout_redraw_all();
 }
 
-// Dispatch one id returned by gui_menu_bar_click()/gui_menu_key().
-static void term_menu_action(int id) {
-    if (id >= MID_BOOKMARK_BASE) {
-        int b = id - MID_BOOKMARK_BASE;
-        if (b >= 0 && b < g_bookmark_count) {
-            char cmd[TM_PATH_MAX + 8];
-            snprintf(cmd, sizeof(cmd), "cd %s", g_bookmarks[b]);
-            tm_run_command(cmd);
-            tm_rebuild_bookmark_items();
-            term_redraw();
-        }
-        return;
-    }
-    if (id >= MID_PROFILE_BASE) { tm_pick_profile(id - MID_PROFILE_BASE); return; }
-    if (id >= MID_SCHEME_BASE)  { tm_pick_scheme(id - MID_SCHEME_BASE);   return; }
+static void tm_goto_bookmark(int b) {
+    if (b < 0 || b >= g_bookmark_count) return;
+    char cmd[TM_PATH_MAX + 8];
+    snprintf(cmd, sizeof(cmd), "cd %s", g_bookmarks[b]);
+    tm_run_command(cmd);
+    tm_rebuild_bookmark_items();
+    term_redraw();
+}
 
-    switch (id) {
-        case MID_NEW_TAB:       term_layout_command(TL_CMD_NEW_TAB); break;
-        case MID_NEW_WINDOW:    tm_new_window(); break;
-        case MID_CLOSE_TAB:
-            if (term_layout_command(TL_CMD_CLOSE_TAB) < 0) term_menu_quit = 1;
-            break;
-        case MID_CLOSE_WINDOW:  term_menu_quit = 1; break;
-        case MID_COPY:          term_select_copy(); break;
-        case MID_PASTE:         term_select_paste(); term_redraw(); break;
-        case MID_SELECT_ALL:    term_select_all(); term_redraw(); break;
-        case MID_FIND:          term_search_open(); term_layout_redraw_all(); break;
-        case MID_FIND_NEXT:     term_search_next(); term_layout_redraw_all(); break;
-        case MID_FIND_PREV:     term_search_prev(); term_layout_redraw_all(); break;
-        case MID_CLEAR_SB:      tm_clear_scrollback(); break;
-        case MID_RESET:         term_full_reset(); term_redraw(); break;
-        case MID_PREFS:         tm_prefs(); break;
-        case MID_SPLIT_RIGHT:   term_layout_command(TL_CMD_SPLIT_RIGHT); break;
-        case MID_SPLIT_DOWN:    term_layout_command(TL_CMD_SPLIT_DOWN); break;
-        case MID_CLOSE_SPLIT:   term_layout_command(TL_CMD_CLOSE_SPLIT); break;
-        case MID_MAXIMIZE_PANE: term_layout_command(TL_CMD_MAXIMIZE_PANE); break;
-        case MID_PANE_TO_TAB:   term_layout_command(TL_CMD_PANE_TO_TAB); break;
-        case MID_ZOOM_IN:       tm_set_font_size(g_term_font.size + 1); break;
-        case MID_ZOOM_OUT:      tm_set_font_size(g_term_font.size - 1); break;
-        case MID_ZOOM_RESET:    tm_set_font_size(TERM_DEFAULT_FONT_SIZE); break;
-        case MID_SHOW_MENUBAR:  tm_set_menu_visible(!g_menu_visible); break;
-        case MID_MON_FINISH:    tm_toggle_monitor(TERM_MON_FINISH); break;
-        case MID_MON_ACTIVITY:  tm_toggle_monitor(TERM_MON_ACTIVITY); break;
-        case MID_MON_SILENCE:   tm_toggle_monitor(TERM_MON_SILENCE); break;
-        case MID_MON_BELL:      tm_toggle_monitor(TERM_MON_BELL); break;
-        case MID_BM_ADD:        tm_bookmark_add(); break;
-        case MID_BM_REMOVE:     tm_bookmark_remove(); break;
-        case MID_HELP_COMMANDS: tm_run_command("help"); term_redraw(); break;
-        case MID_HELP_KEYS:     tm_help_shortcuts(); break;
-        case MID_HELP_ABOUT:    tm_help_about(); break;
-        default: break;
+// ===========================================================================
+// THE ACTION TABLE, and why the `switch (id)` that used to be here is gone.
+//
+// The switch WAS the dispatcher, so a MID_* was the only handle a menu command
+// had: nothing outside this file could name one, invoke one or describe one, and
+// the thirty-one commands on this bar were the largest undescribed control
+// surface in a contracted app. A `case` label also cannot carry a description or
+// a set of contract terms, so there was nowhere to put them.
+//
+// One table now carries all five things about one command - the MID_* the menu
+// rows are drawn with, the stable dotted contract token, the one line `describe`
+// prints, the handler, and the terms - and there are exactly two readers:
+//
+//   term_menu_action()      looks the id up and calls the row's handler
+//   term_menu_ct_project()  emits the row's token, desc and terms
+//
+// So a command absent from this table can neither be dispatched nor described,
+// which is the completeness property by construction rather than by inspection.
+// The gui_menu_item_t tables above stay as the DRAW/LABEL side (they are the
+// shared widget's input, they are deliberately non-const because `enabled` and
+// `checked` are live state, and gui_menu_item_t is a SHARED libc type this app
+// does not get to change); this is the ACTION side, keyed by the same id.
+//
+// THE ONE PLACE THIS DESIGN COULD ROT is a menu row whose id has no row here,
+// and it is closed twice rather than by comment:
+//
+//  1. _Static_assert, AT COMPILE TIME. The thirty-one fixed ids are exactly
+//     1..MID_FIND_PREV, so requiring TM_ACT_N == MID_FIND_PREV means adding a
+//     MID_* WITHOUT adding a row here FAILS THE BUILD. That is the strongest
+//     check available: a compile-time one that needs nobody to run anything.
+//  2. tm_verify_action_coverage(), AT STARTUP, catches what a count cannot: a
+//     typo'd or duplicated id, where the count is right and a row still has no
+//     handler. It walks the real menu tables, reports the offending row on
+//     serial by its own label, and DIMS it, so a drifted row is visibly
+//     unclickable instead of silently dead (#208) - and, since dispatch and
+//     description come from the same table, it is undescribed as well.
+// ===========================================================================
+static void tma_new_tab(void)        { term_layout_command(TL_CMD_NEW_TAB); }
+static void tma_close_tab(void)      { if (term_layout_command(TL_CMD_CLOSE_TAB) < 0) term_menu_quit = 1; }
+static void tma_close_window(void)   { term_menu_quit = 1; }
+static void tma_copy(void)           { term_select_copy(); }
+static void tma_paste(void)          { term_select_paste(); term_redraw(); }
+static void tma_select_all(void)     { term_select_all(); term_redraw(); }
+static void tma_find(void)           { term_search_open(); term_layout_redraw_all(); }
+static void tma_find_next(void)      { term_search_next(); term_layout_redraw_all(); }
+static void tma_find_prev(void)      { term_search_prev(); term_layout_redraw_all(); }
+static void tma_reset(void)          { term_full_reset(); term_redraw(); }
+static void tma_split_right(void)    { term_layout_command(TL_CMD_SPLIT_RIGHT); }
+static void tma_split_down(void)     { term_layout_command(TL_CMD_SPLIT_DOWN); }
+static void tma_close_split(void)    { term_layout_command(TL_CMD_CLOSE_SPLIT); }
+static void tma_maximize_pane(void)  { term_layout_command(TL_CMD_MAXIMIZE_PANE); }
+static void tma_pane_to_tab(void)    { term_layout_command(TL_CMD_PANE_TO_TAB); }
+static void tma_zoom_in(void)        { tm_set_font_size(g_term_font.size + 1); }
+static void tma_zoom_out(void)       { tm_set_font_size(g_term_font.size - 1); }
+static void tma_zoom_reset(void)     { tm_set_font_size(TERM_DEFAULT_FONT_SIZE); }
+static void tma_show_menubar(void)   { tm_set_menu_visible(!g_menu_visible); }
+static void tma_mon_finish(void)     { tm_toggle_monitor(TERM_MON_FINISH); }
+static void tma_mon_activity(void)   { tm_toggle_monitor(TERM_MON_ACTIVITY); }
+static void tma_mon_silence(void)    { tm_toggle_monitor(TERM_MON_SILENCE); }
+static void tma_mon_bell(void)       { tm_toggle_monitor(TERM_MON_BELL); }
+static void tma_help_commands(void)  { tm_run_command("help"); term_redraw(); }
+
+// ---- the terms: ONE object per distinct shape of consequence ---------------
+// Shared by every row with the same consequence, because a term duplicated per
+// row is a term that can disagree with itself. Every success_ref names a
+// contract item TERMINAL_ITEMS[] really declares (contract-lint check 6a fails
+// the build on one that does not).
+//
+// CT_TF_LIVE_ONLY IS ON ALMOST EVERYTHING HERE, and it is the accurate term
+// rather than a hedge: these commands act on THIS window's tabs, panes, grid,
+// selection and chrome. A spawned `--contract` process has none of those and
+// exits immediately, so the work has nowhere to land. LIVE_ONLY returns
+// immediately and is NOT modal, so it is not marked modal; the one genuinely
+// modal row is Preferences, which opens a dialog and waits for a person.
+static const ct_terms_t k_t_tab = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NOSPACE | CT_FAIL_NEEDSLIVE, "window.tab_count", 0
+};
+static const ct_terms_t k_t_pane = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NOSPACE | CT_FAIL_RANGE | CT_FAIL_NEEDSLIVE, "window.pane_count", 0
+};
+// DEPTH_SYSTEM: it starts another process. NOT live-only - spawning a terminal
+// needs no grid - so this is the one row on this bar a windowless contract call
+// can actually achieve. Risk is DERIVED from that depth, so it is CT_GUARDED.
+static const ct_terms_t k_t_new_window = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_RC, CT_DEPTH_SYSTEM,
+    CT_FAIL_DENIED | CT_FAIL_NOTFOUND, 0, 0
+};
+// CT_SUCC_RC, stated rather than implied: this app exposes no readable item that
+// shows the window has gone, because the process that would answer is the one
+// closing. Saying "the return code is all there is" is the honest term.
+static const ct_terms_t k_t_close_window = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_RC, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, 0, 0
+};
+static const ct_terms_t k_t_copy = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_RC, CT_DEPTH_SYSTEM,
+    CT_FAIL_NOTFOUND | CT_FAIL_DENIED | CT_FAIL_NEEDSLIVE, 0, 0
+};
+// DEPTH_SYSTEM ON A PASTE, which looks surprising until you follow what it does.
+// The bytes go INTO THE PTY, and a clipboard whose contents end in a newline is a
+// command the shell then runs. So its reach is not this view: it is whatever those
+// bytes turn out to be, which is the definition of CT_DEPTH_SYSTEM ("system-wide,
+// or another process"). Marking it VIEW because the pixels change in this window
+// would be the comfortable answer and the wrong one, and because risk is DERIVED
+// from depth here, the honest depth is also what puts it behind the aicap gate.
+static const ct_terms_t k_t_paste = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_RC, CT_DEPTH_SYSTEM,
+    CT_FAIL_NOTFOUND | CT_FAIL_DENIED | CT_FAIL_NEEDSLIVE, 0, 0
+};
+static const ct_terms_t k_t_select_all = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, "select.have", 0
+};
+static const ct_terms_t k_t_clear_sb = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, "scrollback.lines", 0
+};
+static const ct_terms_t k_t_reset = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_RC, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, 0, 0
+};
+// THE ONE MODAL ROW. term_prefs_dialog() runs its own event loop until OK,
+// Cancel or close, i.e. it waits for a PERSON, so its timing is honestly
+// UNBOUNDED and it carries CT_TF_MODAL. ct_do_call() REFUSES both on the spawn
+// path, where nobody is there to answer, and ALLOWS them on a live instance,
+// which has a bounded wait and a user in front of it. That refusal is the
+// correct outcome, not a limitation to work around.
+static const ct_terms_t k_t_prefs = {
+    CT_TIME_UNBOUNDED, CT_TF_LIVE_ONLY | CT_TF_MODAL, 0, CT_SUCC_RC, CT_DEPTH_PREF,
+    CT_FAIL_NEEDSLIVE, 0, 0
+};
+static const ct_terms_t k_t_zoom = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_PREF,
+    CT_FAIL_RANGE | CT_FAIL_NEEDSLIVE, "font_size", 0
+};
+static const ct_terms_t k_t_menubar = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, "menu.visible", 0
+};
+// The four monitor toggles move PER-TAB state, which is a different thing from
+// the notify.* file defaults: term_notify.h's rule is "the file is the default
+// and the per-tab switch is the override". So each names the per-tab item, not
+// the file key.
+static const ct_terms_t k_t_mon_finish = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, "monitor.finish", 0
+};
+static const ct_terms_t k_t_mon_activity = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, "monitor.activity", 0
+};
+static const ct_terms_t k_t_mon_silence = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, "monitor.silence", 0
+};
+static const ct_terms_t k_t_mon_bell = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, "monitor.bell", 0
+};
+// DEPTH_PREF: add/remove rewrite this user's TERMBOOK.CFG. The count is what a
+// caller can read back, and a full table or an already-bookmarked directory
+// leaves it unchanged, so the postcondition names something that CAN be false.
+static const ct_terms_t k_t_bookmark_edit = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_PREF,
+    CT_FAIL_NOSPACE | CT_FAIL_IO | CT_FAIL_NEEDSLIVE, "bookmarks.count", 0
+};
+static const ct_terms_t k_t_bookmark_go = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NOTFOUND | CT_FAIL_NEEDSLIVE, "shell.cwd", 0
+};
+// The three Help rows write TEXT INTO THE PANE. There is no contract item
+// holding the pane's text, so CT_SUCC_RC is the whole claim and is stated as
+// such. `help` runs through the shell, so it is FAST rather than instant.
+static const ct_terms_t k_t_help_run = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_RC, CT_DEPTH_VIEW,
+    CT_FAIL_IO | CT_FAIL_NEEDSLIVE, 0, 0
+};
+static const ct_terms_t k_t_help_text = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_RC, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, 0, 0
+};
+static const ct_terms_t k_t_find_open = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, "find.bar_open", 0
+};
+static const ct_terms_t k_t_find_step = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NOTFOUND | CT_FAIL_NEEDSLIVE, "find.match_count", 0
+};
+// The live COLOUR-SCHEME and PROFILE radio lists, and the live bookmark list.
+static const ct_terms_t k_t_pick_scheme = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_PREF,
+    CT_FAIL_NOTFOUND | CT_FAIL_IO | CT_FAIL_NEEDSLIVE, "colour_scheme", 0
+};
+static const ct_terms_t k_t_pick_profile = {
+    CT_TIME_SLOW, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_PREF,
+    CT_FAIL_NOTFOUND | CT_FAIL_IO | CT_FAIL_NEEDSLIVE, "profile", 0
+};
+
+typedef struct {
+    int               id;     // the MID_* the gui_menu_item_t rows carry
+    const char       *tok;    // the stable dotted contract item name
+    const char       *desc;   // the one line `describe` prints
+    void            (*fn)(void);
+    const ct_terms_t *terms;  // declared in the SAME braces as the handler
+} tm_act_t;
+
+static const tm_act_t TM_ACTS[] = {
+    { MID_NEW_TAB,       "tab.new",
+      "Open another tab on this window, sized to the current grid (File menu)",
+      tma_new_tab,        &k_t_tab },
+    { MID_NEW_WINDOW,    "window.new",
+      "Launch a second Terminal process, resolved through PATH like a typed name",
+      tm_new_window,      &k_t_new_window },
+    { MID_CLOSE_TAB,     "tab.close",
+      "Close the active tab; closing the last one closes the window",
+      tma_close_tab,      &k_t_tab },
+    { MID_CLOSE_WINDOW,  "window.close",
+      "Close this Terminal window and every tab and split in it",
+      tma_close_window,   &k_t_close_window },
+    { MID_COPY,          "edit.copy",
+      "Copy the current selection to the system clipboard (Ctrl+Shift+C)",
+      tma_copy,           &k_t_copy },
+    { MID_PASTE,         "edit.paste",
+      "Paste the system clipboard into the pty; a trailing newline in it RUNS",
+      tma_paste,          &k_t_paste },
+    { MID_SELECT_ALL,    "edit.select_all",
+      "Select the whole scrollback plus the live screen of the focused pane",
+      tma_select_all,     &k_t_select_all },
+    { MID_CLEAR_SB,      "edit.clear_scrollback",
+      "Discard every retained scrollback line of this pane and re-pin the view",
+      tm_clear_scrollback, &k_t_clear_sb },
+    { MID_RESET,         "edit.reset",
+      "Full terminal reset: attributes, modes, tab stops, charset and the grid",
+      tma_reset,          &k_t_reset },
+    { MID_PREFS,         "edit.preferences",
+      "Open the modal Preferences dialog (window theme, colour scheme, font, F9)",
+      tm_prefs,           &k_t_prefs },
+    { MID_SPLIT_RIGHT,   "pane.split_right",
+      "Split the focused pane side by side, giving the new pane the right half",
+      tma_split_right,    &k_t_pane },
+    { MID_SPLIT_DOWN,    "pane.split_down",
+      "Split the focused pane top and bottom, giving the new pane the lower half",
+      tma_split_down,     &k_t_pane },
+    { MID_CLOSE_SPLIT,   "pane.close_split",
+      "Close the focused split and give its area back to its sibling pane",
+      tma_close_split,    &k_t_pane },
+    { MID_MAXIMIZE_PANE, "pane.maximize",
+      "Toggle the focused pane to fill the tab; view only, the split tree is kept",
+      tma_maximize_pane,  &k_t_pane },
+    { MID_PANE_TO_TAB,   "pane.to_new_tab",
+      "Move the focused split out of this tab and into a new tab of its own",
+      tma_pane_to_tab,    &k_t_pane },
+    { MID_ZOOM_IN,       "view.zoom_in",
+      "Increase the terminal font by one point and reflow every pane and child",
+      tma_zoom_in,        &k_t_zoom },
+    { MID_ZOOM_OUT,      "view.zoom_out",
+      "Decrease the terminal font by one point and reflow every pane and child",
+      tma_zoom_out,       &k_t_zoom },
+    { MID_ZOOM_RESET,    "view.zoom_reset",
+      "Return the terminal font to the compiled default size and reflow",
+      tma_zoom_reset,     &k_t_zoom },
+    { MID_SHOW_MENUBAR,  "view.show_menubar",
+      "Show or hide this menu bar, giving every pane the rows back (F10)",
+      tma_show_menubar,   &k_t_menubar },
+    { MID_MON_FINISH,    "monitor.toggle_finish",
+      "Toggle this tab's notify-on-command-finished monitor",
+      tma_mon_finish,     &k_t_mon_finish },
+    { MID_MON_ACTIVITY,  "monitor.toggle_activity",
+      "Toggle this tab's monitor-for-activity notification",
+      tma_mon_activity,   &k_t_mon_activity },
+    { MID_MON_SILENCE,   "monitor.toggle_silence",
+      "Toggle this tab's monitor-for-silence notification",
+      tma_mon_silence,    &k_t_mon_silence },
+    { MID_MON_BELL,      "monitor.toggle_bell",
+      "Toggle this tab's bell notification (the visual bell is separate)",
+      tma_mon_bell,       &k_t_mon_bell },
+    { MID_BM_ADD,        "bookmark.add",
+      "Bookmark the shell's current directory; a duplicate is a silent no-op",
+      tm_bookmark_add,    &k_t_bookmark_edit },
+    { MID_BM_REMOVE,     "bookmark.remove",
+      "Remove the shell's current directory from the bookmark list, if it is in it",
+      tm_bookmark_remove, &k_t_bookmark_edit },
+    { MID_HELP_COMMANDS, "help.commands",
+      "Run the shell's own `help`: every builtin plus the live /APPS listing",
+      tma_help_commands,  &k_t_help_run },
+    { MID_HELP_KEYS,     "help.shortcuts",
+      "Print the keyboard-shortcut reference into the pane, scrollable and copyable",
+      tm_help_shortcuts,  &k_t_help_text },
+    { MID_HELP_ABOUT,    "help.about",
+      "Print this window's grid, tab/pane counts, font, theme and colour scheme",
+      tm_help_about,      &k_t_help_text },
+    { MID_FIND,          "find.open",
+      "Open the find-in-scrollback bar, keeping the previous query",
+      tma_find,           &k_t_find_open },
+    { MID_FIND_NEXT,     "find.next",
+      "Move to the next find match, wrapping at the end of the scrollback (F3)",
+      tma_find_next,      &k_t_find_step },
+    { MID_FIND_PREV,     "find.previous",
+      "Move to the previous find match, wrapping at the start (Shift+F3)",
+      tma_find_prev,      &k_t_find_step },
+};
+#define TM_ACT_N ((int)(sizeof(TM_ACTS) / sizeof(TM_ACTS[0])))
+
+// COMPILE-TIME COVERAGE. The fixed ids are exactly 1..MID_FIND_PREV, so this
+// fails the BUILD if a MID_* is added without a TM_ACTS[] row: the new command
+// would be drawable but neither dispatchable nor describable, which is the one
+// way this two-table design could rot.
+_Static_assert(TM_ACT_N == MID_FIND_PREV,
+               "every fixed MID_* needs exactly one TM_ACTS[] row: the menu "
+               "bar's rows are dispatched AND described from that table, so a "
+               "command missing from it is a drawn row that does nothing and "
+               "says nothing (#208).");
+
+static const tm_act_t *tm_act_of(int id) {
+    for (int i = 0; i < TM_ACT_N; i++)
+        if (TM_ACTS[i].id == id) return &TM_ACTS[i];
+    return 0;
+}
+
+// The mutable label tables, so the startup check can DIM a drifted row. Not
+// MENUS[].items, which is `const gui_menu_item_t *` because the widget never
+// writes through it.
+static gui_menu_item_t *const TM_TABLES[MENU_COUNT] = {
+    FILE_ITEMS, EDIT_ITEMS, VIEW_ITEMS, BOOKMARK_ITEMS, SETTINGS_ITEMS, HELP_ITEMS
+};
+
+// The runtime half of the coverage check: a typo'd or duplicated id passes the
+// count assert and still has no handler. Reports the row by its own label so the
+// message names the thing a user would click, and dims it, because a drawn row
+// that cannot run is exactly the #208 dead control.
+static void tm_verify_action_coverage(void) {
+    for (int m = 0; m < MENU_COUNT; m++) {
+        gui_menu_item_t *rows = TM_TABLES[m];
+        for (int r = 0; r < MENUS[m].item_count; r++) {
+            if (!rows[r].label || rows[r].id == 0) continue;   // separator
+            if (rows[r].id >= MID_SCHEME_BASE)      continue;  // runtime family
+            if (tm_act_of(rows[r].id))              continue;
+            printf("[TERMMENU] BUG: menu row \"%s\" carries id %d, which has no "
+                   "TM_ACTS[] row: it can be neither dispatched nor described. "
+                   "Dimming it.\n", rows[r].label, rows[r].id);
+            rows[r].enabled = false;
+        }
     }
+}
+
+// Dispatch one id returned by gui_menu_bar_click()/gui_menu_key(). A TABLE WALK,
+// not a switch: the table is the dispatcher, so a command absent from it cannot
+// run, and the contract projection reads the same rows.
+static void term_menu_action(int id) {
+    if (id >= MID_BOOKMARK_BASE) { tm_goto_bookmark(id - MID_BOOKMARK_BASE); return; }
+    if (id >= MID_PROFILE_BASE)  { tm_pick_profile(id - MID_PROFILE_BASE);   return; }
+    if (id >= MID_SCHEME_BASE)   { tm_pick_scheme(id - MID_SCHEME_BASE);     return; }
+
+    const tm_act_t *a = tm_act_of(id);
+    if (a && a->fn) a->fn();
     tm_apply_context();
 }
+
+// ===========================================================================
+// THE MENU SURFACE, PROJECTED (task 3 of docs/CONTRACT_COVERAGE_PLAN.md)
+//
+// Four families, all of them read out of the structures the bar is BUILT from:
+//   TM_ACTS[]          the thirty-one fixed commands
+//   g_schemes[]        the live colour-scheme radio list, from /PALETTES
+//   g_term_profiles[]  the live profile radio list, from TERMPROF.CFG
+//   g_bookmarks[]      the live bookmark list, from TERMBOOK.CFG
+//
+// The last three are RUNTIME lists rather than static rows, and projecting them
+// from the same arrays tm_rebuild_settings_items()/tm_rebuild_bookmark_items()
+// draw from is still a projection - it is the pattern files_side_ct_sync() uses
+// for the Open-with and Places/device/volume rows. A scheme the user installs, a
+// profile they create or a directory they bookmark gains a contract row in the
+// same moment it gains a menu row, because there is one list.
+// ===========================================================================
+
+// A lowercase dotted slug from a human label or a path, so the contract token is
+// DERIVED from the only name the thing has rather than being a second name table
+// that could drift from what the menu draws.
+static void tm_slug(char *out, int cap, const char *pfx, const char *label) {
+    int n = 0;
+    for (int i = 0; pfx[i] && n < cap - 1; i++) out[n++] = pfx[i];
+    for (int i = 0; label[i] && n < cap - 1; i++) {
+        char c = label[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        else if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) c = '_';
+        out[n++] = c;
+    }
+    out[n] = 0;
+}
+
+// One projected row of a runtime family. `idx` is the index into the family's own
+// live array, which is what the handler needs and what a pointer into a
+// reallocated-by-rebuild table could not safely carry.
+typedef struct {
+    char tok[CT_NAME_MAX];
+    char desc[CT_DESC_MAX];
+    int  idx;
+} tm_dyn_t;
+static tm_dyn_t g_dyn_scheme[TM_MAX_SCHEMES];
+static tm_dyn_t g_dyn_prof[TERM_PROFILE_MAX];
+static tm_dyn_t g_dyn_bm[TM_MAX_BOOKMARKS];
+static int g_dyn_ns = -1, g_dyn_np = -1, g_dyn_nb = -1;
+static int g_ct_bm_loaded = 0;
+
+void term_menu_ct_invalidate(void) { g_dyn_np = -1; }
+
+// Rebuilt when a list's LENGTH changes, and forced by term_menu_ct_invalidate()
+// from the one place a profile can change without the count changing (a rename).
+// A surface that is only correct at startup is the stale-copy fault with a clock
+// on it.
+static void tm_ct_sync(void) {
+    // A WINDOWLESS contract process never ran term_menu_init(), so these lists
+    // are empty. Building them costs a /PALETTES listing and one config read,
+    // neither of which touches the GUI.
+    if (g_scheme_count == 0) tm_rebuild_schemes();
+    if (!g_inited && !g_ct_bm_loaded) { g_ct_bm_loaded = 1; tm_bookmarks_load(); }
+
+    if (g_dyn_ns == g_scheme_count && g_dyn_np == g_term_profile_count &&
+        g_dyn_nb == g_bookmark_count) return;
+    g_dyn_ns = g_scheme_count;
+    g_dyn_np = g_term_profile_count;
+    g_dyn_nb = g_bookmark_count;
+
+    for (int i = 0; i < g_scheme_count; i++) {
+        const char *nm = g_schemes[i].name[0] ? g_schemes[i].name : g_schemes[i].slug;
+        tm_slug(g_dyn_scheme[i].tok, (int)sizeof(g_dyn_scheme[i].tok), "scheme.",
+                g_schemes[i].slug[0] ? g_schemes[i].slug : nm);
+        snprintf(g_dyn_scheme[i].desc, sizeof(g_dyn_scheme[i].desc),
+                 "Apply colour scheme \"%s\" to the cell grid, the same Settings-menu row", nm);
+        g_dyn_scheme[i].idx = i;
+    }
+    for (int i = 0; i < g_term_profile_count && i < TERM_PROFILE_MAX; i++) {
+        tm_slug(g_dyn_prof[i].tok, (int)sizeof(g_dyn_prof[i].tok), "profile.apply.",
+                g_term_profiles[i].name);
+        snprintf(g_dyn_prof[i].desc, sizeof(g_dyn_prof[i].desc),
+                 "Apply profile \"%s\" to this window: scheme, theme, font, cursor, scrollback",
+                 g_term_profiles[i].name);
+        g_dyn_prof[i].idx = i;
+    }
+    // "bookmark." is ALSO the prefix of the two fixed rows bookmark.add and
+    // bookmark.remove, and they cannot collide with a projected one: a bookmark is
+    // always the shell's `cwd`, which is always ABSOLUTE, so its slug always
+    // begins with the '_' that tm_slug() substitutes for the leading '/'. If
+    // bookmarks ever accept a relative path, this stops being true and the two
+    // families need separate prefixes.
+    for (int i = 0; i < g_bookmark_count && i < TM_MAX_BOOKMARKS; i++) {
+        tm_slug(g_dyn_bm[i].tok, (int)sizeof(g_dyn_bm[i].tok), "bookmark.", g_bookmarks[i]);
+        snprintf(g_dyn_bm[i].desc, sizeof(g_dyn_bm[i].desc),
+                 "cd to the bookmarked directory %s, through the shell's own cd", g_bookmarks[i]);
+        g_dyn_bm[i].idx = i;
+    }
+}
+
+int term_menu_ct_count(void) {
+    tm_ct_sync();
+    return TM_ACT_N + g_scheme_count + g_term_profile_count + g_bookmark_count;
+}
+
+// ---- the four shared actfns, one per table SHAPE ---------------------------
+// Each reads the row it was projected from through it->ctx (contract.h calls
+// that the identity payload), so there is no token-to-handler translation table.
+static int ct_menu_run(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)argc; (void)argv;
+    const tm_act_t *a = (const tm_act_t *)it->ctx;
+    if (!a || !a->fn) return -1;
+    if ((a->terms->tflags & CT_TF_LIVE_ONLY) && term_ct_no_live(out, ocap)) return -1;
+    a->fn();                        // the SAME function a click on that row runs
+    if (!term_ct_live()) {
+        snprintf(out, (size_t)ocap,
+                 "ran=%s (no live window: only effects outside this process landed)", a->tok);
+        return 0;
+    }
+    tm_apply_context();
+    // An OBSERVATION, not an echo of the request, so a call that did nothing is
+    // visible in the answer and not only in the return code.
+    snprintf(out, (size_t)ocap,
+             "ran=%s tabs=%d panes=%d font=%d menubar=%d sel=%d matches=%d bookmarks=%d",
+             a->tok, term_layout_tab_count(), term_layout_pane_count(),
+             g_term_font.size, g_menu_visible, term_select_have() ? 1 : 0,
+             term_search_match_count(), g_bookmark_count);
+    return 0;
+}
+CT_CHECK_ACTFN(ct_menu_run);
+
+static int ct_scheme_pick(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)argc; (void)argv;
+    const tm_dyn_t *d = (const tm_dyn_t *)it->ctx;
+    if (!d) return -1;
+    if (term_ct_no_live(out, ocap)) return -1;
+    tm_pick_scheme(d->idx);         // which already saves and redraws every pane
+    snprintf(out, (size_t)ocap, "colour_scheme=%s", g_term_palette_slug);
+    return str_eq(g_term_palette_slug, g_schemes[d->idx].slug) ? 0 : -1;
+}
+CT_CHECK_ACTFN(ct_scheme_pick);
+
+static int ct_profile_pick(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)argc; (void)argv;
+    const tm_dyn_t *d = (const tm_dyn_t *)it->ctx;
+    if (!d) return -1;
+    if (term_ct_no_live(out, ocap)) return -1;
+    tm_pick_profile(d->idx);
+    snprintf(out, (size_t)ocap, "profile=%s scheme=%s theme=%s font=%d",
+             (g_term_profile_active >= 0 && g_term_profile_active < g_term_profile_count)
+                 ? g_term_profiles[g_term_profile_active].name : "(none)",
+             g_term_palette_slug, g_term_theme_slug, g_term_font.size);
+    return (g_term_profile_active == d->idx) ? 0 : -1;
+}
+CT_CHECK_ACTFN(ct_profile_pick);
+
+static int ct_bookmark_go(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)argc; (void)argv;
+    const tm_dyn_t *d = (const tm_dyn_t *)it->ctx;
+    if (!d) return -1;
+    if (term_ct_no_live(out, ocap)) return -1;
+    char want[TM_PATH_MAX];
+    str_copy(want, g_bookmarks[d->idx], TM_PATH_MAX);
+    tm_goto_bookmark(d->idx);
+    snprintf(out, (size_t)ocap, "cwd=%s wanted=%s", cwd, want);
+    // builtin_cd() stats the target and refuses a non-directory, so "the cd ran"
+    // is NOT the claim: the claim is that the shell is now THERE.
+    return str_eq(cwd, want) ? 0 : -1;
+}
+CT_CHECK_ACTFN(ct_bookmark_go);
+
+int term_menu_ct_project(int idx, ct_item_t *out) {
+    tm_ct_sync();
+    if (idx < 0) return 0;
+    ct_item_t it;
+    __builtin_memset(&it, 0, sizeof(it));
+    it.type   = CT_ACTION;
+    it.access = CT_WRITE;
+
+    if (idx < TM_ACT_N) {
+        const tm_act_t *a = &TM_ACTS[idx];
+        it.name = a->tok; it.desc = a->desc; it.terms = a->terms;
+        it.actfn = ct_menu_run; it.ctx = a;
+        term_ct_apply_risk(&it, a->terms);
+        *out = it; return 1;
+    }
+    idx -= TM_ACT_N;
+
+    if (idx < g_scheme_count) {
+        it.name = g_dyn_scheme[idx].tok; it.desc = g_dyn_scheme[idx].desc;
+        it.terms = &k_t_pick_scheme;
+        it.actfn = ct_scheme_pick; it.ctx = &g_dyn_scheme[idx];
+        term_ct_apply_risk(&it, it.terms);
+        *out = it; return 1;
+    }
+    idx -= g_scheme_count;
+
+    if (idx < g_term_profile_count) {
+        it.name = g_dyn_prof[idx].tok; it.desc = g_dyn_prof[idx].desc;
+        it.terms = &k_t_pick_profile;
+        it.actfn = ct_profile_pick; it.ctx = &g_dyn_prof[idx];
+        term_ct_apply_risk(&it, it.terms);
+        *out = it; return 1;
+    }
+    idx -= g_term_profile_count;
+
+    if (idx < g_bookmark_count) {
+        it.name = g_dyn_bm[idx].tok; it.desc = g_dyn_bm[idx].desc;
+        it.terms = &k_t_bookmark_go;
+        it.actfn = ct_bookmark_go; it.ctx = &g_dyn_bm[idx];
+        term_ct_apply_risk(&it, it.terms);
+        *out = it; return 1;
+    }
+    return 0;
+}
+
+// ---- readable state the contract's own value rows answer from ---------------
+// Owned HERE, because this module owns the state. A second copy of "is the menu
+// bar up" in term_contract.c would be a second answer to one question.
+int term_menu_bar_visible(void)   { return g_menu_visible ? 1 : 0; }
+int term_menu_bookmark_count(void) { tm_ct_sync(); return g_bookmark_count; }
 
 // ===========================================================================
 // Public entry points
@@ -768,6 +1315,11 @@ void term_menu_init(void) {
     gui_menu_bar_init(&g_bar, MENUS, MENU_COUNT, 0, 0, TERM_MENU_BAR_H);
     term_content_y = TERM_MENU_BAR_H;
     term_menu_refresh();
+    // AFTER the refresh, so the live scheme/profile/bookmark rows are in place
+    // and the walk sees the tables exactly as a click will. Every drawn row's id
+    // must have a TM_ACTS[] row or it is dispatched by nothing and described by
+    // nothing; see the comment above TM_ACTS[].
+    tm_verify_action_coverage();
     term_render_add_chrome_hook(tm_draw_chrome);
 }
 

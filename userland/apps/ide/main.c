@@ -12,6 +12,8 @@
 #include "dirent.h"
 #include "unistd.h"
 #include "fcntl.h"
+#include "userconf.h"   // #peruserrows: userhome_path/userscratch_path
+#include "notify.h"     // [deadbtn] toast when PYTHON.ELF cannot be launched
 
 // ---------------------------------------------------------------- palette ---
 #define C_BG        0x001E1E1E
@@ -363,6 +365,12 @@ static void *run_worker(void *arg){
     if(pid<=0){
         const char *m="[Failed to launch /APPS/PYTHON.ELF - is the Python runtime installed?]\n";
         pthread_mutex_lock(&g_lock); int ml=strlen(m); if(g_cap_len+ml<CAPMAX){memcpy(g_cap+g_cap_len,m,ml);g_cap_len+=ml;g_cap[g_cap_len]=0;} g_run_active=0; g_run_done=1; g_run_exit=-1; g_dirty=1; pthread_mutex_unlock(&g_lock);
+        // [deadbtn] The message above only ever reaches the Run console pane
+        // inside this window; on a build with no PYTHON.ELF (a from-scratch
+        // public image, see build/app-presence.policy) that pane can be easy
+        // to miss (user is in the editor tab, not Run). Also raise it as a
+        // toast through the shared notify_post().
+        notify_post("Cannot run Python", "PYTHON.ELF is not on this build", NOTIFY_ERROR);
         close(p[0]); return 0;
     }
     char buf[2048]; long n;
@@ -407,6 +415,34 @@ static void run_active_file(void){
     char m[200]; snprintf(m,sizeof m,"Running %s ...",b->name); set_status(m);
     start_run(b->path, 0);
 }
+// #peruserrows: THE TWO FILES THIS IDE WRITES, AND WHY THEY GO TO DIFFERENT
+// PLACES. Both used to be literals at the root-owned ext2 root, so for the uid
+// an app actually runs as (1000) the welcome file could not be created and the
+// console REPL reported "[cannot write session file]" on every line.
+//
+//   HELLO.PY is the user's DOCUMENT. userhome_path(0, ...) keeps its legacy
+//   directory, which is the filesystem root, so a ROOT session still resolves to
+//   exactly /HELLO.PY and nothing about it changes; a uid-1000 session with an
+//   account gets <home>/HELLO.PY.
+//
+//   IDECON.PY is MACHINE SCRATCH: one REPL submission, overwritten by the next,
+//   never meant to be opened by hand. userscratch_path() is the accessor whose
+//   job is "somewhere this session can ACTUALLY write", so the REPL also works on
+//   a machine with no account at all (/TMP, 01777). Root's home is "/", which
+//   that accessor treats as no usable home, so root's copy moves to
+//   /TMP/IDECON.PY. It is chmod 0600 after the write because it holds whatever
+//   the user typed, and /TMP is world-readable.
+static const char *ide_welcome_path(void){
+    static char p[256];
+    if(!p[0] && userhome_path(0,"HELLO.PY",p,sizeof p)!=0) p[0]=0;
+    return p[0] ? p : "/HELLO.PY";
+}
+static const char *ide_console_path(void){
+    static char p[256];
+    if(!p[0] && userscratch_path("IDECON.PY",p,sizeof p)!=0) p[0]=0;
+    return p[0] ? p : "/IDECON.PY";
+}
+
 // Console REPL: submit a line
 static void console_submit(const char *line){
     if(g_run_active){ set_status("Busy - a program is running"); return; }
@@ -414,14 +450,16 @@ static void console_submit(const char *line){
     char pr[540]; snprintf(pr,sizeof pr,">>> %s\n",line);
     append_buf(&g_con,&g_con_len,&g_con_cap,pr,strlen(pr));
     // build session file = committed session + this line
-    int fd=sys_open("/IDECON.PY", O_WRONLY|O_CREAT|O_TRUNC);
+    const char *cpath=ide_console_path();
+    int fd=userconf_open_write_path(cpath);
     if(fd<0){ append_buf(&g_con,&g_con_len,&g_con_cap,"[cannot write session file]\n",28); return; }
     if(g_sess_len) sys_write(fd,g_sess,g_sess_len);
     if(g_sess_len) sys_write(fd,"\n",1);
     sys_write(fd,line,strlen(line));
     sys_close(fd);
+    userconf_protect(cpath);   // the user's typed lines; /TMP is world-readable
     strncpy(g_pending_line,line,511); g_pending_line[511]=0;
-    start_run("/IDECON.PY", 1);
+    start_run(cpath, 1);
 }
 // called from UI loop when a console run finished
 static void console_finish(void){
@@ -1023,9 +1061,9 @@ static void handle_mouse_down(gui_event_t *ev){
 // ---------------------------------------------------------- sample project -
 static void ensure_welcome(void){
     // create a welcome .py if none, so the IDE has something to show/run
-    int fd=sys_open("/HELLO.PY", O_RDONLY);
+    int fd=sys_open(ide_welcome_path(), O_RDONLY);
     if(fd>=0){ sys_close(fd); return; }
-    fd=sys_open("/HELLO.PY", O_WRONLY|O_CREAT|O_TRUNC);
+    fd=userconf_open_write_path(ide_welcome_path());
     if(fd>=0){ const char *s=
         "# Welcome to Maytera Code Studio\n"
         "# Press Run (or F5) to execute this file with CPython.\n"
@@ -1053,7 +1091,7 @@ int main(int argc, char **argv){
     tree_init("/");
     // open a file passed as arg, else the welcome file
     if(argc>1 && argv[1] && argv[1][0]) open_path_tab(argv[1]);
-    else { if(open_path_tab("/HELLO.PY")<0) new_untitled(); }
+    else { if(open_path_tab(ide_welcome_path())<0) new_untitled(); }
     focus_console_input=0;
 
     render();

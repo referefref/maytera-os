@@ -6,6 +6,7 @@
 #include "stdio.h"    /* printf (fd 1 -> serial) for the #491 Rust selftest    */
 #include "arena_rs.h" /* #491 Stage 0: userland Rust FFI (arena_rs_selftest)   */
 #include "bsp_load.h" /* #491 Stage 1: GoldSrc BSP v30 import                  */
+#include "../../libc/userconf.h"  /* #peruser2: per-user game settings          */
 
 #define MAXW 1280
 #define MAXH 800
@@ -191,7 +192,12 @@ Entity *ent_get(World *w, int idx) {
 }
 
 /* ============================================================ settings I/O = */
-#define CFG_PATH "/CONFIG/ARENA.CFG"
+/* #peruser2: game settings are a PREFERENCE, so <home>/CONFIG/ARENA.CFG with a
+ * fallback read of the system copy. Root's home is "/", so a root session still
+ * uses exactly /CONFIG/ARENA.CFG. Before this, every Arena settings change made
+ * by a non-root session was discarded at exit with no message.               */
+#define CFG_NAME   "ARENA.CFG"
+#define CFG_LEGACY "/CONFIG/ARENA.CFG"
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
@@ -226,7 +232,7 @@ static const char *cfg_match(const char *line, const char *key) {
 }
 
 static void arena_cfg_load(void) {
-    int fd = sys_open(CFG_PATH, O_RDONLY);
+    int fd = userconf_open_read(CFG_NAME, CFG_LEGACY);   /* #peruser2 */
     if (fd < 0) { cfg_clamp_apply(); return; }
     char buf[512];
     long n = sys_read(fd, buf, sizeof(buf) - 1);
@@ -275,10 +281,13 @@ void arena_cfg_save(void) {
     putkv(buf, &p, "bots",        g_arena_cfg.bots);
     putkv(buf, &p, "minimap",     g_arena_cfg.minimap);
     putkv(buf, &p, "render_scale", g_arena_cfg.render_scale);
-    int fd = sys_open(CFG_PATH, O_WRONLY | O_CREAT | O_TRUNC);
-    if (fd < 0) return;
-    sys_write(fd, buf, (unsigned long)p);
-    sys_close(fd);
+    /* #peruser2: checked write into the user's own home. The write and close
+     * results used to be discarded, so a full volume looked like a good save. */
+    int fd = userconf_open_write(CFG_NAME);
+    if (userconf_finish_write(fd, buf, (unsigned long)p) != 0) {
+        /* Reported by userconf_open_write()/userconf_finish_write() through
+         * sys_bootlog; the game has no status line to surface it in.          */
+    }
 }
 
 /* Mouse-look radians per pixel from the sensitivity setting (1..30, widened
@@ -463,7 +472,17 @@ static void apply_local_input(World *w) {
  * /ARENA/KEYLOG.TXT so, if WASD STILL fails on the iMac, one boot + a few W/A/S/D
  * presses + reading this file tells us EXACTLY what the USB-HID keyboard sends
  * (are DOWN/UP arriving at all? what codes? clean edges or bouncing?).         */
-#define KEYLOG_PATH   "/ARENA/KEYLOG.TXT"
+/* #peruserrows: /ARENA is the game's root-owned ASSET directory, so the keylog
+ * could only ever be written by uid 0 and was empty in exactly the session whose
+ * keyboard was being investigated, on exactly the real iMac this exists for.
+ * userscratch_path() gives the session's own writable location: <home>/KEYLOG.TXT
+ * with an account, /TMP/KEYLOG.TXT without one (root included, home "/"). It is a
+ * RECORD OF KEYSTROKES, so it is chmod 0600 after every flush; /TMP is 01777. */
+static const char *keylog_path(void) {
+    static char p[192];
+    if (!p[0] && userscratch_path("KEYLOG.TXT", p, sizeof p) != 0) p[0] = 0;
+    return p;
+}
 #define KEYLOG_CAP    32000
 #define KEYLOG_MAXEV  600      /* per-key-event budget                            */
 #define KEYLOG_MAXST  400      /* separate STAT-line budget (not gated by keys)   */
@@ -488,7 +507,9 @@ static void klog_di(int v) {   /* signed decimal                                
     klog_d((unsigned)v);
 }
 static void klog_flush(void) {
-    int fd = sys_open(KEYLOG_PATH, O_WRONLY | O_CREAT | O_TRUNC);
+    const char *kp = keylog_path();
+    if (!kp[0]) return;
+    int fd = userconf_open_write_path(kp);
     if (fd < 0) return;
     sys_write(fd, g_klog, (unsigned long)g_klog_len);
     /* O_TRUNC does NOT shrink an existing file on this FAT volume: a run that
@@ -501,6 +522,7 @@ static void klog_flush(void) {
     static const char eof_mark[] = "\n#EOF#\n";
     sys_write(fd, eof_mark, sizeof(eof_mark) - 1);
     sys_close(fd);
+    userconf_protect(kp);
 }
 
 /* Loud, rare, cross-module log line (declared in game.h). modes.c uses it for

@@ -277,31 +277,94 @@ extern char kernel_stack_bottom[];   // #446: entry.asm boot stack (64 KB)
 volatile uint64_t g_reap_deferred = 0;   // reaps refused because a core was on it
 int g_exit_stack_guard = 1;              // cleared by /NOSTACKGUARD.TXT (control arm)
 
-static int cleanup_proc_slot(process_t *proc) {
-    if (g_exit_stack_guard && proc && proc->sched_on_cpu != 0) {
-        g_reap_deferred++;
-        return 0;
-    }
+// #heapinvptr: RELEASE-AND-FORGET. THE ONE PLACE a process_t's owned resources
+// are handed back, and the reason this is a function rather than four copies.
+//
+// THE DEFECT. proc_create_user_as() has four failure exits that run after some
+// combination of the kernel stack, the user address space and the user stack pages
+// already exists. Each one released those resources and then set
+// state = PROC_STATE_UNUSED while LEAVING stack_base, cr3, user_stack_base and
+// user_stack_size in the PCB still naming the memory it had just handed back.
+// alloc_proc_slot() claims the LOWEST-INDEX UNUSED slot and calls
+// cleanup_proc_slot() on it, and the slot a failed spawn has just released IS that
+// lowest-index slot. So THE NEXT SPAWN released all of it a second time. That is
+// the whole of "it fires reliably on the second spawn in a sequence": the second
+// spawn is not the broken one, it is the one that steps on the first spawn's
+// corpse. proc_fork() and proc_clone() had the same shape, plus a worse window of
+// their own: their memcpy of the parent's process_t leaves child->stack_base
+// ALIASING THE PARENT'S LIVE KERNEL STACK until kstack_alloc() overwrites it, and
+// a failure exit in between left that alias in an UNUSED slot for the next
+// allocation to free.
+//
+// MEASURED, both in the field and deterministically. Field: golden 2600,
+// /root/co2600-fatapps-run.log, two independent boots, "[PROC] WRITER: refused
+// initial stack" immediately followed by "[HEAP] ERROR: kfree() called on invalid
+// pointer 0x000000000fdb1000 (magic=0xbaadb4dd want 0x48454150)" and a run of
+// "[PMM] WARNING: Double free of page". Deterministic: proc/slotdbl.c, which drives
+// the refusal four times and measured +3 bad kernel-stack frees and +90 doubly
+// freed physical pages on the unfixed kernel, +0 on the fixed one, with
+// addr2line naming THIS function, process.c:290, as the caller.
+//
+// WHY THE PMM LINES ARE THE DANGEROUS HALF. 0xbaadb4dd is KSTACK_POISON, so the
+// "invalid heap pointer" was never a heap pointer and kfree() REFUSED it: that
+// half leaks a granule and corrupts nothing. The PMM lines are
+// vmm_destroy_user_space() walking page tables it had already freed, and
+// pmm_free_page() only warns about the frames that happen to be free ALREADY. A
+// stale table entry naming a frame that had been re-issued to somebody else is
+// cleared silently, and the next allocation gets memory that already has an owner.
+//
+// THE FIX IS BY CONSTRUCTION, not by discipline: every field is cleared in the
+// same statement sequence that releases what it names, BEFORE the release call, so
+// a second call releases nothing. No caller has to remember to clear four fields,
+// which is exactly what four callers did not do.
+//
+// LANGUAGE NOTE (project rule: new kernel code is Rust unless there is a stated
+// reason). This is C. The stated reason is entanglement: it is field stores on the
+// C process_t plus calls to kstack_free(), vmm_free_user_pages(),
+// vmm_destroy_user_space() and mm_put_detach(), and it runs inside the reap path
+// under proc_mm_lock(). An FFI boundary here would add a process_t layout lock as
+// its only new behaviour and would put a foreign-language call between a release
+// and the store that must precede it, which is the exact ordering this change
+// exists to make unbreakable.
+static void proc_release_resources(process_t *proc) {
+    if (!proc) return;
     // Free kernel stack if allocated.
     // #446: pid 0's stack_base points at the STATIC boot stack in entry.asm,
     // which must never be handed to kfree().
     if (proc->stack_base && proc->stack_base != (void *)kernel_stack_bottom) {
-        kstack_free(proc->stack_base, proc->stack_size);
+        void  *__sb = proc->stack_base;
+        size_t __ss = proc->stack_size;
+        // FORGET FIRST, THEN RELEASE. The other order is what shipped, and it is
+        // why a failure exit that returned without clearing left a PCB naming a
+        // kernel stack the PMM had already taken back.
         proc->stack_base = NULL;
+        proc->stack_size = 0;
+        kstack_free(__sb, __ss);
     }
     
     // Free user address space if this was a user process.
     // #430: a thread (shares_vm) borrows the leader's cr3 and its user stack
     // lives in the shared heap; destroying either here would corrupt/kill the
     // rest of the thread group. Only the owning task frees the address space.
-    if (proc->cr3 != 0 && !proc->shares_vm) {
-        // Free user stack pages first
-        if (proc->user_stack_base != 0 && proc->user_stack_size != 0) {
-            uint64_t stack_pages = proc->user_stack_size / VMM_PAGE_SIZE_4K;
-            vmm_free_user_pages(proc->cr3, proc->user_stack_base, stack_pages);
+    {
+        uint64_t __cr3   = proc->cr3;
+        uint64_t __ubase = proc->user_stack_base;
+        uint64_t __usize = proc->user_stack_size;
+        int      __owns  = (__cr3 != 0 && !proc->shares_vm);
+        // FORGET FIRST, AND FORGET UNCONDITIONALLY. A thread that only BORROWED
+        // the leader's cr3 must still stop naming it: shares_vm is cleared at the
+        // bottom of this function, so a slot left holding a non-zero cr3 with
+        // shares_vm already 0 would, on its next release, destroy the LEADER's
+        // address space. The ownership test governs the FREE, not the forgetting.
+        proc->cr3 = 0;
+        proc->user_stack_base = 0;
+        proc->user_stack_size = 0;
+        if (__owns) {
+            // Free user stack pages first, then destroy the address space.
+            if (__ubase != 0 && __usize != 0)
+                vmm_free_user_pages(__cr3, __ubase, __usize / VMM_PAGE_SIZE_4K);
+            vmm_destroy_user_space(__cr3);
         }
-        // Then destroy the address space
-        vmm_destroy_user_space(proc->cr3);
     }
     // #429: free the per-process demand-paging mm.
     //
@@ -354,9 +417,23 @@ static int cleanup_proc_slot(process_t *proc) {
         proc_mm_unlock();
         if (dead) mm_destroy(dead);
     }
-    proc->cr3 = 0;
     proc->shares_vm = 0;
     proc->clear_child_tid = NULL;
+}
+
+/**
+ * Clean up resources from a previously used process slot.
+ *
+ * #167(c): RETURNS 0 and cleans NOTHING if the task is still on a core, so the
+ * caller must not mark the slot UNUSED either; see the block comment above
+ * g_reap_deferred for the measured reason.
+ */
+static int cleanup_proc_slot(process_t *proc) {
+    if (g_exit_stack_guard && proc && proc->sched_on_cpu != 0) {
+        g_reap_deferred++;
+        return 0;
+    }
+    proc_release_resources(proc);
     return 1;
 }
 
@@ -937,6 +1014,51 @@ static void init_proc(process_t *proc, const char *name, process_priority_t prio
                     "instruction)\n",
                     (unsigned)proc->pid, proc->escrow_scope_prefix,
                     (unsigned)proc->escrow_task_node);
+        } else {
+            // #246 THE SPAWN ESCAPE, measured 2026-10-03 and closed here.
+            //
+            // WHAT WAS WRONG. This function memsets the whole process_t, so a
+            // brand-new process starts with escrow_active == 0. fork() and
+            // clone() copy the mark through their whole-struct memcpy (see the
+            // comments in proc_fork / proc_clone), and execve() keeps the SAME
+            // process_t so the mark survives it. SPAWN was the one way to make
+            // a process, and it built a FRESH process_t. So a marked AI actor
+            // could call SYS_SPAWN and the child was an ordinary uid-0 process
+            // with no contract, free to hard-delete anything. Copying a process
+            // kept the mark; launching a program dropped it.
+            //
+            // THE FIX. A child of a marked creator inherits the contract. The
+            // creator is proc_current(): for a SYS_SPAWN this is the spawning
+            // Ring-3 process, and for the kernel's own worker-launched
+            // processes it is an unmarked kernel thread, so every ordinary
+            // spawn in the system is the untouched zero case.
+            //
+            // The inherited state is LOCKED whatever the parent was, because a
+            // SELF actor whose child could self-exit would have laundered the
+            // contract through a process boundary. The rule itself lives in
+            // rustkern/escrowmark.rs, beside the self-exit rule, so the two
+            // cannot drift.
+            extern unsigned char escmark_inherit_rs(unsigned char parent_active);
+            process_t *__cre = proc_current();
+            if (__cre && __cre != proc && __cre->escrow_active) {
+                unsigned char __ia = escmark_inherit_rs(__cre->escrow_active);
+                if (__ia) {
+                    proc->escrow_active     = __ia;
+                    proc->escrow_task_node  = __cre->escrow_task_node;
+                    proc->escrow_obj_node   = __cre->escrow_obj_node;
+                    proc->escrow_grant_edge = __cre->escrow_grant_edge;
+                    strncpy(proc->escrow_scope_prefix, __cre->escrow_scope_prefix,
+                            ESCROW_SCOPE_PREFIX_MAX - 1);
+                    proc->escrow_scope_prefix[ESCROW_SCOPE_PREFIX_MAX - 1] = '\0';
+                    kprintf("[ESCROW] init_proc INHERITED marker pid=%u from "
+                            "pid=%u scope=%s task=%08x active=%u (a child of a "
+                            "marked actor is itself a LOCKED actor; the spawn "
+                            "escape is closed)\n",
+                            (unsigned)proc->pid, (unsigned)__cre->pid,
+                            proc->escrow_scope_prefix,
+                            (unsigned)proc->escrow_task_node, (unsigned)__ia);
+                }
+            }
         }
     }
 }
@@ -4098,6 +4220,18 @@ void sched_smp_selftest(void) {
                       "con>acq, maxhold>window, held>capacity, at-capacity-ok, "
                       "long>acq, stalled, disarmed, first-window, spin-underflow, "
                       "unknown-window)\n"); }
+    // #245: the VMA-list-length instrument. do_mmap() now coalesces adjacent
+    // mappings, so the [VMASCALE] warning line should NEVER appear on a healthy
+    // boot. That is precisely why its decision function is proved here: an
+    // instrument whose only observed behaviour is silence cannot be told apart
+    // from one that is broken, and this tree has shipped several of those.
+    { extern int vmascale_selftest_rs(void);
+      int vf = vmascale_selftest_rs();
+      if (!vf) kprintf("[VMASCALE] SELFTEST FAILED - the VMA-list-length warning "
+                       "on this build will not fire, so a return of the #245 "
+                       "quadratic would be silent\n");
+      else     kprintf("[VMASCALE] selftest OK (quiet below 256, fires at 256, "
+                       "reports the power of two, says each threshold once)\n"); }
 }
 
 /**
@@ -4984,6 +5118,27 @@ void proc_exit(int exit_code) {
     if (!me->shares_vm) {
         extern void advlock_proc_exit(uint32_t owner);
         advlock_proc_exit(me->tgid ? me->tgid : me->pid);
+    }
+
+    // #fdreclaim: and now actually GIVE THE SLOTS BACK. fdown_proc_exit() above
+    // only poisoned them, which made a leaked slot unreachable but never
+    // reusable: nothing in the kernel cleared fd_used[i] or freed e2fd[i].rbuf
+    // (up to 128 KiB) outside sys_close(), so every process that died without
+    // closing shrank a SYSTEM-WIDE 128-slot pool for the rest of the boot.
+    //
+    // NOT gated on shares_vm, and that is deliberate rather than an oversight.
+    // A worker thread can outlive its group leader, and the reclaim is only safe
+    // once NO member of the group can still be inside a syscall holding a
+    // pointer into a slot. So every exit asks, and only the last member out gets
+    // a yes. Gating this on the leader would have left every multithreaded
+    // process leaking, which is most of the ones that matter.
+    //
+    // Same cli()-safe contract as its neighbours: a bounded sweep of atomics
+    // plus kfree(), which takes the heap spinlock with irqsave and never
+    // sleeps. See proc/fdlayer.c for the full safety argument.
+    {
+        extern void fdown_proc_reclaim(uint32_t owner);
+        fdown_proc_reclaim(me->tgid ? me->tgid : me->pid);
     }
 
     // #COMPRESPAWN: TEAR DOWN THE sys_fb_map() WINDOW BEFORE THE ADDRESS SPACE
@@ -6760,6 +6915,27 @@ int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
 
     // Initialize process structure
     init_proc(proc, name, PRIO_NORMAL);
+
+    // RECYCLE-ONLY BINDING, applied by the KERNEL at launch.
+    //
+    // THIS IS WHAT MAKES "AN AI CANNOT DESTROY YOUR FILES" NON-VOLUNTARY. The
+    // shipping AI assistant (/APPS/AICHAT) is an ordinary Ring-3 process whose
+    // delete tool called sys_unlink directly, so model output could destroy a
+    // file outright. Nothing marked it, and nothing could: the escrow contract
+    // states bind a process to ONE directory prefix, which would have broken an
+    // assistant the user asks to write anywhere.
+    //
+    // So the kernel binds the AI programs into RECYCLE-ONLY mode here, from the
+    // program path it was asked to launch, BEFORE the process is enqueued. It
+    // is a restriction and not a permission, nothing is escalated by applying
+    // it, there is no syscall that asks for it or releases it, and the
+    // inheritance rule above carries it into every child. A no-op for every
+    // other program, and a no-op for a process the trusted spawner already
+    // marked with a real contract.
+    {
+        extern void escrow_recycle_bind(void *p, const char *program_path);
+        escrow_recycle_bind(proc, name);
+    }
     proc->privilege = PRIV_USER;
 
     // #692: OVERWRITE the credentials init_proc() inherited from
@@ -6786,7 +6962,7 @@ int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
     if (!proc->stack_base) {
         kprintf("[PROC] Failed to allocate kernel stack for %s\n", name);
         LOG_ERROR("[Process] Failed to allocate kernel stack");
-        vmm_destroy_user_space(proc->cr3);
+        proc_release_resources(proc);   // #heapinvptr: release AND forget
         proc->state = PROC_STATE_UNUSED;
         sched_set_preemption(old_preempt);
         return -1;
@@ -6806,8 +6982,12 @@ int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
     if (__usr != 0) {
         kprintf("[PROC] Failed to allocate user stack for %s\n", name);
         LOG_ERROR("[Process] Failed to allocate user stack");
-        kstack_free(proc->stack_base, proc->stack_size);
-        vmm_destroy_user_space(proc->cr3);
+        // #heapinvptr: the user stack MAPPING never happened, so stop naming it
+        // before releasing, or the release would free pages that were never
+        // allocated. Everything else goes through the one release path.
+        proc->user_stack_base = 0;
+        proc->user_stack_size = 0;
+        proc_release_resources(proc);
         proc->state = PROC_STATE_UNUSED;
         sched_set_preemption(old_preempt);
         return -1;
@@ -6825,9 +7005,7 @@ int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
     if (elf_result != ELF_SUCCESS) {
         kprintf("[PROC] Failed to load ELF for %s: %s\n", name, elf_strerror(elf_result));
         LOG_ERROR("[Process] Failed to load ELF into user space");
-        vmm_free_user_pages(proc->cr3, proc->user_stack_base, stack_pages);
-        kstack_free(proc->stack_base, proc->stack_size);
-        vmm_destroy_user_space(proc->cr3);
+        proc_release_resources(proc);   // #heapinvptr: release AND forget
         proc->state = PROC_STATE_UNUSED;
         sched_set_preemption(old_preempt);
         return -1;
@@ -6859,9 +7037,7 @@ int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
     if (user_sp == 0) {
         kprintf("[PROC] %s: refused initial stack (argc=%d envc=%d)\n",
                 name, argc, envc);
-        vmm_free_user_pages(proc->cr3, proc->user_stack_base, stack_pages);
-        kstack_free(proc->stack_base, proc->stack_size);
-        vmm_destroy_user_space(proc->cr3);
+        proc_release_resources(proc);   // #heapinvptr: release AND forget
         proc->state = PROC_STATE_UNUSED;
         sched_set_preemption(old_preempt);
         return -1;
@@ -7070,6 +7246,14 @@ int proc_fork(void) {
 
     // Copy parent process structure
     memcpy(child, me, sizeof(process_t));
+    // #heapinvptr: THE COPY ABOVE MADE child->stack_base POINT AT THE PARENT'S
+    // LIVE KERNEL STACK. It is overwritten by kstack_alloc() further down, but
+    // between here and there sit a COW clone of the whole address space and two
+    // failure exits, and a slot left UNUSED carrying that alias is a slot whose
+    // next allocation calls kstack_free() on the stack the parent is standing on.
+    // The child owns nothing yet, so it names nothing yet.
+    child->stack_base = NULL;
+    child->stack_size = 0;
     { uint64_t __fl = spinlock_acquire_irqsave(&g_proc_table_lock);
       child->pid = next_pid++;   // #75: unlocked RMW on a shared global
       spinlock_release_irqrestore(&g_proc_table_lock, __fl); }
@@ -7130,6 +7314,10 @@ int proc_fork(void) {
     if (me->privilege == PRIV_USER && me->cr3 != 0) {
         child->cr3 = vmm_clone_user_space_cow(me->cr3);  // #429 COW fork
         if (child->cr3 == 0) {
+            // #heapinvptr: child->mm was already mm_dup()'d above, and the copied
+            // user_stack_base is the parent's. Release and forget both rather than
+            // leaving them for the next occupant of this slot to free.
+            proc_release_resources(child);
             child->state = PROC_STATE_UNUSED;
             sched_set_preemption(old_preempt);
             return -1;
@@ -7139,7 +7327,7 @@ int proc_fork(void) {
     // Allocate new kernel stack for child
     child->stack_base = kstack_alloc(me->stack_size);   // #stackguard: guard page below
     if (!child->stack_base) {
-        if (child->cr3) vmm_destroy_user_space(child->cr3);
+        proc_release_resources(child);   // #heapinvptr: release AND forget
         child->state = PROC_STATE_UNUSED;
         sched_set_preemption(old_preempt);
         return -1;
@@ -7307,6 +7495,14 @@ int proc_clone(uint32_t flags, void *user_stack, uint32_t *parent_tid,
 
     // Copy parent structure, then fix up the thread-specific fields.
     memcpy(child, me, sizeof(process_t));
+    // #heapinvptr: THE COPY ABOVE MADE child->stack_base POINT AT THE PARENT'S
+    // LIVE KERNEL STACK. It is overwritten by kstack_alloc() further down, but
+    // between here and there sit a COW clone of the whole address space and two
+    // failure exits, and a slot left UNUSED carrying that alias is a slot whose
+    // next allocation calls kstack_free() on the stack the parent is standing on.
+    // The child owns nothing yet, so it names nothing yet.
+    child->stack_base = NULL;
+    child->stack_size = 0;
     { uint64_t __fl = spinlock_acquire_irqsave(&g_proc_table_lock);
       child->pid = next_pid++;   // #75: unlocked RMW on a shared global
       spinlock_release_irqrestore(&g_proc_table_lock, __fl); }
@@ -7381,8 +7577,12 @@ int proc_clone(uint32_t flags, void *user_stack, uint32_t *parent_tid,
     // stack for syscalls; the copy carries the parent's syscall-entry frame).
     child->stack_base = kstack_alloc(me->stack_size);   // #stackguard: guard page below
     if (!child->stack_base) {
+        // #heapinvptr: this used to clear cr3/shares_vm by hand and leave the mm
+        // reference this function took a few lines above UNRELEASED, which only
+        // balanced because the next occupant of the slot happened to put it. One
+        // release path, which puts the mm and forgets the borrowed cr3.
+        proc_release_resources(child);
         child->state = PROC_STATE_UNUSED;
-        child->cr3 = 0; child->shares_vm = 0;
         sched_set_preemption(old_preempt);
         return -1;
     }
@@ -7819,6 +8019,37 @@ uint32_t proc_thread_count(uint32_t pid) {
         if (p->pid == pid || (p->shares_vm && p->tgid == pid)) count++;
     }
     return count ? count : 1;
+}
+
+// #fdreclaim: how many members of thread group `tgid` can still RUN. Same
+// membership rule as proc_thread_count() above (the leader plus every
+// shares_vm thread naming it), with two differences that are the entire point:
+// there is no floor of 1, and a ZOMBIE does not count.
+//
+// A zombie has already run proc_exit(); it will never return into a syscall, so
+// it cannot be holding a pointer into anything. Everything else can: a RUNNING
+// or READY member may be mid-syscall, and a BLOCKED one may be parked INSIDE
+// sys_read() on a legacy fd waiting for the disk, which is precisely the
+// context that must not have its read window kfree'd underneath it.
+//
+// So "this returns 0" is the exact condition under which the group's leaked fd
+// slots can be torn down rather than merely poisoned. Called from proc_exit()
+// via fdown_proc_reclaim() with the caller already marked ZOMBIE, so the
+// last member out sees 0 and does the reclaim.
+//
+// Justified C, not Rust: it reads proc_table[], the C static this file owns,
+// and has no #[repr(C)] mirror. Read-only, bounded by MAX_PROCESSES, no lock
+// (the caller is under cli() on the exit path), no allocation, cannot block.
+uint32_t proc_group_live_count(uint32_t tgid) {
+    uint32_t count = 0;
+    if (!tgid) return 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t *p = &proc_table[i];
+        if (p->state == PROC_STATE_UNUSED) continue;
+        if (p->state == PROC_STATE_ZOMBIE) continue;
+        if (p->pid == tgid || (p->shares_vm && p->tgid == tgid)) count++;
+    }
+    return count;
 }
 
 

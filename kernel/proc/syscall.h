@@ -1502,7 +1502,80 @@ typedef struct {
 //   SYS_CAP_INJECT_KEY_UP(int win, int keycode) -> 0 | CAP_E*  [gated: input.inject]
 #define SYS_CAP_INJECT_KEY_UP          460  // (int win, int keycode) -> 0 | CAP_E*  [gated: input.inject]
 
-#define SYS_MAX                        461  // top is SYS_CAP_INJECT_KEY_UP=460 (#469 ai-vision)
+// #smbdisk: SYS_NET_CRED_TAG(const char *pass, char *out, uint32_t outcap) -> 0 | -1 | -14
+//   Derive the PERSISTABLE form of an SMB password: "nt$" + 32 lowercase hex of
+//   nt_hash = MD4(UTF-16LE(password)). Exists so the Files app can save a hash
+//   instead of a cleartext password in /CONFIG/NETMOUNTS.CFG WITHOUT a second
+//   MD4 implementation in userland (kernel/crypto/md4.c is the only one, and
+//   crypto/ntlm_nthash_kat.sh pins the derivation to the published MS-NLMP
+//   vectors). Pure function of its argument: it reveals no kernel state and
+//   grants no capability, since the caller already holds the password. It is
+//   therefore [NOCAP], stated rather than defaulted.
+#define SYS_NET_CRED_TAG               461  // (const char *pass, char *out, uint32_t cap) -> 0 | -1
+
+// #secretuse: THE SECRET-USE PROXY. (int op, uint32_t idx, void *out,
+// uint32_t outcap, const void *in, uint32_t inlen) -> >=0 | SECRET_E_*
+//
+// NUMBER CHOICE: 462, which WAS the SYS_MAX sentinel and is therefore the first
+// genuinely unallocated number; SYS_MAX is bumped to 463 in this same edit, which
+// is the only way to allocate one without leaving the sentinel describing a
+// number that is now in use.
+//
+// THE OPERATIONS ARE THE SURFACE, and NONE of them returns a secret. Read
+// proc/secretuse.h for the enumeration and for why there is deliberately no
+// caller-supplied counter or challenge (docs/OPEN_BACKLOG.md A4).
+#define SYS_SECRET_USE                 462
+
+// #harendezvous: WHERE DOES THE ACTIVE SESSION'S PER-USER STATE LIVE, asked by
+// a process that is NOT that user. (char *out, int cap) -> len | -1 | -14
+//
+// NUMBER CHOICE: 463, which WAS the SYS_MAX sentinel and is therefore the first
+// genuinely unallocated number; SYS_MAX is bumped to 464 in this same edit, for
+// the same reason #secretuse gives above.
+//
+// ROOT-ONLY. A non-root caller already has this answer for itself through
+// libc userhome_root(); the only caller that needs somebody ELSE's home is a
+// privileged boot service, so restricting it to euid 0 means this syscall
+// tells an unprivileged app nothing it did not already know, in particular not
+// who is logged in. Returns the home with no trailing '/' ("/" stays "/").
+#define SYS_SESSION_HOME               463
+
+// ===========================================================================
+// #791 [winopacity] PER-WINDOW OPACITY DECLARED BY THE OWNING APP (tier 1).
+//
+// (int handle, int opacity) -> effective opacity 40..255, or -1 on a bad handle.
+//
+// WHY THIS IS NOT SYS_SET_WIN_OPACITY (233). That one is the OS-WIDE pair with
+// SYS_GET_WIN_OPACITY (236): it moves g_default_window_opacity, i.e. the value
+// behind the Settings "Window Opacity" slider, and therefore every window that
+// has not been chosen for. An app calling it to make ITSELF opaque would move
+// everyone, which is precisely the mistake #790 made and the owner rejected:
+// "apps are meant to use the opacity value specified in the settings page not
+// a hardcoded one? i'm looking at only changing the first run wizard".
+//
+// THE THREE TIERS (window_t::opacity_src, kernel/gui/window.h):
+//   tier 0 theme / Settings default - loses to everything
+//   tier 1 THIS syscall, the app's own declaration - beats tier 0
+//   tier 2 the user's titlebar Opacity stepper - beats everything
+// A higher tier is never overwritten by a lower one. So the first-run wizard
+// and full-screen DOS guests / games can ship opaque without a hardcoded
+// OS-wide value, a theme switch cannot stomp them, and the user's per-window
+// control still wins and keeps winning.
+//
+// ACCESS CONTROL is the slot check sys_win_move()/sys_win_get_size() already
+// use, character for character: `handle` indexes the user-window table the
+// caller uses for every draw call, so a caller can only aim this at a window
+// it holds a handle to. No pointer arguments, so nothing to validate and no
+// argtab.rs descriptor.
+//
+// CLAMP: shared, not a new one. wm_clamp_opacity() in gui/window.c is now the
+// single definition of "40..255, never fully invisible" for all three tiers.
+//
+// NUMBER CHOICE: 464, which WAS the SYS_MAX sentinel and is therefore the
+// first genuinely unallocated number; SYS_MAX is bumped to 465 in this same
+// edit. [NOCAP: acts only on a window the caller already owns a handle to]
+#define SYS_WIN_SET_OPACITY            464
+#define SYS_MAX                        465  // top is SYS_WIN_SET_OPACITY=464 (#791 winopacity)
 
 
 // ============================================================================

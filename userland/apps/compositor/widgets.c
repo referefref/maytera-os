@@ -8,7 +8,8 @@
 extern int g_draw_blend;   // draw.c blend factor (255=opaque)
 extern int g_win_opacity;  // main.c global window opacity
 #include "../../libc/syscall.h"
-#include "../../libc/stdio.h"   // #213 snprintf() for the /RAILPOS.TXT verification dump
+#include "../../libc/stdio.h"   // #213 snprintf() for the RAILPOS.TXT verification dump
+#include "../../libc/userconf.h" // #peruser2: a dump the session user can write
 #include "../../libc/theme.h"   // #723 theme_color()/THEME_COLOR_* for HA semantic tint
 #include "ha_format.h"          // #723 HA entity-state display formatter
 #include "../../libc/wifi_client.h"   // #159 sect 6a: wifi_tray_state() for the
@@ -1464,8 +1465,57 @@ static void ha_load_catalog(void){
     while(got<(int)sizeof(s_ha_cat)-1){ long n=sys_read(fd,s_ha_cat+got,sizeof(s_ha_cat)-1-got); if(n<=0) break; got+=(int)n; }
     s_ha_cat[got]=0; s_ha_cat_len=got; sys_close(fd);
 }
+// ===========================================================================
+// #harendezvous: THE THREE FILES BELOW ARE THE SESSION USER'S, NOT ROOT'S.
+//
+// All three used to be written at hardcoded root-owned literals (/HALIST.REQ,
+// /HAENT.TXT, /HALABEL.TXT). The compositor runs as the SESSION user (uid 1000;
+// kernel/dos/dosexec.c carries a real "[PERMS-DENY] proc=COMPOSIT uid=1000"
+// line), so every one of these writes returned -13 and the return value was
+// discarded: the entity picker could not record a choice and the custom label
+// could not be saved, for every non-root session, silently. That is the
+// #peruserpath bug, and the fix is the same one as everywhere else: the file
+// belongs in the user's home, so no permission has to be granted.
+//
+// WHAT MADE THESE HARDER THAN THE REST, and what actually solved it: HALIST.REQ
+// and HAENT.TXT are read by apps/haservice, which the shipped
+// /CONFIG/SERVICES.CFG runs as UID 0, so moving them into a home would normally
+// hide them from the reader. It does not here, because the kernel now answers
+// "where does the ACTIVE SESSION's per-user state live" for a privileged
+// service (SYS_SESSION_HOME, libc userhome_path_session()), and root can read a
+// user's home. HALABEL.TXT needed none of that: grep says nothing outside this
+// file has ever touched it, so it was never a rendezvous at all.
+//
+// `sub` IS DELIBERATELY NULL, NOT "CONFIG". userhome_path(NULL, "X") is
+// "<home>/X", and root's home is "/", so a ROOT session resolves to exactly the
+// legacy "/X" and nothing about the shipping root-autologin image changes.
+// Choosing "CONFIG" by taste would silently move root's files (blame.md,
+// 2026-09-28: "Choosing the helper by taste moves root's file silently").
+// ===========================================================================
+
 // Ask the haservice to (re)generate the catalog.
-static void ha_request_catalog(void){ int fd=sys_open("/HALIST.REQ",0x0001|0x0040); if(fd>=0){ sys_write(fd,"1\n",2); sys_close(fd);} }
+//
+// A CHANGING TOKEN, NOT A FLAG, and that is the part that makes the rendezvous
+// one-directional. The old protocol had haservice CONSUME this file by
+// TRUNCATING it, i.e. the server WROTE into the client's file. In the user's own
+// home that is the wrong shape twice over: it is the server needing write access
+// to the client's private space, and if the file were ever absent at that moment
+// root would CREATE it and OWN it, after which the uid-1000 compositor could
+// never write it again, breaking the picker permanently in a way that looks like
+// nothing. Writing a value that CHANGES per request lets the service consume by
+// REMEMBERING instead of by mutating, so it needs only READ access. The service
+// compares for INEQUALITY, not order, so either side restarting is harmless.
+static void ha_request_catalog(void){
+    int fd=userhome_open_write(NULL,"HALIST.REQ");
+    // Last resort only, and it is reached by a root session on a machine whose
+    // home lookup fails. For a non-root session this literal was never writable,
+    // so falling back to it adds exactly nothing and costs nothing.
+    if(fd<0) fd=sys_open("/HALIST.REQ",0x0001|0x0040|0x0200);
+    if(fd<0) return;
+    char tok[24]; int n=snprintf(tok,sizeof(tok),"%lu\n",(unsigned long)uptime_ms());
+    if(n>0) sys_write(fd,tok,n);
+    sys_close(fd);
+}
 // Persist the chosen entity for slot 0 so the service caches it. O_TRUNC (not
 // just O_CREAT) so a PRIOR longer /HAENT.TXT (e.g. leftover multi-entity
 // lines past this write's padding) can never survive underneath the new
@@ -1473,21 +1523,36 @@ static void ha_request_catalog(void){ int fd=sys_open("/HALIST.REQ",0x0001|0x004
 // refreshes a slot per line, so stale trailing entities would otherwise keep
 // being refreshed even after the user picked a single entity here.
 static void ha_write_entity(const char *eid){
-    int fd=sys_open("/HAENT.TXT",0x0001|0x0040|0x0200); if(fd<0) return;
+    // #harendezvous: per-user; haservice resolves the same path through
+    // userhome_path_session(). userhome_open_write() already implies O_TRUNC,
+    // which is what the comment above requires.
+    int fd=userhome_open_write(NULL,"HAENT.TXT");
+    if(fd<0) fd=sys_open("/HAENT.TXT",0x0001|0x0040|0x0200);   // last resort
+    if(fd<0) return;
     char out[128]; int i=0; for(;eid[i]&&i<95;i++) out[i]=eid[i]; out[i++]='\n';
     sys_write(fd,out,i); sys_close(fd);
     int n=0; for(;eid[n]&&n<95;n++) s_ha_entity[n]=eid[n]; s_ha_entity[n]=0;
 }
 // #419 Load the custom display label from /HALABEL.TXT (blank => use HA name).
 static void ha_load_label(void){
-    int fd=sys_open("/HALABEL.TXT",0); if(fd<0){ g_ha_label[0]=0; return; }
+    // #harendezvous: per-user first, then the legacy literal, so an upgrade
+    // keeps a label that was saved before this moved (the #683 asymmetric rule:
+    // READ per-user then legacy, WRITE per-user only).
+    int fd=userhome_open_read(NULL,"HALABEL.TXT","/HALABEL.TXT");
+    if(fd<0){ g_ha_label[0]=0; return; }
     char b[80]; long n=sys_read(fd,b,sizeof(b)-1); sys_close(fd);
     if(n<=0){ g_ha_label[0]=0; return; }
     b[n]=0; int i=0; for(;b[i]&&b[i]!='\n'&&b[i]!='\r'&&i<63;i++) g_ha_label[i]=b[i]; g_ha_label[i]=0;
     if(g_ha_label[0]==' ') g_ha_label[0]=0;                // padded/blank => none
 }
 static void ha_write_label(const char *lbl){
-    int fd=sys_open("/HALABEL.TXT",0x0001|0x0040); if(fd<0) return;
+    // #harendezvous: PURELY PER-USER. Nothing outside this file reads
+    // HALABEL.TXT (grep over kernel/ and userland/ finds this function and
+    // ha_load_label() and nothing else), so unlike HALIST.REQ/HAENT.TXT there
+    // is no second principal here and this row needed no new mechanism at all.
+    int fd=userhome_open_write(NULL,"HALABEL.TXT");
+    if(fd<0) fd=sys_open("/HALABEL.TXT",0x0001|0x0040|0x0200);   // last resort
+    if(fd<0) return;
     char out[80]; int i=0; for(;lbl[i]&&i<63;i++) out[i]=lbl[i]; out[i++]='\n';
     while(i<72) out[i++]=' '; out[i++]='\n';               // pad over any old longer label
     sys_write(fd,out,i); sys_close(fd);
@@ -3191,9 +3256,21 @@ static void widgets_debug_dump_positions(void) {
     n += snprintf(buf + n, sizeof(buf) - n, "digclock vis=%d x=%d y=%d w=%d h=%d\n",
         g_show_digclock, g_digclk_x, g_digclk_y, s_digclk_w, s_digclk_h);
 
-    sys_unlink("/RAILPOS.TXT");                 // clean truncate, matches profile_save()
-    int fd = sys_open("/RAILPOS.TXT", 0x41);    // O_WRONLY | O_CREAT
-    if (fd >= 0) { sys_write(fd, buf, (unsigned long)n); sys_close(fd); }
+    // #peruser2: was unlink-then-open at "/RAILPOS.TXT" on the root-owned ext2
+    // root, so this verification dump produced nothing for a non-root session -
+    // which is worse than producing nothing for a normal feature, because the
+    // whole point of the file is to be the ground truth somebody reads back
+    // instead of eyeballing a screenshot. A breadcrumb at the top of the user's
+    // space, so userhome_open_write(NULL, ...): root's home is "/", so a root
+    // session still writes exactly /RAILPOS.TXT and the existing reader is fine.
+    // The unlink is gone: O_TRUNC in the open already gives the clean truncate
+    // this was reaching for, without destroying the previous dump when the open
+    // is refused.
+    int fd = userhome_open_write(0, "RAILPOS.TXT");
+    if (userconf_finish_write(fd, buf, (unsigned long)n) != 0) {
+        // Reported through sys_bootlog by the shared helpers. This runs on the
+        // draw thread, so there is deliberately nothing else done here.
+    }
 }
 
 void widgets_render(void) {

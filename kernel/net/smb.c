@@ -8,9 +8,22 @@
 #include "../serial.h"
 #include "../mm/heap.h"
 #include "../crypto/md4.h"
+#include "../security/security.h"   // #smbnt: secure_zero()
 #include "../crypto/md5.h"
 #include "../crypto/hmac.h"
+#include "../crypto/crypto.h" // #smbpreauth: sha512_ctx_t, for the size lock below
 #include "../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
+#include "../fs/fat.h"     // /CONFIG/SMB.CFG: the signing-policy knob
+#include "../fs/cfgread.h" // #192: is this config-read outcome worth a log line?
+#include "../security/selftest_registry.h" // a measurement that did not run must SAY so, through the registry
+
+// rustkern/smbpreauth.rs keeps a fixed local scratch of
+// SMB_PREAUTH_SHA512_CTX_ROOM bytes for one sha512_ctx_t, because a Rust
+// #[repr(C)] struct cannot name a C typedef's size. Locking it HERE means that
+// if sha512_ctx_t ever grows, the build stops, rather than the Rust side
+// quietly overwriting its own stack on every handshake message.
+_Static_assert(sizeof(sha512_ctx_t) <= SMB_PREAUTH_SHA512_CTX_ROOM,
+               "sha512_ctx_t outgrew the scratch in rustkern/smbpreauth.rs");
 
 // External timer ticks
 extern volatile uint64_t timer_ticks;
@@ -84,6 +97,7 @@ static void generate_guid(uint8_t *guid) {
 }
 
 // Convert ASCII to Unicode (UTF-16LE)
+// NTLM_KAT_HELPER_BEGIN
 static int ascii_to_unicode(const char *ascii, uint16_t *unicode, int max_chars) {
     int len = 0;
     while (*ascii && len < max_chars - 1) {
@@ -92,6 +106,7 @@ static int ascii_to_unicode(const char *ascii, uint16_t *unicode, int max_chars)
     unicode[len] = 0;
     return len * 2;  // Return byte length
 }
+// NTLM_KAT_HELPER_END
 
 // Convert Unicode to ASCII
 static int unicode_to_ascii(const uint16_t *unicode, int unicode_len, char *ascii, int max_chars) {
@@ -190,16 +205,103 @@ static int smb_send_all(smb_connection_t *conn, const uint8_t *p, uint32_t len) 
 }
 
 // Send SMB packet with NetBIOS session header
-static int smb_send_packet(smb_connection_t *conn, const void *data, uint32_t len) {
+//
+// `data` is non-const because SIGNING MUTATES THE MESSAGE: MS-SMB2 3.1.4.1
+// requires the Signature field to be written into the header that is about to
+// go on the wire. Every caller passes smb_send_buffer, which is writable.
+static int smb_send_packet(smb_connection_t *conn, void *data, uint32_t len) {
+    // #749: ONE chokepoint for "this connection is not in a state to be used".
+    // Checking here rather than at each of the eleven build_smb2_header()
+    // callers is the whole point: a new SMB2 command added later is covered
+    // without its author having to know the rule exists.
+    uint16_t sf = smbseq_fault(&conn->seq);
+    if (sf != SMB_SEQ_FAULT_NONE) {
+        // This line used to end "This is a PROTOCOL SEQUENCING fault on socket
+        // %d, not a credential problem". That was true of all four faults that
+        // existed when it was written and became FALSE the moment
+        // SMB_SEQ_FAULT_SIGNATURE was added: a response that failed its
+        // signature is not a sequencing fault. Classifying the fault inside the
+        // sentence, rather than letting smbseq_fault_text() speak, is the same
+        // mistake one layer up as the #749 misdiagnosis this whole family of
+        // messages exists to avoid. It now states only what it knows.
+        kprintf("[SMB] NOT SENDING: this connection is marked bad on socket %d: "
+                "%s. Nothing further goes out on it; the share must be "
+                "reconnected.\n",
+                conn->tcp_socket, smbseq_fault_text(sf));
+        return -1;
+    }
+
+    // THE OUTBOUND SIGNING CHOKEPOINT.
+    //
+    // It sits here, in the one function every SMB2 request leaves through,
+    // for the same reason the sequence check above does: there are eleven
+    // build_smb2_header() callers and a twelfth will be added by someone who
+    // has not read this file. Signing per command would mean the twelfth
+    // command ships unsigned and nothing says so.
+    //
+    // smbsign_sign() returns R_NOT_ARMED (1) for NEGOTIATE, for SESSION_SETUP,
+    // and for any connection that has no session key yet. That is the correct
+    // answer, not a failure: those messages precede the key. Any OTHER
+    // non-zero code is a refusal to produce a signature we are obliged to
+    // produce, and sending unsigned in that case is precisely the silent
+    // downgrade this work exists to remove.
+    // THE OUTBOUND ENCRYPTION CHOKEPOINT, in the same function and for the
+    // same reason as the signing one above: there are eleven
+    // build_smb2_header() callers and a twelfth will be added by someone who
+    // has not read this file. Encrypting per command would mean the twelfth
+    // command ships readable and nothing says so.
+    int sealing = smbcrypt_should_seal(&conn->crypt, (const uint8_t *)data,
+                                       (size_t)len);
+
+    // A MESSAGE THAT IS ENCRYPTED IS NOT ALSO SIGNED, and that is the spec,
+    // not an omission: MS-SMB2 3.2.4.1.1 signs a request only when it is not
+    // being encrypted, and MEASURED here, Samba's encrypted replies carry no
+    // SMB2_FLAGS_SIGNED and an all-zero Signature field. The AEAD tag already
+    // authenticates the whole message, including its SessionId, under a key
+    // derived from the same session key, so a second MAC would add nothing.
+    // The sentence to be suspicious of is "the signature check was skipped",
+    // so: it is skipped here ONLY when something stronger covers the message.
+    if (len >= SMB2_HEADER_SIZE && !sealing) {
+        uint16_t sr = smbsign_sign(&conn->sign, (uint8_t *)data, (size_t)len);
+        if (sr != 0 && sr != 1 /* not-armed */) {
+            kprintf("[SMB] NOT SENDING: could not sign this request (%s). The "
+                    "request is DROPPED rather than sent unsigned.\n",
+                    smbsign_reason_text(sr));
+            return -1;
+        }
+    }
+
+    // Encryption happens IN PLACE, with the 52-byte transform header built
+    // separately on the stack. The alternative, a second SMB_BUFFER_SIZE
+    // staging buffer, would cost another 64 KB of permanently resident kernel
+    // memory to hold a copy of something we already have.
+    uint8_t tform[SMB2_TRANSFORM_HEADER_SIZE];
+    uint32_t wire_len = len;
+    if (sealing) {
+        uint16_t er = smbcrypt_seal(&conn->crypt, (uint8_t *)data, (size_t)len,
+                                    tform);
+        if (er != 0) {
+            kprintf("[SMB] NOT SENDING: could not encrypt this request (%s). "
+                    "The request is DROPPED rather than sent in the clear.\n",
+                    smbcrypt_reason_text(er));
+            return -1;
+        }
+        wire_len = len + SMB2_TRANSFORM_HEADER_SIZE;
+    }
+
     // NetBIOS session message header (4 bytes)
     uint8_t header[4];
-    header[0] = 0x00;                   // Session message
-    header[1] = (len >> 16) & 0xFF;     // Length high byte
-    header[2] = (len >> 8) & 0xFF;
-    header[3] = len & 0xFF;
+    header[0] = 0x00;                        // Session message
+    header[1] = (wire_len >> 16) & 0xFF;     // Length high byte
+    header[2] = (wire_len >> 8) & 0xFF;
+    header[3] = wire_len & 0xFF;
 
     if (smb_send_all(conn, header, 4) < 0) {
         kprintf("[SMB] Failed to send NetBIOS header\n");
+        return -1;
+    }
+    if (sealing && smb_send_all(conn, tform, SMB2_TRANSFORM_HEADER_SIZE) < 0) {
+        kprintf("[SMB] Failed to send the SMB2 TRANSFORM header\n");
         return -1;
     }
     if (smb_send_all(conn, (const uint8_t *)data, len) < 0) {
@@ -209,8 +311,10 @@ static int smb_send_packet(smb_connection_t *conn, const void *data, uint32_t le
     return len;
 }
 
-// Receive SMB packet
-static int smb_recv_packet(smb_connection_t *conn, void *buffer, uint32_t max_len, int timeout_ms) {
+// Receive one SMB PDU off the wire (NetBIOS length prefix + payload).
+// #749: this is the RAW read. The MessageId gate is in smb_recv_packet() below;
+// the two deadline loops in here are unchanged on purpose (see the note there).
+static int smb_recv_pdu(smb_connection_t *conn, void *buffer, uint32_t max_len, int timeout_ms) {
     uint8_t header[4];
     int total_recv = 0;
     uint64_t start = sched_now_ms();
@@ -263,22 +367,337 @@ static int smb_recv_packet(smb_connection_t *conn, void *buffer, uint32_t max_le
     return total_recv;
 }
 
+// #749: the MessageId gate on the receive side.
+//
+// smb_recv_pdu() above is unchanged, deliberately: its two deadline loops are
+// reviewed entries in the concurrency lint's allowlist and this change has no
+// business altering them. Everything new lives out here, where it can be read
+// as one rule instead of being threaded through a polling loop.
+//
+// TWO things were missing before, and they compound:
+//
+//   1. Nothing checked that a response was the answer to the request we sent.
+//      A connection the server had killed over a sequencing fault, or one whose
+//      reply stream was offset by a timed-out request, handed the caller
+//      someone else's status. smb2_session_setup() then printed it as
+//      "Authentication failed: 0x%08x", and 0xC000006D really is
+//      STATUS_LOGON_FAILURE, so the message was not even obviously wrong. That
+//      cost an hour of looking at passwords before anyone read the server log.
+//
+//   2. A request that timed out left the connection usable. The reply may
+//      still arrive, after which every response is one request behind forever.
+//      A timeout therefore CONDEMNS the connection here, which is what makes
+//      the next operation reconnect rather than inherit the offset.
+// How many interim (STATUS_PENDING + ASYNC) responses to ride out before giving
+// up on a request. Matches the guard smb2_read() already used for the \srvsvc
+// pipe, so this is not a new number, it is the same one moved to where it
+// covers every command.
+#define SMB_MAX_INTERIM_RESPONSES 16
+
+static int smb_recv_packet(smb_connection_t *conn, void *buffer, uint32_t max_len,
+                           int timeout_ms) {
+    for (int interim = 0; interim <= SMB_MAX_INTERIM_RESPONSES; interim++) {
+        int n = smb_recv_pdu(conn, buffer, max_len, timeout_ms);
+        if (n < 0) {
+            if (smbseq_fault(&conn->seq) == SMB_SEQ_FAULT_NONE) {
+                smbseq_condemn(&conn->seq, SMB_SEQ_FAULT_REPLY_ID);
+                kprintf("[SMB] no answer to MessageId %llu; the reply stream "
+                        "would be offset from here on, so this connection is "
+                        "marked bad and must be reconnected\n",
+                        (unsigned long long)smbseq_last_sent(&conn->seq));
+            }
+            return n;
+        }
+        // THE INBOUND DECRYPTION CHOKEPOINT, and it is NECESSARILY above the
+        // SMB2 magic check below. An encrypted message has no SMB2 header to
+        // look at: its first four bytes are 0xFD'SMB', not 0xFE'SMB', so
+        // before this existed such a frame fell straight through that test
+        // and was handed up as an unparseable reply.
+        int was_encrypted = 0;
+        if (smbcrypt_is_armed(&conn->crypt)
+            && smbcrypt_pdu_is_transform((const uint8_t *)buffer, (size_t)n)) {
+            uint32_t plain_len = 0;
+            uint16_t ur = smbcrypt_unseal(&conn->crypt, (uint8_t *)buffer,
+                                          (size_t)n, &plain_len);
+            if (ur != 0) {
+                uint32_t nse = 0, nun = 0, nrj = 0, nco = 0, nci = 0;
+                smbcrypt_counts(&conn->crypt, &nse, &nun, &nrj, &nco, &nci);
+                kprintf("[SMB] ENCRYPTED RESPONSE REJECTED on %s: %s\n",
+                        conn->mount_point[0] ? conn->mount_point : "this share",
+                        smbcrypt_reason_text(ur));
+                kprintf("[SMB]   %d bytes on the wire, encryption=%s. The "
+                        "contents are DISCARDED and the connection is marked "
+                        "bad. (this connection: %u sealed, %u unsealed, %u "
+                        "rejected, %u sent clear, %u received clear)\n",
+                        n, smbcrypt_algo_text(&conn->crypt),
+                        nse, nun, nrj, nco, nci);
+                kprintf("[SMB]   This is NOT a wrong password, NOT a dropped "
+                        "connection and NOT a sequencing fault. Either the "
+                        "bytes that arrived are not the bytes the server sent, "
+                        "or they did not come from a server holding this "
+                        "session's key.\n");
+                if (smbseq_fault(&conn->seq) == SMB_SEQ_FAULT_NONE) {
+                    smbseq_condemn(&conn->seq, SMB_SEQ_FAULT_ENCRYPTION);
+                }
+                return -1;
+            }
+            n = (int)plain_len;
+            was_encrypted = 1;
+        }
+
+        if ((uint32_t)n < SMB2_HEADER_SIZE) return n;
+
+        const smb2_header_t *rh = (const smb2_header_t *)buffer;
+        if (le32(rh->protocol_id) != SMB2_MAGIC) return n;
+
+        // THE ANTI-DOWNGRADE GATE ON THE RECEIVE SIDE.
+        //
+        // Once a session is encrypted, a response that arrives in the CLEAR
+        // must not be acted on. This is the same defect shape as the guest
+        // downgrade closed the day before: a protection an attacker can strip
+        // and still be believed is decorative. NEGOTIATE and SESSION_SETUP
+        // are the only exceptions, because they precede every key.
+        if (!was_encrypted) {
+            uint16_t clr = smbcrypt_check_clear_response(
+                &conn->crypt, (const uint8_t *)buffer, (size_t)n);
+            if (clr != 0) {
+                kprintf("[SMB] CLEARTEXT RESPONSE REFUSED on %s: %s\n",
+                        conn->mount_point[0] ? conn->mount_point : "this share",
+                        smbcrypt_reason_text(clr));
+                kprintf("[SMB]   cmd 0x%04x, MessageId %llu, status 0x%08x, %d "
+                        "bytes. This session is encrypted, so an unencrypted "
+                        "answer either did not come from the server or was "
+                        "stripped in flight. It is DISCARDED and the "
+                        "connection is marked bad.\n",
+                        le16(rh->command),
+                        (unsigned long long)le64(rh->message_id),
+                        le32(rh->status), n);
+                if (smbseq_fault(&conn->seq) == SMB_SEQ_FAULT_NONE) {
+                    smbseq_condemn(&conn->seq, SMB_SEQ_FAULT_ENCRYPTION);
+                }
+                return -1;
+            }
+        }
+
+        // THE INBOUND SIGNATURE CHOKEPOINT, and it is deliberately the FIRST
+        // thing that happens to a response after the magic check.
+        //
+        // Nothing below here may read a field of a response whose signature
+        // has not been checked, which is why this sits ABOVE the MessageId
+        // gate rather than after it. The MessageId is itself inside the signed
+        // region, so verifying first means a forged MessageId is reported as
+        // what it is, a bad signature, instead of being diagnosed as a
+        // sequencing desync. #749's whole lesson was that a wrong diagnosis in
+        // an error message is a defect in its own right.
+        //
+        // PRODUCING SIGNATURES WITHOUT CHECKING THEM WOULD BE THE WHOLE BUG.
+        // An implementation that signs its own requests and trusts whatever
+        // comes back has the appearance of protection and none of it: the
+        // server is still unauthenticated, and every forged read result, every
+        // forged directory listing and every forged write status still lands.
+        // This is the half that actually closes the hole.
+        // `!was_encrypted`: an encrypted message carries no signature and
+        // is not supposed to (see the send path). Demanding one here would
+        // refuse every response on an encrypted mount.
+        if (!was_encrypted && smbsign_is_armed(&conn->sign)) {
+            uint16_t vr = smbsign_check_response(&conn->sign, (uint8_t *)buffer,
+                                                 (size_t)n);
+            if (vr != 0) {
+                uint32_t nsig = 0, nver = 0, nrej = 0, nuns = 0;
+                smbsign_counts(&conn->sign, &nsig, &nver, &nrej, &nuns);
+                kprintf("[SMB] RESPONSE REJECTED on %s: %s\n",
+                        conn->mount_point[0] ? conn->mount_point : "this share",
+                        smbsign_reason_text(vr));
+                kprintf("[SMB]   cmd 0x%04x, MessageId %llu, status 0x%08x, "
+                        "SessionId 0x%llx, %d bytes, signing=%s\n",
+                        le16(rh->command),
+                        (unsigned long long)le64(rh->message_id),
+                        le32(rh->status),
+                        (unsigned long long)smbsign_pdu_session_id(
+                            (const uint8_t *)buffer, (size_t)n),
+                        n, smbsign_algo_text(smbsign_algo(&conn->sign)));
+                kprintf("[SMB]   This is NOT a wrong password, NOT a dropped "
+                        "connection and NOT a sequencing fault. The bytes that "
+                        "arrived are not the bytes the server sent, or they did "
+                        "not come from a server holding this session's key. The "
+                        "contents are DISCARDED and the connection is marked "
+                        "bad. (this connection: %u requests signed, %u "
+                        "responses verified, %u rejected, %u accepted UNSIGNED "
+                        "under signing=enabled)\n",
+                        nsig, nver, nrej, nuns);
+                // Condemn the connection. A peer that is altering or
+                // withholding signatures is not a peer we carry on talking to
+                // for the remaining commands of this mount, and the existing
+                // revive path (smb_conn_revive) is the honest way back: it
+                // re-authenticates and derives a fresh key.
+                if (smbseq_fault(&conn->seq) == SMB_SEQ_FAULT_NONE) {
+                    smbseq_condemn(&conn->seq, SMB_SEQ_FAULT_SIGNATURE);
+                }
+                return -1;
+            }
+        }
+
+        uint64_t rid = le64(rh->message_id);
+        int cr = smbseq_check_reply(&conn->seq, rid, le32(rh->flags),
+                                    le32(rh->status));
+        if (cr < 0) {
+            kprintf("[SMB] MessageId MISMATCH: response carries %llu but we "
+                    "sent %llu (cmd 0x%04x, status 0x%08x). The connection's "
+                    "message sequence has desynchronised, so that status is NOT "
+                    "an answer about our request and must not be reported as "
+                    "one.\n",
+                    (unsigned long long)rid,
+                    (unsigned long long)smbseq_last_sent(&conn->seq),
+                    le16(rh->command), le32(rh->status));
+            return -1;
+        }
+
+        if (cr == 1) {
+            // An unsolicited server message: MS-SMB2 2.2.1.2 gives an oplock
+            // break MessageId 0xFFFFFFFFFFFFFFFF. Not a desync and not ours.
+            // We request SMB2_OPLOCK_LEVEL_NONE (smb2_create below), so a
+            // conforming server has nothing to break; it is logged and handed
+            // up, which is the pre-existing behaviour, rather than silently
+            // swallowed.
+            kprintf("[SMB] unsolicited server message (cmd 0x%04x); not a "
+                    "reply to anything we sent\n", le16(rh->command));
+            return n;
+        }
+
+        smbseq_note_grant(&conn->seq, le16(rh->credit_req_resp));
+
+        if (cr == 2) {
+            // Interim response: the server has our request and is still on it
+            // (MS-SMB2 3.3.4.2). Keep receiving; the real answer carries the
+            // same MessageId.
+            //
+            // This used to be handled in smb2_read() ALONE, added by #317 pass
+            // 2 for the \srvsvc pipe because that is where it was hit. Every
+            // other SMB2 command would have mistaken the interim for the
+            // answer. Doing it here means a command added later inherits it.
+            continue;
+        }
+
+        return n;   // cr == 0: the final answer to the request we sent
+    }
+
+    kprintf("[SMB] gave up after %d interim responses to MessageId %llu\n",
+            SMB_MAX_INTERIM_RESPONSES,
+            (unsigned long long)smbseq_last_sent(&conn->seq));
+    smbseq_condemn(&conn->seq, SMB_SEQ_FAULT_REPLY_ID);
+    return -1;
+}
+
 // ============================================================================
 // NTLM Authentication
 // ============================================================================
 
-// Compute NTLM hash from password (MD4 of Unicode password)
+// NTLM_KAT_REGION_BEGIN
+// Everything between these markers is extracted VERBATIM by
+// crypto/ntlm_nthash_kat.sh and compiled against the real crypto/md4.c and
+// crypto/hmac.c, so the oracle cannot drift from what ships. Keep it free of
+// kernel-only dependencies (no kprintf, no kmalloc) or the oracle stops
+// building, which is the point: this is the SMB auth trust anchor.
+
+// Compute NTLM hash from password (MD4 of Unicode password).
+// This is the ONLY place a cleartext SMB password is consumed. Everything
+// downstream needs these 16 bytes and nothing more, which is what lets the
+// connection struct and the VFS defaults store a hash instead (#smbnt).
 static void ntlm_hash(const char *password, uint8_t *hash) {
     uint16_t unicode_pwd[128];
     int len = ascii_to_unicode(password, unicode_pwd, 128);
     md4((uint8_t*)unicode_pwd, len, hash);
 }
 
+// NTOWFv2: HMAC-MD5(NT hash, UPPERCASE(username) + domain), both UTF-16LE.
+// Extracted from ntlm_compute_ntlmv2_response so it can be tested on its own
+// against the published MS-NLMP 4.2.4 vector; it had been inline, which meant
+// the one step that decides whether authentication succeeds had no test.
+static void ntlm_v2_hash(const char *domain, const char *username,
+                         const uint8_t *nt_hash, uint8_t *out) {
+    uint16_t concat[128];
+    char upper_user[64];
+    int i;
+
+    for (i = 0; username[i] && i < 63; i++) {
+        upper_user[i] = (username[i] >= 'a' && username[i] <= 'z')
+                        ? username[i] - 32 : username[i];
+    }
+    upper_user[i] = 0;
+
+    int concat_len = ascii_to_unicode(upper_user, concat, 64);
+    concat_len += ascii_to_unicode(domain, concat + concat_len / 2, 64);
+
+    hmac_md5(nt_hash, 16, (uint8_t*)concat, concat_len, out);
+}
+// NTLM_KAT_REGION_END
+
+// ---------------------------------------------------------------------------
+// #smbdisk: the ON-DISK form of a saved credential, and the one place a
+// password is turned into it.
+//
+// rustkern/ntsecret.rs owns the parse/format of `nt$<32 hex>`. It is the only
+// part of this change that consumes attacker-influenceable bytes (a line of
+// /CONFIG/NETMOUNTS.CFG), it is pure, and it needs no kernel services, so it is
+// the part that is in Rust per the standing directive. See its header comment
+// for the strictness rules and for WHY a tagged-but-malformed record is refused
+// loudly rather than quietly treated as a password.
+// ---------------------------------------------------------------------------
+extern int nt_secret_is_tagged(const char *s);
+extern int nt_secret_parse(const char *s, uint8_t *out16);
+extern int nt_secret_format(const uint8_t *h, char *out, unsigned long cap);
+extern int nt_secret_selftest_rs(void);
+#define NT_SECRET_BUF 40   /* "nt$" + 32 hex + NUL = 36 */
+
+// Public NT-hash derivation. Exactly one caller outside this file needs it:
+// SYS_NET_CRED_TAG, which lets the Files app persist a hash instead of the
+// password the user just typed. ntlm_hash() itself stays static and stays
+// INSIDE the KAT region, so there is still exactly one derivation in the tree
+// and crypto/ntlm_nthash_kat.sh still tests the thing that ships.
+void smb_nt_hash(const char *password, uint8_t *out16) {
+    ntlm_hash(password ? password : "", out16);
+}
+
+// Turn whatever a config line or a syscall handed us into the 16 bytes the
+// protocol actually needs.
+//   returns 1 = ok (out16 written), 0 = REFUSE (tagged nt$ but malformed).
+// It deliberately does NOT also report "that was a legacy password": the
+// migration path needs that answer per LINE of the file, not per mount, so it
+// asks nt_secret_is_tagged() directly. An output parameter with no caller is
+// prose that looks like code.
+static int smb_secret_to_nthash(const char *secret, uint8_t *out16) {
+    if (!secret) secret = "";
+    if (nt_secret_is_tagged(secret)) {
+        if (nt_secret_parse(secret, out16)) return 1;
+        // Deliberately NOT a fallback. Treating a corrupt nt$ field as a
+        // password would try to authenticate with the literal string "nt$..."
+        // and present as a mystery logon failure, hiding a corrupt file.
+        kprintf("[SMB] REFUSING a saved credential: field is tagged nt$ but "
+                "malformed. Not falling back to treating it as a password.\n");
+        return 0;
+    }
+    ntlm_hash(secret, out16);
+    return 1;
+}
+
+// Boot self-test for the on-disk encoding. Runs on EVERY boot including the
+// golden: crypto/run-all-kats.sh cannot host it (its oracles compile
+// crypto/*.c with the host cc, this is Rust in the kernel crate), so the boot
+// path is what makes it un-rottable. blame.md's standing lesson is that an
+// inert check and no check are indistinguishable from outside.
+void nt_secret_selftest(void) {
+    int rc = nt_secret_selftest_rs();
+    if (rc == 0)
+        kprintf("[NTSECRET] PASS: nt$<32hex> round-trips the published MS-NLMP "
+                "NTOWFv1 vector and rejects all 10 malformed forms\n");
+    else
+        kprintf("[NTSECRET] FAIL: case %d (see rustkern/ntsecret.rs "
+                "nt_secret_selftest_rs for which rule that is)\n", rc);
+}
+
 // Compute NTLMv1 response
-void ntlm_compute_response(const char *password, const uint8_t *challenge,
+void ntlm_compute_response(const uint8_t *nt_hash, const uint8_t *challenge,
                            uint8_t *lm_response, uint8_t *nt_response) {
-    uint8_t nt_hash[16];
-    ntlm_hash(password, nt_hash);
 
     // For NTLMv1, we use DES-based response, but for simplicity
     // we'll use a simpler approach compatible with many servers
@@ -301,32 +720,17 @@ void ntlm_compute_response(const char *password, const uint8_t *challenge,
 
 // Compute NTLMv2 response (more secure, widely supported)
 void ntlm_compute_ntlmv2_response(const char *domain, const char *username,
-                                   const char *password, const uint8_t *challenge,
+                                   const uint8_t *nt_hash, const uint8_t *challenge,
                                    const uint8_t *target_info, uint32_t target_info_len,
-                                   uint8_t *response, uint32_t *response_len) {
-    uint8_t nt_hash[16];
+                                   uint8_t *response, uint32_t *response_len,
+                                   uint8_t *session_key) {
     uint8_t ntlmv2_hash[16];
+    int i;   // used by the blob/response assembly below
 
-    // Step 1: Compute NT hash
-    ntlm_hash(password, nt_hash);
+    // Step 1 (the NT hash) happened at mount time; we never see the password.
 
-    // Step 2: Compute NTLMv2 hash = HMAC-MD5(NT hash, uppercase(username) + domain)
-    uint16_t concat[128];
-    char upper_user[64];
-    int i;
-
-    // Uppercase username
-    for (i = 0; username[i] && i < 63; i++) {
-        upper_user[i] = (username[i] >= 'a' && username[i] <= 'z')
-                        ? username[i] - 32 : username[i];
-    }
-    upper_user[i] = 0;
-
-    // Concatenate uppercase username + domain in Unicode
-    int concat_len = ascii_to_unicode(upper_user, concat, 64);
-    concat_len += ascii_to_unicode(domain, concat + concat_len/2, 64);
-
-    hmac_md5(nt_hash, 16, (uint8_t*)concat, concat_len, ntlmv2_hash);
+    // Step 2: NTOWFv2 (see ntlm_v2_hash, which the KAT oracle tests directly).
+    ntlm_v2_hash(domain, username, nt_hash, ntlmv2_hash);
 
     // Step 3: Build client blob
     uint8_t blob[256];
@@ -378,6 +782,27 @@ void ntlm_compute_ntlmv2_response(const char *domain, const char *username,
     memcpy(response, nt_proof, 16);
     memcpy(response + 16, blob, blob_len);
     *response_len = 16 + blob_len;
+
+    // Step 6: THE SESSION KEY, which this function used to throw away.
+    //
+    // MS-NLMP 3.3.2: for NTLMv2 the SessionBaseKey is
+    // HMAC-MD5(NTOWFv2, NTProofStr). Because smb2_session_setup() does not
+    // negotiate NTLMSSP_NEGOTIATE_KEY_EXCH, there is no EncryptedRandomSessionKey
+    // and the ExportedSessionKey IS the SessionBaseKey (MS-NLMP 3.1.5.1.2). That
+    // is the 16 bytes SMB2 message signing is keyed from.
+    //
+    // Every input needed for it was already sitting in this function as a
+    // local; it was computed, used for the response, and dropped. That single
+    // omission is why net/smb.c had a `session_key` field nothing wrote and a
+    // `signing_required` field nothing read.
+    if (session_key) {
+        hmac_md5(ntlmv2_hash, 16, nt_proof, 16, session_key);
+    }
+
+    // The NTLMv2 hash is password-equivalent; do not leave it on the stack for
+    // whatever runs next in this kernel thread.
+    secure_zero(ntlmv2_hash, sizeof(ntlmv2_hash));
+    secure_zero(temp, sizeof(temp));
 }
 
 // ============================================================================
@@ -385,6 +810,13 @@ void ntlm_compute_ntlmv2_response(const char *domain, const char *username,
 // ============================================================================
 
 // Build SMB2 header
+//
+// #749: the MessageId comes from the connection's sequence, which refuses to
+// number a request at all when it is not bound to the socket we are about to
+// send on. On a refusal the sequence records a FAULT and smb_send_packet()
+// declines to transmit, so a desynchronised request never reaches the server.
+// Nothing here invents an id to "keep going": a request the server would kill
+// the connection over is worse than a request that is not sent.
 static void build_smb2_header(smb_connection_t *conn, smb2_header_t *hdr,
                                uint16_t command, uint32_t tree_id) {
     memset(hdr, 0, sizeof(smb2_header_t));
@@ -393,7 +825,8 @@ static void build_smb2_header(smb_connection_t *conn, smb2_header_t *hdr,
     hdr->credit_charge = le16(1);
     hdr->command = le16(command);
     hdr->credit_req_resp = le16(31);  // Request credits
-    hdr->message_id = le64(conn->message_id++);
+    int64_t mid = smbseq_next(&conn->seq, conn->tcp_socket);
+    hdr->message_id = le64(mid < 0 ? 0 : (uint64_t)mid);
     hdr->tree_id = le32(tree_id);
     hdr->session_id = le64(conn->session_id);
 }
@@ -411,11 +844,35 @@ int smb2_negotiate(smb_connection_t *conn) {
     // Build negotiate request
     smb2_negotiate_req_t *req = (smb2_negotiate_req_t *)(buf + offset);
     req->structure_size = le16(36);
-    req->dialect_count = le16(4);  // Offer 4 dialects
-    req->security_mode = le16(SMB2_NEGOTIATE_SIGNING_ENABLED);
+    // SMB 3.1.1 (0x0311) is now offered, which is what makes the opening
+    // handshake authenticatable at all. Offering it costs nothing: a server
+    // that does not support it simply selects something lower, and whether
+    // that lower dialect is ACCEPTABLE is a separate decision taken by
+    // smbpreauth_floor_check() below. Keeping those two apart is what stops
+    // "we never asked" from passing itself off as "it was not available".
+    const int smb_dialect_count = smbpreauth_offer_311() ? 5 : 4;
+    req->dialect_count = le16((uint16_t)smb_dialect_count);
+    // ANNOUNCE OUR OWN SIGNING REQUIREMENT, not just our capability.
+    //
+    // This field used to be a flat SMB2_NEGOTIATE_SIGNING_ENABLED, which says
+    // "I can sign" and nothing more. A server set to `server signing = no`
+    // (Samba's shipping default for a standalone server) hears that as "not
+    // required" and answers unsigned, which measured out exactly that way on
+    // the test rig. Setting SIGNING_REQUIRED here is what makes a merely
+    // capable server actually sign its replies. The bit comes from policy, so
+    // the weaker policy still only announces ENABLED.
+    req->security_mode = le16(smbsign_client_security_mode());
     req->reserved = 0;
-    req->capabilities = le32(SMB2_GLOBAL_CAP_LARGE_MTU);
+    // SMB2_GLOBAL_CAP_ENCRYPTION comes from the encryption policy, and it is
+    // LOAD-BEARING rather than decorative: MEASURED against Samba 4.17.12,
+    // the server sets that bit in its own NEGOTIATE response only if we set
+    // it here (capabilities 0x47 with it, 0x07 without). Without this line
+    // the server never offers encryption and a required-encryption policy
+    // would refuse every mount for a reason that was our own doing.
+    req->capabilities = le32(SMB2_GLOBAL_CAP_LARGE_MTU |
+                             smbcrypt_client_capabilities());
     generate_guid(req->client_guid);
+    // Zero by default; overwritten below if 3.1.1 contexts are appended.
     req->negotiate_context_offset = 0;
     req->negotiate_context_count = 0;
     req->reserved2 = 0;
@@ -427,9 +884,89 @@ int smb2_negotiate(smb_connection_t *conn) {
     dialects[1] = le16(SMB21_PROTOCOL);     // SMB 2.1
     dialects[2] = le16(SMB30_PROTOCOL);     // SMB 3.0
     dialects[3] = le16(SMB302_PROTOCOL);    // SMB 3.0.2
-    offset += 8;
+    if (smb_dialect_count >= 5) {
+        dialects[4] = le16(SMB311_PROTOCOL);  // SMB 3.1.1
+    }
+    offset += 2 * smb_dialect_count;
+
+    // ========================================================================
+    // THE NEGOTIATE CONTEXTS. This is where pre-auth integrity starts.
+    //
+    // SMB 3.1.1 carries its extra negotiation in contexts appended after the
+    // dialect array, and NegotiateContextOffset is counted FROM THE START OF
+    // THE SMB2 HEADER (MEASURED off a real smbclient capture, not assumed from
+    // the field's name) and must be 8-byte aligned, so the message needs
+    // padding here. rustkern/smbpreauth.rs builds the blob and reports how many
+    // pad bytes to insert, rather than this file computing an alignment that
+    // the module would then have to agree with.
+    //
+    // The salt is 32 bytes of real randomness and is drawn HERE, because the
+    // Rust side is deliberately a pure function of its inputs so the boot
+    // self-test can pin it to a known-answer vector. A key-schedule input that
+    // comes from a global RNG is a key-schedule input you cannot write a test
+    // for.
+    // ========================================================================
+    if (smb_dialect_count >= 5) {
+        uint8_t salt[32];
+        if (rng_get_bytes(salt, sizeof(salt)) != 0) {
+            // Without randomness we cannot build an honest PREAUTH context.
+            // Fall back to NOT offering 3.1.1 rather than sending a predictable
+            // salt, which would look like protection and be worth less than
+            // none. The floor then decides whether the resulting lower dialect
+            // is acceptable, so this degrades loudly, not quietly.
+            kprintf("[SMB] no entropy for the SMB 3.1.1 pre-auth salt; NOT "
+                    "offering 3.1.1 on this connection\n");
+            req->dialect_count = le16(4);
+            offset -= 2;
+        } else {
+            uint32_t ctx_pad = 0;
+            uint16_t ctx_count = 0;
+            int32_t ctx_len = smbpreauth_build_contexts(
+                &conn->preauth, salt, sizeof(salt), (size_t)offset,
+                buf + offset + 8, (size_t)(SMB_BUFFER_SIZE - offset - 8),
+                &ctx_pad, &ctx_count);
+            secure_zero(salt, sizeof(salt));
+            if (ctx_len < 0) {
+                kprintf("[SMB] could not build the SMB 3.1.1 negotiate "
+                        "contexts: %s\n",
+                        smbpreauth_reason_text((uint16_t)(-ctx_len)));
+                return -1;
+            }
+            // build_contexts wrote at offset+8 so the blob could be moved into
+            // place after the pad length was known without a second buffer.
+            if (ctx_pad > 0) {
+                memmove(buf + offset + ctx_pad, buf + offset + 8,
+                        (size_t)ctx_len);
+                memset(buf + offset, 0, ctx_pad);
+            } else {
+                memmove(buf + offset, buf + offset + 8, (size_t)ctx_len);
+            }
+            req->negotiate_context_offset = le32((uint32_t)offset + ctx_pad);
+            req->negotiate_context_count = le16(ctx_count);
+            offset += (int)ctx_pad + ctx_len;
+        }
+    }
 
     kprintf("[SMB] Sending NEGOTIATE request\n");
+
+    // Fold the request we are about to send into the running pre-auth hash.
+    // It has to happen HERE, on the exact bytes that go on the wire, and not
+    // from a reconstruction afterwards: the server hashes what it receives, so
+    // anything we hash that differs by one byte gives us a different key and
+    // no way to tell why.
+    //
+    // Note it is folded BEFORE smb_send_packet(), because that function may
+    // sign or seal the buffer in place, and what the far end folds is the
+    // pre-signature bytes. For NEGOTIATE neither applies (no key exists yet),
+    // but relying on that would make this correct by coincidence.
+    if (smb_dialect_count >= 5) {
+        uint16_t fr = smbpreauth_fold(&conn->preauth, buf, (size_t)offset);
+        if (fr != 0) {
+            kprintf("[SMB] pre-auth integrity: could not fold the NEGOTIATE "
+                    "request: %s\n", smbpreauth_reason_text(fr));
+            return -1;
+        }
+    }
 
     // Send request
     if (smb_send_packet(conn, buf, offset) < 0) {
@@ -465,11 +1002,202 @@ int smb2_negotiate(smb_connection_t *conn) {
     conn->capabilities = le32(resp->capabilities);
     memcpy(conn->server_guid, resp->server_guid, 16);
     conn->signing_required = (le16(resp->security_mode) & SMB2_NEGOTIATE_SIGNING_REQUIRED) != 0;
-    conn->credits = le16(resp_hdr->credit_req_resp);
+    // #749: the credit grant is recorded in ONE place now, by
+    // smb_recv_packet() for every response, instead of at eight
+    // separate sites that each stored it into a field nothing read.
 
     kprintf("[SMB] Negotiated dialect: 0x%04x\n", conn->dialect);
     kprintf("[SMB] Max read size: %u, Max write size: %u\n",
             conn->max_read_size, conn->max_write_size);
+
+    // ========================================================================
+    // THE HANDSHAKE-INTEGRITY GATE. It fires BEFORE any credential leaves this
+    // machine, for the same reason the two gates below it do.
+    //
+    // Three things happen here and they are three DIFFERENT checks:
+    //
+    //   (a) THE DIALECT FLOOR. We offered 3.1.1; if the server answered with
+    //       anything lower, an attacker may simply have deleted 0x0311 from
+    //       our dialect list, and at a lower dialect there is no pre-auth hash
+    //       on EITHER side, so nothing can ever detect that. This is the only
+    //       possible defence against a version downgrade and it is a client-
+    //       side policy, not a protocol feature.
+    //
+    //   (b) FOLD the NEGOTIATE response into the running hash.
+    //
+    //   (c) VALIDATE what the server actually selected: SHA-512 for the hash,
+    //       a cipher we offered, a signing algorithm we offered, and a
+    //       PREAUTH_INTEGRITY context present at all, which 3.1.1 requires.
+    //       This catches an HONEST server whose choices we cannot implement,
+    //       which would otherwise surface several messages later as an
+    //       unexplained decryption failure. An attack and a compatibility
+    //       problem look identical on a console if you do not separate them.
+    // ========================================================================
+    {
+        uint16_t fl = smbpreauth_floor_check(conn->dialect);
+        if (fl != 0) {
+            kprintf("[SMB] MOUNT REFUSED: %s (server selected dialect "
+                    "0x%04x; we offered up to 0x%04x).\n",
+                    smbpreauth_reason_text(fl), conn->dialect,
+                    SMB311_PROTOCOL);
+            kprintf("[SMB]   The OPENING HANDSHAKE of an SMB connection "
+                    "decides the protocol version, whether messages are "
+                    "signed, whether they are encrypted and with which "
+                    "cipher. It happens in the clear, before any key exists. "
+                    "Only SMB 3.1.1 authenticates it afterwards, by mixing a "
+                    "hash of every handshake message into the session keys. "
+                    "Below 3.1.1 an attacker who can modify packets can edit "
+                    "that negotiation and NEITHER SIDE CAN TELL.\n");
+            kprintf("[SMB]   This is the DEFAULT policy, not a hard rule. To "
+                    "allow older servers, put\n"
+                    "[SMB]       min_dialect=3.0.2\n"
+                    "[SMB]   in %s. Under that setting signing and encryption "
+                    "still work exactly as before; what you give up is any "
+                    "ability to detect a tampered handshake.\n",
+                    SMB_SIGN_CFG_PATH);
+            return -1;
+        }
+        if (conn->preauth.offered) {
+            uint16_t fr = smbpreauth_fold(&conn->preauth, smb_recv_buffer,
+                                          (size_t)recv_len);
+            if (fr != 0) {
+                kprintf("[SMB] MOUNT REFUSED: pre-auth integrity could not "
+                        "fold the NEGOTIATE response: %s\n",
+                        smbpreauth_reason_text(fr));
+                return -1;
+            }
+            uint16_t nr2 = smbpreauth_note_negotiate(&conn->preauth,
+                                                     conn->dialect,
+                                                     smb_recv_buffer,
+                                                     (size_t)recv_len);
+            if (nr2 != 0) {
+                kprintf("[SMB] MOUNT REFUSED: %s\n",
+                        smbpreauth_reason_text(nr2));
+                return -1;
+            }
+        }
+        if (smbpreauth_is_active(&conn->preauth)) {
+            kprintf("[SMB] Pre-auth integrity: ACTIVE (SMB 3.1.1, SHA-512 over "
+                    "the handshake); server chose cipher 0x%04x, signing "
+                    "algorithm 0x%04x\n",
+                    smbpreauth_cipher(&conn->preauth),
+                    smbpreauth_signalg(&conn->preauth));
+        } else {
+            kprintf("[SMB] Pre-auth integrity: NOT ACTIVE at dialect 0x%04x. "
+                    "The opening handshake of this connection is NOT "
+                    "authenticated (min_dialect=%s)\n",
+                    conn->dialect, smbpreauth_floor_text(smbpreauth_floor()));
+        }
+    }
+
+    // THE SIGNING DOWNGRADE GATE, and it fires BEFORE any credential leaves
+    // this machine.
+    //
+    // `conn->signing_required` above is the field that, until this change, was
+    // written here and read by nothing in any file in the tree. It is now one
+    // of the two inputs to this decision; the other is our own policy.
+    //
+    // Refusing here rather than at the first signed message is the point: a
+    // server that cannot sign cannot be talked to safely, and finding that out
+    // after sending an NTLM authentication is finding it out too late.
+    {
+        uint16_t nr = smbsign_note_negotiate(&conn->sign, conn->dialect,
+                                             le16(resp->security_mode));
+        if (nr != 0) {
+            kprintf("[SMB] MOUNT REFUSED: %s (server security_mode=0x%04x, "
+                    "dialect 0x%04x).\n", smbsign_reason_text(nr),
+                    le16(resp->security_mode), conn->dialect);
+            kprintf("[SMB]   Without message signing nothing authenticates "
+                    "this file server: an attacker able to modify packets in "
+                    "flight could change the contents of any file read from "
+                    "it, and no layer below the application could tell. The "
+                    "mount is refused rather than brought up unprotected.\n");
+            kprintf("[SMB]   This is the DEFAULT policy, not a hard rule. To "
+                    "allow unsigned mounts to SMB2 servers, put\n"
+                    "[SMB]       signing=enabled\n"
+                    "[SMB]   in %s. Signatures that ARE present are still "
+                    "verified under that setting; only the refusal of a server "
+                    "that offers none is relaxed.\n", SMB_SIGN_CFG_PATH);
+            return -1;
+        }
+        kprintf("[SMB] Signing: policy=%s, server says %s\n",
+                smbsign_policy() == SMB_SIGN_POLICY_REQUIRED ? "required" : "enabled",
+                conn->signing_required ? "REQUIRED" : "supported");
+    }
+
+    // THE ENCRYPTION DOWNGRADE GATE, and like the signing one it fires BEFORE
+    // any credential leaves this machine.
+    //
+    // Refusing here is the only place a downgrade CAN be refused at this
+    // dialect. SMB 3.0.2 has no pre-auth integrity protection: this NEGOTIATE
+    // exchange is unsigned, precedes every key, and nothing later
+    // authenticates it (the running SHA-512 that fixes this arrives with
+    // 3.1.1, which this client does not offer). So an attacker in the path
+    // need only clear ONE BIT of the capabilities we just read, and an
+    // opportunistic client carries on in plain text with no way to notice.
+    // "Require it, and fail loudly" is what turns that from an invisible
+    // success into a visible failure.
+    {
+        // ====================================================================
+        // AT SMB 3.1.1 THE CAPABILITY BIT IS NOT HOW ENCRYPTION IS NEGOTIATED,
+        // AND THIS WAS FOUND BY MEASUREMENT, NOT BY READING.
+        //
+        // MEASURED against Samba 4.17.12 on 2026-10-07: when the client sends
+        // an ENCRYPTION_CAPABILITIES negotiate context, the server's NEGOTIATE
+        // response capabilities come back as 0x0000000f with
+        // SMB2_GLOBAL_CAP_ENCRYPTION (0x40) CLEAR, and its cipher choice is
+        // reported in the context instead. Send NO encryption context and the
+        // same server answers 0x0000004f, with the bit SET. So the bit means
+        // "encryption, the 3.0.x way" and goes quiet once the 3.1.1 mechanism
+        // is in use.
+        //
+        // Passing conn->capabilities through unchanged would therefore have
+        // smbcrypt_note_negotiate() conclude "this server cannot encrypt" for
+        // EVERY 3.1.1 mount, and under the default encrypt=required it would
+        // refuse all of them, with a message blaming the server for something
+        // the client had done to itself. That is the same failure mode as the
+        // capabilities line a few dozen lines above this one, which records
+        // that NOT setting the bit in our REQUEST made the server never offer
+        // encryption and would have refused every mount "for a reason that was
+        // our own doing".
+        //
+        // So the negotiated CIPHER is translated into the capability the
+        // encryption module already understands. If 3.1.1 came back with no
+        // cipher context at all, the server declined to encrypt, the bit stays
+        // clear, and encrypt=required refuses it, which is correct.
+        // ====================================================================
+        uint32_t crypt_caps = conn->capabilities;
+        if (smbpreauth_is_active(&conn->preauth)
+            && smbpreauth_cipher(&conn->preauth) != 0xFFFFu) {
+            crypt_caps |= SMB2_GLOBAL_CAP_ENCRYPTION;
+        }
+        uint16_t er = smbcrypt_note_negotiate(&conn->crypt, conn->dialect,
+                                              crypt_caps);
+        if (er != 0) {
+            kprintf("[SMB] MOUNT REFUSED: %s (server capabilities=0x%08x, "
+                    "as judged 0x%08x, dialect 0x%04x).\n",
+                    smbcrypt_reason_text(er), conn->capabilities, crypt_caps,
+                    conn->dialect);
+            kprintf("[SMB]   Without encryption, every byte of every file read "
+                    "from or written to this server crosses the network in "
+                    "PLAIN TEXT, readable by anything on the path. Signing "
+                    "proves who sent a message and that it was not altered; it "
+                    "does nothing to stop it being read. The mount is refused "
+                    "rather than brought up readable.\n");
+            kprintf("[SMB]   This is the DEFAULT policy, not a hard rule. To "
+                    "allow unencrypted mounts, put\n"
+                    "[SMB]       encrypt=enabled\n"
+                    "[SMB]   in %s (or `encrypt=off` to never encrypt). Under "
+                    "`enabled` a server that CAN encrypt still does, and every "
+                    "mount that ends up readable says so on this console.\n",
+                    SMB_SIGN_CFG_PATH);
+            return -1;
+        }
+        kprintf("[SMB] Encryption: policy=%s, server %s\n",
+                smbcrypt_policy_text(smbcrypt_policy()),
+                smbcrypt_server_capable(&conn->crypt) ? "OFFERS it"
+                                                      : "does NOT offer it");
+    }
 
     return 0;
 }
@@ -517,6 +1245,17 @@ int smb2_session_setup(smb_connection_t *conn) {
 
     kprintf("[SMB] Sending SESSION_SETUP (NTLM Negotiate)\n");
 
+    // Fold SESSION_SETUP request #1. Before smb_send_packet(), on the exact
+    // bytes that go on the wire.
+    if (smbpreauth_is_active(&conn->preauth)) {
+        uint16_t fr = smbpreauth_fold(&conn->preauth, buf, (size_t)offset);
+        if (fr != 0) {
+            kprintf("[SMB] pre-auth integrity: could not fold SESSION_SETUP "
+                    "request 1: %s\n", smbpreauth_reason_text(fr));
+            return -1;
+        }
+    }
+
     if (smb_send_packet(conn, buf, offset) < 0) {
         return -1;
     }
@@ -545,7 +1284,6 @@ int smb2_session_setup(smb_connection_t *conn) {
 
     // Store session ID for continuation
     conn->session_id = le64(resp_hdr->session_id);
-    conn->credits = le16(resp_hdr->credit_req_resp);
 
     // Parse NTLM Challenge
     smb2_session_setup_resp_t *resp = (smb2_session_setup_resp_t *)(smb_recv_buffer + SMB2_HEADER_SIZE);
@@ -562,6 +1300,21 @@ int smb2_session_setup(smb_connection_t *conn) {
         le32(challenge->message_type) != NTLM_CHALLENGE) {
         kprintf("[SMB] Invalid NTLM challenge\n");
         return -1;
+    }
+
+    // Fold SESSION_SETUP response #1, the STATUS_MORE_PROCESSING_REQUIRED one.
+    // MEASURED: this response IS folded; the FINAL one is not, and that
+    // asymmetry is not arbitrary. The final response is the message whose
+    // signature the derived key has to verify, so it cannot also be an input
+    // to the key.
+    if (smbpreauth_is_active(&conn->preauth)) {
+        uint16_t fr = smbpreauth_fold(&conn->preauth, smb_recv_buffer,
+                                      (size_t)recv_len);
+        if (fr != 0) {
+            kprintf("[SMB] pre-auth integrity: could not fold SESSION_SETUP "
+                    "response 1: %s\n", smbpreauth_reason_text(fr));
+            return -1;
+        }
     }
 
     kprintf("[SMB] Received NTLM Challenge\n");
@@ -606,12 +1359,15 @@ int smb2_session_setup(smb_connection_t *conn) {
         target_info_len = le16(challenge->target_info_len);
     }
 
-    // Compute NTLMv2 response
+    // Compute NTLMv2 response, AND the session key it falls out of. The key is
+    // a local, not a field: it is consumed by smbsign_begin() below and wiped
+    // on every path out of this function.
     uint8_t nt_response[256];
     uint32_t nt_response_len;
-    ntlm_compute_ntlmv2_response(conn->domain, conn->username, conn->password,
+    uint8_t session_key[16];
+    ntlm_compute_ntlmv2_response(conn->domain, conn->username, conn->nt_hash,
                                   challenge->server_challenge, target_info, target_info_len,
-                                  nt_response, &nt_response_len);
+                                  nt_response, &nt_response_len, session_key);
 
     // LM response (empty for NTLMv2)
     auth->lm_response_offset = le32(auth_offset);
@@ -656,13 +1412,40 @@ int smb2_session_setup(smb_connection_t *conn) {
 
     kprintf("[SMB] Sending SESSION_SETUP (NTLM Authenticate)\n");
 
+    // Fold the FINAL SESSION_SETUP request. This is the LAST message that goes
+    // into the hash, and the hash as it stands after this fold is exactly what
+    // both sides derive their keys from.
+    //
+    // MEASURED, and NOT what a first attempt assumed: a real client does NOT
+    // sign this request. Its Flags field carried 0x00000010 with
+    // SMB2_FLAGS_SIGNED (0x08) CLEAR and its Signature field all zero. Signing
+    // it changes the bytes folded here by one bit in Flags, which changes every
+    // derived key, and Samba 4.17.12 answers that by dropping the connection
+    // with NT_STATUS_INVALID_HANDLE and "No signing key for SMB2 signing" --
+    // an error that points nowhere near the cause. smbsign_sign() already
+    // declines to sign SESSION_SETUP (R_NOT_ARMED for pre-session commands),
+    // so the two agree by construction rather than by luck, but the hash is
+    // taken here, before smb_send_packet() could change a byte of it.
+    if (smbpreauth_is_active(&conn->preauth)) {
+        uint16_t fr = smbpreauth_fold(&conn->preauth, buf, (size_t)offset);
+        if (fr != 0) {
+            kprintf("[SMB] pre-auth integrity: could not fold the final "
+                    "SESSION_SETUP request: %s\n",
+                    smbpreauth_reason_text(fr));
+            secure_zero(session_key, sizeof(session_key));
+            return -1;
+        }
+    }
+
     if (smb_send_packet(conn, buf, offset) < 0) {
+        secure_zero(session_key, sizeof(session_key));
         return -1;
     }
 
     // Receive final response
     recv_len = smb_recv_packet(conn, smb_recv_buffer, SMB_BUFFER_SIZE, 5000);
     if (recv_len < (int)SMB2_HEADER_SIZE) {
+        secure_zero(session_key, sizeof(session_key));
         return -1;
     }
 
@@ -670,20 +1453,376 @@ int smb2_session_setup(smb_connection_t *conn) {
     status = le32(resp_hdr->status);
 
     if (status != STATUS_SUCCESS) {
-        kprintf("[SMB] Authentication failed: 0x%08x\n", status);
+        // #749: do NOT blame the credentials unless the server actually
+        // answered OUR request and said so. This line used to read
+        // "Authentication failed: 0x%08x" for every non-success status,
+        // including one read off a connection the server had already torn down
+        // over a MessageId it rejected, and 0xC000006D (STATUS_LOGON_FAILURE)
+        // reads exactly like a wrong password. A wrong diagnosis in an error
+        // message is a defect in its own right: it sends the next person to
+        // look at the password instead of at the sequence, and that is where
+        // the hour went.
+        //
+        // smb_recv_packet() has already checked that this response answers the
+        // MessageId we sent, so by the time we are here the status IS about
+        // our request. The sequence fault is still reported first, because a
+        // faulted sequence means the status we are holding is not trustworthy
+        // evidence of anything.
+        uint16_t sf = smbseq_fault(&conn->seq);
+        if (sf != SMB_SEQ_FAULT_NONE) {
+            kprintf("[SMB] SESSION_SETUP could not complete: %s. This is a "
+                    "PROTOCOL SEQUENCING fault, NOT a credential problem. The "
+                    "server status 0x%08x is not a verdict on the password.\n",
+                    smbseq_fault_text(sf), status);
+        } else if (status == STATUS_LOGON_FAILURE ||
+                   status == STATUS_WRONG_PASSWORD ||
+                   status == STATUS_NO_SUCH_USER ||
+                   status == STATUS_ACCOUNT_DISABLED ||
+                   status == STATUS_PASSWORD_EXPIRED) {
+            kprintf("[SMB] Authentication REJECTED by the server for %s\\%s: "
+                    "0x%08x (%s). The credentials are wrong.\n",
+                    conn->domain, conn->username, status, smb_strerror((smb2_status_t)status));
+        } else {
+            kprintf("[SMB] SESSION_SETUP failed with 0x%08x (%s). This is NOT "
+                    "an authentication rejection; the server refused the "
+                    "request for another reason.\n",
+                    status, smb_strerror((smb2_status_t)status));
+        }
+        secure_zero(session_key, sizeof(session_key));
         return -1;
     }
 
     conn->session_established = true;
-    conn->credits = le16(resp_hdr->credit_req_resp);
+
+    // ========================================================================
+    // ARM SIGNING, AND VERIFY THIS VERY RESPONSE BEFORE READING A FIELD OF IT.
+    //
+    // This block sits ABOVE the session_flags read and the identity check on
+    // purpose. The identity check (advisory 0044, rustkern/smbident.rs) reads
+    // SMB2_SESSION_FLAG_IS_GUEST out of this response and refuses a session
+    // that came back anonymous when a named one was asked for. That is a real
+    // fix, and until this block existed it rested entirely on the server's own
+    // unauthenticated word: an attacker in the network path had only to clear
+    // one bit to turn a refused downgrade into an accepted one. Verifying the
+    // signature on THIS message is what makes the flag it reads evidence.
+    //
+    // MS-SMB2 3.2.5.3 puts the check in the same place, for the same reason:
+    // the final SESSION_SETUP response is the first message the server can
+    // sign, and signing it proves the server holds the session key, which for
+    // NTLMv2 means it holds the user's NT hash.
+    // ========================================================================
+    // Declared out here because the encryption summary at the END of this
+    // function has to know whether keys were derived, and the block below is
+    // the only place the session key exists.
+    uint16_t crypt_begin_rc = 0;
+    {
+        uint16_t br;
+        // ====================================================================
+        // THE KEY SCHEDULE. At 3.0.2 both keys are functions of the session key
+        // ALONE, which is why a tampered handshake still produced a working
+        // session there. At 3.1.1 they are functions of the session key AND the
+        // SHA-512 over every handshake message, so if an attacker edited any of
+        // those messages our keys and the server's keys differ and the very
+        // next signature check fails. That is the whole mechanism.
+        // ====================================================================
+        if (smbpreauth_is_active(&conn->preauth)) {
+            uint8_t k_sign[16], k_enc[16], k_dec[16], k_app[16];
+            uint16_t dr = smbpreauth_derive(&conn->preauth, session_key,
+                                            k_sign, k_enc, k_dec, k_app);
+            // The application key has no consumer in this kernel yet. It is
+            // derived anyway: deriving three of the four and leaving a gap
+            // invites someone to guess the fourth label later.
+            secure_zero(k_app, sizeof(k_app));
+            if (dr != 0) {
+                br = dr;
+                crypt_begin_rc = dr;
+                secure_zero(k_sign, sizeof(k_sign));
+                secure_zero(k_enc, sizeof(k_enc));
+                secure_zero(k_dec, sizeof(k_dec));
+                secure_zero(session_key, sizeof(session_key));
+                kprintf("[SMB] MOUNT REFUSED: the SMB 3.1.1 key schedule "
+                        "refused its inputs: %s\n",
+                        smbpreauth_reason_text(dr));
+                conn->session_established = false;
+                conn->session_id = 0;
+                smbsign_reset(&conn->sign);
+                smbcrypt_reset(&conn->crypt);
+                smbpreauth_reset(&conn->preauth);
+                return -1;
+            }
+            br = smbsign_begin311(&conn->sign, k_sign);
+            crypt_begin_rc = smbcrypt_begin311(&conn->crypt, k_enc, k_dec,
+                                               conn->session_id);
+            secure_zero(k_sign, sizeof(k_sign));
+            secure_zero(k_enc, sizeof(k_enc));
+            secure_zero(k_dec, sizeof(k_dec));
+            // The session key is password-adjacent and is needed exactly once.
+            secure_zero(session_key, sizeof(session_key));
+            // The hash is frozen by smbpreauth_derive(), so the count can be
+            // reported as final evidence rather than as a work in progress.
+            // Five is the expected number; anything else means a message was
+            // folded that does not belong, or one that does was missed.
+            if (smbpreauth_folded(&conn->preauth) != SMB_PREAUTH_EXPECT_FOLDS) {
+                kprintf("[SMB] MOUNT REFUSED: the pre-auth integrity hash "
+                        "covers %u handshake messages, not %u. The hash does "
+                        "not describe this handshake, so the keys derived from "
+                        "it prove nothing.\n",
+                        smbpreauth_folded(&conn->preauth),
+                        SMB_PREAUTH_EXPECT_FOLDS);
+                conn->session_established = false;
+                conn->session_id = 0;
+                smbsign_reset(&conn->sign);
+                smbcrypt_reset(&conn->crypt);
+                smbpreauth_reset(&conn->preauth);
+                return -1;
+            }
+        } else {
+        br = smbsign_begin(&conn->sign, conn->dialect, session_key);
+        // THE ENCRYPTION KEYS COME OFF THE SAME SESSION KEY, so they are
+        // derived HERE, inside the one window where that key exists, rather
+        // than by keeping it alive for a later caller. conn->session_id is
+        // already set (phase 1 above); it travels in the clear in every
+        // transform header AND inside the AEAD's associated data, which is
+        // what makes a frame re-aimed at another session detectable.
+        crypt_begin_rc = smbcrypt_begin(&conn->crypt, conn->dialect,
+                                        session_key, conn->session_id);
+        // The session key is password-adjacent and is needed exactly once.
+        secure_zero(session_key, sizeof(session_key));
+        }
+
+        if (br == 0) {
+            // Read the unsigned-accepted counter before and after, because
+            // smbsign_check_response() returns 0 BOTH for "verified" and for
+            // "arrived unsigned and the policy permits that". Those two are the
+            // same return value and completely different facts, and at 3.1.1
+            // the difference decides whether the pre-auth hash was ever
+            // compared to anything.
+            uint32_t uin_before = 0;
+            smbsign_counts(&conn->sign, NULL, NULL, NULL, &uin_before);
+            uint16_t vr = smbsign_check_response(&conn->sign,
+                                                 smb_recv_buffer,
+                                                 (size_t)recv_len);
+            uint32_t uin_after = 0;
+            smbsign_counts(&conn->sign, NULL, NULL, NULL, &uin_after);
+            if (vr == 0 && smbpreauth_is_active(&conn->preauth)
+                && uin_after != uin_before) {
+                // ============================================================
+                // THE PRE-AUTH HASH IS ONLY EVER CHECKED BY THIS SIGNATURE.
+                //
+                // An unsigned final SESSION_SETUP response would leave the hash
+                // COMPUTED and NEVER COMPARED, which is exactly the shape of a
+                // control that looks present and does nothing. So at 3.1.1 this
+                // message must be signed and must verify, REGARDLESS of the
+                // signing policy: `signing=enabled` relaxes the refusal of a
+                // server that offers no signatures at all, and it must not also
+                // silently relax handshake integrity. That coupling, one
+                // setting quietly carrying another control, is the exact fault
+                // this whole change exists to remove; reintroducing it one
+                // layer down would be worse than not fixing it.
+                // ============================================================
+                kprintf("[SMB] MOUNT REFUSED: the final SESSION_SETUP response "
+                        "arrived UNSIGNED and SMB 3.1.1 pre-auth integrity is "
+                        "active.\n");
+                kprintf("[SMB]   That signature is the ONLY thing that ever "
+                        "compares our hash of the opening handshake against "
+                        "the server's. Without it the handshake would be "
+                        "hashed and never checked, which protects nothing "
+                        "while looking as though it does. This refusal is NOT "
+                        "relaxed by signing=enabled.\n");
+                conn->session_established = false;
+                conn->session_id = 0;
+                smbsign_reset(&conn->sign);
+                smbcrypt_reset(&conn->crypt);
+                smbpreauth_reset(&conn->preauth);
+                return -1;
+            }
+            if (vr != 0) {
+                kprintf("[SMB] SESSION_SETUP RESPONSE REJECTED: %s\n",
+                        smbsign_reason_text(vr));
+                kprintf("[SMB]   The server returned STATUS_SUCCESS for %s\\%s "
+                        "but could not prove it holds this session's key. "
+                        "Either the reply was altered in flight, or whatever "
+                        "answered is not the server that holds the credential. "
+                        "The session is ABANDONED; nothing about it, including "
+                        "who it says we are, is treated as true.\n",
+                        conn->domain, conn->username);
+                conn->session_established = false;
+                conn->session_id = 0;
+                smbsign_reset(&conn->sign);
+                return -1;
+            }
+            // THE HANDSHAKE IS NOW AUTHENTICATED, and this is the only point
+            // at which that becomes true. Up to here the hash was computed; the
+            // signature just verified is what compared it with the server's.
+            if (smbpreauth_is_active(&conn->preauth)) {
+                smbpreauth_note_verified(&conn->preauth);
+                kprintf("[SMB] HANDSHAKE AUTHENTICATED: the SMB 3.1.1 pre-auth "
+                        "integrity hash over %u handshake messages keyed this "
+                        "session, and the server's signature on the final "
+                        "SESSION_SETUP response verified against it. A "
+                        "tampered negotiation could not have reached this "
+                        "point.\n", smbpreauth_folded(&conn->preauth));
+            }
+            kprintf("[SMB] Signing ARMED for this session: %s\n",
+                    smbsign_algo_text(smbsign_algo(&conn->sign)));
+        } else if (smbident_name_is_anonymous(conn->username)) {
+            // AN ANONYMOUS MOUNT CANNOT BE PROTECTED BY SIGNING, AND SAYING
+            // OTHERWISE WOULD BE THE DISHONEST OPTION.
+            //
+            // A guest or null NTLM session produces no secret session key, so
+            // there is nothing to key a MAC with that an attacker could not
+            // key just as well by opening their own anonymous session to the
+            // same server. Refusing the mount here would break the documented
+            // /SMB/<server>/<share> no-credential flow in exchange for no
+            // security at all, so it proceeds, loudly.
+            //
+            // This is NOT a downgrade an attacker can force. Reaching this
+            // branch requires that the CALLER asked for an anonymous identity
+            // (smbident_name_is_anonymous reads conn->username, which is local
+            // and not from the wire). A named mount whose session came back
+            // anonymous is refused a few lines below by the identity check.
+            kprintf("[SMB] UNSIGNED session, and it cannot be otherwise: an "
+                    "anonymous/guest mount produces no secret session key, so "
+                    "message signing would protect nothing (any peer can "
+                    "derive the same key). Reads from %s are NOT protected "
+                    "against modification in flight. Use a named account if "
+                    "that matters.\n",
+                    conn->mount_point[0] ? conn->mount_point : "this share");
+        } else {
+            kprintf("[SMB] MOUNT REFUSED for %s\\%s: %s\n",
+                    conn->domain, conn->username, smbsign_reason_text(br));
+            kprintf("[SMB]   A named account authenticated successfully but "
+                    "produced no usable signing key, so nothing can "
+                    "authenticate the server from here on. This is not "
+                    "expected against an SMB2 server and is refused rather "
+                    "than run unprotected.\n");
+            smb2_logoff(conn);
+            conn->session_established = false;
+            conn->session_id = 0;
+            smbsign_reset(&conn->sign);
+            return -1;
+        }
+    }
 
     resp = (smb2_session_setup_resp_t *)(smb_recv_buffer + SMB2_HEADER_SIZE);
     conn->session_flags = le16(resp->session_flags);
 
+    // #749 pass 2: THE IDENTITY CHOKEPOINT. Every mount path in this file
+    // reaches smb_conn_establish(), and smb_conn_establish() reaches here, so
+    // this is the one place that can answer "who did we actually end up as"
+    // for the first mount, a reconnect, the on-demand /SMB mount and the share
+    // enumerator alike.
+    //
+    // This block used to be the two kprintf arms below and a `return 0`. The
+    // guest flag was READ and then thrown away: a server that answered our
+    // NTLM authentication for a named user with STATUS_SUCCESS plus "and you
+    // are the guest account" got a working mount, reported as working, with
+    // every read and write on it running as the server's guest account. The
+    // only trace was one serial line on a desktop machine nobody is watching.
+    // SMB2_SESSION_FLAG_IS_NULL was not read by any .c file in the kernel.
+    //
+    // The policy is in rustkern/smbident.rs, not here, because it is policy
+    // and because the alternative is this rule existing once per mount path.
+    {
+        uint16_t idv = smbident_check(conn->username, conn->session_flags);
+        if (idv != 0) {
+            // NAME THE REAL CAUSE. The first half of #749 was a sequencing
+            // fault reported as "Authentication failed: 0xC000006D", which
+            // sent an engineer to look at the password. This is the same hazard
+            // pointing the other way: the server returned SUCCESS, so a message
+            // about a rejected password or a lost connection would be just as
+            // wrong. Say that the server ACCEPTED the request and SUBSTITUTED
+            // the identity.
+            kprintf("[SMB] IDENTITY DOWNGRADE REFUSED on %s: you asked to "
+                    "connect as %s\\%s and %s (session_flags=0x%04x). The "
+                    "mount is REFUSED rather than brought up as somebody else. "
+                    "This is NOT a wrong password and NOT a sequencing fault: "
+                    "the server returned STATUS_SUCCESS. Either the account or "
+                    "secret is not what this server expects for that name, or "
+                    "the server is configured to map failures to its guest "
+                    "account (Samba 'map to guest'), or it is not the server "
+                    "you think it is.\n",
+                    conn->mount_point[0] ? conn->mount_point : "this share",
+                    conn->domain, conn->username, smbident_verdict_text(idv),
+                    conn->session_flags);
+            // Hand the session back politely, then make sure nothing can use
+            // it: smb2_logoff() needs session_established set, and clears it.
+            smb2_logoff(conn);
+            conn->session_established = false;
+            conn->session_id = 0;
+            return -1;
+        }
+    }
+
     if (conn->session_flags & SMB2_SESSION_FLAG_IS_GUEST) {
-        kprintf("[SMB] Logged in as guest\n");
+        // Reached only when an anonymous session is what was ASKED for, which
+        // is the normal case for /SMB/<server>/<share> with no saved
+        // credentials. It is no longer a silent substitution, so say which.
+        kprintf("[SMB] Logged in as guest (an anonymous session was what was "
+                "requested, user=\"%s\")\n", conn->username);
     } else {
         kprintf("[SMB] Authenticated as %s\\%s\n", conn->domain, conn->username);
+    }
+
+    // ========================================================================
+    // DECIDE WHETHER THIS SESSION IS ENCRYPTED, and say so either way.
+    //
+    // This sits AFTER the identity check deliberately: there is no point
+    // discussing the protection of a session that has already been refused
+    // for coming back as somebody else. It reads SessionFlags, which this
+    // very response carried and whose signature has just been verified, so
+    // the flag it reads is evidence rather than the server's unchecked word.
+    // ========================================================================
+    {
+        uint16_t sr = smbcrypt_note_session_flags(&conn->crypt,
+                                                  conn->session_flags);
+        if (sr != 0) {
+            kprintf("[SMB] MOUNT REFUSED for %s\\%s: %s\n",
+                    conn->domain, conn->username, smbcrypt_reason_text(sr));
+            kprintf("[SMB]   The server will not serve this session "
+                    "unencrypted and the local policy will not encrypt it. "
+                    "Refusing here, rather than at the first file operation, "
+                    "is deliberate: the alternative is an unexplained "
+                    "0xC0000022 three requests later.\n");
+            smb2_logoff(conn);
+            conn->session_established = false;
+            conn->session_id = 0;
+            smbcrypt_reset(&conn->crypt);
+            smbpreauth_reset(&conn->preauth);
+            return -1;
+        }
+        if (smbcrypt_is_active(&conn->crypt)) {
+            kprintf("[SMB] ENCRYPTION ARMED for this session: %s%s\n",
+                    smbcrypt_algo_text(&conn->crypt),
+                    smbcrypt_server_requires(&conn->crypt)
+                        ? ", and the server requires it" : "");
+        } else if (crypt_begin_rc == 0
+                   && smbcrypt_policy() == SMB_CRYPT_POLICY_OFF) {
+            kprintf("[SMB] NOT ENCRYPTED, by local policy (encrypt=off in %s). "
+                    "Everything read from or written to %s crosses the network "
+                    "in PLAIN TEXT.\n", SMB_SIGN_CFG_PATH,
+                    conn->mount_point[0] ? conn->mount_point : "this share");
+        } else if (crypt_begin_rc != 0) {
+            // No keys. For an anonymous mount this is unavoidable and is the
+            // same honest limit signing has: a guest session yields no secret
+            // session key, so "encryption" would run under a key any peer can
+            // derive. The mount proceeds, loudly, exactly as the signing path
+            // does, and only because the CALLER asked for anonymity; a named
+            // mount that came back as guest was refused above.
+            kprintf("[SMB] NOT ENCRYPTED, and it cannot be otherwise: %s. "
+                    "Everything read from or written to %s crosses the network "
+                    "in PLAIN TEXT. Use a named account if that matters.\n",
+                    smbcrypt_reason_text(crypt_begin_rc),
+                    conn->mount_point[0] ? conn->mount_point : "this share");
+        } else {
+            kprintf("[SMB] NOT ENCRYPTED: this server did not offer encryption "
+                    "and the policy is encrypt=enabled, so the mount is "
+                    "allowed. Everything read from or written to %s crosses "
+                    "the network in PLAIN TEXT. `encrypt=required` in %s "
+                    "refuses such a mount instead.\n",
+                    conn->mount_point[0] ? conn->mount_point : "this share",
+                    SMB_SIGN_CFG_PATH);
+        }
     }
 
     return 0;
@@ -733,10 +1872,36 @@ int smb2_tree_connect(smb_connection_t *conn, const char *share) {
 
     conn->tree_id = le32(resp_hdr->tree_id);
     conn->tree_connected = true;
-    conn->credits = le16(resp_hdr->credit_req_resp);
 
     smb2_tree_connect_resp_t *resp = (smb2_tree_connect_resp_t *)(smb_recv_buffer + SMB2_HEADER_SIZE);
     conn->share_type = resp->share_type;
+
+    // A SHARE CAN DEMAND ENCRYPTION ON ITS OWN, and this is the half that is
+    // easy to miss. MEASURED against Samba 4.17.12: a per-share
+    // `smb encrypt = required` sets ShareFlags 0x8000 here and leaves the
+    // SESSION flag clear, so a client that read only the session flag carries
+    // on in the clear and is then refused at CREATE with 0xC0000022 and no
+    // stated reason. Both flags feed the same decision in
+    // rustkern/smbcrypt.rs.
+    {
+        uint16_t sfr = smbcrypt_note_share_flags(&conn->crypt,
+                                                 le32(resp->share_flags));
+        if (sfr != 0) {
+            kprintf("[SMB] SHARE REFUSED (%s): %s\n", share,
+                    smbcrypt_reason_text(sfr));
+            kprintf("[SMB]   This SHARE requires encryption (ShareFlags "
+                    "0x%08x) and the local policy will not encrypt.\n",
+                    le32(resp->share_flags));
+            conn->tree_connected = false;
+            conn->tree_id = 0;
+            return -1;
+        }
+        if (smbcrypt_is_active(&conn->crypt)
+            && (le32(resp->share_flags) & SMB2_SHAREFLAG_ENCRYPT_DATA)) {
+            kprintf("[SMB] this share requires encryption (ShareFlags "
+                    "0x%08x); it is in force\n", le32(resp->share_flags));
+        }
+    }
 
     strncpy(conn->share_path, share, SMB_MAX_PATH - 1);
 
@@ -875,7 +2040,6 @@ static int smb2_create(smb_connection_t *conn, const char *path,
     file->access = desired_access;
     strncpy(file->path, path, SMB_MAX_PATH - 1);
 
-    conn->credits = le16(resp_hdr->credit_req_resp);
 
     return 0;
 }
@@ -990,7 +2154,6 @@ static ssize_t smb2_read(smb_connection_t *conn, smb_file_t *file,
 
     memcpy(buffer, smb_recv_buffer + data_offset, data_len);
     file->position += data_len;
-    conn->credits = le16(resp_hdr->credit_req_resp);
 
     return data_len;
 }
@@ -1049,7 +2212,6 @@ static ssize_t smb2_write(smb_connection_t *conn, smb_file_t *file,
     uint32_t written = le32(resp->count);
 
     file->position += written;
-    conn->credits = le16(resp_hdr->credit_req_resp);
 
     return written;
 }
@@ -1119,7 +2281,6 @@ static int smb2_query_directory(smb_connection_t *conn, smb_file_t *dir,
 
     memcpy(buffer, smb_recv_buffer + data_offset, data_len);
     *out_len = data_len;
-    conn->credits = le16(resp_hdr->credit_req_resp);
 
     return 0;
 }
@@ -1129,9 +2290,36 @@ static int smb2_query_directory(smb_connection_t *conn, smb_file_t *dir,
 // ============================================================================
 
 // Initialize SMB subsystem
+// #749: ONE-SHOT. This used to memset the whole connection table and the whole
+// open-file table every time it was called, and it is called from FOUR places,
+// THREE of them at runtime with shares already mounted: smb_vfs_mount_creds(),
+// smb_list_shares() and smb_run_selftest().
+//
+// MEASURED on the wire, golden 2564 (tcpdump on the test server, 2026-10-03):
+// the self-test's share connection sent 25 SMB2 messages and then received
+// NEITHER a FIN NOR an RST from us. It was simply abandoned, mid-session, when
+// smb_list_shares() called smb_init() and zeroed the table underneath it. The
+// server kept that connection and its session open; our TCP socket was never
+// closed, so it leaked too.
+//
+// That abandonment is the mechanism behind the Samba log lines in smb.h: a
+// connection struct zeroed under a live connection has message_id back at 0
+// while the server's window has moved on, and a struct zeroed while ANOTHER
+// thread holds a pointer to it has two users incrementing one counter. Both
+// produce exactly the observed "bad message_id 0 ... low = 2" and
+// "bad message_id 3 ... low = 1".
+//
+// Initialising once is the fix. A caller that wants a clean slate has
+// smb_unmount(), which disconnects properly. Resetting shared state as a
+// side-effect of a mount is not a clean slate, it is data loss with a
+// reassuring log line.
+static bool smb_initialised = false;
+
 void smb_init(void) {
+    if (smb_initialised) return;
     memset(connections, 0, sizeof(connections));
     memset(open_files, 0, sizeof(open_files));
+    smb_initialised = true;
     kprintf("[SMB] SMB client initialized\n");
 }
 
@@ -1264,7 +2452,12 @@ int smb_mount(const char *url, const char *mount_point) {
         return -1;
     }
 
-    return smb_mount_auth(server_ip, share, domain, username, password, mount_point);
+    int r = smb_mount_auth(server_ip, share, domain, username, password, mount_point);
+    // The URL carried a cleartext password into this frame. secure_zero, not
+    // memset: a memset of a dead local is exactly what the compiler is allowed
+    // to delete (same reasoning as ssh2_server.c:678).
+    secure_zero(password, sizeof(password));
+    return r;
 }
 
 // Mount with explicit credentials
@@ -1289,24 +2482,166 @@ static inline int smb_connect_settle(int attempt) {
     return s > 400 ? 400 : s;
 }
 
+static int smb_mount_auth_nt(uint32_t server_ip, const char *share,
+                             const char *domain, const char *username,
+                             const uint8_t *nt_hash, const char *mount_point);
+
+// Public entry point, unchanged signature so no caller has to move. It hashes
+// on the way in and wipes its own copy, so the cleartext exists only for the
+// length of this frame and is never stored.
 int smb_mount_auth(uint32_t server_ip, const char *share,
                    const char *domain, const char *username,
                    const char *password, const char *mount_point) {
-    // Allocate connection
-    int conn_idx = alloc_connection();
-    if (conn_idx < 0) {
-        kprintf("[SMB] No free connection slots\n");
-        return -1;
+    uint8_t nt[16];
+    ntlm_hash(password ? password : "", nt);
+    int r = smb_mount_auth_nt(server_ip, share, domain, username, nt, mount_point);
+    secure_zero(nt, sizeof(nt));
+    return r;
+}
+
+// #smbnt: the REAL implementation takes the NT hash. Callers that already hold
+// a hash (the VFS default-credential paths) use this directly, so a hash never
+// has to be turned back into anything password-shaped to satisfy an API.
+// #749: connect + SMB2 handshake, in ONE place, shared by the first mount and
+// by a reconnect.
+//
+// This body used to live inline in smb_mount_auth_nt(), which meant there was
+// exactly one way to get a connection: mount a new one. When a server dropped
+// an idle session, the mount stayed in the table with a dead socket and every
+// later operation on that share failed forever with no way back. Reviving in
+// place needs the same sixty lines, and this tree has already been bitten by
+// near-verbatim copies of a network loop (blame.md records three copies of the
+// send-all loop), so this is extracted rather than duplicated.
+//
+// It is also where the MessageId reset lives, inside the connect loop, so a
+// revived connection cannot reach the server carrying the old count.
+// THE SIGNING POLICY KNOB. Read once, from /CONFIG/SMB.CFG, on the first
+// mount attempt of the boot.
+//
+// Why a lazy read here rather than at boot: /CONFIG lives on the ext2 root,
+// which is mounted long after the early init that would otherwise be the
+// natural home for this, and gui/clock.c already records what happens when a
+// config read runs before its filesystem is up (it reported "not configured"
+// on a machine that WAS configured, #192). A mount is by definition late
+// enough.
+//
+// The parse itself is in rustkern/smbsign.rs so that the file format has one
+// implementation and a self-test.
+static void smbsign_policy_load_once(void) {
+    static int loaded = 0;
+    if (loaded) return;
+    loaded = 1;
+
+    extern fat_fs_t g_fat_fs;
+
+    // #192: no /CONFIG means storage is not where we think it is, which is not
+    // the same as "no preference recorded". Say nothing and keep the default.
+    if (fat_exists(&g_fat_fs, "/CONFIG") != 1) return;
+    if (fat_exists(&g_fat_fs, SMB_SIGN_CFG_PATH) != 1) {
+        if (cfgread_report_rs(SMB_SIGN_CFG_PATH, -1, CFG_OUTCOME_ABSENT) == CFG_LOG_NOTE) {
+            kprintf("[SMB] no %s; SMB message signing AND encryption are both "
+                    "REQUIRED (the defaults)\n", SMB_SIGN_CFG_PATH);
+        }
+        return;
     }
 
-    smb_connection_t *conn = &connections[conn_idx];
-    conn->active = true;
-    conn->server_ip = server_ip;
-    conn->server_port = SMB_PORT;
-    strncpy(conn->domain, domain ? domain : "WORKGROUP", 63);
-    strncpy(conn->username, username ? username : "guest", 63);
-    strncpy(conn->password, password ? password : "", 63);
-    strncpy(conn->mount_point, mount_point, SMB_MAX_PATH - 1);
+    uint32_t size = 0;
+    void *data = fat_read_file(&g_fat_fs, SMB_SIGN_CFG_PATH, &size);
+    if (!data || size == 0) {
+        // Present a moment ago and unreadable now IS a fault, and it must not
+        // quietly weaken the policy: the default stands.
+        if (cfgread_report_rs(SMB_SIGN_CFG_PATH, -1, CFG_OUTCOME_IOERR) == CFG_LOG_WARN) {
+            kprintf("[SMB] %s present but unreadable; keeping signing=required\n",
+                    SMB_SIGN_CFG_PATH);
+        }
+        if (data) kfree(data);
+        return;
+    }
+
+    int32_t p = smbsign_policy_parse((const uint8_t *)data, (int32_t)size);
+
+    // THE ENCRYPTION POLICY LIVES IN THE SAME FILE and is read in the same
+    // pass. One file, two independent settings: a mount can be signed and
+    // unencrypted, which is what every mount was until this change.
+    {
+        int32_t e = smbcrypt_policy_parse((const uint8_t *)data, (int32_t)size);
+    // THE DIALECT FLOOR, read from the SAME file as the other two settings.
+    // Three settings in one file rather than three files, because three files
+    // is three chances for one to be missing and for its default to be
+    // mistaken for a decision.
+    int32_t df = smbpreauth_floor_parse((const uint8_t *)data, (int32_t)size);
+    if (df == 1) {
+        smbpreauth_floor_set(SMB_PREAUTH_FLOOR_311);
+        kprintf("[SMB] %s: min_dialect=3.1.1; the opening handshake will be "
+                "AUTHENTICATED (pre-auth integrity) or the mount refused\n",
+                SMB_SIGN_CFG_PATH);
+    } else if (df == 0) {
+        smbpreauth_floor_set(SMB_PREAUTH_FLOOR_NONE);
+        kprintf("[SMB] %s: min_dialect=3.0.2. THE OPENING HANDSHAKE WILL NOT BE "
+                "AUTHENTICATED on a server that selects a dialect below 3.1.1. "
+                "Signing and encryption are unaffected; what is given up is "
+                "any ability to DETECT a tampered negotiation.\n",
+                SMB_SIGN_CFG_PATH);
+    } else if (df == -2) {
+        kprintf("[SMB] %s: a `min_dialect=` line with a value this kernel does "
+                "not recognise (expected 3.1.1 or 3.0.2). Keeping "
+                "min_dialect=3.1.1.\n", SMB_SIGN_CFG_PATH);
+    }
+        if (e == 2) {
+            smbcrypt_policy_set(SMB_CRYPT_POLICY_REQUIRED);
+            kprintf("[SMB] %s: encrypt=required\n", SMB_SIGN_CFG_PATH);
+        } else if (e == 1) {
+            smbcrypt_policy_set(SMB_CRYPT_POLICY_ENABLED);
+            kprintf("[SMB] %s: encrypt=enabled. A server that CAN encrypt "
+                    "still does; what is relaxed is the refusal of one that "
+                    "cannot. Such a mount is NOT protected against being read "
+                    "on the network, and every one says so when it comes "
+                    "up.\n", SMB_SIGN_CFG_PATH);
+        } else if (e == 0) {
+            smbcrypt_policy_set(SMB_CRYPT_POLICY_OFF);
+            kprintf("[SMB] %s: encrypt=off. NOTHING sent to or read from an "
+                    "SMB share will be encrypted; it all crosses the network "
+                    "in plain text.\n", SMB_SIGN_CFG_PATH);
+        } else if (e == -2) {
+            kprintf("[SMB] %s has an `encrypt=` line with a value this kernel "
+                    "does not recognise. The only accepted values are "
+                    "`required`, `enabled` and `off`. Keeping "
+                    "encrypt=required.\n", SMB_SIGN_CFG_PATH);
+        } else {
+            kprintf("[SMB] %s has no `encrypt=` line; encryption is REQUIRED "
+                    "(the default)\n", SMB_SIGN_CFG_PATH);
+        }
+    }
+
+    kfree(data);
+
+    if (p == 1) {
+        smbsign_policy_set(SMB_SIGN_POLICY_REQUIRED);
+        kprintf("[SMB] %s: signing=required\n", SMB_SIGN_CFG_PATH);
+    } else if (p == 0) {
+        smbsign_policy_set(SMB_SIGN_POLICY_ENABLED);
+        kprintf("[SMB] %s: signing=enabled. Signatures that arrive are still "
+                "VERIFIED; what is relaxed is the refusal of a server that "
+                "offers no signing at all. Mounts to such a server are NOT "
+                "protected against modification in flight.\n",
+                SMB_SIGN_CFG_PATH);
+    } else if (p == -2) {
+        // A typo must NOT silently resolve to a policy. Name it and keep the
+        // safer default, so the operator finds out from the log rather than
+        // from an incident.
+        kprintf("[SMB] %s has a `signing=` line with a value this kernel does "
+                "not recognise. The only accepted values are `required` and "
+                "`enabled`. Keeping signing=required.\n", SMB_SIGN_CFG_PATH);
+    } else {
+        kprintf("[SMB] %s has no `signing=` line; signing is REQUIRED (the "
+                "default)\n", SMB_SIGN_CFG_PATH);
+    }
+}
+
+static int smb_conn_establish(smb_connection_t *conn, const char *share) {
+    uint32_t server_ip = conn->server_ip;
+
+    smbsign_policy_load_once();
 
     // Pre-resolve ARP for the server BEFORE connecting (task #317). The TCP
     // layer gives up after 5 SYN retransmits (~0.9s); if ARP for the peer is
@@ -1371,6 +2706,7 @@ int smb_mount_auth(uint32_t server_ip, const char *share,
         int cr = tcp_connect(conn->tcp_socket, server_ip, SMB_PORT);
         if (cr < 0 && cr != TCP_ERR_IN_PROGRESS) {
             tcp_close(conn->tcp_socket);
+            smbseq_unbind(&conn->seq);   // #749: a sequence must never outlive its socket
             conn->tcp_socket = -1;
             int settle = smb_connect_settle(attempt);
             for (int k = 0; k < settle; k++) smb_net_pump();
@@ -1386,10 +2722,76 @@ int smb_mount_auth(uint32_t server_ip, const char *share,
         }
 
         if (tcp_get_state(conn->tcp_socket) == TCP_STATE_ESTABLISHED) {
+            // #749: THIS IS THE RESET, and it is the only one. MessageId and
+            // the credit window are per TRANSPORT CONNECTION (MS-SMB2
+            // 2.2.1.2), so the sequence is bound here, at the one instant a
+            // connection becomes usable. "Re-established" and "reset" are
+            // therefore the same event and cannot drift apart, which is the
+            // difference between this and a reset call someone has to remember
+            // to make. Until this runs, smbseq_next() refuses to number a
+            // single request.
+            // THE SIGNING KEY IS RESET AT THE SAME INSTANT, and for the same
+            // reason: a signing key is scoped to an SMB2 SESSION, and a new
+            // transport connection means a new session. Clearing it here, at
+            // the one point a connection becomes usable, is what stops a
+            // revived mount (smb_conn_revive) from carrying the dead session's
+            // key onto a fresh one, where it would verify nothing the new
+            // server signs and would make every response look tampered with.
+            // Binding it to the same event as the MessageId reset is
+            // deliberate: it cannot drift from "the connection is new".
+            smbsign_reset(&conn->sign);
+            // THE ENCRYPTION KEYS GO AT THE SAME INSTANT, for the same
+            // reason AND one more: a nonce must never repeat under a key,
+            // so a reset that threw away the counter but kept the keys
+            // would be worse than no reset at all. smbcrypt_reset() clears
+            // both together, and is bound to the same event as the
+            // MessageId reset so it cannot drift from "the connection is
+            // new".
+            smbcrypt_reset(&conn->crypt);
+            // THE PRE-AUTH INTEGRITY HASH GOES AT THE SAME INSTANT, and this
+            // one is not optional for a reason the others are not: after the
+            // keys are derived the hash is FROZEN, and a frozen hash refuses
+            // every further fold by design, so a reconnect that kept it could
+            // not even begin a new handshake.
+            //
+            // MEASURED, and this is how the bug was found: the first version
+            // of this change put the reset in the wrong function, and the
+            // #749 reconnect sub-test of the in-kernel SMB harness went from
+            // PASS to FAIL with
+            //   "could not fold the NEGOTIATE request: a message was folded
+            //    into the pre-auth hash after the session keys were already
+            //    derived from it"
+            // on the SECOND connection. Nothing else noticed: the first mount
+            // worked perfectly, every boot self-test passed, and the tamper
+            // arms all behaved. Only an existing test that drops the transport
+            // and reconnects caught it. Binding the reset to the same event as
+            // the other three is what stops it drifting from "the connection
+            // is new" again.
+            smbpreauth_reset(&conn->preauth);
+#ifndef SMBSEQ_NORESET
+            smbseq_bind(&conn->seq, conn->tcp_socket);
+#else
+            // `make SMBSEQNORESET=1`: the #749 DEFECT, deliberately restored,
+            // so the RED arm can be SEEN against a real server. Bind to the
+            // new socket but CARRY THE OLD MessageId, which is exactly what a
+            // bare `conn->message_id++` field did across a reconnect. Never in
+            // a golden; see the Makefile block beside NOBLOCKTEST.
+            {
+                uint64_t carried = conn->seq.next_id;
+                smbseq_bind(&conn->seq, conn->tcp_socket);
+                if (carried != 0) {
+                    conn->seq.next_id = carried;
+                    kprintf("[SMB] SMBSEQ_NORESET: carrying MessageId %llu onto "
+                            "the NEW connection (deliberate #749 defect)\n",
+                            (unsigned long long)carried);
+                }
+            }
+#endif
             connected = 1;
             break;
         }
         tcp_close(conn->tcp_socket);
+        smbseq_unbind(&conn->seq);
         conn->tcp_socket = -1;
         int settle = smb_connect_settle(attempt);   // escalating settle
         for (int k = 0; k < settle; k++) smb_net_pump();
@@ -1406,6 +2808,7 @@ int smb_mount_auth(uint32_t server_ip, const char *share,
     // Negotiate protocol
     if (smb2_negotiate(conn) < 0) {
         tcp_close(conn->tcp_socket);
+        smbseq_unbind(&conn->seq);   // #749: a sequence must never outlive its socket
         conn->active = false;
         return -1;
     }
@@ -1413,6 +2816,7 @@ int smb_mount_auth(uint32_t server_ip, const char *share,
     // Session setup
     if (smb2_session_setup(conn) < 0) {
         tcp_close(conn->tcp_socket);
+        smbseq_unbind(&conn->seq);   // #749: a sequence must never outlive its socket
         conn->active = false;
         return -1;
     }
@@ -1427,9 +2831,139 @@ int smb_mount_auth(uint32_t server_ip, const char *share,
     if (smb2_tree_connect(conn, unc_path) < 0) {
         smb2_logoff(conn);
         tcp_close(conn->tcp_socket);
+        smbseq_unbind(&conn->seq);   // #749: a sequence must never outlive its socket
         conn->active = false;
         return -1;
     }
+
+    return 0;
+}
+
+// #749: is the transport under this mount still usable?
+//
+// A mount is not alive just because it is in the table. The socket can be gone
+// (the server closed an idle session; Samba does exactly that on its own
+// `deadtime`), and the message sequence can be faulted by an unanswered
+// request or a mismatched reply. Either way the next request must not go out
+// on it.
+static int smb_conn_transport_ok(const smb_connection_t *conn) {
+    if (!conn->active || conn->tcp_socket < 0) return 0;
+    if (tcp_get_state(conn->tcp_socket) != TCP_STATE_ESTABLISHED) return 0;
+    if (!smbseq_is_healthy(&conn->seq)) return 0;
+    return 1;
+}
+
+// #749: re-establish a mount whose transport has gone, keeping its mount point
+// and credentials. THIS is the reconnect the MessageId reset exists for, and
+// before this change the client had no such path at all: a dropped session
+// left a mount that failed every operation forever.
+//
+// Open file handles do NOT survive. An SMB2 FileId is scoped to the session
+// that created it and we do not request durable or persistent handles, so a
+// stale FileId sent to a fresh session is a request for whatever file that id
+// now means. They are invalidated here, loudly, rather than silently reused.
+static int smb_conn_revive(smb_connection_t *conn) {
+    kprintf("[SMB] %s: transport is gone (socket %d, sequence: %s); "
+            "reconnecting\n", conn->mount_point, conn->tcp_socket,
+            smbseq_fault_text(smbseq_fault(&conn->seq)));
+
+    for (int j = 0; j < SMB_MAX_OPEN_FILES; j++) {
+        if (open_files[j].active && open_files[j].conn == conn) {
+            kprintf("[SMB] invalidating handle for %s: its SMB2 session is "
+                    "gone, so its FileId no longer means that file\n",
+                    open_files[j].path);
+            open_files[j].active = false;
+        }
+    }
+
+    if (conn->tcp_socket >= 0) {
+        tcp_close(conn->tcp_socket);
+#ifndef SMBSEQ_NORESET
+        smbseq_unbind(&conn->seq);   // #749: a sequence must never outlive its socket
+#else
+        // `make SMBSEQNORESET=1`: do NOT unbind, so the old MessageId
+        // survives into the new connection. The unbind is part of the
+        // fix, not scaffolding around it: without it the counter has
+        // nowhere to be forgotten, which is the defect.
+#endif
+        conn->tcp_socket = -1;
+    }
+    conn->session_established = false;
+    conn->session_id = 0;
+    conn->tree_connected = false;
+    conn->tree_id = 0;
+
+    if (smb_conn_establish(conn, conn->share_name) < 0) {
+        // #749 pass 2: KEEP THE MOUNT, and keep its credentials with it.
+        //
+        // smb_conn_establish() clears `active` on every failure path, which is
+        // right for a first mount (release the slot) and WRONG here: it took
+        // the mount out of the table, so the next touch of that path fell
+        // through smb_vfs_ensure() to an on-demand mount built from
+        // g_smb_def_user, which outside the self-test is the hard-coded
+        // "guest". The share then reappeared at the same path, worked, and
+        // belonged to somebody else. Re-arming `active` keeps the configured
+        // identity in the table so the next attempt retries as the SAME user.
+        conn->active = true;
+        kprintf("[SMB] %s: reconnect FAILED. The mount is KEPT (as %s\\%s) so a "
+                "later attempt retries with the same identity; it is NOT "
+                "replaced by an anonymous one. Operations on it fail until the "
+                "server answers.\n",
+                conn->mount_point, conn->domain, conn->username);
+        return -1;
+    }
+    kprintf("[SMB] %s: reconnected; MessageId restarted at 0 for the new "
+            "connection\n", conn->mount_point);
+    return 0;
+}
+
+static int smb_mount_auth_nt(uint32_t server_ip, const char *share,
+                             const char *domain, const char *username,
+                             const uint8_t *nt_hash, const char *mount_point) {
+    // #749 pass 2: a mount point belongs to ONE identity, enforced at the one
+    // place a connection is allocated, so no caller can take a path over.
+    //
+    // Belt to smb_conn_revive()'s braces: that keeps a failed mount in the
+    // table, and this refuses to put a second, differently-authenticated mount
+    // on the same path even if some future caller manages to get past it. The
+    // check is smbident_same() rather than strcmp so that "", "guest" and
+    // "GUEST" are one identity and a retry is not mistaken for a takeover.
+    {
+        smb_connection_t *held = smb_find_connection(mount_point);
+        if (held && !smbident_same(held->domain, held->username,
+                                   domain ? domain : "WORKGROUP",
+                                   username ? username : "guest")) {
+            kprintf("[SMB] REFUSING to mount %s as %s\\%s: that path is already "
+                    "mounted as %s\\%s. A mount point belongs to one identity; "
+                    "replacing it in place would silently change who every "
+                    "read and write on that path belongs to. Unmount it first "
+                    "if that is what you want.\n",
+                    mount_point, domain ? domain : "WORKGROUP",
+                    username ? username : "guest",
+                    held->domain, held->username);
+            return -1;
+        }
+    }
+
+    // Allocate connection
+    int conn_idx = alloc_connection();
+    if (conn_idx < 0) {
+        kprintf("[SMB] No free connection slots\n");
+        return -1;
+    }
+
+    smb_connection_t *conn = &connections[conn_idx];
+    conn->active = true;
+    conn->server_ip = server_ip;
+    conn->server_port = SMB_PORT;
+    strncpy(conn->domain, domain ? domain : "WORKGROUP", 63);
+    strncpy(conn->username, username ? username : "guest", 63);
+    memcpy(conn->nt_hash, nt_hash, 16);
+    strncpy(conn->mount_point, mount_point, SMB_MAX_PATH - 1);
+
+    strncpy(conn->share_name, share ? share : "", sizeof(conn->share_name) - 1);
+
+    if (smb_conn_establish(conn, share) < 0) return -1;
 
     kprintf("[SMB] Share mounted at %s\n", mount_point);
 
@@ -1456,6 +2990,7 @@ int smb_unmount(const char *mount_point) {
             smb2_tree_disconnect(conn);
             smb2_logoff(conn);
             tcp_close(conn->tcp_socket);
+            smbseq_unbind(&conn->seq);   // #749: a sequence must never outlive its socket
             conn->active = false;
 
             kprintf("[SMB] Unmounted %s\n", mount_point);
@@ -1482,7 +3017,30 @@ smb_connection_t *smb_find_connection(const char *path) {
 
 // Check if path is on SMB mount
 bool smb_is_smb_path(const char *path) {
+    // Deliberately smb_find_connection(), NOT the reviving form below: this is
+    // a cheap predicate that path routing calls on every open, and it must
+    // never trigger a network reconnect as a side effect of being asked a
+    // question.
     return smb_find_connection(path) != NULL;
+}
+
+// #749: find the connection for a path AND make sure it can actually be used.
+//
+// This is the chokepoint every operation that starts a new request goes
+// through. smb_find_connection() answers "is this path on a mount", which is
+// not the same question as "can I send a request right now", and conflating
+// the two is what left a share permanently broken after the server dropped its
+// session: the mount was still in the table, so every operation found it, used
+// its dead socket, and failed.
+//
+// One place, so a new operation added later inherits the recovery instead of
+// having to know it exists.
+static smb_connection_t *smb_find_connection_live(const char *path) {
+    smb_connection_t *conn = smb_find_connection(path);
+    if (!conn) return NULL;
+    if (smb_conn_transport_ok(conn)) return conn;
+    if (smb_conn_revive(conn) < 0) return NULL;
+    return conn;
 }
 
 // Get relative path within share
@@ -1512,7 +3070,7 @@ static void normalize_path(const char *src, char *dst, int max_len) {
 
 // Open a file
 int smb_open(const char *path, uint32_t desired_access, uint32_t disposition) {
-    smb_connection_t *conn = smb_find_connection(path);
+    smb_connection_t *conn = smb_find_connection_live(path);
     if (!conn) {
         kprintf("[SMB] No mount found for path: %s\n", path);
         return -1;
@@ -1610,7 +3168,7 @@ static int dir_handle_count = 0;
 
 // Open directory
 int smb_opendir(const char *path) {
-    smb_connection_t *conn = smb_find_connection(path);
+    smb_connection_t *conn = smb_find_connection_live(path);
     if (!conn) return -1;
 
     // Reuse a freed slot. Pass 1 monotonically bumped dir_handle_count and
@@ -1711,7 +3269,7 @@ int smb_closedir(int dirfd) {
 
 // Create directory
 int smb_mkdir(const char *path) {
-    smb_connection_t *conn = smb_find_connection(path);
+    smb_connection_t *conn = smb_find_connection_live(path);
     if (!conn) return -1;
 
     const char *rel_path = get_relative_path(conn, path);
@@ -1733,7 +3291,7 @@ int smb_mkdir(const char *path) {
 
 // Remove directory
 int smb_rmdir(const char *path) {
-    smb_connection_t *conn = smb_find_connection(path);
+    smb_connection_t *conn = smb_find_connection_live(path);
     if (!conn) return -1;
 
     const char *rel_path = get_relative_path(conn, path);
@@ -1755,7 +3313,7 @@ int smb_rmdir(const char *path) {
 
 // Delete file
 int smb_delete(const char *path) {
-    smb_connection_t *conn = smb_find_connection(path);
+    smb_connection_t *conn = smb_find_connection_live(path);
     if (!conn) return -1;
 
     const char *rel_path = get_relative_path(conn, path);
@@ -1777,7 +3335,7 @@ int smb_delete(const char *path) {
 
 // Get file info
 int smb_stat(const char *path, smb_dirent_t *info) {
-    smb_connection_t *conn = smb_find_connection(path);
+    smb_connection_t *conn = smb_find_connection_live(path);
     if (!conn) return -1;
 
     const char *rel_path = get_relative_path(conn, path);
@@ -1866,13 +3424,24 @@ extern fat_fs_t g_fat_fs;
 // the most recent explicit smb_mount_auth (stored per connection). Pass 2 will
 // load these from /CONFIG/NETMOUNTS.CFG.
 static char g_smb_def_user[64] = "guest";
-static char g_smb_def_pass[64] = "";
+// #smbnt: WAS `static char g_smb_def_pass[64]`. A cleartext SMB password sat in
+// kernel BSS for the entire life of the boot, so it was readable in any crash
+// dump or memory image of a running machine, quite apart from what was on disk.
+// Now only the NT hash lives here.
+static uint8_t g_smb_def_nthash[16] = {0};
 static char g_smb_def_domain[64] = "WORKGROUP";
 
-void smb_vfs_set_default_creds(const char *domain, const char *user, const char *pass) {
+void smb_vfs_set_default_creds(const char *domain, const char *user, const char *secret) {
     strncpy(g_smb_def_domain, domain ? domain : "WORKGROUP", 63);
     strncpy(g_smb_def_user, user ? user : "guest", 63);
-    strncpy(g_smb_def_pass, pass ? pass : "", 63);
+    // #smbdisk: same chokepoint, so a caller holding a persisted nt$ secret
+    // does not have to turn it back into something password-shaped to satisfy
+    // this API. A malformed tagged value falls back to the EMPTY password (the
+    // guest default) rather than to the literal text, and says so.
+    uint8_t nt[16];
+    if (!smb_secret_to_nthash(secret, nt)) ntlm_hash("", nt);
+    memcpy(g_smb_def_nthash, nt, 16);
+    secure_zero(nt, sizeof(nt));
 }
 
 bool smb_vfs_is_smb_path(const char *path) {
@@ -1883,8 +3452,27 @@ bool smb_vfs_is_smb_path(const char *path) {
 static smb_connection_t *smb_vfs_ensure(const char *path) {
     if (!smb_vfs_is_smb_path(path)) return NULL;
 
-    smb_connection_t *c = smb_find_connection(path);
+    smb_connection_t *c = smb_find_connection_live(path);
     if (c) return c;
+
+    // #749 pass 2: THIS FALL-THROUGH IS THE DOWNGRADE, so it must only ever
+    // run when there is no mount here at all.
+    //
+    // smb_find_connection_live() returns NULL for two completely different
+    // reasons: "nothing is mounted on this path" (mount it on demand, which is
+    // what the rest of this function is for) and "something IS mounted here
+    // but could not be revived". Treating the second as the first is what
+    // re-created the share as an anonymous guest mount at the same path: the
+    // on-demand mount below uses g_smb_def_user, which outside the self-test
+    // is the hard-coded "guest" with an empty NT hash.
+    if (smb_find_connection(path)) {
+        kprintf("[SMB] %s: the share is mounted but its connection could not "
+                "be re-established. REFUSING to re-mount it on demand, because "
+                "an on-demand mount uses the default (anonymous) credentials "
+                "and this path is mounted as a named user. The reason the "
+                "reconnect failed is logged above this line.\n", path);
+        return NULL;
+    }
 
     // Parse /SMB/<server>/<share>/...
     const char *p = path + 5;
@@ -1904,8 +3492,8 @@ static smb_connection_t *smb_vfs_ensure(const char *path) {
     char mp[SMB_MAX_PATH];
     snprintf(mp, sizeof(mp), "/SMB/%s/%s", server, share);
 
-    int idx = smb_mount_auth(ip, share, g_smb_def_domain, g_smb_def_user,
-                             g_smb_def_pass, mp);
+    int idx = smb_mount_auth_nt(ip, share, g_smb_def_domain, g_smb_def_user,
+                                g_smb_def_nthash, mp);
     if (idx < 0) return NULL;
     return &connections[idx];
 }
@@ -1955,10 +3543,17 @@ uint32_t smb_resolve_ip(const char *host) {
 // Mount an SMB share with explicit credentials, keyed by /SMB/<server>/<share>.
 // Reuses an existing connection if already mounted. Returns 0 / -1. The Files
 // app calls this (via SYS_NET_MOUNT) before navigating into a saved network
-// location so the configured user/pass are used rather than the guest default
+// location so the configured user/secret are used rather than the guest default
 // (task #317 pass 2).
+//
+// #smbdisk: THIS IS THE SHARED CHOKEPOINT for both persisted credential forms.
+// `secret` is either a cleartext password (legacy records, and whatever a
+// caller passes straight from a dialog) or the `nt$<32 hex>` NT hash. Every
+// path that arrives with a SAVED credential comes through here - the boot-time
+// /CONFIG/NETMOUNTS.CFG loader and SYS_NET_MOUNT from the Files app - so the
+// new form is understood ONCE, not once per path.
 int smb_vfs_mount_creds(const char *server, const char *share,
-                        const char *user, const char *pass) {
+                        const char *user, const char *secret) {
     if (!server || !share || !server[0] || !share[0]) return -1;
 
     char mp[SMB_MAX_PATH];
@@ -1972,9 +3567,11 @@ int smb_vfs_mount_creds(const char *server, const char *share,
     // Warm the net stack / ARP so the first SYN goes out with a known MAC.
     for (int i = 0; i < 100; i++) smb_net_pump();
 
-    int idx = smb_mount_auth(ip, share, "WORKGROUP",
-                             (user && user[0]) ? user : "guest",
-                             pass ? pass : "", mp);
+    uint8_t nt[16];
+    if (!smb_secret_to_nthash(secret, nt)) return -1;
+    int idx = smb_mount_auth_nt(ip, share, "WORKGROUP",
+                                (user && user[0]) ? user : "guest", nt, mp);
+    secure_zero(nt, sizeof(nt));
     return idx >= 0 ? 0 : -1;
 }
 
@@ -2006,8 +3603,8 @@ char **smb_list_shares(uint32_t server_ip, int *count) {
 
     char mp[SMB_MAX_PATH];
     snprintf(mp, sizeof(mp), "/SMB-IPC/%08x", (unsigned)server_ip);
-    int idx = smb_mount_auth(server_ip, "IPC$", g_smb_def_domain,
-                             g_smb_def_user, g_smb_def_pass, mp);
+    int idx = smb_mount_auth_nt(server_ip, "IPC$", g_smb_def_domain,
+                                g_smb_def_user, g_smb_def_nthash, mp);
     if (idx < 0) { kprintf("[SMB] list_shares: IPC$ connect failed\n"); return NULL; }
     smb_connection_t *conn = &connections[idx];
 
@@ -2250,6 +3847,133 @@ const char *net_mounts_path(int i) {
     return (i >= 0 && i < g_net_mount_count) ? g_net_mount_paths[i] : 0;
 }
 
+// ---------------------------------------------------------------------------
+// #smbdisk: migrate /CONFIG/NETMOUNTS.CFG from cleartext passwords to nt$.
+//
+// MIGRATION IS THE RISKY HALF OF THIS CHANGE, so the rules are explicit:
+//
+//   - NOTHING IS EVER UNLINKED. #peruser2 had to remove exactly that pattern
+//     at five sites: unlink-then-write turns a failed migration into DATA LOSS
+//     on the failure path.
+//   - THE TRANSFORM IS LINE-PRESERVING. Only the 5th pipe-separated field of a
+//     5-field record changes. Comments, blank lines, NFS records and anything
+//     this code does not recognise are copied through BYTE FOR BYTE. In
+//     particular the new file is NOT rebuilt from the parsed mount table: that
+//     table is capped at NET_MAX_MOUNTS (16) while the Files app allows 24
+//     records, so rebuilding from it would silently DELETE the 17th saved
+//     location onwards. That would be losing a mount to a credential change.
+//   - THE RESULT IS VERIFIED, AND ROLLED BACK IF IT IS WRONG. After the write
+//     the file is read back and compared; on any mismatch the ORIGINAL bytes,
+//     still in memory, are written back. The only unrecoverable case left is
+//     both writes failing, which is a failing disk rather than a logic error.
+//   - It runs at BOOT, so an existing install converts on its first boot with
+//     this kernel instead of whenever somebody next opens the Files app. A
+//     credential-at-rest fix that waits for a GUI visit is not a fix yet.
+//
+// fat_write_file() is the established kernel-side whole-file config write in
+// this tree (/CONFIG/PASSWD, /CONFIG/SHADOW, /CONFIG/GROUP, /CONFIG/PERMS.DB
+// all use it, and it routes to ext2 when the path lives there); it is reused
+// rather than replaced.
+// ---------------------------------------------------------------------------
+static int netmounts_migrate_text(const char *in, uint32_t insz,
+                                  char *out, uint32_t outcap, int *changed) {
+    uint32_t o = 0, i = 0;
+    *changed = 0;
+    while (i < insz) {
+        uint32_t ls = i;
+        while (i < insz && in[i] != '\n' && in[i] != '\r') i++;
+        uint32_t le = i;                      /* end of the text of the line */
+        uint32_t eol = i;
+        while (eol < insz && (in[eol] == '\n' || in[eol] == '\r')) eol++;
+
+        int emitted = 0;
+        if (le > ls && in[ls] != '#') {
+            uint32_t p[8]; int np = 0;
+            for (uint32_t k = ls; k < le && np < 8; k++) if (in[k] == '|') p[np++] = k;
+            /* 5 fields = 4 pipes; the secret is field 5. Both accepted 5-field
+               forms put it there: "SMB|server|share|user|secret" and the legacy
+               Files form "label|server|share|user|secret". */
+            if (np >= 4) {
+                uint32_t fs = p[3] + 1, fe = (np >= 5) ? p[4] : le;
+                uint32_t flen = fe - fs;
+                int is_nfs = (le - ls >= 4 && in[ls] == 'N' && in[ls+1] == 'F' &&
+                              in[ls+2] == 'S' && in[ls+3] == '|');
+                char fld[128];
+                if (!is_nfs && flen > 0 && flen < sizeof(fld)) {
+                    memcpy(fld, in + fs, flen); fld[flen] = 0;
+                    if (!nt_secret_is_tagged(fld)) {
+                        uint8_t nt[16]; char tag[NT_SECRET_BUF];
+                        ntlm_hash(fld, nt);
+                        if (nt_secret_format(nt, tag, sizeof(tag))) {
+                            uint32_t tl = (uint32_t)strlen(tag);
+                            uint32_t need = (fs - ls) + tl + (le - fe) + (eol - le);
+                            if (o + need + 1 >= outcap) {
+                                secure_zero(nt, sizeof(nt));
+                                secure_zero(fld, sizeof(fld));
+                                return -1;
+                            }
+                            memcpy(out + o, in + ls, fs - ls); o += fs - ls;
+                            memcpy(out + o, tag, tl);          o += tl;
+                            memcpy(out + o, in + fe, le - fe); o += le - fe;
+                            memcpy(out + o, in + le, eol - le); o += eol - le;
+                            emitted = 1; *changed = 1;
+                        }
+                        secure_zero(nt, sizeof(nt));
+                    }
+                    secure_zero(fld, sizeof(fld));
+                }
+            }
+        }
+        if (!emitted) {
+            uint32_t need = eol - ls;
+            if (o + need + 1 >= outcap) return -1;
+            memcpy(out + o, in + ls, need); o += need;
+        }
+        i = eol;
+    }
+    out[o] = 0;
+    return (int)o;
+}
+
+static void netmounts_migrate_on_disk(const char *cfg, uint32_t sz) {
+    uint32_t cap = sz * 2 + 256;   /* nt$ + 32 hex is longer than most passwords */
+    char *nb = (char *)kmalloc(cap);
+    if (!nb) {
+        kprintf("[NETMOUNTS] migration SKIPPED: no memory. File left exactly as it was.\n");
+        return;
+    }
+    int changed = 0;
+    int nlen = netmounts_migrate_text(cfg, sz, nb, cap, &changed);
+    if (nlen < 0) {
+        kprintf("[NETMOUNTS] migration REFUSED: the converted file would not fit. "
+                "File left exactly as it was.\n");
+    } else if (!changed) {
+        kprintf("[NETMOUNTS] on-disk credentials are already hashed (nt$); nothing to migrate\n");
+    } else if (fat_write_file(&g_fat_fs, "/CONFIG/NETMOUNTS.CFG", nb, (uint32_t)nlen) != 0) {
+        kprintf("[NETMOUNTS] MIGRATION WRITE FAILED. Nothing was unlinked; the saved "
+                "locations are still mounted from the copy already in memory.\n");
+    } else {
+        uint32_t vsz = 0;
+        char *v = (char *)fat_read_file(&g_fat_fs, "/CONFIG/NETMOUNTS.CFG", &vsz);
+        int ok = (v && vsz == (uint32_t)nlen && memcmp(v, nb, vsz) == 0);
+        if (v) kfree(v);
+        if (ok) {
+            kprintf("[NETMOUNTS] MIGRATED cleartext -> nt$ (%u -> %d bytes), "
+                    "verified by readback\n", sz, nlen);
+        } else {
+            kprintf("[NETMOUNTS] MIGRATION READBACK MISMATCH - rolling back to the "
+                    "original bytes\n");
+            if (fat_write_file(&g_fat_fs, "/CONFIG/NETMOUNTS.CFG", cfg, sz) == 0)
+                kprintf("[NETMOUNTS] rollback OK: no saved location was lost\n");
+            else
+                kprintf("[NETMOUNTS] ROLLBACK ALSO FAILED - /CONFIG/NETMOUNTS.CFG may "
+                        "be damaged. The mounts for THIS boot are unaffected.\n");
+        }
+    }
+    secure_zero(nb, cap);
+    kfree(nb);
+}
+
 void net_mounts_load(void) {
     uint32_t sz = 0;
     char *cfg = (char *)fat_read_file(&g_fat_fs, "/CONFIG/NETMOUNTS.CFG", &sz);
@@ -2311,6 +4035,9 @@ void net_mounts_load(void) {
             }
         }
     }
+    // #smbdisk: the mounts above are already established from the copy in
+    // memory, so a migration failure below cannot cost this boot a mount.
+    netmounts_migrate_on_disk(cfg, sz);
     kfree(cfg);
     kprintf("[NETMOUNTS] %d mount(s) loaded\n", g_net_mount_count);
     kprintf("==================================================\n\n");
@@ -2321,12 +4048,15 @@ void smb_run_selftest(void) {
     char *cfg = (char *)fat_read_file(&g_fat_fs, "/CONFIG/SMBTEST.CFG", &cfgsz);
     if (!cfg) return;  // no config -> silent
 
-    char ipstr[64], share[64], user[64], pass[64], file[128];
+    char ipstr[64], share[64], user[64], pass[64], file[128], bigfile[128];
     smbtest_get(cfg, "ip", ipstr, sizeof(ipstr));
     smbtest_get(cfg, "share", share, sizeof(share));
     smbtest_get(cfg, "user", user, sizeof(user));
     smbtest_get(cfg, "pass", pass, sizeof(pass));
     smbtest_get(cfg, "file", file, sizeof(file));
+    // Optional. Absent means the timed bulk read is skipped entirely, so a rig
+    // that does not have a large file is unaffected.
+    smbtest_get(cfg, "bigfile", bigfile, sizeof(bigfile));
     kfree(cfg);
 
     if (!ipstr[0] || !share[0]) {
@@ -2385,21 +4115,80 @@ void smb_run_selftest(void) {
     snprintf(fpath, sizeof(fpath), "%s/%s", mp, file);
     kprintf("[SMBTEST] --- reading %s ---\n", fpath);
     int read_ok = 0;
+    // #smbdisk: hoisted out of the block so step 4 can compare the two
+    // independent read paths byte for byte. `got > 0` alone would pass on a
+    // truncated or wrong-content read, which is most of what could break.
+    static uint8_t fbuf[4096];
+    ssize_t direct_len = 0;
     int fd = smb_open(fpath, FILE_READ_DATA | FILE_READ_ATTRIBUTES, FILE_OPEN);
     if (fd >= 0) {
-        static uint8_t fbuf[4096];
         ssize_t got = smb_read(fd, fbuf, sizeof(fbuf) - 1);
         if (got > 0) {
             fbuf[got] = 0;
             kprintf("[SMBTEST] read %d bytes:\n", (int)got);
             kprintf("----8<----\n%s\n----8<----\n", (char *)fbuf);
             read_ok = 1;
+            direct_len = got;
         } else {
             kprintf("[SMBTEST] read returned %d\n", (int)got);
         }
         smb_close(fd);
     } else {
         kprintf("[SMBTEST] open FAILED\n");
+    }
+
+    // 3b) TIMED BULK READ, so the COST of encryption is a measured number.
+    //
+    // It reads one large file in fixed chunks and reports bytes, milliseconds
+    // and KB/s, together with whether encryption was in force. Run the same
+    // image twice, once with `encrypt=off` in /CONFIG/SMB.CFG and once without
+    // it, and the difference between the two lines IS the cost of encryption
+    // on a real read of a real file from a real server: same kernel, same VM,
+    // same share, one variable.
+    //
+    // Reported rather than asserted. A throughput threshold in a self-test is
+    // a flaky test on a shared host, and this host routinely runs at a load
+    // average above 20.
+    if (bigfile[0]) {
+        char bpath[SMB_MAX_PATH];
+        snprintf(bpath, sizeof(bpath), "%s/%s", mp, bigfile);
+        int bfd = smb_open(bpath, FILE_READ_DATA | FILE_READ_ATTRIBUTES, FILE_OPEN);
+        if (bfd >= 0) {
+            static uint8_t chunk[32768];
+            uint64_t t0 = sched_now_ms();
+            uint64_t total = 0;
+            int reads = 0;
+            for (;;) {
+                ssize_t got = smb_read(bfd, chunk, sizeof(chunk));
+                if (got <= 0) break;
+                total += (uint64_t)got;
+                reads++;
+                if (reads > 4096) break;   // a bound, not a poll: see above
+            }
+            uint64_t ms = sched_now_ms() - t0;
+            smb_close(bfd);
+            uint32_t kbs = (ms > 0) ? (uint32_t)((total * 1000ull) / (ms * 1024ull))
+                                    : 0;
+            smb_connection_t *bc = (idx >= 0) ? &connections[idx] : NULL;
+            uint32_t nse = 0, nun = 0, nrj = 0, nco = 0, nci = 0;
+            if (bc) smbcrypt_counts(&bc->crypt, &nse, &nun, &nrj, &nco, &nci);
+            kprintf("[SMBTEST] BULKREAD %s: %llu bytes in %llu ms over %d "
+                    "reads = %u KB/s, encryption=%s (%s), sealed=%u "
+                    "unsealed=%u clear_out=%u clear_in=%u\n",
+                    bigfile, (unsigned long long)total,
+                    (unsigned long long)ms, reads, kbs,
+                    (bc && smbcrypt_is_active(&bc->crypt)) ? "ON" : "OFF",
+                    bc ? smbcrypt_algo_text(&bc->crypt) : "no connection",
+                    nse, nun, nco, nci);
+        } else {
+            // Through selftest_notrun(), not a kprintf: a measurement that
+            // declines to run has to reach /BOOTLOG.TXT and the end-of-boot
+            // [SELFTEST] summary, because serial is absent on the laptop and
+            // on the iMac, which is exactly where the evidence is needed. The
+            // skipgate enforces this and caught the first version of this line.
+            selftest_notrun("SMBTEST/bulkread",
+                            "the bigfile named in /CONFIG/SMBTEST.CFG could not be opened");
+        }
     }
 
     // 4) Read the SAME file through the VFS routing hook (fat_read_file on an
@@ -2410,8 +4199,15 @@ void smb_run_selftest(void) {
     int vfs_ok = 0;
     if (vbuf) {
         kprintf("[SMBTEST] VFS read %u bytes:\n----8<----\n%s\n----8<----\n", vsz, vbuf);
+        if (read_ok && vsz == (uint32_t)direct_len && memcmp(vbuf, fbuf, vsz) == 0) {
+            vfs_ok = 1;
+            kprintf("[SMBTEST] VFS read is BYTE-IDENTICAL to the direct smb_read "
+                    "(%u bytes)\n", vsz);
+        } else {
+            kprintf("[SMBTEST] VFS read DIFFERS from the direct smb_read "
+                    "(vfs=%u direct=%d) - FAIL\n", vsz, (int)direct_len);
+        }
         kfree(vbuf);
-        vfs_ok = 1;
     } else {
         kprintf("[SMBTEST] VFS read FAILED\n");
     }
@@ -2420,30 +4216,129 @@ void smb_run_selftest(void) {
     //    to prove task #317 pass-2 FS wiring + smb_vfs_write_whole upload work.
     int write_ok = 0;
     {
-        extern int64_t sys_open(const char *, int);
-        extern int64_t sys_write(int, const void *, uint64_t);
+        // #smbdisk: THIS SITE CALLED sys_open() WITH A KERNEL POINTER, so it
+        // could never succeed and this whole self-test could only ever print
+        // FAIL. sys_open() is the USER boundary: it runs sc_path_from_user() on
+        // its argument, which correctly rejects a kernel address, so the SMB
+        // write code below was never reached even once. #567 fixed exactly this
+        // defect in netfs_fdpath_selftest() and ext2_dir_open_selftest() and
+        // MISSED this one; measured on golden 2491, where the only line this
+        // step produced was a bare "write-open FAILED" with no diagnosis.
+        extern int64_t sys_open_k(const char *, int);
         extern int64_t sys_close(int);
         char wpath[SMB_MAX_PATH];
         snprintf(wpath, sizeof(wpath), "%s/P2WRITE.TXT", mp);
         const char *payload = "MayteraOS task #317 pass-2 SMB upload OK\n";
+        uint32_t plen = (uint32_t)strlen(payload);
         kprintf("[SMBTEST] --- WRITE via syscall path %s ---\n", wpath);
-        int64_t wfd = sys_open(wpath, 0x41);   // O_CREAT|O_WRONLY
-        if (wfd >= 0) {
-            int64_t wn = sys_write((int)wfd, payload, (uint64_t)strlen(payload));
-            sys_close((int)wfd);               // close triggers the SMB upload
-            kprintf("[SMBTEST] wrote %d bytes (buffered), uploaded on close\n", (int)wn);
-            // Read it back through the VFS hook to confirm the round-trip.
-            uint32_t rb = 0;
-            char *back = (char *)fat_read_file(&g_fat_fs, wpath, &rb);
-            if (back) {
-                kprintf("[SMBTEST] readback %u bytes:\n----8<----\n%s----8<----\n", rb, back);
-                if (rb == (uint32_t)strlen(payload)) write_ok = 1;
-                kfree(back);
-            } else {
-                kprintf("[SMBTEST] readback FAILED\n");
-            }
+        int64_t wfd = sys_open_k(wpath, 0x41);   // O_CREAT|O_WRONLY
+        int open_ok = (wfd >= 0);
+        if (open_ok) {
+            kprintf("[SMBTEST] fd-layer write-open OK (fd=%d)\n", (int)wfd);
+            sys_close((int)wfd);
         } else {
-            kprintf("[SMBTEST] write-open FAILED\n");
+            kprintf("[SMBTEST] fd-layer write-open FAILED (%d)\n", (int)wfd);
+        }
+        // The PAYLOAD cannot go through sys_write() from here: sys_write copies
+        // with copy_from_user(), which correctly refuses a kernel pointer, and
+        // there is no sys_write_k() core (sys_open_k and sys_readdir_k exist;
+        // the write side was never given one). Rather than leave the upload
+        // untested, drive it through smb_vfs_write_whole(), which is the exact
+        // function sys_close() calls to perform the upload. What is NOT covered
+        // is therefore only the fd payload buffering, and that is said here
+        // instead of being implied by a green line.
+        int upload_ok = (smb_vfs_write_whole(wpath, payload, plen) == 0);
+        kprintf("[SMBTEST] upload via smb_vfs_write_whole: %s\n",
+                upload_ok ? "OK" : "FAILED");
+        uint32_t rb = 0;
+        char *back = (char *)fat_read_file(&g_fat_fs, wpath, &rb);
+        if (back) {
+            kprintf("[SMBTEST] readback %u bytes:\n----8<----\n%s----8<----\n", rb, back);
+            if (rb == plen && memcmp(back, payload, plen) == 0) write_ok = 1;
+            else kprintf("[SMBTEST] readback is NOT byte-identical to what was "
+                         "written (%u vs %u) - FAIL\n", rb, plen);
+            kfree(back);
+        } else {
+            kprintf("[SMBTEST] readback FAILED\n");
+        }
+        write_ok = write_ok && open_ok && upload_ok;
+    }
+
+    // 5b) #749: RECONNECT. Everything above runs on the FIRST connection, so
+    //     none of it can tell you whether a re-established one works. Drop the
+    //     transport the way a server's idle timeout does (Samba closes idle
+    //     sessions on its own `deadtime`), then do an ordinary read.
+    //
+    //     The MessageId and the credit window are per CONNECTION (MS-SMB2
+    //     2.2.1.2). Before #749 the connection struct kept its counter, so the
+    //     first request on the NEW connection carried the old count; the server
+    //     logged "bad message_id N (granted = 1, low = 0, range = 1)" and
+    //     terminated the connection, and this client then printed
+    //     "Authentication failed: 0xC000006D", sending whoever hit it to look
+    //     at the password. `make SMBSEQNORESET=1` restores exactly that, so
+    //     this step can be watched going RED.
+    int reconnect_ok = 0;
+    {
+        kprintf("[SMBTEST] --- #749 RECONNECT: dropping the transport under "
+                "%s ---\n", mp);
+        smb_connection_t *live = smb_find_connection(mp);
+        if (!live) {
+            kprintf("[SMBTEST] no live connection to drop - FAIL\n");
+        } else {
+            // #749: the pass criterion is that THIS connection came back,
+            // not that something somewhere could still read the file. Without
+            // the epoch check this step passes on a FAILED reconnect, because
+            // smb_vfs_ensure() then mounts a brand-new connection and the read
+            // succeeds anyway. Measured: on `make SMBSEQNORESET=1` the fallback
+            // mount even logged in as GUEST instead of the configured user,
+            // so a dropped session silently changed WHO we were.
+            uint64_t epoch_before = live->seq.epoch;
+            kprintf("[SMBTEST] before drop: socket=%d next MessageId=%llu "
+                    "epoch=%llu\n", live->tcp_socket,
+                    (unsigned long long)live->seq.next_id,
+                    (unsigned long long)epoch_before);
+            // tcp_close() takes the socket out of ESTABLISHED on the
+            // spot, which is all smb_conn_transport_ok() looks at, so
+            // there is nothing to wait for here. No settle loop: a new
+            // poll loop is exactly what the concurrency lint exists to
+            // stop, and this one would have had nothing to poll for.
+            tcp_close(live->tcp_socket);
+
+            uint32_t rsz = 0;
+            char *rbuf = (char *)fat_read_file(&g_fat_fs, fpath, &rsz);
+            smb_connection_t *after = smb_find_connection(mp);
+            int revived_in_place = (after == live &&
+                                    after->seq.epoch == epoch_before + 1);
+            if (rbuf) {
+                if (!revived_in_place) {
+                    kprintf("[SMBTEST] the read SUCCEEDED but this connection "
+                            "was NOT re-established: it was replaced by a new "
+                            "mount (epoch %llu, expected %llu). A reconnect "
+                            "that silently becomes a remount loses the "
+                            "session and the credentials - FAIL\n",
+                            after ? (unsigned long long)after->seq.epoch : 0ULL,
+                            (unsigned long long)(epoch_before + 1));
+                } else if (read_ok && rsz == (uint32_t)direct_len &&
+                           memcmp(rbuf, fbuf, rsz) == 0) {
+                    reconnect_ok = 1;
+                    kprintf("[SMBTEST] RECONNECT OK: this connection was "
+                            "re-established in place (epoch %llu) and read %u "
+                            "bytes byte-identical to the pre-drop read\n",
+                            (unsigned long long)after->seq.epoch, rsz);
+                } else {
+                    kprintf("[SMBTEST] RECONNECT read came back WRONG "
+                            "(%u bytes vs %d) - FAIL\n", rsz, (int)direct_len);
+                }
+                kfree(rbuf);
+            } else {
+                kprintf("[SMBTEST] RECONNECT read FAILED\n");
+            }
+            if (after) {
+                kprintf("[SMBTEST] after reconnect: socket=%d next "
+                        "MessageId=%llu sequence=%s\n", after->tcp_socket,
+                        (unsigned long long)after->seq.next_id,
+                        smbseq_fault_text(smbseq_fault(&after->seq)));
+            }
         }
     }
 
@@ -2462,10 +4357,12 @@ void smb_run_selftest(void) {
         }
     }
 
-    if (read_ok && nent > 0 && vfs_ok && write_ok) {
+    if (read_ok && nent > 0 && vfs_ok && write_ok && reconnect_ok) {
         kprintf("========== SMB SELFTEST: PASS ==========\n\n");
     } else {
-        kprintf("========== SMB SELFTEST: FAIL ==========\n\n");
+        kprintf("========== SMB SELFTEST: FAIL (read=%d entries=%d vfs=%d "
+                "write=%d reconnect=%d) ==========\n\n",
+                read_ok, nent, vfs_ok, write_ok, reconnect_ok);
     }
 }
 

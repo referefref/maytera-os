@@ -95,7 +95,14 @@ _Static_assert(HEAP_START + HEAP_MAX_SIZE <= USER_WIN_MMAP_BASE_MIRROR,
 typedef struct block_header {
     size_t size;                    // Size of data area
     int free;                       // 1 if free, 0 if allocated
-    struct block_header *next;      // Next block in list
+    struct block_header *next;      // Next block in list (address order)
+    // #245 domscript: PREVIOUS block in address order. This costs NOTHING:
+    // the three fields above occupy 24 bytes and BLK_HDR was already padded
+    // to 32 for 16-byte alignment, so `prev` lands in bytes that were pure
+    // padding. It buys O(1) BACKWARD coalescing, which is the only reason
+    // free() ever had to walk the whole list (see the block comment on the
+    // free bins below).
+    struct block_header *prev;
 } block_header_t;
 
 // Physical header size used for pointer arithmetic. Padded up to 16 so that,
@@ -104,6 +111,15 @@ typedef struct block_header {
 // mlibc both guarantee max_align_t (16 on x86-64); CPython, SSE and doubles
 // rely on it. (Previously data started at sizeof()==24 -> only 8-aligned.)
 #define BLK_HDR 32
+
+// #245 domscript: the header must keep FITTING the padding it was given. If a
+// future field pushes it past 32 the data area silently stops being 16-aligned
+// and every SSE store through a malloc'd pointer becomes a landmine, so fail
+// the build instead. userland/libc/tests/malloc_cycle_test.c and
+// userland/apps/heaptest/main.c both mirror this layout and assert the same
+// thing; change all three together.
+_Static_assert(sizeof(block_header_t) <= BLK_HDR,
+               "block_header_t no longer fits the padded BLK_HDR");
 
 static block_header_t *heap_start = NULL;
 static uint64_t heap_end = HEAP_START;
@@ -261,7 +277,8 @@ static int block_size_sane(block_header_t *b) {
 //
 // The bound is the live block count, maintained at the ONLY four sites that
 // can change it: request_space() and malloc_locked()'s split each create a
-// block; coalesce_all()'s merge and realloc()'s absorb each destroy one.
+// block; free_locked()'s two merges (forward and, since #245 domscript,
+// backward) and realloc()'s absorb each destroy one.
 // Nothing else adds or removes a node (free() only sets ->free = 1). The
 // count can therefore only ever OVER-count - a walk that aborts on
 // corruption orphans blocks that stay counted - and never under-count, so a
@@ -292,53 +309,141 @@ static uint64_t g_block_count = 0;
 // This is also why removing the per-token parser logging (real, and fixed) only
 // bought 12%: the logging was never the dominant term.
 //
-// The fix keeps the SAME data structure and every corruption guard; it only
-// removes the three linear walks:
+// That round of fixes kept the SAME data structure and every corruption guard;
+// it removed three of the four linear walks:
 //
 //   heap_last   - tail pointer, so request_space() appends in O(1). Maintained
-//                 at the only sites that can unlink a node.
-//   g_free_hint - an UPPER BOUND on the largest free data area. It is only ever
-//                 raised outside coalesce_all(), and set to the exact maximum by
-//                 a completed sweep, so it can be stale-HIGH (a wasted scan,
-//                 harmless) but never stale-LOW (a missed block, which would
-//                 leak). find_free_block() returns immediately when no free
-//                 block can possibly be large enough.
-//   g_free_cur  - next-fit cursor, so a scan that CAN succeed starts near the
-//                 recently touched end of the list instead of at heap_start.
-//                 The scan still wraps, so it remains complete.
-//   the sweep   - free() now merges forward from the block being freed in O(1)
-//                 and runs the full coalesce_all() once per HEAP_SWEEP_EVERY
-//                 frees, which is what keeps backward fragmentation bounded and
-//                 recomputes g_free_hint exactly. Amortised O(1).
+//                 at the only sites that can unlink a node. STILL HERE.
+//   g_free_hint - a single scalar UPPER BOUND on the largest free data area,
+//                 letting find_free_block() reject in O(1) when no free block
+//                 could possibly be large enough. SUPERSEDED, see the next
+//                 block comment: a scalar bound that every free() raises does
+//                 not reject the case that actually mattered, and proving it
+//                 wrong cost a complete list scan.
+//   g_free_cur  - next-fit cursor. SUPERSEDED by the free bins, which do not
+//                 walk allocated blocks at all, so there is nothing to skip.
+//   the sweep   - free() merged forward in O(1) and ran the full coalesce_all()
+//                 once per 256 frees. SUPERSEDED: `prev` makes the backward
+//                 merge O(1) too, so no periodic full sweep is needed at all.
+// ============================================================================
+// ============================================================================
+// #245 domscript: ...AND IT WAS STILL O(live-block-count) PER malloc().
+//
+// The three fixes above removed three walks and left the fourth, which turned
+// out to be the expensive one. MEASURED, not inferred, with the shipping
+// allocator algorithm driven by the real browser engine and the real Duktape
+// binding (one DOM element plus one JS wrapper per loop iteration, nothing
+// inserted, so no DOM or GC cost is in the number):
+//
+//   nodes   blocks   malloc calls   find_free_block steps   script time
+//     625     2528          7148              4,954,332       0.029 s
+//    1250     4414         12148             13,115,742       0.078 s
+//    2500     8121         22148             39,983,617       0.242 s
+//    5000    15671         42148            135,906,867       1.305 s
+//   10000    30659         82148            496,501,543       5.788 s
+//
+// 6044 list steps per malloc() against a 30659-block list, and 4x the steps
+// for 2x the nodes: quadratic. The SAME loop allocating plain JS objects
+// instead of DOM elements, so that the blocks are freed again and the list
+// stays 555 long, is LINEAR and 500x cheaper. The list LENGTH is the cost.
+//
+// WHY g_free_hint DID NOT STOP IT. The hint is one scalar upper bound over all
+// sizes and EVERY free() raises it to the freed block's size. So a free of a
+// 4 KB block makes a 32-byte malloc believe a fit might exist; proving it does
+// not costs a COMPLETE scan of the block list (next-fit wraps, so it is still
+// complete), and only then is the hint lowered. The next free raises it again.
+// A single global bound cannot be both sound and cheap, and lowering it per
+// failed scan just moves the cost to the next size requested.
+//
+// THE FIX IS STRUCTURAL: an EXPLICIT, SIZE-BINNED FREE LIST. find_free_block()
+// now walks only blocks that are actually FREE, bucketed by size, so the long
+// already-allocated prefix is never touched. The links live in the free block's
+// own PAYLOAD (a free block's data area is by definition unused), so the bins
+// cost zero bytes of header; and `prev` in the header, which was padding, makes
+// backward coalescing O(1), which is what removes the periodic full sweep
+// entirely rather than making it rarer.
+//
+// The guard set is unchanged in kind: every remaining walk still carries the
+// #631 step budget and still reports through heap_report_walk_overrun(), and
+// the redzone / range / size-sanity checks are untouched.
 // ============================================================================
 static block_header_t *heap_last = NULL;   // tail of the block list
-static block_header_t *g_free_cur = NULL;  // next-fit search cursor
-static size_t   g_free_hint = 0;           // upper bound on largest free size
-static uint64_t g_frees_since_sweep = 0;
-#define HEAP_SWEEP_EVERY 256
 
-// A SHORT list is walked exactly as before - every walk, every time, with every
-// corruption diagnostic firing on the very call that meets the damage. That is
-// deliberate and it is not a performance compromise: a walk over a few hundred
-// blocks is free, and it is the regime every normal app lives in, so their
-// behaviour here is bit-for-bit unchanged (userland/libc/tests/run_malloc.sh,
-// the #631 cycle-detection regression test, exercises exactly this regime and
-// must keep passing - it caught the first version of this patch, which had
-// amortised the sweep unconditionally and thereby made a corrupt list return
-// quietly instead of reporting).
+// Free-list links, stored IN the free block's data area. A free block's payload
+// is unused by definition, so this is free of charge; it is also why every
+// block is forced to carry at least HEAP_MIN_DATA bytes of payload (below), so
+// there is always room for the two links without touching the trailing redzone.
+typedef struct free_link {
+    block_header_t *fnext;
+    block_header_t *fprev;
+} free_link_t;
+#define FLINK(b) ((free_link_t *)((uint8_t *)(b) + BLK_HDR))
+
+// Smallest data area any block may have. 16 bytes would already hold the two
+// links, but the redzone canary sits at payload[size-8], so 16 would make the
+// links and the canary the same bytes. 32 keeps them disjoint:
+// links at [0,16), canary at [size-8, size).
+#define HEAP_MIN_DATA 32
+_Static_assert(HEAP_MIN_DATA >= (int) sizeof(free_link_t) + 8,
+               "#245: a free block must hold both links and its redzone");
+
+// Bins 0..HEAP_NBIN-2 are EXACT size classes in 16-byte steps (every block size
+// is a multiple of 16), so the common small allocation is an O(1) pop. The last
+// bin is the catch-all for everything larger and is the only one that has to be
+// searched for a fit.
+#define HEAP_BIN_STEP      16
+#define HEAP_BIN_MAX_EXACT 1024
+#define HEAP_NBIN          ((HEAP_BIN_MAX_EXACT / HEAP_BIN_STEP) - 1)  /* 63 */
+static block_header_t *free_bins[HEAP_NBIN];
+
+// Length of each bin, maintained at the only two sites that change it. It is
+// what makes a CYCLE in a bin detectable independently of how big the heap is:
+// a well-formed bin of length L cannot be walked for more than L steps, so the
+// step budget for a bin walk is L-derived, not heap-derived. Like g_block_count
+// it can only ever OVER-count (a dropped bin orphans its nodes), never under,
+// so it cannot produce a false corruption report.
+static uint32_t bin_count[HEAP_NBIN];
+
+// How far into the catch-all bin a single request may look before giving up and
+// growing the heap instead. A bound is required here for the same reason every
+// other walk in this file has one, and unlike those it is also a performance
+// bound: without it one request can walk every large free block. Giving up is
+// SOUND, not a fallback to wrong behaviour: request_space() then satisfies the
+// caller from fresh arena, which costs address space, never correctness.
 //
-// Only once the list is genuinely long do the walks amortise. A cycle is then
-// still detected and reported, within at most HEAP_SWEEP_EVERY frees rather
-// than on the first one.
+// 512 IS MEASURED, not picked. It is the point where giving up stops costing
+// memory. 3,000,000 random malloc/realloc/free operations with sizes from 1 to
+// 20,000 bytes (peak 3143 live blocks), heap arena high-water:
+//
+//      cap   8    43,634 KB
+//      cap  64    15,578 KB
+//      cap 512    12,564 KB
+//      cap 4096   12,373 KB      (diminishing: 1.5% better for 8x the work)
+//      pre-fix    14,558 KB      (unbounded first-fit over the WHOLE list)
+//
+// So 512 uses 14% LESS arena than the allocator this replaces while bounding
+// the work, i.e. this is not a memory-for-time trade at all on that workload.
+// A cap of 64 would have been one, which is why the number was measured.
+// The cap is a CONSTANT, so no choice of it changes the complexity; it only
+// decides how good the reuse is.
+#define HEAP_BIN_SCAN_MAX 512
+
+// The cached tail is only trusted once the list is long enough for the walk it
+// replaces to matter; a short list still takes the validated walk, so a small
+// app's behaviour (and every corruption report it would have produced) is
+// unchanged. userland/libc/tests/run_malloc.sh, the #631 cycle-detection
+// regression test, lives in exactly this regime and must keep passing.
 #define HEAP_BIGLIST 512
 static int heap_big(void) { return g_block_count > (uint64_t) HEAP_BIGLIST; }
 
-// A node is being unlinked from the list. Keep the two cached pointers honest;
-// a stale one would be a wild dereference later, which is exactly the class of
-// bug the guards in this file exist for.
+// A node is being unlinked from the address-ordered list. Keep the cached tail
+// honest; a stale one would be a wild dereference later, which is exactly the
+// class of bug the guards in this file exist for. The free bins are NOT fixed
+// up here: a node leaving the list must be unlinked from its bin explicitly by
+// whoever removes it, because "which bin" depends on the size it had BEFORE any
+// merge changed it.
 static void heap_note_unlinked(block_header_t *removed, block_header_t *keep) {
     if (heap_last == removed)  heap_last = keep;
-    if (g_free_cur == removed) g_free_cur = keep;
 }
 
 // Rate-limited and reported through the same [malloc] channel the allocator
@@ -347,6 +452,15 @@ static void heap_note_unlinked(block_header_t *removed, block_header_t *keep) {
 // Same de-duplication shape as the kernel's [WQBLOCK] assert.
 #define HEAP_WALK_REPORT_MAX 8
 static unsigned g_walk_reports = 0;
+
+// #245 domscript: TOTAL steps taken by every bounded walk in this file, for the
+// lifetime of the process. It exists so that "malloc() does not do work that
+// grows with the number of live blocks" is a MEASURED, deterministic property
+// rather than a wall-clock impression: see userland/libc/tests/run_malloc_scale.sh,
+// which asserts on this counter at two workload sizes and has a RED arm against
+// the pre-fix allocator. It is free in the fixed allocator precisely because the
+// walks it counts no longer run: a hit in an exact size bin takes zero steps.
+static uint64_t g_walk_steps = 0;
 
 // #631 follow-up: EVERY corruption diagnostic in this file shares one rate
 // limit. The step-budget report above was rate-limited from the start, but the
@@ -367,11 +481,23 @@ static unsigned g_diag_reports = 0;
 
 // Returns non-zero if the caller may print one corruption report. Prints the
 // suppression notice exactly once, on the first call past the cap.
+// #245 domscript: COUNT ALWAYS, PRINT ONLY UP TO THE CAP. This used to stop
+// INCREMENTING once the cap was passed, which is the exact defect the counter
+// beside it (g_walk_reports) carries a comment warning against: a counter that
+// stops counting is a counter that lies. MEASURED IN THE OS, not inferred:
+// userland/apps/heaptest runs all its scenarios in ONE process, so the first
+// scenario exhausted the cap and scenarios 2 and 3 then scored a corruption the
+// allocator HAD detected and printed as "terminated but reported nothing". The
+// host test (userland/libc/tests/run_malloc.sh) could not see it because it runs
+// each scenario in a separate process. Printing is still capped at
+// HEAP_DIAG_REPORT_MAX and the suppression notice is still emitted exactly once;
+// only the arithmetic changed.
 static int heap_diag_ok(void) {
-    if (g_diag_reports > HEAP_DIAG_REPORT_MAX) return 0;
     g_diag_reports++;
     if (g_diag_reports > HEAP_DIAG_REPORT_MAX) {
-        heap_write_str("[malloc] further heap corruption reports suppressed\n");
+        if (g_diag_reports == HEAP_DIAG_REPORT_MAX + 1) {
+            heap_write_str("[malloc] further heap corruption reports suppressed\n");
+        }
         return 0;
     }
     return 1;
@@ -406,9 +532,9 @@ static uint64_t heap_walk_limit(void) {
         // corruption into a stream of false ones. From that point on, fall
         // back to the arena's HARD physical bound - the most nodes the heap
         // could possibly hold, given the smallest block a split can leave
-        // (BLK_HDR + 16). Still strictly bounded, just no longer tight, so
+        // (BLK_HDR + HEAP_MIN_DATA). Still strictly bounded, just no longer tight, so
         // the allocator keeps working on a heap it already knows is damaged.
-        uint64_t hard = ((heap_end - HEAP_START) / (BLK_HDR + 16)) + 8;
+        uint64_t hard = ((heap_end - HEAP_START) / (BLK_HDR + HEAP_MIN_DATA)) + 8;
         if (lim < hard) lim = hard;
     }
     return lim;
@@ -420,75 +546,163 @@ static uint64_t heap_walk_limit(void) {
 // a guard. Returns the number of overrun reports emitted so far.
 unsigned __malloc_walk_report_count(void) { return g_walk_reports; }
 
-static block_header_t *find_free_block(size_t size) {
-    // #245: O(1) reject. g_free_hint is an upper bound on the largest free
-    // block, so if it is smaller than the request no scan can succeed. This is
-    // the common case while a document is being BUILT (allocate, never free),
-    // and it is what turned the whole scan from per-allocation into never.
-    if (heap_big() && size > g_free_hint) return NULL;
+// #245 domscript: the OTHER report channel, for the same reason. Not every
+// corruption is a walk that ran too long: a value guard (range, size sanity,
+// a block that is not in the bin its size selects) can catch the same damage
+// without any walk overrunning, and after this change some shapes are ALWAYS
+// caught that way. A test that could only see the step-budget counter read
+// "terminated but reported nothing" on a corruption that was in fact reported
+// loudly. Returns the number of guard reports emitted so far.
+unsigned __malloc_diag_report_count(void) { return g_diag_reports; }
 
-    // #245: next-fit. Start where the last successful search left off and wrap
-    // once, instead of always restarting at heap_start. Still a complete scan,
-    // so no reusable block is missed; it just does not re-walk the long
-    // already-allocated prefix of the list on every call.
-    block_header_t *start = (heap_big() && g_free_cur && block_in_range(g_free_cur))
-                            ? g_free_cur : heap_start;
-    block_header_t *block = start;
-    int wrapped = 0;
-    // #631: bounded walk - see heap_walk_limit() above.
-    uint64_t steps = 0, limit = heap_walk_limit();
-    while (1) {
-        if (block == NULL) {
-            if (wrapped || start == heap_start) break;
-            wrapped = 1;
-            block = heap_start;
+// #245 domscript: see g_walk_steps. Deliberately NOT in stdlib.h for the same
+// reason as the two counters above: it exists for a test, and a test is the
+// only honest way to keep a complexity claim true.
+uint64_t __malloc_walk_steps(void) { return g_walk_steps; }
+
+// --- #245 domscript: the explicit, size-binned free list -------------------
+//
+// THE ONE INVARIANT. A block sits in exactly one bin if and only if
+// block->free, and that bin is bin_index(block->size). Every site that flips
+// ->free or changes ->size must bin_unlink() BEFORE and bin_insert() AFTER,
+// because the bin a block belongs to is a function of the size it had at the
+// time it was linked. Nothing anywhere else may read or write a free block's
+// first 16 payload bytes.
+
+// The class a block of this size BELONGS to (rounds DOWN).
+static int bin_index(size_t size) {
+    size_t i = size / HEAP_BIN_STEP;
+    if (i < HEAP_MIN_DATA / HEAP_BIN_STEP) i = HEAP_MIN_DATA / HEAP_BIN_STEP;
+    i -= HEAP_MIN_DATA / HEAP_BIN_STEP;                 /* HEAP_MIN_DATA -> 0 */
+    if (i >= (size_t) HEAP_NBIN) i = (size_t) HEAP_NBIN - 1;
+    return (int) i;
+}
+
+// The smallest class that can SATISFY this request (rounds UP). Identical to
+// bin_index() for every size the allocator actually asks for, since those are
+// all multiples of HEAP_BIN_STEP; written separately so that the "a block in a
+// higher exact bin always fits" argument below holds by construction rather
+// than by relying on that fact staying true.
+static int bin_index_fit(size_t size) {
+    return bin_index((size + HEAP_BIN_STEP - 1) & ~(size_t)(HEAP_BIN_STEP - 1));
+}
+
+static void bin_insert(block_header_t *b) {
+    int i = bin_index(b->size);
+    free_link_t *l = FLINK(b);
+    l->fprev = NULL;
+    l->fnext = free_bins[i];
+    if (free_bins[i]) FLINK(free_bins[i])->fprev = b;
+    free_bins[i] = b;
+    bin_count[i]++;
+}
+
+static void bin_unlink(block_header_t *b) {
+    int i = bin_index(b->size);
+    free_link_t *l = FLINK(b);
+    block_header_t *p = l->fprev, *n = l->fnext;
+    if (p && block_in_range(p)) FLINK(p)->fnext = n;
+    if (n && block_in_range(n)) FLINK(n)->fprev = p;
+    if (free_bins[i] == b) {
+        free_bins[i] = n;
+        if (bin_count[i]) bin_count[i]--;
+    } else if (p) {
+        if (bin_count[i]) bin_count[i]--;
+    } else {
+        // b claims to be a bin head but is not the head of the bin its size
+        // selects, so either its size changed while it was linked (a bug at
+        // one of the sites named in the invariant above) or the links are
+        // damaged. Nothing was written through a wrong head, so the bins stay
+        // consistent; say so rather than continuing silently.
+        if (heap_diag_ok()) {
+            heap_write_str("[malloc] heap corruption: bin_unlink on a block that is not in its own bin ");
+            heap_write_hex((uint64_t)b);
+            heap_write_str(" size="); heap_write_hex((uint64_t)b->size);
+            heap_write_str("\n");
+        }
+    }
+    l->fnext = NULL;
+    l->fprev = NULL;
+}
+
+// Drop a whole bin after finding damage in it. The blocks become unreachable
+// (an address-space leak, bounded by the heap ceiling) instead of a wild
+// dereference, which is the same trade every other guard in this file makes.
+static void bin_drop(int i, const char *why, block_header_t *b) {
+    if (heap_diag_ok()) {
+        heap_write_str("[malloc] heap corruption: ");
+        heap_write_str(why);
+        heap_write_str(" at block ");
+        heap_write_hex((uint64_t)b);
+        heap_write_str("; dropping free bin ");
+        heap_write_hex((uint64_t)i);
+        heap_write_str("\n");
+    }
+    free_bins[i] = NULL;
+    bin_count[i] = 0;
+}
+
+// Returns a free block of at least `size` bytes of data area, ALREADY UNLINKED
+// from its bin and still marked free; the caller owns it. NULL means "nothing
+// reusable", on which malloc_locked() grows the heap, so NULL is never a
+// failure the caller sees.
+//
+// This walks FREE blocks only. That is the whole point: the previous version
+// walked the address-ordered list of ALL blocks, so it paid for every live DOM
+// node ever allocated (see the measurement table above).
+static block_header_t *find_free_block(size_t size) {
+    int want = bin_index_fit(size);
+
+    // Exact classes first. Every block in a class at or above `want` is at
+    // least `size` bytes by construction, so the head of the first non-empty
+    // one fits and there is nothing to search.
+    for (int i = want; i < HEAP_NBIN - 1; i++) {
+        block_header_t *b = free_bins[i];
+        if (!b) continue;
+        if (!block_in_range(b)) { bin_drop(i, "free-bin head out of range", b); continue; }
+        if (!b->free || !block_size_sane(b) || b->size < size) {
+            bin_drop(i, "free-bin head disagrees with its bin", b);
             continue;
         }
-        if (wrapped && block == start) break;
-        if (++steps > limit) {
-            heap_report_walk_overrun("find_free_block", block, steps);
-            // Fall back to growing the heap: malloc_locked() treats NULL as
-            // "no reusable block found" and calls request_space(), so the
-            // allocation still succeeds instead of the app hanging.
-            return NULL;
-        }
-        // Validate BEFORE dereferencing - block may itself be the corrupted
-        // value left behind by a previous merge step, not just block->next.
-        if (!block_in_range(block)) {
-            if (heap_diag_ok()) {
-                heap_write_str("[malloc] heap corruption: find_free_block landed on an out-of-range block pointer ");
-                heap_write_hex((uint64_t)block);
-                heap_write_str("\n");
-            }
-            return NULL;
-        }
-        if (block->free) {
-            if (!block_size_sane(block)) {
-                if (heap_diag_ok()) {
-                    heap_write_str("[malloc] heap corruption: find_free_block found a block with an implausible size ");
-                    heap_write_hex((uint64_t)block);
-                    heap_write_str(" size="); heap_write_hex((uint64_t)block->size);
-                    heap_write_str("\n");
-                }
-                // Do not trust this block's size for split/canary math - it
-                // would compute a wild address (the exact crash this fix is
-                // for). Skip it and keep walking; a well-formed block further
-                // down the list (or request_space() as the final fallback)
-                // still satisfies the allocation.
-                block = block->next;
-                continue;
-            }
-            if (block->size >= size) {
-                g_free_cur = block;   // #245: next-fit cursor
-                return block;
-            }
-        }
-        block = block->next;
+        bin_unlink(b);
+        return b;
     }
-    // Scanned the whole list and nothing fit, so the hint was stale-high.
-    // Lower it to just under this request: still an upper bound on what is
-    // actually there, and it stops the next same-sized request re-scanning.
-    if (g_free_hint >= size) g_free_hint = size - 1;
+
+    // The catch-all class is the only one that can hold blocks SMALLER than the
+    // request, so it is the only one that is searched. Two independent bounds:
+    // the #631 step budget catches a cycle in the links, and HEAP_BIN_SCAN_MAX
+    // caps the work on a long but perfectly well-formed bin.
+    int last = HEAP_NBIN - 1;
+    // Two INDEPENDENT bounds, and the order matters. The cycle bound comes from
+    // the bin's own recorded length, so a loop of four nodes is caught in twelve
+    // steps whether the heap holds ten blocks or ten million; deriving it from
+    // heap_walk_limit() alone would let the effort cap below silently preempt
+    // the cycle detector on any large heap, which is the #631 failure mode
+    // wearing a different hat. heap_walk_limit() is still applied as the
+    // backstop for a bin_count that corruption has driven too high.
+    uint64_t steps = 0;
+    uint64_t limit = (uint64_t) bin_count[last] + 8;
+    uint64_t hard = heap_walk_limit();
+    if (limit > hard) limit = hard;
+    int looked = 0;
+    block_header_t *b = free_bins[last];
+    while (b) {
+        if (g_walk_steps++, ++steps > limit) {
+            heap_report_walk_overrun("free-bin scan", b, steps);
+            break;
+        }
+        if (!block_in_range(b)) { bin_drop(last, "free-bin node out of range", b); break; }
+        if (!b->free || !block_size_sane(b)) {
+            bin_drop(last, "free-bin node is not a sane free block", b);
+            break;
+        }
+        if (b->size >= size) {
+            bin_unlink(b);
+            return b;
+        }
+        if (++looked >= HEAP_BIN_SCAN_MAX) break;   // grow the heap instead
+        b = FLINK(b)->fnext;
+    }
     return NULL;
 }
 
@@ -515,6 +729,7 @@ static block_header_t *request_space(size_t needed_data) {
     block->size = needed_data;
     block->free = 0;
     block->next = NULL;
+    block->prev = NULL;        // #245 domscript: set by whichever append wins
     *(uint64_t *)((uint8_t *)block + BLK_HDR + needed_data - 8) = HEAP_CANARY;
 
     if (heap_start) {
@@ -540,6 +755,7 @@ static block_header_t *request_space(size_t needed_data) {
         block_header_t *last = heap_start;
         if (heap_big() && heap_last && block_in_range(heap_last) &&
             heap_last->next == NULL) {
+            block->prev = heap_last;          // #245 domscript
             heap_last->next = block;
             heap_last = block;
             heap_end += total;
@@ -549,7 +765,7 @@ static block_header_t *request_space(size_t needed_data) {
         // #631: bounded walk - see heap_walk_limit() above.
         uint64_t steps = 0, limit = heap_walk_limit();
         while (last->next) {
-            if (++steps > limit) {
+            if (g_walk_steps++, ++steps > limit) {
                 heap_report_walk_overrun("request_space tail walk", last, steps);
                 break;
             }
@@ -564,6 +780,7 @@ static block_header_t *request_space(size_t needed_data) {
             }
             last = last->next;
         }
+        block->prev = last;                   // #245 domscript
         last->next = block;
         heap_last = block;
     } else {
@@ -598,63 +815,21 @@ static void check_canary(block_header_t *b) {
     }
 }
 
-// Merge every run of adjacent free blocks in the list. Cheap O(n) sweep run on
-// free() so fragmentation from a stream of alloc/free (very common in CPython)
-// gets reclaimed instead of only coalescing the single following block.
-static void coalesce_all(void) {
-    block_header_t *b = heap_start;
-    // #631: one step budget shared by BOTH loops. Every iteration of either
-    // loop either advances past a node that is never revisited (outer) or
-    // removes a node from the list (inner merge), so a well-formed list
-    // costs at most g_block_count steps in total.
-    uint64_t steps = 0, limit = heap_walk_limit();
-    size_t maxfree = 0;   // #245: exact largest free data area, this sweep
-    while (b) {
-        if (++steps > limit) {
-            heap_report_walk_overrun("coalesce_all", b, steps);
-            return;
-        }
-        // Validate BEFORE dereferencing - b may itself be the garbage value
-        // a previous `b->next = b->next->next` merge step left behind
-        // (its OWN validity is only proven by the block_in_range() check
-        // inside the merge loop's condition below, one step removed from
-        // where it gets assigned). Checking only b->next (as an earlier
-        // version of this function did) misses exactly that case.
-        if (!block_in_range(b)) {
-            if (heap_diag_ok()) {
-                heap_write_str("[malloc] heap corruption: coalesce_all landed on an out-of-range block pointer ");
-                heap_write_hex((uint64_t)b);
-                heap_write_str("\n");
-            }
-            return;
-        }
-        if (b->free) {
-            // #421 phase 8: also require the neighbor's size to be sane
-            // before folding it into b->size - absorbing a corrupted size
-            // here would silently propagate the garbage into b itself,
-            // turning b into the next call's implausible-size victim
-            // instead of stopping the corruption where it is first seen.
-            while (b->next && block_in_range(b->next) && b->next->free && block_size_sane(b->next)) {
-                if (++steps > limit) {
-                    heap_report_walk_overrun("coalesce_all merge", b, steps);
-                    return;
-                }
-                heap_note_unlinked(b->next, b);       // #245
-                b->size += BLK_HDR + b->next->size;
-                b->next = b->next->next;
-                if (g_block_count) g_block_count--;   // #631: node removed
-            }
-            if (b->size > maxfree) maxfree = b->size;   // #245
-        }
-        if (b->next == NULL) heap_last = b;             // #245
-        b = b->next;
-    }
-    // #245: a COMPLETED sweep is the only place that knows the exact largest
-    // free block, so it is the only place allowed to LOWER the hint. Every
-    // early return above leaves the previous (conservatively high) value.
-    g_free_hint = maxfree;
-    g_free_cur = NULL;
-}
+// #245 domscript: coalesce_all() IS GONE, and that is the point.
+//
+// Its job was to merge a freed block with its free PREDECESSOR, which the
+// address-ordered singly-linked list could not find without walking from
+// heap_start. That walk ran once per 256 frees and was therefore still a term
+// that grows with the live block count. `prev` in the block header, which cost
+// nothing because BLK_HDR was already padded to 32, makes the backward merge a
+// single O(1) step inside free_locked(), so there is no sweep to amortise.
+//
+// Two consequences worth stating. The no-two-adjacent-free-blocks invariant is
+// now maintained EAGERLY on every free rather than within 256 frees, so
+// fragmentation is strictly better, not merely as good. And the periodic sweep
+// was also the only place that recomputed g_free_hint exactly; the size bins
+// answer that question structurally, so the hint is gone with it.
+
 
 // Internal, NON-locking bodies. Callers must hold g_heap_lock.
 static void *malloc_locked(size_t size) {
@@ -668,26 +843,33 @@ static void *malloc_locked(size_t size) {
     // caller is entitled to write.
     size = (size + 15) & ~15;
     size_t needed = (size + 8 + 15) & ~15;
+    // #245 domscript: every block, including a split remainder, must be able to
+    // hold the two free-list links in its payload without touching its redzone.
+    if (needed < HEAP_MIN_DATA) needed = HEAP_MIN_DATA;
 
-    // Try to find a free block
+    // Try to find a free block. It comes back ALREADY UNLINKED from its bin.
     block_header_t *block = find_free_block(needed);
 
     if (block) {
-        // Split block if the remainder can hold a header plus a useful chunk.
-        if (block->size >= needed + BLK_HDR + 16) {
+        // Split block if the remainder can hold a header plus a usable chunk.
+        // #245 domscript: the threshold is HEAP_MIN_DATA, not 16, because a
+        // 16-byte remainder could not carry the free-list links clear of its
+        // own redzone.
+        if (block->size >= needed + BLK_HDR + HEAP_MIN_DATA) {
             block_header_t *new_block = (block_header_t *)((uint8_t *)block +
                                         BLK_HDR + needed);
             new_block->size = block->size - needed - BLK_HDR;
             new_block->free = 1;
             new_block->next = block->next;
+            new_block->prev = block;                         // #245 domscript
+            if (block->next) block->next->prev = new_block;   // #245 domscript
             *(uint64_t *)((uint8_t *)new_block + BLK_HDR + new_block->size - 8) = HEAP_CANARY;
 
             if (heap_last == block) heap_last = new_block;   // #245
-            if (new_block->size > g_free_hint)                // #245
-                g_free_hint = new_block->size;
             block->size = needed;
             block->next = new_block;
             g_block_count++;  // #631: the split created a node
+            bin_insert(new_block);                           // #245 domscript
         }
         block->free = 0;
         // Re-arm the canary at this block's (possibly unchanged) size - cheap
@@ -727,45 +909,63 @@ static void free_locked(void *ptr) {
         return;
     }
     check_canary(block);
-    block->free = 1;
 
-    // #245: a short list keeps the original behaviour EXACTLY - full sweep on
-    // every free, every diagnostic firing on the offending call.
-    if (!heap_big()) {
-        coalesce_all();
+    // #245 domscript: a DOUBLE FREE must be refused, not absorbed. An already
+    // free block is already in a bin; running the rest of this function on it
+    // would link one node into a bin twice, which is a cycle in the bin list
+    // and corrupts every later allocation. The old code could not detect this
+    // and merely re-coalesced. Refusing is strictly safer and names the bug at
+    // the call that commits it rather than at some unrelated malloc() later.
+    if (block->free) {
+        if (heap_diag_ok()) {
+            heap_write_str("[malloc] invalid free: block is already free (double free) ");
+            heap_write_hex((uint64_t)ptr);
+            heap_write_str("\n");
+        }
         return;
     }
+    block->free = 1;
 
-    // #245: merge forward from THIS block only - O(1) in the common case,
-    // bounded by the same step budget as every other walk in this file. The
-    // full sweep below is what still reclaims a free block that PRECEDES this
-    // one; running it on every free() was the single most expensive thing the
-    // browser did (see the block comment at g_block_count).
+    // #245 domscript: merge FORWARD. One step is enough while the
+    // no-two-adjacent-free-blocks invariant holds, which this function now
+    // maintains eagerly; the loop and its #631 step budget stay because a
+    // corrupted heap can break the invariant and a cycle must still terminate
+    // with a report rather than spin.
     {
         uint64_t steps = 0, limit = heap_walk_limit();
         while (block->next && block_in_range(block->next) &&
                block->next->free && block_size_sane(block->next)) {
-            if (++steps > limit) {
+            if (g_walk_steps++, ++steps > limit) {
                 heap_report_walk_overrun("free forward merge", block, steps);
                 break;
             }
             block_header_t *victim = block->next;
+            bin_unlink(victim);                   // #245 domscript: before size changes
             heap_note_unlinked(victim, block);
             block->size += BLK_HDR + victim->size;
             block->next = victim->next;
+            if (block->next) block->next->prev = block;
             if (g_block_count) g_block_count--;
         }
     }
-    if (block->size > g_free_hint) g_free_hint = block->size;
-    if (block->next == NULL) heap_last = block;
-    // Reuse this block next: it is warm, and it stops the cursor drifting to
-    // the far end of the list.
-    g_free_cur = block;
 
-    if (++g_frees_since_sweep >= HEAP_SWEEP_EVERY) {
-        g_frees_since_sweep = 0;
-        coalesce_all();
+    // #245 domscript: merge BACKWARD in O(1). This is what coalesce_all() used
+    // a full list walk to do. The ->next cross-check is the cheap way to say
+    // "these two really are neighbours" before folding one into the other.
+    if (block->prev && block_in_range(block->prev) && block->prev->free &&
+        block_size_sane(block->prev) && block->prev->next == block) {
+        block_header_t *keep = block->prev;
+        bin_unlink(keep);                         // its size is about to change
+        heap_note_unlinked(block, keep);
+        keep->size += BLK_HDR + block->size;
+        keep->next = block->next;
+        if (keep->next) keep->next->prev = keep;
+        if (g_block_count) g_block_count--;
+        block = keep;
     }
+
+    if (block->next == NULL) heap_last = block;
+    bin_insert(block);
 }
 
 // #613: high-water mark of the heap arena, in bytes. heap_end only ever grows
@@ -843,9 +1043,11 @@ void *realloc(void *ptr, size_t size) {
     if (block->next && block_in_range(block->next) && block->next->free &&
         block_size_sane(block->next) &&
         block->size + BLK_HDR + block->next->size >= needed) {
+        bin_unlink(block->next);                      // #245 domscript
         heap_note_unlinked(block->next, block);       // #245
         block->size += BLK_HDR + block->next->size;
         block->next = block->next->next;
+        if (block->next) block->next->prev = block;   // #245 domscript
         if (block->next == NULL) heap_last = block;   // #245
         if (g_block_count) g_block_count--;           // #631: node removed
         *(uint64_t *)((uint8_t *)block + BLK_HDR + block->size - 8) = HEAP_CANARY;

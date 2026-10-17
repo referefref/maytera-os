@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # pbkdf2_shadow_kat.sh - build-container known-answer oracle for
-# pbkdf2_shadow_selftest() (authkat).
+# pbkdf2_shadow_selftest() (authkat) and, since #secretuse, for the PROMOTED
+# crypto/pbkdf2.c.
 #
 # WHY THIS FILE EXISTS
 # verify_against_record() in kernel/proc/users.c is the password trust anchor for
@@ -9,43 +10,101 @@
 # any account whose password was set). A passing kernel build with real callers
 # proves NOTHING about whether it (a) computes PBKDF2-HMAC-SHA256 correctly or
 # (b) REJECTS a wrong password / truncated record / flipped-byte record. This
-# oracle compiles the REAL PBKDF2 + verify code (extracted verbatim between the
+# oracle compiles the REAL verify code (extracted verbatim between the
 # PBKDF2_SHADOW_KAT_REGION_BEGIN/END markers in users.c, so it cannot drift from
-# what ships) against the REAL crypto/sha256.c HMAC primitive, and proves,
-# without a VM:
+# what ships) plus the REAL crypto/pbkdf2.c and the REAL crypto/sha256.c HMAC
+# primitive, and proves, without a VM:
 #
 #   GREEN : the unmodified verify computes the RFC-style PBKDF2-HMAC-SHA256
 #           vectors correctly AND accepts the right password AND rejects every
 #           tamper  -> pbkdf2_shadow_selftest() returns 0.
-#   RED   : compiled with -DPBKDF2_KAT_FAULT (an unconditional-accept verifier,
+#   RED 1 : compiled with -DPBKDF2_KAT_FAULT (an unconditional-accept verifier,
 #           the single most dangerous auth bug and exactly what an unguarded
 #           trust anchor must never be) the SAME self-test returns non-zero,
 #           proving its reject checks actually FIRE and are not a no-op.
+#   RED 2 : compiled with -DPBKDF2_CORE_FAULT, which collapses the ITERATION LOOP
+#           inside crypto/pbkdf2.c to a single HMAC, the SAME self-test returns
+#           non-zero.
+#
+# ===========================================================================
+# WHY RED 2 EXISTS, AND IT IS THE REASON THIS FILE CHANGED IN #secretuse.
+# ===========================================================================
+# pbkdf2_hmac_sha256() used to be file-static INSIDE the marked region. It was
+# promoted to crypto/pbkdf2.c so the encrypted secret store could derive a key
+# from the same login password without a second PBKDF2 implementation.
+#
+# That move is exactly the shape of failure this repository has already suffered:
+# a KAT that quietly stops covering the thing it is named after. The region
+# extraction would still have compiled, this oracle would still have printed
+# PASS, and the promoted KDF would have been tested by nothing at all. RED 1
+# would NOT have noticed, because it faults the verifier in users.c and fires
+# whether or not crypto/pbkdf2.c is even on the compile line.
+#
+# So RED 2 faults the loop IN THE PROMOTED FILE. Its fault is chosen to be
+# invisible to everything except a known-answer vector: a single HMAC still
+# returns a perfectly well-formed 32 bytes, still verifies against itself, and
+# still lets every password in the system work. Only the RFC vectors disagree.
+#
+# GREEN proves the vectors match. RED 2 proves the vectors are computed BY THAT
+# FILE. Together they are the evidence that the promotion did not silently end
+# the coverage; separately, neither is.
+#
+# There is also a structural guard below: if the marked region ever RE-DEFINES
+# pbkdf2_hmac_sha256 locally, the oracle exits 2 rather than testing two
+# implementations and reporting on whichever one won the link.
 #
 # The KAT vectors (P="password", S="salt", c in {1,2,4096}, dkLen=32) were
 # independently reproduced with Python hashlib.pbkdf2_hmac; a correct verifier
 # plus a correct vector table is the ONLY combination that yields GREEN, so a
 # passing GREEN run also validates the transcribed vectors.
 #
-# Exit 0 iff GREEN is green AND RED is red. Run in the kernel build container
-# (the build container, gcc-12) or userland (the build container):
+# Exit 0 iff GREEN is green AND both REDs are red. Run in the kernel build
+# container (the build container, gcc-12) or userland (the build container):
 #     kernel/crypto/pbkdf2_shadow_kat.sh
 set -u
 
 SRCDIR="$(cd "$(dirname "$0")" && pwd)"
 SHA="$SRCDIR/sha256.c"
+PBK_C="$SRCDIR/pbkdf2.c"
+PBK_H="$SRCDIR/pbkdf2.h"
 USERS="$SRCDIR/../proc/users.c"
 CC="${CC:-gcc}"
-[ -r "$SHA" ]   || { echo "FATAL: cannot read $SHA"; exit 2; }
-[ -r "$USERS" ] || { echo "FATAL: cannot read $USERS"; exit 2; }
+for f in "$SHA" "$PBK_C" "$PBK_H" "$USERS"; do
+  [ -r "$f" ] || { echo "FATAL: cannot read $f"; exit 2; }
+done
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# 1) Shim header: the kernel typedefs, crypto ctx types/constants and PBKDF2
-#    constants the region + sha256.c need, reproduced from kernel/crypto/crypto.h
-#    and kernel/proc/users.{c,h}. libc prototypes are resolved against the system
-#    libc at link time.
+# ---------------------------------------------------------------------------
+# 0) STRUCTURAL GUARDS. Each of these, if it trips, means the oracle would have
+#    reported on something other than what ships. Exit 2 (oracle broken), which
+#    is deliberately distinct from exit 1 (test failed).
+# ---------------------------------------------------------------------------
+grep -q 'void pbkdf2_hmac_sha256' "$PBK_C" || {
+  echo "FATAL: crypto/pbkdf2.c does not define pbkdf2_hmac_sha256 (moved again?)"; exit 2; }
+grep -q 'PBKDF2_CORE_FAULT' "$PBK_C" || {
+  echo "FATAL: the RED-2 hook PBKDF2_CORE_FAULT is gone from crypto/pbkdf2.c."
+  echo "       Without it this oracle cannot prove it still covers the promoted KDF."; exit 2; }
+grep -q 'PBKDF2_KAT_FAULT' "$USERS" || {
+  echo "FATAL: the RED-1 hook PBKDF2_KAT_FAULT is gone from proc/users.c"; exit 2; }
+# If the region defines the KDF again, there would be TWO implementations and the
+# link would silently pick one. Refuse rather than report on a coin toss.
+if awk '/PBKDF2_SHADOW_KAT_REGION_BEGIN/{f=1;next} /PBKDF2_SHADOW_KAT_REGION_END/{f=0} f' \
+      "$USERS" | grep -qE '^[[:space:]]*(static[[:space:]]+)?void[[:space:]]+pbkdf2_hmac_sha256'; then
+  echo "FATAL: the users.c marked region DEFINES pbkdf2_hmac_sha256 again."
+  echo "       It was promoted to crypto/pbkdf2.c in #secretuse. Two copies of a KDF"
+  echo "       is the exact drift that promotion removed; pick one."
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# 1) Shim header: the kernel typedefs, crypto ctx types/constants the region +
+#    sha256.c + pbkdf2.c need, reproduced from kernel/crypto/crypto.h. The PBKDF2
+#    constants are deliberately NOT reproduced here: the REAL crypto/pbkdf2.h is
+#    staged below and supplies them, so a change to the shipping work factor
+#    reaches this oracle instead of being shadowed by a stale copy.
+# ---------------------------------------------------------------------------
 cat > "$WORK/shim.h" <<'EOF'
 #ifndef PBKDF2_KAT_SHIM_H
 #define PBKDF2_KAT_SHIM_H
@@ -79,9 +138,6 @@ static inline uint64_t dp_tsc(void) { return 0; }
 static volatile uint64_t g_dp_sha_cyc, g_dp_sha_bytes;
 
 /* from kernel/proc/users.{c,h} */
-#define PBKDF2_ITERATIONS 50000u
-#define PBKDF2_SALT_LEN   16
-#define PBKDF2_DK_LEN     32
 #define PASSWORD_HASH_SIZE 160
 
 /* libc used by the region + sha256.c (resolved against system libc) */
@@ -95,6 +151,12 @@ void   bootlog_write(const char *, ...);
 #endif
 EOF
 
+# 1b) The REAL crypto/pbkdf2.h, with only its kernel include swapped for the
+#     shim. The work factor and dkLen under test are therefore the shipping ones.
+sed -E 's|^#include "\.\./types\.h"|#include "shim.h"|' "$PBK_H" > "$WORK/pbkdf2.h"
+grep -q 'PBKDF2_ITERATIONS' "$WORK/pbkdf2.h" || {
+  echo "FATAL: staged pbkdf2.h has no PBKDF2_ITERATIONS (did the constants move again?)"; exit 2; }
+
 # 2) Host copy of the REAL crypto/sha256.c with its kernel includes swapped for
 #    the shim. Only #include lines change; every hashing function is byte-identical.
 sed -E \
@@ -104,16 +166,30 @@ sed -E \
   -e 's|^#include "fs/bootlog.h".*||' \
   "$SHA" > "$WORK/sha256_host.c"
 
-# 3) Host copy of the REAL PBKDF2/verify/self-test region, extracted VERBATIM
-#    between the markers in users.c so it cannot drift from what ships.
+# 2b) Host copy of the REAL crypto/pbkdf2.c, same treatment. This is the file the
+#     promotion created, and RED 2 faults it.
+sed -E \
+  -e 's|^#include "crypto.h"|#include "shim.h"|' \
+  -e 's|^#include "\.\./string.h".*||' \
+  "$PBK_C" > "$WORK/pbkdf2_host.c"
+
+# 3) Host copy of the REAL verify/self-test region, extracted VERBATIM between
+#    the markers in users.c so it cannot drift from what ships. It now includes
+#    the staged pbkdf2.h for the KDF it calls, exactly as users.c does.
 {
   echo '#include "shim.h"'
+  echo '#include "pbkdf2.h"'
   awk '/PBKDF2_SHADOW_KAT_REGION_BEGIN/{f=1;next} /PBKDF2_SHADOW_KAT_REGION_END/{f=0} f' "$USERS"
 } > "$WORK/region_host.c"
 
-LINES=$(grep -c ';' "$WORK/region_host.c" || true)
 if ! grep -q 'pbkdf2_shadow_selftest' "$WORK/region_host.c"; then
   echo "FATAL: region extraction found no pbkdf2_shadow_selftest (markers moved?)"; exit 2
+fi
+# The region must still CALL the promoted KDF, or GREEN would be testing a
+# verifier that no longer uses it and RED 2 would be unreachable.
+if ! grep -q 'pbkdf2_hmac_sha256' "$WORK/region_host.c"; then
+  echo "FATAL: the extracted region never calls pbkdf2_hmac_sha256, so this"
+  echo "       oracle would not be exercising crypto/pbkdf2.c at all."; exit 2
 fi
 
 # 4) Host driver: stubs for the symbols the compiled TUs reference but that live
@@ -142,26 +218,36 @@ EOF
 build_and_run() {  # $1 = extra cflags, $2 = label ; returns process exit code
     local flags="$1" label="$2" bin="$WORK/kat_$2"
     if ! "$CC" -O2 -Wall -Wno-array-parameter -Wno-unused-variable -Wno-unused-function -I "$WORK" $flags \
-            "$WORK/region_host.c" "$WORK/sha256_host.c" "$WORK/driver.c" \
+            "$WORK/region_host.c" "$WORK/pbkdf2_host.c" "$WORK/sha256_host.c" "$WORK/driver.c" \
             -o "$bin" 2> "$WORK/cc_$label.log"; then
         echo "FATAL: compile failed for $label"; cat "$WORK/cc_$label.log"; exit 2
     fi
     "$bin"; return $?
 }
 
-echo "== GREEN: unmodified verify_against_record + real sha256.c HMAC =="
+echo "== GREEN: unmodified verify_against_record + crypto/pbkdf2.c + real sha256.c =="
 build_and_run "" green
 GREEN=$?
-echo "== RED:   -DPBKDF2_KAT_FAULT (unconditional-accept verifier) =="
-build_and_run "-DPBKDF2_KAT_FAULT" red
-RED=$?
+echo "== RED 1: -DPBKDF2_KAT_FAULT  (unconditional-accept verifier, users.c) =="
+build_and_run "-DPBKDF2_KAT_FAULT" red1
+RED1=$?
+echo "== RED 2: -DPBKDF2_CORE_FAULT (iteration loop collapsed, crypto/pbkdf2.c) =="
+build_and_run "-DPBKDF2_CORE_FAULT" red2
+RED2=$?
 
 echo "------------------------------------------------------------"
 rc=0
 if [ "$GREEN" -eq 0 ]; then echo "GREEN ok  : PBKDF2 vectors match AND verify accepts+rejects correctly (exit 0)";
 else echo "GREEN FAIL: correct code did not pass the KAT (exit $GREEN)"; rc=1; fi
-if [ "$RED" -ne 0 ]; then echo "RED   ok  : always-accept verifier is CAUGHT by the KAT (exit $RED)";
-else echo "RED   FAIL: KAT did not catch an always-accept verifier -> it is a no-op"; rc=1; fi
+if [ "$RED1" -ne 0 ]; then echo "RED 1 ok  : always-accept verifier is CAUGHT by the KAT (exit $RED1)";
+else echo "RED 1 FAIL: KAT did not catch an always-accept verifier -> it is a no-op"; rc=1; fi
+if [ "$RED2" -ne 0 ]; then echo "RED 2 ok  : a faulted loop in the PROMOTED crypto/pbkdf2.c is CAUGHT (exit $RED2)";
+else
+  echo "RED 2 FAIL: KAT did not catch a faulted iteration loop in crypto/pbkdf2.c."
+  echo "            That means this oracle is no longer covering the promoted KDF,"
+  echo "            which is the precise failure #secretuse added RED 2 to prevent."
+  rc=1
+fi
 echo "------------------------------------------------------------"
 [ "$rc" -eq 0 ] && echo "pbkdf2_shadow_kat.sh: PASS" || echo "pbkdf2_shadow_kat.sh: FAIL"
 exit $rc

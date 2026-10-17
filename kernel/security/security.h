@@ -230,12 +230,18 @@ typedef enum {
     // /CONFIG/SECURITY.LOG is relabelled.
     AUDIT_ELEVATION,
     // #745: an outbound LLM request was REFUSED, or allowed and flagged, by the
-    // prompt-injection screen. Appended, per the append-only rule above, so no
-    // historical ordinal in /CONFIG/SECURITY.LOG is relabelled. Ordinal 12; the
-    // name and severity tables in rustkern.rs carry the matching arm, because
-    // an enum in this tree has TWO switches and the second one is the file
-    // record (#697: a new event logged itself as "INFO UNKNOWN" for exactly
-    // this reason).
+    // prompt-injection screen. Ordinal 12; the name and severity tables in
+    // rustkern.rs carry the matching arm, because an enum in this tree has TWO
+    // switches and the second one is the file record (#697: a new event logged
+    // itself as "INFO UNKNOWN" for exactly this reason).
+    //
+    // RETIRED 2026-09-29, AND STILL HERE ON PURPOSE. Its only producer was the
+    // Nova keyword screen, removed at #469m aititleinject; the reporter that
+    // raised it (seclog_report_ai_injection) is deleted, so NOTHING emits this
+    // event any more. The ORDINAL stays because this enum is append-only and
+    // /CONFIG/SECURITY.LOG records decode by ordinal: dropping 12 would relabel
+    // every historical AI_INJECTION line as IO_BOUNDARY and every IO_BOUNDARY
+    // line as CAPABILITY. Do NOT reuse ordinal 12 for a new event; append.
     AUDIT_AI_INJECTION,
     // #fdguard: a cross-process file-descriptor access, or an attach to a
     // /dev/pts terminal the caller does not own, was REFUSED. Appended per
@@ -248,6 +254,30 @@ typedef enum {
     // (like ELEVATION: per-use refusals are rate-limited into the durable log
     // and the GraphFS journal, not toasted). Named in rustkern.rs sec_event_name.
     AUDIT_CAPABILITY,
+    // #prewrite: a removal or replacement in an all-users (sticky) directory
+    // was REFUSED because the caller owns neither the victim nor the
+    // directory, or was ALLOWED CROSS-OWNER under the directory-owner rule.
+    // Ordinal 15; INFO severity via the default arm of sec_event_severity(),
+    // and named in rustkern.rs sec_event_name in this same change. The
+    // cross-owner ALLOW is the one that matters: a privileged-shaped path with
+    // no record is how you get the convenience without the accountability.
+    AUDIT_FS_REMOVE,
+    // #kfirewall: the packet filter's POLICY CHANGED. Ordinal 16; INFO severity
+    // via the default arm of sec_event_severity(), and named in rustkern.rs
+    // sec_event_name in this same change (#785 appended ordinal 10 without a
+    // name and every service start logged as UNKNOWN for weeks; leaving a hole
+    // next to a new entry is how the next one gets missed).
+    //
+    // WHY INFO AND NOT WARNING. Every producer is already root-gated and
+    // operator-initiated: SYS_NET_FW's non-GET ops refuse a non-zero euid, and
+    // the boot load is the machine reading its own config. A toast per rule edit
+    // would fire while someone is sitting in Settings > Network deliberately
+    // editing rules, which is how you train a person to dismiss the toasts that
+    // matter (the same argument sec_event_severity() records for AUTH_PROBE).
+    // The value here is the DURABLE record in /CONFIG/SECURITY.LOG: the detail
+    // string carries the resulting posture, so "when did inbound stop being
+    // DENY" is answerable after the fact rather than only observable live.
+    AUDIT_FIREWALL,
 } audit_event_t;
 
 /**

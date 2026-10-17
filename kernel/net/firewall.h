@@ -96,6 +96,14 @@ extern int  fw_default_config_rs(fw_config_t *out);
 extern int  fw_parse_cfg_rs(const uint8_t *text, uint32_t len, fw_config_t *out);
 extern int  fw_format_cfg_rs(const fw_config_t *cfg, uint8_t *out, uint32_t max);
 extern int  fw_selftest_rs(void);
+// #kfirewall: would a NEW inbound TCP connection to `port` be admitted by the
+// policy in force? 1 = yes, 0 = the filter would drop the SYN. A PURE QUERY: no
+// conntrack entry is probed or created and no counter moves, so a service may
+// ask about its own port without the asking changing the answer. It speaks only
+// about NEW flows; an ESTABLISHED flow passes on the conntrack fast path without
+// consulting the rules, so 0 means "an unsolicited connection is dropped", never
+// "nothing can reach this port".
+extern int  fw_admits_in_tcp_rs(uint16_t port);
 
 // ---- net/firewall.c -------------------------------------------------------
 // Run the boot self-test, then load FW_CFG_PATH and install it. Called once

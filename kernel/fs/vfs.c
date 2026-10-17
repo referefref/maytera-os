@@ -340,17 +340,29 @@ void fd_close_all(void) {
     FDL_REL(p, fl);
 }
 
-// file_get() is a bare refcount increment with no release op behind it, so it
-// is the one thing that may run inside the lock.
-void fd_refcount_all_plus_plus(void) {
-    process_t *p = proc_current();
-    if (!p) return;
-    uint64_t fl = FDL_ACQ(p);
-    for (int i = 0; i < MAX_FDS; i++) {
-        if (p->fds[i]) file_get(p->fds[i]);
-    }
-    FDL_REL(p, fl);
-}
+// #heapdbl: fd_refcount_all_plus_plus() USED TO BE HERE AND IS DELETED. Read this
+// before writing it again, because it is the obvious-looking wrong fix for an fd
+// double free and it was sitting here with ZERO CALLERS while exactly that bug was
+// being investigated.
+//
+// WHAT IT WAS. A loop taking a reference on every slot of proc_current()'s fd
+// table. Nothing in the tree ever called it, in any commit.
+//
+// WHY IT CANNOT BE THE MISSING CALL. The two places that inherit descriptions
+// across a spawn (proc/syscall.c's stdio-inherit block in spawn_impl(), and
+// proc/process.c's fork/clone copy) both already take a reference per inherited
+// fd, and both must bump the PARENT's refcounts while writing the CHILD's table.
+// This function only ever operated on proc_current(), so it could not express
+// either one. Calling it would have added a THIRD reference nobody releases,
+// turning a double free into a permanent leak of the description and of whatever
+// it buffers - a quieter bug that kfree() would never have reported.
+//
+// AND THE DOUBLE FREE IT LOOKED LIKE THE CURE FOR WAS NOT AN fd BUG AT ALL. The
+// five `ra=0x511ff8` refusals in /root/co2600-fatapps-run.log are file_put()
+// inlined into fd_close_all(), and the file_t headers they name sit three to a
+// 4 KB page in two pages (0x10bcb000 and 0x10be4000), 192 bytes apart. They read
+// back as zero because something cleared those pages whole (#aicappersist), not
+// because anybody freed them twice. See blame.md and mm/heapzero.h.
 
 // ============================================================================
 // Phase A3: dup / dup2 / CLOEXEC

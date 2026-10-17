@@ -18,6 +18,7 @@
 #include "string.h"
 #include "stdio.h"
 #include "userconf.h"   // #745: <home>/APPS, the per-user application directory
+#include "notify.h"    // [deadbtn] toast when a launch fails; safe from any process
 
 #define WIN_W       560
 #define MAX_APPS    192
@@ -331,7 +332,12 @@ static int calc_height(void) {
 // "uses only existing syscalls") and is a separate binary from the
 // compositor, not linked against it.
 static int launcher_is_console_app(const char *path) {
-    static const char *const console_apps[] = { "myman", "rogue", "angband" };
+    // [deadbtn] Kept in step with compositor/desktop.c's desk_is_console_app()
+    // (this file's header explains why the two are deliberately separate
+    // copies rather than shared). PYTHON.ELF needs a pty for the same reason
+    // the other three do; see the measurement recorded at that call site.
+    static const char *const console_apps[] = { "myman", "rogue", "angband",
+                                                "python.elf", "python" };
     const char *base = path;
     for (const char *p = path; *p; p++) if (*p == '/') base = p + 1;
     for (unsigned i = 0; i < sizeof(console_apps) / sizeof(console_apps[0]); i++) {
@@ -351,14 +357,23 @@ static int launcher_is_console_app(const char *path) {
 static void launch_selected(void) {
     if (g_sel < 0 || g_sel >= g_match_count) return;
     app_entry_t *a = &g_apps[g_match[g_sel]];
+    int rc;
     if (launcher_is_console_app(a->path)) {
         char *av[2];
         av[0] = (char *)"/APPS/TERMINAL";
         av[1] = (char *)a->path;
-        sys_spawn_args("/APPS/TERMINAL", av, 2);
+        rc = sys_spawn_args("/APPS/TERMINAL", av, 2);
     } else {
-        sys_spawn(a->path);
+        rc = sys_spawn(a->path);
     }
+    // [deadbtn] This used to ignore rc entirely, and the process exits right
+    // below regardless, so a missing binary (e.g. Python on a public image
+    // with no PYTHON.ELF) left no trace anywhere: the palette window is gone
+    // before anyone could read a status line even if one existed. notify_post
+    // just writes a spool file, so it works fine even though we exit right
+    // after; the compositor picks it up on its own next poll.
+    if (rc < 0)
+        notify_post("Cannot open app", a->name, NOTIFY_ERROR);
     // Palette semantics: launch and get out of the way.
     win_destroy(g_win);
     sys_exit(0);

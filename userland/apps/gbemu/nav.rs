@@ -305,7 +305,13 @@ pub fn draw(buf: &mut [u32], nav: &Navigator) {
         let hint = b"PLACE .GB FILES IN /ROMS";
         let hw = font::text_width(hint, 1);
         font::draw_text(buf, 160, 144, (160 - hw) / 2, 84, hint, fg, 1);
-        let hint2 = b"<B> BACK";
+        // Deliberately NO "<B> BACK" line here. main.rs opens this navigator as the
+        // HOME SCREEN when the cartridge slot is empty and refuses to close it until
+        // a ROM is actually loaded, because closing it would leave a blank LCD with
+        // no visible way back. An on-screen hint for a button that is inert in the
+        // exact state that draws the hint is worse than no hint: it reads as a
+        // broken button rather than a deliberate one.
+        let hint2 = b"COPY ROMS WITH FILES";
         let hw2 = font::text_width(hint2, 1);
         font::draw_text(buf, 160, 144, (160 - hw2) / 2, 110, hint2, fg, 1);
         return;

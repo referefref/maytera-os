@@ -14,10 +14,27 @@
 #ifndef MAYTERA_VERSION_H
 #define MAYTERA_VERSION_H
 
-// Version format: MAJOR.MINOR.PATCH (e.g., 1.8.2)
+// Version format: MAJOR.MINOR.PATCH
+//
+// DO NOT HAND-EDIT THESE THREE. They are DERIVED from MAYTERA_BUILD_NUMBER by
+// build/version-derive.sh, which build/build-golden.sh runs at the same moment it
+// allocates the build number, and build/version-gate.sh FAILS THE BUILD if the triple
+// and the build number below ever disagree.
+//
+// OWNER RULE, 2026-10-01: "each 100 builds should constitute 0.0.N+1 and 1000 builds
+// 0.N+1.0 and 10000 builds N.0.0". So:
+//     patch = (build % 1000)  / 100
+//     minor = (build % 10000) / 1000
+//     major = 2 + build / 10000        (the 2 is MAJOR_BASE, see version-derive.sh)
+//
+// WHY IT IS DERIVED NOW. These were three hand-set literals while the build number
+// beside them was written automatically. Keeping them in step was a step a human had
+// to remember, so they drifted: at build 2520 the desktop still read v2.0.2, the
+// version it had carried for roughly two thousand builds. A number that stays correct
+// only while somebody remembers is already wrong, it has just not been read yet.
 #define MAYTERA_VERSION_MAJOR    2
-#define MAYTERA_VERSION_MINOR    0
-#define MAYTERA_VERSION_PATCH    2
+#define MAYTERA_VERSION_MINOR    2
+#define MAYTERA_VERSION_PATCH    5
 
 // Build number (increment for each build)
 // #418 iMac debug/test kernel: crash-dialog CR3 fix + /STAGE.TXT + /PANIC.TXT
@@ -453,7 +470,7 @@
 // I/O, inode/bitmap allocation and i_size stay in C. Live under
 // -DRUST_EXT2_DIRADD, C kept as ext2_dirblock_insert_c for one-line rollback.
 // Build numbers 944..951 were burned by the #446 FPU differential builds.
-#define MAYTERA_BUILD_NUMBER 2482   // #404 disk-mgr Stage 4b: VFS resolver + ext2 write-mount (aux mounts under /MNT). Golden number set by build-golden.sh.
+#define MAYTERA_BUILD_NUMBER 2584   // [binmigrate] a file deleted during first-boot setup follows the user into their account. Golden number set by build-golden.sh.
 
 // Version string helper macros
 #define STRINGIFY(x) STRINGIFY_HELPER(x)

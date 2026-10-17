@@ -25,6 +25,7 @@
 #include "term_layout.h"   // PHASE 1: tabs + splits
 #include "term_search.h"   // PHASE 1: find-in-scrollback
 #include "term_menu.h"     // PHASE 1: the menu bar
+#include "term_contract.h" // the terminal.* tool contract, PROJECTED
 
 // Window position for coordinate conversion
 static int win_x = 100;
@@ -149,14 +150,30 @@ int main(int argc, char **argv) {
     // #221: prime the find bar with the window's FULL content size before the
     // layout takes its share, so opening the bar can re-run the layout with
     // the strip subtracted without needing to ask the compositor again.
-    term_search_note_window(TERM_INIT_COLS * TERM_CHAR_W,
+    // (#745, angband) TERM_CONTENT_W, not TERM_INIT_COLS * TERM_CHAR_W: the
+    // window was sized to give the grid its full TERM_INIT_COLS columns WITH
+    // the scrollbar gutter (term_grid.h), so the content width primed here has
+    // to include that gutter too or the first frame is laid out 80 columns
+    // wide in a 78-column rectangle until the first EVENT_RESIZE corrects it.
+    // The HEIGHT deliberately still uses the LIVE term_content_y rather than
+    // TERM_CONTENT_H: the menu bar can be off (Settings > Show Menu Bar), and
+    // the reserve must not be charged for chrome that is not on screen.
+    term_search_note_window(TERM_CONTENT_W,
                             TERM_INIT_ROWS * TERM_CHAR_H + term_content_y);
-    term_layout_init(TERM_INIT_COLS * TERM_CHAR_W,
+    term_layout_init(TERM_CONTENT_W,
                      TERM_INIT_ROWS * TERM_CHAR_H + term_content_y
                          - term_search_reserved_h());
 
     // Initialize terminal
     term_clear();
+
+    // THIS PROCESS NOW HAS A WINDOW AND A GRID. Every CT_TF_LIVE_ONLY contract
+    // row's handler refuses until this is set, because those controls act on
+    // tabs, panes, the grid and the chrome, none of which exist in the
+    // windowless `--contract` process that returned at the top of main(). Set
+    // AFTER term_clear() so nothing can write into a grid that has not been
+    // initialised.
+    term_contract_note_live();
 
     // No startup banner. The "Type 'help' for available commands." line was
     // already removed at the owner's explicit request (docs/TERMINAL_PARITY.md);
@@ -263,6 +280,35 @@ int main(int argc, char **argv) {
             // work per call and no wait of any kind, so it adds nothing to
             // this branch's cost when no search is open (#426).
             if (term_search_tick()) term_layout_redraw_all();
+            // LIVE CONTRACT DELIVERY (contract.h's tier-2 wire). Almost every
+            // projected Terminal action is CT_TF_LIVE_ONLY - it acts on this
+            // window's tabs, panes, grid or chrome - and the modal Preferences
+            // row is REFUSED outright on the spawn path, so without this poll
+            // the whole projected surface would be describable and unreachable.
+            // contract_live_poll() is non-blocking, never spins, and runs the
+            // SAME engine and the SAME gate contract_cli() runs.
+            //
+            // THROTTLED to 200 ms, which this branch can do for free because it
+            // already exists for the gui_mods_next_event() timeout. The timeout
+            // drops to 10 ms while a pty child is running (term_layout_timeout_ms),
+            // so an unthrottled poll would attempt ~100 mailbox opens a second
+            // on a busy pane for no benefit; the client's own wait is 4 s.
+            {
+                static uint32_t ct_poll_ms = 0;
+                uint32_t now = (uint32_t)uptime_ms();
+                if (now - ct_poll_ms >= 200) {
+                    ct_poll_ms = now;
+                    if (contract_live_poll(&TERMINAL_CONTRACT)) term_layout_redraw_all();
+                }
+            }
+            // ONE place that notices "something asked this window to close" from
+            // outside the menu's own event path: File > Close Window sets this
+            // flag and term_menu_event() reports it, but builtin_exit() and a
+            // contract-delivered window.close / shell.exit have no event to
+            // report through. Checked on the idle branch, which every one of
+            // those reaches within a tick, so there is ONE close mechanism rather
+            // than one per caller.
+            if (term_menu_quit) { running = 0; continue; }
             continue;
         }
 

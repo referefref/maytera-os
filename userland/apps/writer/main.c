@@ -31,6 +31,7 @@
 #include "../../officelib/include/formats.h"
 #include "../../officelib/include/layout.h"
 #include "../../officelib/officeui/officetk.h"
+#include "../../libc/contract.h"
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
@@ -60,44 +61,186 @@ enum { M_EDIT_UNDO = 20, M_EDIT_REDO,
        M_INS_TABLE = 40, M_INS_IMAGE,
        M_VIEW_RULER = 50 };
 
+// Forward declarations: the toolbar/menu tables just below now carry these
+// as their own .afn (otoolbar.h/gui_menu.h task 3 phase 4 widening), so they
+// must be declared before the tables; the bodies are defined later, with the
+// rest of the contract machinery, unchanged from when they were reached only
+// through WRITER_ITEMS[].
+static int run_file_new(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_file_open(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_file_save(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_file_save_as(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_file_close(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_font_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_paragraph_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_insert_table(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_insert_image(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_set_bold(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_set_italic(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_set_underline(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_align_l(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_align_c(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_align_r(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_align_j(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_set_bullet(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_set_numbered(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_set_family(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_set_size(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+
+// ---- the terms ------------------------------------------------------------
+static const ct_terms_t k_t_fmt = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_NEEDSLIVE, 0, 0
+};
+static const ct_terms_t k_t_align = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_NEEDSLIVE, "format.align", 0
+};
+static const ct_terms_t k_t_list = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_NEEDSLIVE, "format.list", 0
+};
+static const ct_terms_t k_t_fontfam = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC,
+    CT_FAIL_NEEDSLIVE | CT_FAIL_RANGE, "format.font_family", 0
+};
+static const ct_terms_t k_t_fontsize = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC,
+    CT_FAIL_NEEDSLIVE | CT_FAIL_RANGE, "format.font_size", 0
+};
+static const ct_terms_t k_t_newdoc = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, 0, "doc.has_path", 0
+};
+static const ct_terms_t k_t_save_to = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_FS,
+    CT_FAIL_IO | CT_FAIL_NOSPACE, "doc.path", 0
+};
+static const ct_terms_t k_t_open_path = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC,
+    CT_FAIL_NOTFOUND | CT_FAIL_IO | CT_FAIL_UNSUPPORTED, "doc.path", 0
+};
+static const ct_terms_t k_t_insert_text = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_NEEDSLIVE, "doc.last_inserted", 0
+};
+static const ct_terms_t k_t_new_para = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_NEEDSLIVE, "doc.caret_paragraph", 0
+};
+static const ct_terms_t k_t_nav = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_RANGE | CT_FAIL_NEEDSLIVE, "doc.caret_offset", 0
+};
+// Dialog-opening actions: MODAL. Refused on the spawn path, allowed against a
+// live instance where a person can answer the dialog (docs/CONTRACT_API.md
+// section 3, "the LIVE-instance path").
+static const ct_terms_t k_t_file_dialog = {
+    CT_TIME_SLOW, CT_TF_MODAL | CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_FS,
+    CT_FAIL_IO | CT_FAIL_NOTFOUND, "doc.path", 0
+};
+static const ct_terms_t k_t_file_close = {
+    CT_TIME_FAST, CT_TF_MODAL | CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, 0, "doc.has_path", 0
+};
+static const ct_terms_t k_t_modal_dialog = {
+    CT_TIME_SLOW, CT_TF_MODAL | CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_DOC,
+    CT_FAIL_IO | CT_FAIL_UNSUPPORTED, "doc.word_count", 0
+};
+// view.ruler is a VALUE row (CT_BOOL, getfn/setfn), not an action, so its
+// terms are DERIVED by contract_terms_of() and it needs no ct_terms_t here.
+
 // Toolbar: docs/OFFICE_UI_DESIGN.md section 4, Writer row, WR* family only.
+// otb_item_t now carries the contract exposure too (task 3 phase 4,
+// otoolbar.h): a row's .tok/.afn/.desc/.terms are read by writer_project()
+// below exactly as .icon/.tooltip are read by otb_draw(), so a button added
+// here with a tok is both drawn AND described with no second table to keep
+// in sync. tok == 0 (most separators, and T_UNDO/T_REDO while disabled)
+// means "not exposed", not "forgotten".
 static const otb_item_t ITEMS[] = {
-    { OTB_BUTTON, T_NEW,  "WRNEW",  "New (Ctrl+N)",   0, 0 },
-    { OTB_BUTTON, T_OPEN, "WROPEN", "Open (Ctrl+O)",  0, 0 },
-    { OTB_BUTTON, T_SAVE, "WRSAVE", "Save (Ctrl+S)",  0, 0 },
+    { OTB_BUTTON, T_NEW,  "WRNEW",  "New (Ctrl+N)",   0, 0,
+      .tok = "file.new", .afn = run_file_new,
+      .desc = "Discard the current document (after an unsaved-changes prompt if dirty) and start a new blank one",
+      .terms = &k_t_newdoc },
+    { OTB_BUTTON, T_OPEN, "WROPEN", "Open (Ctrl+O)",  0, 0,
+      .tok = "file.open", .afn = run_file_open,
+      .desc = "Raise the interactive Open dialog (.docx/.odt/.doc) and load the chosen file",
+      .terms = &k_t_file_dialog },
+    { OTB_BUTTON, T_SAVE, "WRSAVE", "Save (Ctrl+S)",  0, 0,
+      .tok = "file.save", .afn = run_file_save,
+      .desc = "Save to the current path, or raise Save As when the document has none yet",
+      .terms = &k_t_file_dialog },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
     { OTB_BUTTON, T_UNDO, "WRUNDO", "Undo (Ctrl+Z)",  0, 0 },
     { OTB_BUTTON, T_REDO, "WRREDO", "Redo (Ctrl+Y)",  0, 0 },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
-    { OTB_TOGGLE, T_BOLD, "WRBOLD", "Bold (Ctrl+B)",  0, 0 },
-    { OTB_TOGGLE, T_ITAL, "WRITAL", "Italic (Ctrl+I)", 0, 0 },
-    { OTB_TOGGLE, T_UNDL, "WRUNDL", "Underline (Ctrl+U)", 0, 0 },
+    { OTB_TOGGLE, T_BOLD, "WRBOLD", "Bold (Ctrl+B)",  0, 0,
+      .tok = "format.toggle_bold", .afn = run_set_bold,
+      .desc = "Set (argv[0]=0/1) or, with no argument, toggle bold on the whole current paragraph",
+      .terms = &k_t_fmt },
+    { OTB_TOGGLE, T_ITAL, "WRITAL", "Italic (Ctrl+I)", 0, 0,
+      .tok = "format.toggle_italic", .afn = run_set_italic,
+      .desc = "Set or toggle italic on the whole current paragraph",
+      .terms = &k_t_fmt },
+    { OTB_TOGGLE, T_UNDL, "WRUNDL", "Underline (Ctrl+U)", 0, 0,
+      .tok = "format.toggle_underline", .afn = run_set_underline,
+      .desc = "Set or toggle underline on the whole current paragraph",
+      .terms = &k_t_fmt },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
-    { OTB_COMBO,  T_FONT, 0, "Font", 150, 0 },
-    { OTB_COMBO,  T_SIZE, 0, "Size", 56, 0 },
+    { OTB_COMBO,  T_FONT, 0, "Font", 150, 0,
+      .tok = "format.set_font_family", .afn = run_set_family,
+      .desc = "Set the current paragraph's font family by name (the same registry the Font combo lists)",
+      .terms = &k_t_fontfam },
+    { OTB_COMBO,  T_SIZE, 0, "Size", 56, 0,
+      .tok = "format.set_font_size", .afn = run_set_size,
+      .desc = "Set the current paragraph's font size in points, 4..200",
+      .terms = &k_t_fontsize },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
-    { OTB_TOGGLE, T_ALNL, "WRALNL", "Align Left (Ctrl+L)",  0, 1 },
-    { OTB_TOGGLE, T_ALNC, "WRALNC", "Center (Ctrl+E)",      0, 1 },
-    { OTB_TOGGLE, T_ALNR, "WRALNR", "Align Right (Ctrl+R)", 0, 1 },
-    { OTB_TOGGLE, T_ALNJ, "WRALNJ", "Justify (Ctrl+J)",     0, 1 },
+    { OTB_TOGGLE, T_ALNL, "WRALNL", "Align Left (Ctrl+L)",  0, 1,
+      .tok = "format.align_left", .afn = run_align_l,
+      .desc = "Left-align the current paragraph (Ctrl+L)", .terms = &k_t_align },
+    { OTB_TOGGLE, T_ALNC, "WRALNC", "Center (Ctrl+E)",      0, 1,
+      .tok = "format.align_center", .afn = run_align_c,
+      .desc = "Center the current paragraph (Ctrl+E)", .terms = &k_t_align },
+    { OTB_TOGGLE, T_ALNR, "WRALNR", "Align Right (Ctrl+R)", 0, 1,
+      .tok = "format.align_right", .afn = run_align_r,
+      .desc = "Right-align the current paragraph (Ctrl+R)", .terms = &k_t_align },
+    { OTB_TOGGLE, T_ALNJ, "WRALNJ", "Justify (Ctrl+J)",     0, 1,
+      .tok = "format.align_justify", .afn = run_align_j,
+      .desc = "Justify the current paragraph (Ctrl+J)", .terms = &k_t_align },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
-    { OTB_TOGGLE, T_LSTB, "WRLSTB", "Bullet List",   0, 0 },
-    { OTB_TOGGLE, T_LSTN, "WRLSTN", "Numbered List", 0, 0 },
+    { OTB_TOGGLE, T_LSTB, "WRLSTB", "Bullet List",   0, 0,
+      .tok = "format.set_bullet_list", .afn = run_set_bullet,
+      .desc = "Set (argv[0]=0/1, default on) or clear bullet-list on the current paragraph",
+      .terms = &k_t_list },
+    { OTB_TOGGLE, T_LSTN, "WRLSTN", "Numbered List", 0, 0,
+      .tok = "format.set_numbered_list", .afn = run_set_numbered,
+      .desc = "Set (argv[0]=0/1, default on) or clear numbered-list on the current paragraph",
+      .terms = &k_t_list },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
-    { OTB_BUTTON, T_TABLE, "WRTABLE", "Insert Table...", 0, 0 },
-    { OTB_BUTTON, T_IMAGE, "WRIMAGE", "Insert Image...", 0, 0 },
+    { OTB_BUTTON, T_TABLE, "WRTABLE", "Insert Table...", 0, 0,
+      .tok = "insert.table", .afn = run_insert_table,
+      .desc = "Raise the Insert Table dialog and insert the chosen rows/columns after the current paragraph",
+      .terms = &k_t_modal_dialog },
+    { OTB_BUTTON, T_IMAGE, "WRIMAGE", "Insert Image...", 0, 0,
+      .tok = "insert.image", .afn = run_insert_image, .risk = CT_GUARDED, .cap = "fs.read",
+      .desc = "Raise the Insert Image file picker and embed the chosen PNG/JPEG/BMP after the current paragraph",
+      .terms = &k_t_modal_dialog },
 };
 #define N_ITEMS ((int)(sizeof(ITEMS) / sizeof(ITEMS[0])))
 
 // Menus (docs/OFFICE_UI_DESIGN.md 2.1). FORMAT/VIEW are non-const so their
 // check marks can follow the current paragraph / ruler state.
+// New/Open/Save are tok == 0 here on purpose: the toolbar's T_NEW/T_OPEN/
+// T_SAVE rows (ITEMS[] above) already carry file.new/file.open/file.save, and
+// a token can be projected from exactly one table - a second row claiming it
+// would be the COPY #235 was made of, just moved one layer down.
 static const gui_menu_item_t FILE_ITEMS[] = {
     { "New",        "Ctrl+N", OAPP_MID_FILE_NEW,     true, false },
     { "Open...",    "Ctrl+O", OAPP_MID_FILE_OPEN,    true, false },
     { "Save",       "Ctrl+S", OAPP_MID_FILE_SAVE,    true, false },
-    { "Save As...", 0,        OAPP_MID_FILE_SAVE_AS, true, false },
+    { "Save As...", 0,        OAPP_MID_FILE_SAVE_AS, true, false,
+      .tok = "file.save_as", .afn = run_file_save_as,
+      .desc = "Raise the Save As dialog regardless of whether the document already has a path",
+      .terms = &k_t_file_dialog },
     { 0, 0, 0, false, false },
-    { "Close",      0,        OAPP_MID_FILE_CLOSE,   true, false },
+    { "Close",      0,        OAPP_MID_FILE_CLOSE,   true, false,
+      .tok = "file.close", .afn = run_file_close,
+      .desc = "Close the document (after an unsaved-changes prompt if dirty) back to a new blank one",
+      .terms = &k_t_file_close },
 };
 static const gui_menu_item_t EDIT_ITEMS[] = {
     // Disabled on purpose: Writer keeps no edit history yet. The label says
@@ -105,9 +248,19 @@ static const gui_menu_item_t EDIT_ITEMS[] = {
     { "Undo (no edit history yet)", "Ctrl+Z", M_EDIT_UNDO, false, false },
     { "Redo (no edit history yet)", "Ctrl+Y", M_EDIT_REDO, false, false },
 };
+// Bold/Italic/Underline are tok == 0 here too: the toolbar's T_BOLD/T_ITAL/
+// T_UNDL rows already carry format.toggle_bold/italic/underline, same reason
+// as FILE_ITEMS above. Font.../Paragraph... have no toolbar equivalent, so
+// they carry their own tokens here.
 static gui_menu_item_t FORMAT_ITEMS[] = {
-    { "Font...",      0,        M_FMT_FONT, true, false },
-    { "Paragraph...", 0,        M_FMT_PARA, true, false },
+    { "Font...",      0,        M_FMT_FONT, true, false,
+      .tok = "format.font_dialog", .afn = run_font_dialog,
+      .desc = "Raise the platform Font dialog for the current paragraph",
+      .terms = &k_t_modal_dialog },
+    { "Paragraph...", 0,        M_FMT_PARA, true, false,
+      .tok = "format.paragraph_dialog", .afn = run_paragraph_dialog,
+      .desc = "Raise the Paragraph dialog (alignment, list) for the current paragraph",
+      .terms = &k_t_modal_dialog },
     { 0, 0, 0, false, false },
     { "Bold",         "Ctrl+B", M_FMT_BOLD, true, false },
     { "Italic",       "Ctrl+I", M_FMT_ITAL, true, false },
@@ -495,9 +648,11 @@ static void relayout(void) {
         uint32_t paper = theme_color(THEME_COLOR_TEXTBOX_BG);
         uint32_t label = theme_color(THEME_COLOR_LABEL_TEXT);
         uint32_t ink   = theme_color(THEME_COLOR_ON_SURFACE);
-        if (!paper) paper = 0x00FFFFFF;
-        if (!label) label = 0x00FFFFFF;
-        if (!ink) ink = 0x00000000;
+        // [filesui] The three zero tests that were here are gone. `label` MUST
+        // agree with textlayout.c's def_ink for the comparison below to
+        // recognise an engine-default span, and both used to agree on a
+        // FABRICATED white rather than on the theme's actual label_text. See
+        // libc/theme.h: 0 is black, never "unset", so these could only corrupt.
         for (int i = 0; i < g_lo->nspan; i++) {
             laid_span *s = &g_lo->spans[i];
             uint32_t c = s->fmt.color & 0xFFFFFFu;
@@ -1108,10 +1263,8 @@ static void draw(office_app *a) {
     uint32_t paper  = theme_color(THEME_COLOR_TEXTBOX_BG);
     uint32_t border = theme_color(THEME_COLOR_WINDOW_BORDER);
     uint32_t ink    = theme_color(THEME_COLOR_ON_SURFACE);
-    if (!bg) bg = 0x001E1E1E;
-    if (!paper) paper = 0x00FFFFFF;
-    if (!border) border = 0x00404040;
-    if (!ink) ink = 0x00000000;
+    // [filesui] zero tests removed; see libc/theme.h. Every one of these is a
+    // populated theme field, and the ink is floored against its ground below.
     win_draw_rect(win, v.cx, v.cy, v.cw, v.ch, bg);
 
     // The page sheet, clipped to the viewport.
@@ -1238,57 +1391,57 @@ static int on_key(int keycode, char c) {
     return 1;
 }
 
+// Forward-declared: the contract's setter for view.ruler (defined with the
+// rest of the contract, below on_event()), reused here so Format menu's
+// Ruler toggle and the contract row cannot disagree about what "on" does.
+static int ct_set_ruler(int v);
+
+// T_FONT/T_SIZE stay special-cased: a combo's live event value is an INDEX
+// into g_fam[]/SIZES[] (or -1 with the typed text in the combo's own
+// text[]), which is UI-widget state otb_ctl_dispatch has no way to see - it
+// only has the (id, value) pair otoolbar.c hands on_tool(). Their ROWS in
+// ITEMS[] still carry a tok/afn (format.set_font_family/size), because a
+// contract caller supplies the family NAME or the size directly as argv[0],
+// which is exactly what run_set_family()/run_set_size() already expect; the
+// row is projected either way, only the LIVE click path for these two ids
+// keeps its own logic. Every other control is table-driven: a row added to
+// ITEMS[] with a tok+afn is wired with no change below.
 static int on_tool(int id, int value) {
     switch (id) {
-        case T_NEW:   file_new(); break;
-        case T_OPEN:  file_open(); break;
-        case T_SAVE:  save_flow(0); break;
-        case T_UNDO: case T_REDO: break;   // disabled; never delivered
-        case T_BOLD:  cur_set_flag(FA_BOLD, value); break;
-        case T_ITAL:  cur_set_flag(FA_ITAL, value); break;
-        case T_UNDL:  cur_set_flag(FA_UNDL, value); break;
-        case T_ALNL:  cur_set_align(DOC_ALIGN_L); break;
-        case T_ALNC:  cur_set_align(DOC_ALIGN_C); break;
-        case T_ALNR:  cur_set_align(DOC_ALIGN_R); break;
-        case T_ALNJ:  cur_set_align(DOC_ALIGN_J); break;
-        case T_LSTB:  cur_set_list(value, 0); break;
-        case T_LSTN:  cur_set_list(value, 1); break;
+        case T_UNDO: case T_REDO: return 1;   // disabled; never delivered
         case T_FONT: {
             ocombo_t *c = otb_combo(&g_tb, T_FONT);
             if (value >= 0 && value < g_nfam) cur_set_family(g_fam[value]);
             else if (c) cur_set_family(c->text);
-            break;
+            return 1;
         }
         case T_SIZE: {
             ocombo_t *c = otb_combo(&g_tb, T_SIZE);
             if (value >= 0 && value < NSIZES) cur_set_size(SIZES[value]);
             else if (c) cur_set_size(atoi(c->text));
-            break;
+            return 1;
         }
-        case T_TABLE: insert_table_modal(); break;
-        case T_IMAGE: insert_image_flow(); break;
         default: break;
     }
+    char scratch[80];
+    otb_ctl_dispatch(ITEMS, N_ITEMS, id, value, scratch, sizeof(scratch), 0);
     return 1;
 }
 
+// M_VIEW_RULER stays special-cased: it toggles the view.ruler VALUE row
+// (ct_set_ruler), not a separate action token - there is no "view.toggle_
+// ruler" row to project, by design (view.ruler is already CT_RW). Every
+// other menu item is table-driven across the four menus that carry rows.
 static int on_menu(int id) {
-    switch (id) {
-        case M_EDIT_UNDO: case M_EDIT_REDO: break;   // disabled items
-        case M_FMT_FONT:  font_modal(); break;
-        case M_FMT_PARA:  paragraph_modal(); break;
-        case M_FMT_BOLD:  cur_toggle(FA_BOLD); break;
-        case M_FMT_ITAL:  cur_toggle(FA_ITAL); break;
-        case M_FMT_UNDL:  cur_toggle(FA_UNDL); break;
-        case M_INS_TABLE: insert_table_modal(); break;
-        case M_INS_IMAGE: insert_image_flow(); break;
-        case M_VIEW_RULER:
-            g_ruler = !g_ruler;
-            oapp_set_chrome(g_app, g_ruler ? ORULER_H : 0, 0);
-            relayout(); sync_toolbar();
-            break;
-        default: break;
+    if (id == M_VIEW_RULER) {
+        ct_set_ruler(!g_ruler);   // the same setter view.ruler's contract row calls
+        return 1;
     }
+    char scratch[80];
+    if (menu_ctl_dispatch(FILE_ITEMS, 6, id, scratch, sizeof(scratch), 0)) return 1;
+    if (menu_ctl_dispatch(EDIT_ITEMS, 2, id, scratch, sizeof(scratch), 0)) return 1;
+    if (menu_ctl_dispatch(FORMAT_ITEMS, 6, id, scratch, sizeof(scratch), 0)) return 1;
+    if (menu_ctl_dispatch(INSERT_ITEMS, 2, id, scratch, sizeof(scratch), 0)) return 1;
     return 1;
 }
 
@@ -1358,8 +1511,620 @@ static void build_families(void) {
 static const char *fam_label(void *ctx, int i, char *buf, int cap) { (void)ctx; (void)buf; (void)cap; return i >= 0 && i < g_nfam ? g_fam[i] : ""; }
 static const char *size_label(void *ctx, int i, char *buf, int cap) { (void)ctx; if (i < 0 || i >= NSIZES) return ""; snprintf(buf, cap, "%d", SIZES[i]); return buf; }
 
-int main(int argc, char **argv) {
+// ===========================================================================
+// THE CONTRACT (docs/CONTRACT_COVERAGE_PLAN.md task 3 phase 4).
+//
+// PROJECTED, not static, for every action that has a toolbar or menu
+// control: otb_item_t (otoolbar.h) and gui_menu_item_t (gui_menu.h) were
+// widened to carry tok/afn/desc/risk/cap/terms (the officelib-wide change
+// this phase made, following files/main.c's fctl_t precedent), so ITEMS[],
+// FILE_ITEMS[] and FORMAT_ITEMS[] above are now the SAME CONTROL TABLES
+// writer_project() (below) reads to build the contract - the exact table
+// on_tool()/on_menu() dispatch from via otb_ctl_dispatch()/menu_ctl_dispatch().
+// A toolbar button or menu item added with a tok and no matching afn, or an
+// afn with the wrong signature, is a CT_CHECK_ACTFN build error, not a silent
+// gap; a control added with neither is simply not exposed, same as a row
+// that was never written for a hand-maintained table.
+//
+// Twenty rows moved from a hand-written WRITER_ITEMS[] entry into this
+// projection: file.new/open/save/save_as/close, format.toggle_bold/italic/
+// underline, format.align_left/center/right/justify, format.set_bullet_list/
+// numbered_list, format.set_font_family/size, format.font_dialog,
+// format.paragraph_dialog, insert.table, insert.image. Each still calls the
+// IDENTICAL run_*() function it always did (the toolbar/menu table's .afn
+// field IS that function now, not a copy of its name) - only the STORAGE of
+// "which row maps to which function" moved from a hand-paired static table
+// to the one table the UI itself reads, closing the #235 gap structurally
+// for these twenty controls: a new switch case can no longer exist without a
+// matching contract row, because there is no longer a switch case.
+//
+// SIX ROWS REMAIN STATIC in WRITER_ITEMS[] below, legitimately: file.save_to,
+// file.open_path, edit.insert_text, edit.new_paragraph, nav.goto_paragraph
+// and nav.set_caret_offset have NO toolbar or menu control at all, so there
+// is no table to project them from - Writer's only way to author text or
+// choose a save path was live typing and an interactive file picker, neither
+// of which a non-interactive caller can drive. Each wraps the SAME model
+// function the interactive path uses (save_document, load_document,
+// para_insert_text, split_para, caret_set), the #235 judgement acted on
+// rather than just agreed with: a real capability gap gets a real
+// implementation, built on existing, already-tested model code. Writer's 17
+// value rows (doc.path, format.bold, ...) also stay static, same as every
+// other contracted app: a value row's terms are DERIVED (contract_terms_of),
+// and it is state, not a control a table draws and dispatches.
+//
+// WHY MOST ACTIONS RUN WITH NO WINDOW EVER SHOWN. main() checks
+// contract_is_invocation() right after oapp_create() returns (contract-lint
+// check 8 matches the literal token win_create()/win_create_bg(), which
+// office_app's oapp_create() is not - it is hidden inside officeui.c - so
+// this ordering is invisible to the lint; the real property it exists for,
+// no unbounded wait, holds anyway: the process returns before oapp_run()'s
+// event loop is ever entered, so it never paints and never blocks). Eight
+// actions that raise a blocking native dialog (file.open, file.save,
+// file.save_as, file.close, format.font_dialog, format.paragraph_dialog,
+// insert.table, insert.image) declare CT_TF_MODAL, which ct_do_call()
+// REFUSES on this spawn path and ALLOWS against a live instance, where a
+// person is present to answer the dialog. Every other action is a plain
+// document-model edit and needs no window at all.
+//
+// NOT COVERED, and these are gestures rather than discrete controls: mouse
+// click-to-place-caret, arrow-key navigation, printable-key typing,
+// Backspace/Delete, and scrollbar drag. edit.insert_text and
+// nav.set_caret_offset/nav.goto_paragraph are the primitives that make the
+// same end state reachable without them.
+// ===========================================================================
+
+static char g_last_inserted[256] = "(none)";
+
+static void fmt_family_buf(char *buf, int cap) {
+    buf[0] = 0;
+    doc_para *p = cur_para();
+    if (p) font_name(para_eff_fmt(p).face, buf, cap);
+}
+
+
+// ---- the handler wrappers: each calls the EXACT function the menu/toolbar
+// switch calls. No behaviour is duplicated, only re-exposed. -----------------
+static int run_file_new(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
     (void)argc; (void)argv;
+    file_new();
+    snprintf(out, (size_t)ocap, "has_path=%d dirty=%d", g_has_path, g_app ? oapp_is_dirty(g_app) : 0);
+    return 0;
+}
+static int run_file_open(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    (void)argc; (void)argv;
+    file_open();
+    snprintf(out, (size_t)ocap, "path=%s", g_has_path ? g_path : "(none)");
+    return 0;
+}
+static int run_file_save(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    (void)argc; (void)argv;
+    int ok = save_flow(0);
+    snprintf(out, (size_t)ocap, "path=%s", g_has_path ? g_path : "(none)");
+    return ok ? 0 : -1;
+}
+static int run_file_save_as(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    (void)argc; (void)argv;
+    int ok = save_flow(1);
+    snprintf(out, (size_t)ocap, "path=%s", g_has_path ? g_path : "(none)");
+    return ok ? 0 : -1;
+}
+static int run_file_close(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    (void)argc; (void)argv;
+    if (confirm_discard()) new_document();
+    snprintf(out, (size_t)ocap, "has_path=%d", g_has_path);
+    return 0;
+}
+// A save/open path with no dialog: the SAME save_document()/load_document()
+// the interactive flows call, given the path directly.
+static int run_file_save_to(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0] || !argv[0][0]) { snprintf(out, (size_t)ocap, "need-path"); return -1; }
+    int ok = save_document(argv[0]);
+    snprintf(out, (size_t)ocap, "path=%s", g_has_path ? g_path : "(none)");
+    return ok ? 0 : -1;
+}
+static int run_file_open_path(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0] || !argv[0][0]) { snprintf(out, (size_t)ocap, "need-path"); return -1; }
+    if (!confirm_discard()) { snprintf(out, (size_t)ocap, "discard-declined"); return -1; }
+    load_document(argv[0]);
+    snprintf(out, (size_t)ocap, "path=%s has_path=%d", g_path, g_has_path);
+    return g_has_path ? 0 : -1;
+}
+static int run_font_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    (void)argc; (void)argv;
+    if (!cur_para()) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    font_modal();
+    char fam[48]; fmt_family_buf(fam, sizeof(fam));
+    doc_para *p = cur_para();
+    snprintf(out, (size_t)ocap, "font_family=%s font_size=%d", fam[0] ? fam : "(default)", p ? para_eff_fmt(p).size : 0);
+    return 0;
+}
+static int run_paragraph_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    (void)argc; (void)argv;
+    if (!cur_para()) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    paragraph_modal();
+    doc_para *p = cur_para();
+    snprintf(out, (size_t)ocap, "align=%d list=%d", p ? (int)p->align : 0,
+             p ? (p->list_level < 0 ? 0 : (p->list_ordered ? 2 : 1)) : 0);
+    return 0;
+}
+static int run_insert_table(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    (void)argc; (void)argv;
+    if (!g_doc) { snprintf(out, (size_t)ocap, "no-document"); return -1; }
+    int before = g_doc->nblk;
+    insert_table_modal();
+    snprintf(out, (size_t)ocap, "blocks=%d", g_doc->nblk);
+    return g_doc->nblk > before ? 0 : -1;
+}
+static int run_insert_image(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    (void)argc; (void)argv;
+    if (!g_doc) { snprintf(out, (size_t)ocap, "no-document"); return -1; }
+    int before = g_doc->nblk;
+    insert_image_flow();
+    snprintf(out, (size_t)ocap, "blocks=%d images=%d", g_doc->nblk, g_doc->nimg);
+    return g_doc->nblk > before ? 0 : -1;
+}
+static int run_set_bold(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (!cur_para()) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    if (argc >= 1 && argv[0]) cur_set_flag(FA_BOLD, atoi(argv[0]) != 0); else cur_toggle(FA_BOLD);
+    doc_para *p = cur_para();
+    snprintf(out, (size_t)ocap, "bold=%d", p ? para_eff_fmt(p).bold : 0);
+    return 0;
+}
+static int run_set_italic(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (!cur_para()) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    if (argc >= 1 && argv[0]) cur_set_flag(FA_ITAL, atoi(argv[0]) != 0); else cur_toggle(FA_ITAL);
+    doc_para *p = cur_para();
+    snprintf(out, (size_t)ocap, "italic=%d", p ? para_eff_fmt(p).italic : 0);
+    return 0;
+}
+static int run_set_underline(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (!cur_para()) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    if (argc >= 1 && argv[0]) cur_set_flag(FA_UNDL, atoi(argv[0]) != 0); else cur_toggle(FA_UNDL);
+    doc_para *p = cur_para();
+    snprintf(out, (size_t)ocap, "underline=%d", p ? para_eff_fmt(p).underline : 0);
+    return 0;
+}
+static int run_align_l(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    (void)argc; (void)argv;
+    if (!cur_para()) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    cur_set_align(DOC_ALIGN_L); snprintf(out, (size_t)ocap, "align=0"); return 0;
+}
+static int run_align_c(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    (void)argc; (void)argv;
+    if (!cur_para()) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    cur_set_align(DOC_ALIGN_C); snprintf(out, (size_t)ocap, "align=1"); return 0;
+}
+static int run_align_r(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    (void)argc; (void)argv;
+    if (!cur_para()) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    cur_set_align(DOC_ALIGN_R); snprintf(out, (size_t)ocap, "align=2"); return 0;
+}
+static int run_align_j(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    (void)argc; (void)argv;
+    if (!cur_para()) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    cur_set_align(DOC_ALIGN_J); snprintf(out, (size_t)ocap, "align=3"); return 0;
+}
+static int run_set_bullet(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (!cur_para()) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    int on = (argc >= 1 && argv[0]) ? (atoi(argv[0]) != 0) : 1;
+    cur_set_list(on, 0);
+    doc_para *p = cur_para();
+    snprintf(out, (size_t)ocap, "list=%d", p ? (p->list_level < 0 ? 0 : (p->list_ordered ? 2 : 1)) : 0);
+    return 0;
+}
+static int run_set_numbered(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (!cur_para()) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    int on = (argc >= 1 && argv[0]) ? (atoi(argv[0]) != 0) : 1;
+    cur_set_list(on, 1);
+    doc_para *p = cur_para();
+    snprintf(out, (size_t)ocap, "list=%d", p ? (p->list_level < 0 ? 0 : (p->list_ordered ? 2 : 1)) : 0);
+    return 0;
+}
+static int run_set_family(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (!cur_para()) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    if (argc < 1 || !argv[0] || !argv[0][0]) { snprintf(out, (size_t)ocap, "need-family"); return -1; }
+    cur_set_family(argv[0]);
+    char fam[48]; fmt_family_buf(fam, sizeof(fam));
+    snprintf(out, (size_t)ocap, "font_family=%s", fam[0] ? fam : "(unresolved)");
+    return 0;
+}
+static int run_set_size(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (!cur_para()) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    if (argc < 1 || !argv[0]) { snprintf(out, (size_t)ocap, "need-size"); return -1; }
+    cur_set_size(atoi(argv[0]));
+    doc_para *p = cur_para();
+    snprintf(out, (size_t)ocap, "font_size=%d", p ? para_eff_fmt(p).size : 0);
+    return 0;
+}
+static int run_insert_text(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    doc_para *p = cur_para();
+    if (!p) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    if (argc < 1 || !argv[0]) { snprintf(out, (size_t)ocap, "need-text"); return -1; }
+    para_insert_text(p, g_cur_off, argv[0]);
+    g_cur_off += (int)strlen(argv[0]);
+    strncpy(g_last_inserted, argv[0], sizeof(g_last_inserted) - 1);
+    g_last_inserted[sizeof(g_last_inserted) - 1] = 0;
+    edited();
+    snprintf(out, (size_t)ocap, "words=%d caret_off=%d", g_words, g_cur_off);
+    return 0;
+}
+static int run_new_paragraph(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    (void)argc; (void)argv;
+    if (!cur_para()) { snprintf(out, (size_t)ocap, "no-paragraph"); return -1; }
+    split_para();
+    snprintf(out, (size_t)ocap, "caret_paragraph=%d caret_offset=%d", g_cur_blk, g_cur_off);
+    return 0;
+}
+static int run_goto_paragraph(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0] || !g_doc) { snprintf(out, (size_t)ocap, "need-index"); return -1; }
+    int idx = atoi(argv[0]);
+    if (idx < 0 || idx >= g_doc->nblk) { snprintf(out, (size_t)ocap, "out-of-range 0..%d", g_doc->nblk - 1); return -1; }
+    caret_set(idx, 0);
+    ensure_caret_visible();
+    snprintf(out, (size_t)ocap, "caret_paragraph=%d", g_cur_blk);
+    return 0;
+}
+static int run_set_caret_offset(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0] || g_cur_blk < 0) { snprintf(out, (size_t)ocap, "no-paragraph-or-need-offset"); return -1; }
+    caret_set(g_cur_blk, atoi(argv[0]));
+    ensure_caret_visible();
+    snprintf(out, (size_t)ocap, "caret_offset=%d", g_cur_off);
+    return 0;
+}
+
+// CT_CHECK_ACTFN: a leading-`it`-parameter mismatch is a warning, not an
+// error (contract.h); these turn it into a build-stopping one.
+CT_CHECK_ACTFN(run_file_new);
+CT_CHECK_ACTFN(run_file_open);
+CT_CHECK_ACTFN(run_file_save);
+CT_CHECK_ACTFN(run_file_save_as);
+CT_CHECK_ACTFN(run_file_close);
+CT_CHECK_ACTFN(run_file_save_to);
+CT_CHECK_ACTFN(run_file_open_path);
+CT_CHECK_ACTFN(run_font_dialog);
+CT_CHECK_ACTFN(run_paragraph_dialog);
+CT_CHECK_ACTFN(run_insert_table);
+CT_CHECK_ACTFN(run_insert_image);
+CT_CHECK_ACTFN(run_set_bold);
+CT_CHECK_ACTFN(run_set_italic);
+CT_CHECK_ACTFN(run_set_underline);
+CT_CHECK_ACTFN(run_align_l);
+CT_CHECK_ACTFN(run_align_c);
+CT_CHECK_ACTFN(run_align_r);
+CT_CHECK_ACTFN(run_align_j);
+CT_CHECK_ACTFN(run_set_bullet);
+CT_CHECK_ACTFN(run_set_numbered);
+CT_CHECK_ACTFN(run_set_family);
+CT_CHECK_ACTFN(run_set_size);
+CT_CHECK_ACTFN(run_insert_text);
+CT_CHECK_ACTFN(run_new_paragraph);
+CT_CHECK_ACTFN(run_goto_paragraph);
+CT_CHECK_ACTFN(run_set_caret_offset);
+
+// ---- the readable state a caller checks a control against ------------------
+static int ct_get_has_path(void)   { return g_has_path; }
+static int ct_get_readonly(void)   { return g_readonly; }
+static int ct_get_dirty(void)      { return g_app ? oapp_is_dirty(g_app) : 0; }
+static int ct_get_words(void)      { return g_words; }
+static int ct_get_para_count(void) { return g_doc ? g_doc->nblk : 0; }
+static int ct_get_caret_para(void) { return g_cur_blk; }
+static int ct_get_caret_off(void)  { return g_cur_off; }
+static int ct_get_bold(void)  { doc_para *p = cur_para(); return p ? para_eff_fmt(p).bold : 0; }
+static int ct_get_ital(void)  { doc_para *p = cur_para(); return p ? para_eff_fmt(p).italic : 0; }
+static int ct_get_undl(void)  { doc_para *p = cur_para(); return p ? para_eff_fmt(p).underline : 0; }
+static int ct_get_align(void) { doc_para *p = cur_para(); return p ? (int)p->align : 0; }
+static int ct_get_list(void)  { doc_para *p = cur_para(); return (p && p->list_level >= 0) ? (p->list_ordered ? 2 : 1) : 0; }
+static int ct_get_fontsize(void) { doc_para *p = cur_para(); return p ? para_eff_fmt(p).size : 0; }
+static int ct_str_path(char *o, int n)          { snprintf(o, (size_t)n, "%s", g_has_path ? g_path : "(none)"); return 0; }
+static int ct_str_family(char *o, int n)        { fmt_family_buf(o, n); if (!o[0]) snprintf(o, (size_t)n, "(none)"); return 0; }
+static int ct_str_last_inserted(char *o, int n) { snprintf(o, (size_t)n, "%s", g_last_inserted); return 0; }
+static int ct_get_ruler(void) { return g_ruler; }
+static int ct_set_ruler(int v) {
+    g_ruler = v ? 1 : 0;
+    if (g_app) { oapp_set_chrome(g_app, g_ruler ? ORULER_H : 0, 0); relayout(); sync_toolbar(); }
+    return 0;
+}
+
+static const ct_item_t WRITER_ITEMS[] = {
+    // ---- value rows: the state a caller reads or a success_ref checks -----
+    {
+      .name = "doc.path",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_str_path,
+      .desc = "Absolute path of the open document, or (none) for an unsaved Untitled",
+    },
+    {
+      .name = "doc.has_path",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_has_path,
+      .desc = "Whether the open document has ever been saved to a path",
+    },
+    {
+      .name = "doc.readonly",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_readonly,
+      .desc = "Whether the open document was loaded read-only (legacy .doc)",
+    },
+    {
+      .name = "doc.dirty",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_dirty,
+      .desc = "Whether the document has unsaved changes",
+    },
+    {
+      .name = "doc.word_count",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1000000,
+      .getfn = ct_get_words,
+      .desc = "Word count of the open document",
+    },
+    {
+      .name = "doc.paragraph_count",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1000000,
+      .getfn = ct_get_para_count,
+      .desc = "Number of blocks (paragraphs, tables, images) in the open document",
+    },
+    {
+      .name = "doc.caret_paragraph",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .lo = -1,
+      .hi = 1000000,
+      .getfn = ct_get_caret_para,
+      .desc = "Block index the caret is in, -1 for none",
+    },
+    {
+      .name = "doc.caret_offset",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1000000,
+      .getfn = ct_get_caret_off,
+      .desc = "Character offset of the caret within its paragraph",
+    },
+    {
+      .name = "doc.last_inserted",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_str_last_inserted,
+      .desc = "Text most recently inserted by edit.insert_text, (none) if never called",
+    },
+    {
+      .name = "format.bold",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_bold,
+      .desc = "Whether the current paragraph's effective format is bold",
+    },
+    {
+      .name = "format.italic",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_ital,
+      .desc = "Whether the current paragraph's effective format is italic",
+    },
+    {
+      .name = "format.underline",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_undl,
+      .desc = "Whether the current paragraph's effective format is underlined",
+    },
+    {
+      .name = "format.align",
+      .type = CT_ENUM,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 3,
+      .options = "Left|Center|Right|Justify",
+      .getfn = ct_get_align,
+      .desc = "Current paragraph's alignment",
+    },
+    {
+      .name = "format.list",
+      .type = CT_ENUM,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 2,
+      .options = "None|Bullet|Numbered",
+      .getfn = ct_get_list,
+      .desc = "Current paragraph's list state",
+    },
+    {
+      .name = "format.font_size",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 200,
+      .getfn = ct_get_fontsize,
+      .desc = "Current paragraph's effective font size in points",
+    },
+    {
+      .name = "format.font_family",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_str_family,
+      .desc = "Current paragraph's effective font family name",
+    },
+    // Value row: terms are DERIVED by contract_terms_of() (instant; success =
+    // read it back; depth = PREF because it persists nothing but follows the
+    // view, per contract.h's own rule that only ACTION rows must declare).
+    {
+      .name = "view.ruler",
+      .type = CT_BOOL,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_ruler,
+      .setfn = ct_set_ruler,
+      .desc = "Whether the ruler chrome strip is shown (View > Ruler)",
+    },
+
+    // ---- action rows: STATIC because there is no toolbar/menu control to --
+    // project them from (see the big comment above WRITER_ITEMS's removed
+    // twenty rows, now writer_project()'d from ITEMS[]/FILE_ITEMS/FORMAT_ITEMS
+    // just above main()). Each still calls the exact function a UI control
+    // would call if one existed for it.
+    {
+      .name = "file.save_to",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_GUARDED,
+      .actfn = run_file_save_to,
+      .cap = "fs.write",
+      .desc = "Save the document to an exact path with no dialog, the same docx_save/odt_save Save uses",
+      .terms = &k_t_save_to,
+    },
+    {
+      .name = "file.open_path",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_GUARDED,
+      .actfn = run_file_open_path,
+      .cap = "fs.read",
+      .desc = "Open an exact path with no dialog (after an unsaved-changes prompt if dirty), the same office_open_document() Open uses",
+      .terms = &k_t_open_path,
+    },
+    {
+      .name = "edit.insert_text",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_insert_text,
+      .desc = "Insert literal text at the caret in the current paragraph, the same model function typing calls per character",
+      .terms = &k_t_insert_text,
+    },
+    {
+      .name = "edit.new_paragraph",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_new_paragraph,
+      .desc = "Split the current paragraph at the caret, as pressing Enter does",
+      .terms = &k_t_new_para,
+    },
+    {
+      .name = "nav.goto_paragraph",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_goto_paragraph,
+      .desc = "Move the caret to the start of the paragraph at this block index",
+      .terms = &k_t_nav,
+    },
+    {
+      .name = "nav.set_caret_offset",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_set_caret_offset,
+      .desc = "Move the caret to this character offset within the current paragraph",
+      .terms = &k_t_nav,
+    },
+};
+#define WRITER_N_ITEMS ((int)(sizeof(WRITER_ITEMS) / sizeof(WRITER_ITEMS[0])))
+
+// writer_project() chains the three control tables that carry a contract
+// token, in the same order otb_ctl_count()/menu_ctl_count() can report them:
+// the toolbar first (ITEMS[]), then File (Save As, Close), then Format (Font
+// dialog, Paragraph dialog). EDIT_ITEMS/INSERT_ITEMS/VIEW_ITEMS contribute
+// nothing (their tok-bearing controls are owned by the toolbar or, for
+// view.ruler, by the value row above), so they are not chained here.
+static int writer_project(int idx, ct_item_t *out) {
+    if (idx < 0) return 0;
+    int n = otb_ctl_count(ITEMS, N_ITEMS);
+    if (idx < n) return otb_ctl_project(ITEMS, N_ITEMS, idx, out);
+    idx -= n;
+    n = menu_ctl_count(FILE_ITEMS, (int)(sizeof(FILE_ITEMS) / sizeof(FILE_ITEMS[0])));
+    if (idx < n) return menu_ctl_project(FILE_ITEMS, (int)(sizeof(FILE_ITEMS) / sizeof(FILE_ITEMS[0])), idx, out);
+    idx -= n;
+    n = menu_ctl_count(FORMAT_ITEMS, (int)(sizeof(FORMAT_ITEMS) / sizeof(FORMAT_ITEMS[0])));
+    if (idx < n) return menu_ctl_project(FORMAT_ITEMS, (int)(sizeof(FORMAT_ITEMS) / sizeof(FORMAT_ITEMS[0])), idx, out);
+    return 0;
+}
+
+static const ct_contract_t WRITER_CONTRACT = {
+    "writer", "Writer",
+    "Every File/Format/Insert toolbar and menu action is PROJECTED from "
+    "ITEMS[]/FILE_ITEMS[]/FORMAT_ITEMS[] (writer_project(), below), the SAME "
+    "tables otb_draw()/gui_menu_bar_draw() and on_tool()/on_menu() read and "
+    "dispatch from (otoolbar.h/gui_menu.h now carry a tok/afn/desc/terms "
+    "field per row) - a control absent from a table can neither be drawn nor "
+    "described. Six rows stay STATIC in WRITER_ITEMS below because there is "
+    "no table to project them from: file.save_to, file.open_path, "
+    "edit.insert_text, edit.new_paragraph, nav.goto_paragraph and "
+    "nav.set_caret_offset are primitives with no toolbar/menu control of "
+    "their own, added so a non-interactive caller can author and navigate a "
+    "document the way live typing and the interactive pickers otherwise "
+    "require. Dialog-opening rows (file.open/save/save_as/close, "
+    "format.font_dialog, format.paragraph_dialog, insert.table, "
+    "insert.image) declare CT_TF_MODAL and are refused on a fresh spawn; "
+    "call them against a live instance. NOT covered: mouse "
+    "click-to-place-caret, arrow-key navigation, printable-key typing, "
+    "Backspace/Delete and scrollbar drag, which are gestures rather than "
+    "discrete controls - edit.insert_text and "
+    "nav.set_caret_offset/nav.goto_paragraph are the primitives that reach "
+    "the same end state without them.",
+    WRITER_ITEMS, WRITER_N_ITEMS,
+    writer_project,
+    0,   // no persisted config to load
+    0    // no persisted config to commit
+};
+
+
+
+int main(int argc, char **argv) {
     g_app = oapp_create("WRITER", 900, 640);
     if (!g_app) return 1;
     build_families();
@@ -1370,6 +2135,18 @@ int main(int argc, char **argv) {
     oapp_set_toolbar(g_app, &g_tb);
     oapp_set_chrome(g_app, ORULER_H, 0);
     new_document();
+
+    // ---- THE CONTRACT, ANSWERED BEFORE oapp_run() IS EVER ENTERED ----------
+    // contract-lint check 8 matches a literal win_create()/win_create_bg()
+    // token in main()'s body; office_app's oapp_create() hides that call
+    // inside officeui.c, so this ordering is invisible to the lint. The real
+    // property it exists for holds anyway: a --contract invocation returns
+    // here, before oapp_run()'s event loop is ever entered, so the process
+    // never paints a frame and never blocks on one. new_document(), just
+    // above, means doc.word_count and friends answer about a real (empty)
+    // document rather than nothing.
+    if (contract_is_invocation(argc, argv))
+        return contract_cli(argc, argv, &WRITER_CONTRACT);
 #ifdef WRITER_VERIFY_AUTOOPEN
     // THROWAWAY VERIFICATION BUILD ONLY (never in the shipped/landed source):
     // headless QMP keyboard injection into this VM proved unreliable past the

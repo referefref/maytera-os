@@ -1,6 +1,6 @@
 diff -Nur a/src/main-gcu.c b/src/main-gcu.c
---- a/src/main-gcu.c	2025-12-16 05:27:20.000000000 +0000
-+++ b/src/main-gcu.c	2026-09-07 10:12:56.141828781 +0000
+--- a/src/main-gcu.c	2026-09-28 13:51:40.505228279 +0000
++++ b/src/main-gcu.c	2026-09-28 13:51:40.515264562 +0000
 @@ -51,6 +51,8 @@
  
  #undef term
@@ -12,8 +12,8 @@ diff -Nur a/src/main-gcu.c b/src/main-gcu.c
   */
 diff -Nur a/src/mayteraos-curses-compat.c b/src/mayteraos-curses-compat.c
 --- a/src/mayteraos-curses-compat.c	1970-01-01 00:00:00.000000000 +0000
-+++ b/src/mayteraos-curses-compat.c	2026-09-07 10:12:56.133282631 +0000
-@@ -0,0 +1,37 @@
++++ b/src/mayteraos-curses-compat.c	2026-09-28 13:51:40.518527197 +0000
+@@ -0,0 +1,117 @@
 +/* mayteraos-curses-compat.c - see mayteraos-curses-compat.h for why this
 + * exists. MayteraOS #745 Tier 3 #15 (userland/ports/angband).
 + * SPDX-License-Identifier: MIT
@@ -23,18 +23,100 @@ diff -Nur a/src/mayteraos-curses-compat.c b/src/mayteraos-curses-compat.c
 + * n < 0) starting at (y, x) in win, exactly like real ncursesw's version, but
 + * implemented on top of the NARROW waddch() our libncurses.a actually has.
 + *
-+ * Every code point 0x20-0xFF is passed straight through as a single-byte
-+ * chtype: the terminal side (userland/apps/terminal/term_pty.c +
-+ * term_parse.c) is what turns bytes into glyphs, and Angband's GCU frontend
-+ * with no tile graphics only ever asks for plain ASCII/Latin-1 dungeon
-+ * symbols this way, never a multi-byte code point that needs UTF-8 encoding
-+ * on the wire. A code point above 0xFF (only reachable if a user hand-edits
-+ * a .prf file to reference one) is drawn as '?' rather than silently
-+ * corrupting the display or mis-encoding: an honest lossy fallback, not a
-+ * crash and not a lie about what got drawn.
++ * THE FIRST VERSION OF THIS FILE ASSERTED A FALSE PREMISE, AND THE MAP PAID
++ * FOR IT. It said "every code point 0x20-0xFF is passed straight through as a
++ * single-byte chtype" and that the GCU frontend "only ever asks for plain
++ * ASCII/Latin-1 dungeon symbols ... never a multi-byte code point". Both
++ * halves are wrong; the comment is why nobody looked. MEASURED, in order:
++ *
++ *   1. Angband DOES ask for a code point above 0x7F, on most cells of the map.
++ *      lib/customize/font-gcu.prf is loaded because ANGBAND_SYS is "gcu" (see
++ *      lib/customize/font.prf's `?:[EQU $SYS gcu]` guard) and contains exactly
++ *      one line, `feat:open floor:*:0x01:0xb7`, which remaps OPEN FLOOR to
++ *      U+00B7 MIDDLE DOT. Open floor is most of a dungeon level, so this is
++ *      not an edge case reachable only by hand-editing a .prf.
++ *   2. A truncated chtype of 0xB7 is not "passed straight through" by narrow
++ *      ncurses at all. waddch_nosync() (ncurses/base/lib_addch.c) forwards a
++ *      character to waddch_literal() only if it carries A_ALTCHARSET, or
++ *      unctrl() renders it as a single character, or isprint() accepts it.
++ *      unctrl_table[183] is "M-7", and MayteraOS libc's isprint() is
++ *      `c >= 0x20 && c < 0x7f`, so 0xB7 fell through to the unctrl expansion
++ *      and every floor tile was drawn as the THREE cells M, -, 7.
++ *   3. UTF-8 encoding the code point here (0xC2 0xB7) does not fix it, which
++ *      is worth writing down because it is the obvious next guess. Narrow
++ *      ncurses accounts ONE CELL PER BYTE in its own grid, so two bytes per
++ *      glyph would double every map row's cell usage and desynchronise its
++ *      optimised screen updates from the real terminal; and 0xC2 is exactly as
++ *      unprintable as 0xB7, so it would unctrl to "M-B" in its turn.
++ *
++ * WHAT THIS DOES INSTEAD. The code points that can reach here are drawn
++ * through the terminal's DEC SPECIAL GRAPHICS set, which is one byte, one
++ * cell, and already correct end to end:
++ *   - userland/ports/ncurses/terminfo/maytera.terminfo declares an IDENTITY
++ *     acsc with smacs=\E(0 / rmacs=\E(B, so ncurses' acs_map[c] is
++ *     A_ALTCHARSET|c for every listed c and the byte goes out unchanged
++ *     between charset shifts.
++ *   - A_ALTCHARSET is the FIRST test in waddch_nosync(), so the character
++ *     reaches waddch_literal() as exactly ONE cell, with Angband's colour
++ *     still merged in by _nc_render().
++ *   - userland/apps/terminal/term_parse.c (#745) maps DEC graphics bytes
++ *     0x5F-0x7E to Unicode at print time, and the last entry of its table is
++ *     0x7E -> U+00B7. The floor dot therefore arrives as U+00B7 and is
++ *     rasterised by the TrueType renderer like any other code point.
++ * dec_gfx[] below is the exact reverse of that table, so this file and the
++ * emulator cannot drift apart about what a DEC graphics byte means. A code
++ * point with no DEC graphics equivalent is still drawn as '?': an honest lossy
++ * fallback in ONE cell, rather than three cells of meta-notation that shift
++ * the rest of the row.
 + */
 +#include "mayteraos-curses-compat.h"
 +#include <curses.h>
++
++/* The exact reverse of k_dec_graphics[] in userland/apps/terminal/
++ * term_parse.c: the Unicode code point each DEC special-graphics byte renders
++ * as. 0x5F (which that table maps to U+0020) is deliberately absent, because
++ * a space is plain ASCII and takes the fast path in compat_wc_to_chtype(). */
++static const struct { unsigned long cp; unsigned char acs; } dec_gfx[] = {
++	{ 0x25C6, 0x60 }, { 0x2592, 0x61 }, { 0x2409, 0x62 }, { 0x240C, 0x63 },
++	{ 0x240D, 0x64 }, { 0x240A, 0x65 }, { 0x00B0, 0x66 }, { 0x00B1, 0x67 },
++	{ 0x2424, 0x68 }, { 0x240B, 0x69 }, { 0x2518, 0x6A }, { 0x2510, 0x6B },
++	{ 0x250C, 0x6C }, { 0x2514, 0x6D }, { 0x253C, 0x6E }, { 0x23BA, 0x6F },
++	{ 0x23BB, 0x70 }, { 0x2500, 0x71 }, { 0x23BC, 0x72 }, { 0x23BD, 0x73 },
++	{ 0x251C, 0x74 }, { 0x2524, 0x75 }, { 0x2534, 0x76 }, { 0x252C, 0x77 },
++	{ 0x2502, 0x78 }, { 0x2264, 0x79 }, { 0x2265, 0x7A }, { 0x03C0, 0x7B },
++	{ 0x2260, 0x7C }, { 0x00A3, 0x7D }, { 0x00B7, 0x7E },
++};
++
++/* One wide character -> one chtype that narrow ncurses draws in exactly ONE
++ * cell. Every return path below satisfies the A_ALTCHARSET-or-isprint test in
++ * waddch_nosync(), which is the whole point: a cell count that matches the
++ * glyph count is what keeps ncurses' screen model and the real terminal in
++ * agreement. */
++static chtype compat_wc_to_chtype(wchar_t wc)
++{
++	unsigned long cp = (unsigned long)wc;
++	unsigned int i;
++
++	/* Printable ASCII: isprint() accepts it, no charset shift needed. The
++	 * overwhelming majority of Angband's glyphs land here. */
++	if (cp >= 0x20 && cp < 0x7F)
++		return (chtype)cp;
++
++	for (i = 0; i < sizeof(dec_gfx) / sizeof(dec_gfx[0]); i++) {
++		if (dec_gfx[i].cp == cp) {
++			chtype m = NCURSES_ACS(dec_gfx[i].acs);
++			/* acs_map is zero for a byte the terminal's acsc does
++			 * not list. Ours lists every one of them, but do not
++			 * ASSUME the terminfo entry: a zero chtype would draw
++			 * a NUL, not a glyph. */
++			if (m != 0)
++				return m;
++			break;
++		}
++	}
++
++	return (chtype)'?';
++}
 +
 +int mvwaddnwstr(WINDOW *win, int y, int x, const wchar_t *wstr, int n)
 +{
@@ -43,18 +125,16 @@ diff -Nur a/src/mayteraos-curses-compat.c b/src/mayteraos-curses-compat.c
 +	if (wmove(win, y, x) == ERR) return ERR;
 +
 +	for (count = 0; wstr[count] != L'\0' && (n < 0 || count < n); count++) {
-+		wchar_t wc = wstr[count];
-+		chtype ch = (wc <= 0xFF) ? (chtype)wc : (chtype)'?';
-+
-+		if (waddch(win, ch) == ERR) return ERR;
++		if (waddch(win, compat_wc_to_chtype(wstr[count])) == ERR)
++			return ERR;
 +	}
 +
 +	return OK;
 +}
 diff -Nur a/src/mayteraos-curses-compat.h b/src/mayteraos-curses-compat.h
 --- a/src/mayteraos-curses-compat.h	1970-01-01 00:00:00.000000000 +0000
-+++ b/src/mayteraos-curses-compat.h	2026-09-07 10:12:56.132367750 +0000
-@@ -0,0 +1,40 @@
++++ b/src/mayteraos-curses-compat.h	2026-09-28 13:51:40.519462254 +0000
+@@ -0,0 +1,47 @@
 +/* mayteraos-curses-compat.h - narrow-curses stand-in for the ncursesw entry
 + * point Angband's GCU frontend hard-requires.  MayteraOS #745 Tier 3 #15
 + * (userland/ports/angband).
@@ -69,9 +149,16 @@ diff -Nur a/src/mayteraos-curses-compat.h b/src/mayteraos-curses-compat.h
 + * userland/ports/ncurses is deliberately built --disable-widec (see that
 + * port's build.sh: "the emulator and this milestone are 8-bit/UTF-8-
 + * passthrough"), and rebuilding a second, wide copy of ncurses for one
-+ * caller is a disproportionate answer to what Angband actually needs here:
-+ * every glyph the GCU frontend draws in the shipped configuration (no tile
-+ * graphics, no USE_GRAPHICS) is a plain code point under 256.
++ * caller is a disproportionate answer to what Angband actually needs here.
++ *
++ * WHAT ANGBAND ACTUALLY NEEDS, MEASURED.  This header used to claim that
++ * "every glyph the GCU frontend draws in the shipped configuration ... is a
++ * plain code point under 256", which is true of the NUMBER and useless as a
++ * guide to the WIRE: lib/customize/font-gcu.prf remaps open floor to U+00B7
++ * MIDDLE DOT, and a lone 0xB7 is neither printable ASCII nor valid UTF-8.
++ * The .c file carries the full measurement and the answer (the terminal's DEC
++ * special-graphics set, one byte and one cell per glyph); read it before
++ * changing either side.
 + *
 + * ONE COPY, ON PURPOSE, per docs/MPORTS.md's "added files" precedent
 + * (userland/ports/musl-regex/patches/0004, gnuregex.h/gnu_compat.c): this is

@@ -465,6 +465,31 @@ void damage_add(int x, int y, int w, int h)
     g_damage_n = 1;
 }
 
+// #idleclock: drop every damage rect that lies ENTIRELY inside the given
+// rectangle. Used by the main loop to discard desktop-widget damage that sits
+// completely behind an opaque window: those pixels cannot be seen, and
+// presenting one is not free. render_frame_chrome() would then have to ask the
+// kernel for a window composite (compositor_render_windows() redraws EVERY
+// window's FULL bounds regardless of the clip set here), once per second,
+// forever, to show nothing. Rects that are only PARTLY covered are kept,
+// because the uncovered part is real and the composite is then correct work.
+// Order matters at the call site: call this straight after the collector whose
+// rects are to be filtered, and before any collector whose rects must survive.
+void damage_drop_inside(int x, int y, int w, int h)
+{
+    if (w <= 0 || h <= 0) return;
+    int keep = 0;
+    for (int i = 0; i < g_damage_n; i++) {
+        damage_rect_t *r = &g_damage[i];
+        int covered = (r->x >= x && r->y >= y &&
+                       r->x + r->w <= x + w && r->y + r->h <= y + h);
+        if (covered) continue;
+        if (keep != i) g_damage[keep] = *r;
+        keep++;
+    }
+    g_damage_n = keep;
+}
+
 void draw_putpixel(int32_t x, int32_t y, uint32_t color)
 {
     if (x < 0 || y < 0 || x >= g_fb_width || y >= g_fb_height)

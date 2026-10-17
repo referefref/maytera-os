@@ -153,7 +153,15 @@ pub extern "C" fn rk_fs_perm_info(path: *const u8, smb_or_nfs: i32, out: *mut Fs
             o.has_perm_entry = 1;
             o.uid = uid;
             o.gid = gid;
-            o.mode = mode & 0o777;
+            // #prewrite: 0o7777, NOT 0o777. The high digit carries setuid,
+            // setgid and STICKY. Masking it off here would hide the sticky bit
+            // from every Ring-3 caller of SYS_FS_PERM_INFO, and a Properties
+            // dialog that reads a mode and writes it back would then silently
+            // CLEAR the bit that is the whole security property of /SHARED.
+            // fs/perms.c already round-trips four octal digits through
+            // /CONFIG/PERMS.DB (format_octal emits (mode >> 9) & 7), so this
+            // mask was the only place the bit was being lost.
+            o.mode = mode & 0o7777;
         } else {
             // Mirrors perms_check()'s own default (root:root, 0755/0644) so a
             // Properties dialog shows the SAME permissions that would actually

@@ -214,9 +214,48 @@ int contract_invoke(const char *app, int argc, char **argv, char *out, int ocap)
         if (n <= 0) break;
         used += (int)n;
     }
+    // A TRUNCATED REPLY MUST NOT LOOK LIKE A COMPLETE ONE. The loop above stops
+    // when the caller's buffer is full and then returns the app's exit status,
+    // which for a successful `describe` is 0 - so a caller that asked for 61 rows
+    // and got the first 13 received a well-formed prefix, exit 0, and NO WAY TO
+    // TELL. Every row before the cut is complete, so it does not even look odd;
+    // it looks like a smaller contract.
+    //
+    // This is the whole-output twin of the per-LINE truncation already recorded
+    // in blame.md ("a truncated machine-readable line still parses, which is why
+    // it is the worst failure"), and it is the one that gets WORSE as task 3
+    // succeeds: Settings went 41 -> 61 rows in one change and Terminal 8 -> 92,
+    // and `ctl`'s describe buffer was 4096 bytes against a ~18 KB answer.
+    //
+    // So: one more read. If anything is left, the answer was cut, and we say so
+    // in the reply's own machine-readable vocabulary AND fail the call. A caller
+    // that wants the whole thing enlarges its buffer; none of them gets to
+    // silently believe a prefix.
+    int truncated = 0;
+    {
+        char probe;
+        if (read(fd, &probe, 1) > 0) truncated = 1;
+    }
     close(fd);
     unlink(cap);
     if (ocap > 0) out[used < ocap ? used : ocap - 1] = 0;
+
+    if (truncated) {
+        // Overwrite the tail rather than appending past it: the last row is
+        // already half-written, and leaving a half-row in front of the marker
+        // would be one more thing a parser could mistake for data.
+        const char *m = "\nerr code=failed detail=reply-truncated "
+                        "cap-bytes-exceeded reply-was-cut\n";
+        int ml = (int)strlen(m);
+        if (ocap > ml + 1) {
+            int at = used;
+            if (at > ocap - 1 - ml) at = ocap - 1 - ml;
+            // step back to a line boundary so no partial row survives
+            while (at > 0 && out[at - 1] != '\n') at--;
+            strlcpy(out + at, m + 1, (size_t)(ocap - at));
+        }
+        return CT_ERR_FAILED;
+    }
 
     // The app's exit status IS the answer's code. We do not reinterpret its
     // text: a caller that paraphrased would be a second description of the

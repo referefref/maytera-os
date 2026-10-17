@@ -1119,183 +1119,20 @@ do_ok:
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Tool contract (#241/#233): "you can drive settings through the new
-// contract API" per the ticket. Static rows (the app's control surface -
-// theme/font/size - is not one shared draw/hit table the way Calculator's
-// buttons are), gated by tools/contract-lint (repo-guard check 15) only in
-// the sense that every NEW control here has a row; contract-lint's
-// structural checks today are scoped to settings.c/calc.c, so this is the
-// terminal's OWN honest, if not yet structurally-enforced, contract.
+// The terminal.* tool contract MOVED to term_contract.c.
 //
-// theme/font_family are CT_ENUM over a FIXED list (the 14 shipped themes;
-// the six fonts known to ship in /FONTS, three monospace + three not, so a
-// headless caller can prove BOTH "a real font changed the render" and "a
-// proportional choice does not crash it"). A user-installed App Store theme
-// or font is reachable only via the dialog above, not via this contract -
-// documented, not silently unsupported.
+// It used to end this file: eight hand-written static rows, with a comment
+// admitting that contract-lint's structural checks were "scoped to
+// settings.c/calc.c, so this is the terminal's OWN honest, if not yet
+// structurally-enforced, contract". It is enforced now, and the surface it
+// describes is no longer eight preferences - it is every shell builtin, every
+// menu-bar command, the live colour-scheme/profile/bookmark lists, the profile
+// store's edit operations and the nine TERMNOTI.CFG keys - so it is a module in
+// its own right rather than a tail on the preferences file. The appearance
+// getters/setters and the commit hook moved with it verbatim; term_prefs_save(),
+// term_prefs_load() and term_prefs_poll_reload() above are unchanged and are
+// what that contract's load/commit hooks still call.
+//
+// See term_contract.h for the "project, do not hand-write rows" rule and the
+// live guard; term_contract.c for TERMINAL_CONTRACT itself.
 // ---------------------------------------------------------------------------
-#define TERM_CT_THEME_OPTS \
-    "dark|light|retro_unix|classic|ocean|sunset|forest|high_contrast|" \
-    "modern_light|modern_dark|fluent_light|fluent_dark|maytera_light|maytera_dark"
-static const char *const TERM_CT_THEME_SLUGS[14] = {
-    "dark","light","retro_unix","classic","ocean","sunset","forest","high_contrast",
-    "modern_light","modern_dark","fluent_light","fluent_dark","maytera_light","maytera_dark"
-};
-#define TERM_CT_FONT_OPTS \
-    "DejaVu Sans Mono|Inconsolata|IBM Plex Mono|Source Code Pro|DejaVu Sans|Lato"
-static const char *const TERM_CT_FONT_FAMILIES[6] = {
-    "DejaVu Sans Mono", "Inconsolata", "IBM Plex Mono", "Source Code Pro",
-    "DejaVu Sans", "Lato"
-};
-
-static int ct_term_theme_get(void) {
-    for (int i = 0; i < 14; i++)
-        if (strcmp(TERM_CT_THEME_SLUGS[i], g_term_theme_slug) == 0) return i;
-    return 0;
-}
-static int ct_term_theme_set(int v) {
-    if (v < 0 || v >= 14) return -1;
-    strncpy(g_term_theme_slug, TERM_CT_THEME_SLUGS[v], GUI_THEME_SLUG_MAX - 1);
-    g_term_theme_slug[GUI_THEME_SLUG_MAX - 1] = 0;
-    term_resolve_theme();
-    return 0;
-}
-static int ct_term_font_get(void) {
-    for (int i = 0; i < 6; i++)
-        if (strcmp(TERM_CT_FONT_FAMILIES[i], g_term_font.family) == 0) return i;
-    return -1;
-}
-static int ct_term_font_set(int v) {
-    if (v < 0 || v >= 6) return -1;
-    strncpy(g_term_font.family, TERM_CT_FONT_FAMILIES[v], GUI_FONT_NAME_MAX - 1);
-    strncpy(g_term_font.style, "Regular", GUI_FONT_STYLE_MAX - 1);
-    gui_font_resolve(g_term_font.family, g_term_font.style,
-                     &g_term_font.face, &g_term_font.style_bits);
-    term_apply_font();
-    return 0;
-}
-
-// Tier 2 (docs/TERMINAL_PARITY.md): the seven shipped colour schemes plus
-// "system" (Follow system theme, the default). This list is a curated FIXED
-// set for headless contract testing, same reasoning as TERM_CT_THEME_OPTS/
-// TERM_CT_FONT_OPTS above; the F9 dialog reaches every /PALETTES/*.tpalette
-// file via gui_palette_list(), including any an App Store package adds.
-#define TERM_CT_PALETTE_OPTS \
-    "system|classic|homebrew|solarized_dark|solarized_light|tango|campbell|novel"
-static const char *const TERM_CT_PALETTE_SLUGS[8] = {
-    "system", "classic", "homebrew", "solarized_dark", "solarized_light",
-    "tango", "campbell", "novel"
-};
-static int ct_term_palette_get(void) {
-    for (int i = 0; i < 8; i++)
-        if (strcmp(TERM_CT_PALETTE_SLUGS[i], g_term_palette_slug) == 0) return i;
-    return 0;
-}
-static int ct_term_palette_set(int v) {
-    if (v < 0 || v >= 8) return -1;
-    strncpy(g_term_palette_slug, TERM_CT_PALETTE_SLUGS[v], GUI_PALETTE_SLUG_MAX - 1);
-    g_term_palette_slug[GUI_PALETTE_SLUG_MAX - 1] = 0;
-    term_resolve_palette();
-    return 0;
-}
-
-// Profiles added three more real controls to this app's surface, so they get
-// contract rows too. This is not decoration: it is what lets the persistence
-// claim be VERIFIED headlessly (set, reboot, get) instead of asserted from
-// reading the save code, which is exactly how #132's drag-then-reboot check
-// came to be skipped.
-#define TERM_CT_CURSOR_OPTS "block|underline|bar"
-static int ct_term_cursor_get(void) { return g_term_cursor_shape; }
-static int ct_term_cursor_set(int v) {
-    if (v < 0 || v >= TERM_CURSOR_SHAPE_COUNT) return -1;
-    g_term_cursor_shape = v;
-    return 0;
-}
-static int ct_term_sb_get(void) { return sb_want; }
-static int ct_term_sb_set(int v) {
-    if (v < 200 || v > 20000) return -1;
-    term_scrollback_set_capacity(v);
-    return 0;
-}
-// Read-only: switching profile is a GUI action with a preview attached, and a
-// headless caller that wants a profile's settings can set them individually.
-// Reporting WHICH profile is live is what a test actually needs.
-static int ct_term_profile_get(char *out, int ocap) {
-    const char *n = (g_term_profile_active >= 0 && g_term_profile_active < g_term_profile_count)
-                    ? g_term_profiles[g_term_profile_active].name : "";
-    int i = 0;
-    while (n[i] && i < ocap - 1) { out[i] = n[i]; i++; }
-    out[i] = 0;
-    return 0;
-}
-
-static const ct_item_t TERMINAL_ITEMS[] = {
-    { "theme", CT_ENUM, CT_RW, CT_SAFE, 0, 0, 13, TERM_CT_THEME_OPTS,
-      0, ct_term_theme_get, ct_term_theme_set, 0, 0, 0, 0,
-      "WINDOW THEME (chrome), independent of the OS system theme (default: dark). "
-      "This is NOT the terminal's ANSI colour scheme - see colour_scheme below." },
-    { "colour_scheme", CT_ENUM, CT_RW, CT_SAFE, 0, 0, 7, TERM_CT_PALETTE_OPTS,
-      0, ct_term_palette_get, ct_term_palette_set, 0, 0, 0, 0,
-      "COLOUR SCHEME: the 16 ANSI colours + default fg/bg/cursor/selection "
-      "(Solarized/Tango/Campbell/...), in the Terminal.app/Konsole sense. "
-      "'system' (default) follows the theme item above instead of a named scheme." },
-    { "font_family", CT_ENUM, CT_RW, CT_SAFE, 0, 0, 5, TERM_CT_FONT_OPTS,
-      0, ct_term_font_get, ct_term_font_set, 0, 0, 0, 0,
-      "Terminal font family (cell width/height re-derived from its metrics)" },
-    { "font_size", CT_INT, CT_RW, CT_SAFE, 0, 8, 32, 0,
-      &g_term_font.size, 0, 0, 0, 0, 0, 0,
-      "Terminal font point size, 8-32" },
-    { "cursor_shape", CT_ENUM, CT_RW, CT_SAFE, 0, 0, 2, TERM_CT_CURSOR_OPTS,
-      0, ct_term_cursor_get, ct_term_cursor_set, 0, 0, 0, 0,
-      "Cursor shape drawn in the cell grid: full block, baseline underline, or "
-      "left-edge bar. Default underline, which is what it always was." },
-    { "cursor_blink", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
-      &g_term_cursor_blink, 0, 0, 0, 0, 0, 0,
-      "1 = the cursor blinks (~500ms), 0 = solid. The renderer honours this, "
-      "so turning it off cannot desync from the event loop's blink counter." },
-    { "scrollback", CT_INT, CT_RW, CT_SAFE, 0, 200, 20000, 0,
-      0, ct_term_sb_get, ct_term_sb_set, 0, 0, 0, 0,
-      "Retained scrollback lines. The ring is reallocated (newest lines kept) "
-      "at the next redraw; the dialog offers 500/1000/2000/5000/10000." },
-    { "profile", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
-      0, 0, 0, 0, ct_term_profile_get, 0, 0,
-      "Name of the PROFILE this terminal is running. Profiles are the source "
-      "of truth; /CONFIG/TERMPREF.CFG is a mirror of the live state." },
-};
-
-// After a var-backed write (font_size) contract.c does not know to recompute
-// metrics or persist; after a getfn/setfn write the setter already updated
-// live state but did not persist either. commit() is the ONE place both
-// paths funnel through (contract.c calls it after every successful set/call
-// - see libc/contract.c ct_do_set()), so it is the single spot that always
-// re-derives cell metrics and saves, regardless of which row changed.
-static void term_contract_commit(void) {
-    term_apply_font();
-    // Profiles are the source of truth (term_profile.h), so a contract write
-    // has to land THERE as well as in the mirror, or `terminal --contract set
-    // colour_scheme=tango` would be undone by the next launch reading the
-    // default profile back. capture() copies only the live APPEARANCE fields,
-    // leaving the profile's name, starting directory and command alone.
-    if (g_term_profile_active >= 0 && g_term_profile_active < g_term_profile_count) {
-        term_profile_capture(&g_term_profiles[g_term_profile_active]);
-        term_profiles_save();
-    }
-    term_prefs_save();
-}
-
-const ct_contract_t TERMINAL_CONTRACT = {
-    "terminal", "Terminal",
-    "theme (window chrome) and colour_scheme (the 16 ANSI colours) are TWO "
-    "DIFFERENT THINGS, both independent of the OS system theme; theme "
-    "defaults to Dark, colour_scheme defaults to 'system' (follow theme "
-    "above). font_family is a curated 6-name list (3 monospace, 3 not) for "
-    "headless testing - the GUI preferences dialog (F9) reaches the full "
-    "installed theme/colour-scheme/font sets via gui_theme_list()/"
-    "gui_palette_list()/gui_font_dialog(). Every row here belongs to a named "
-    "PROFILE (/CONFIG/TERMPROF.CFG); a write lands in the active profile as "
-    "well as in the live mirror, so it survives a reboot.",
-    TERMINAL_ITEMS, (int)(sizeof(TERMINAL_ITEMS) / sizeof(TERMINAL_ITEMS[0])),
-    0,                    // no projection: three rows, not a drawn button table
-    term_prefs_load,      // load: read TERMPREF.CFG before answering get/set
-    term_contract_commit  // commit: re-derive metrics + persist after a set
-};

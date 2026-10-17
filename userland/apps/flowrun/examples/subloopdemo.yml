@@ -1,4 +1,8 @@
 name: subloopdemo
+# The Library catalog in /APPS/FLOW shows this line. It is part of the
+# additive optional schema: flow.c skips unknown top-level keys, so the
+# runner ignores it.
+description: "Async sub-loop in await mode writing its body result"
 # An ASYNC SUB-LOOP. AWAIT mode runs the sub-body to completion, then fires the
 # `joined` output and continues (fully real). Running `/APPS/FLOWRUN subloopdemo`
 # writes exactly "sub-body result" to /HOME/SUBLOOPOUT.TXT.

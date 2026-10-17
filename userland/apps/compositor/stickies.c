@@ -9,7 +9,25 @@
 // tray menu. "New Sticky Note" is added to the desktop right-click menu.
 //
 // Persistence: all notes (text + position + size + color index) are written to
-// /CONFIG/STICKIES.DAT, one note per line:  "<x> <y> <w> <h> <color>|<text>".
+// <home>/CONFIG/STICKIES.DAT, one note per line: "<x> <y> <w> <h> <color>|<text>".
+//
+// #peruserpath: that path used to be the LITERAL "/CONFIG/STICKIES.DAT", which
+// is root:root, with a "/STICKIES.DAT" fallback at the equally root-owned ext2
+// root. Two consequences, both of them silent:
+//
+//   * a non-root session could not save a note AT ALL. stickies_save_failed()
+//     did fire and did notify, so unlike the rest of this bug family the user
+//     was told something; what they were told was unfixable, because no amount
+//     of retrying earns a uid-1000 process write access to /CONFIG.
+//   * and if it HAD worked, every account would share ONE note file, so your
+//     notes would be on your colleague's desktop. A per-user path is the
+//     correctness fix as much as the permission fix.
+//
+// Root's home is "/", so userhome_open_*("CONFIG", ...) resolves to exactly
+// "/CONFIG/STICKIES.DAT" for a root session: byte for byte the old path. Both
+// legacy locations are still READ, so an upgrade keeps your notes; only the
+// WRITE moves. A note is a preference, not an authorization, so unlike the AI
+// grant store (libc/aicap.c) a legacy read here carries no escalation.
 // The loader is robust to a missing or garbage file (it simply ends up with no
 // notes). Text never contains a newline (Enter inserts a literal-space wrap
 // hint is avoided; Enter just commits/keeps editing with a soft break char).
@@ -20,6 +38,7 @@
 #include "../../libc/syscall.h"
 #include "../../libc/stdio.h"    // #742: printf, the disk-independent report channel
 #include "../../libc/notify.h"   // #742: notify_post (best effort, needs the disk)
+#include "../../libc/userconf.h"  // #peruserpath: userhome_open_read/_write
 
 #define STICKY_MAX     24
 // #uiscale: scaled at the definition.
@@ -116,8 +135,12 @@ static void stickies_save(void) {
     // file FIRST and then open it, so a failure to re-create destroyed every
     // saved note and lost the edit in the same breath. O_TRUNC has no window in
     // which the old file is already gone and the new one does not exist.
-    int fd = sys_open("/CONFIG/STICKIES.DAT", 0x241);
-    if (fd < 0) fd = sys_open("/STICKIES.DAT", 0x241);  // fall back to FAT root
+    // #peruserpath: the session user's own home. For root this IS
+    // /CONFIG/STICKIES.DAT. The two legacy literals remain as a last resort for
+    // a root session on a machine whose home lookup fails; for a non-root
+    // session they were never writable and adding nothing is what they add.
+    int fd = userhome_open_write("CONFIG", "STICKIES.DAT");
+    if (fd < 0) fd = sys_open("/STICKIES.DAT", 0x241);  // last resort: FAT root
     if (fd < 0) { stickies_save_failed("open", fd); return; }
     static char out[STICKY_MAX * (STICKY_TEXTMAX + 48)];
     int o = 0;
@@ -160,7 +183,9 @@ static void stickies_save(void) {
 
 void stickies_load(void) {
     for (int i = 0; i < STICKY_MAX; i++) g_st[i].used = 0;
-    int fd = sys_open("/CONFIG/STICKIES.DAT", 0);
+    // #peruserpath: this user's notes first, then both pre-#peruserpath
+    // locations, so an existing install keeps the notes it already has.
+    int fd = userhome_open_read("CONFIG", "STICKIES.DAT", "/CONFIG/STICKIES.DAT");
     if (fd < 0) fd = sys_open("/STICKIES.DAT", 0);
     if (fd < 0) return;
     static char buf[STICKY_MAX * (STICKY_TEXTMAX + 48)];

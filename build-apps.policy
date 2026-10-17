@@ -1,0 +1,48 @@
+# build-apps.policy  -  WHICH APPS ARE ALLOWED TO FAIL TO BUILD  (#pubfailhard)
+#
+# Read the "failure policy" comment in build.sh first. Short version: until
+# 2026-10-02 an app that failed to compile printed a warning, was added to a
+# list, and the build exited 0. A public MayteraOS image shipped that day
+# without AI Chat and without Maytera Flow, and the build reported success.
+#
+# ONE LINE PER APP DIRECTORY UNDER userland/apps/ WHOSE BUILD FAILURE IS
+# TOLERATED. TAB-separated:
+#
+#     <app-directory-name>  <CLASS>  <reason>
+#
+# CLASSES
+#   TESTONLY  A harness or proof-of-life app. It is never installed on an
+#             image, so a user never loses anything when it does not build.
+#             Listed anyway, because the build must not be left to guess which
+#             names look like tests.
+#   DEBT      It SHOULD build and does not. A reason is REQUIRED and is printed
+#             on every build, so the debt stays visible instead of becoming a
+#             silent skip.
+#
+# WHAT FAILS THE BUILD
+#   - an app that fails and is not listed here;
+#   - a line with no written reason, or an unknown CLASS;
+#   - a line naming a directory that does not exist (STALE);
+#   - a DEBT line for an app that BUILT this time (STALE: the debt is paid, so
+#     delete the line rather than keep apologising for it).
+#
+# THAT LAST RULE IS DEBT-ONLY, AND THE DISTINCTION IS PRINCIPLED RATHER THAN A
+# CONVENIENCE. A DEBT line is a PREDICTION that the app fails, so the app
+# building again makes the line false and it must go. A TESTONLY line is a
+# statement that the app SHIPS NOWHERE, which stays true whether or not it
+# happens to compile today, so compiling does not falsify it. What does falsify
+# it is the directory disappearing, and that IS enforced above.
+#
+# The internal build has had this discipline since #667, in
+# build/userland-expected-fail.allow, which is its own list for the golden
+# image. The two files cannot be one file (the published tree does not carry
+# build/) and they are not asking quite the same question: internally a tolerated
+# failure means the image ships whatever the static asset base holds under that
+# name, while here there is no asset base, so a tolerated failure means the app
+# is simply ABSENT. Keep them in step by hand and expect both to be short.
+#
+# This file is meant to SHRINK. Every line in it is either dead weight in the
+# tree or a feature that does not exist.
+
+ipc_test	TESTONLY	A two-process IPC proof-of-life harness. Not installed on any image; nothing in the Start menu, the first-boot wizard or any app's spawn path refers to it.
+browser	DEBT	Does not build in a clean public tree. userland/apps/browser/Makefile defaults MAYTERA_NS_ROOT and MAYTERA_DUK_ROOT to out-of-tree paths that exist only on the internal build host; the publish scrubber rewrites them to a placeholder, and gcc is then handed an -I directory that does not exist. The consequence is visible to users: the Internet category of the Start menu loses its first entry. Fix it at source by vendoring or by making those roots a declared, checkable prerequisite.

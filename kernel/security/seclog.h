@@ -39,12 +39,12 @@ void seclog_report_bad_user_ptr(unsigned int pid, const char *detail);
 // succeeded.
 void seclog_report_elevation(unsigned int pid, const char *detail);
 
-// #745: the same narrow-producer pattern for the AI prompt-injection screen, so
-// proc/syscall.c needs no security.h include (it already includes this header
-// for seclog_report_bad_user_ptr) and the audit ordinal stays in exactly one
-// place. Every refused and every flagged LLM request goes through here, so
-// /CONFIG/SECURITY.LOG carries the ACTOR pid and the rule for each one.
-void seclog_report_ai_injection(unsigned int pid, const char *detail);
+// seclog_report_ai_injection() WAS DECLARED HERE AND IS DELETED (2026-09-29).
+// It had had zero callers since #469m aititleinject removed the Nova keyword
+// screen that was its only producer. See security.c at the point of deletion for
+// why it was deleted rather than re-wired, and for what was deliberately kept
+// (the AUDIT_AI_INJECTION ordinal, so historical log lines still decode).
+// Do not re-add a declaration here without a caller landing in the same commit.
 
 // #fdguard: the same narrow-producer pattern for cross-process I/O boundary
 // refusals, so proc/fdlayer.c and drivers/pty.c need no security.h include
@@ -57,5 +57,15 @@ void seclog_report_io_boundary(unsigned int pid, const char *detail);
 // Stage 1 capability API: narrow producer for capability grants, refusals and
 // revocations, so proc/caps.c needs no security.h include. See security.c.
 void seclog_report_capability(unsigned int pid, const char *detail);
+
+// #prewrite: removals/replacements in an all-users (sticky) directory. Same
+// narrow-producer pattern; see security.c for why the ALLOW is reported and
+// not only the refusal.
+void seclog_report_fs_remove(unsigned int pid, const char *detail);
+
+// #kfirewall: the packet filter's policy changed (installed via SYS_NET_FW, or
+// loaded/reloaded from /CONFIG/FWRULES.CFG). Same narrow-producer pattern; see
+// security.c for why a successful change is reported and not only a refusal.
+void seclog_report_firewall(unsigned int pid, const char *detail);
 
 #endif // SECLOG_H

@@ -12,6 +12,8 @@
 #include "../fs/cfgread.h"     // #192: is this read outcome worth a log line?
 #include "../crypto/crypto.h"
 #include "../crypto/csprng.h"
+#include "../crypto/pbkdf2.h"   // #secretuse: the SHARED KDF, promoted out of this file
+#include "secretuse.h"          // #secretuse: seckey_on_authenticate()
 
 // #499 SECURITY: lockout timing runs on the SHARED MONOTONIC clock
 // (sched_now_ms(), cpu/mono.h), never on the tick counter.
@@ -36,17 +38,12 @@
 // made user_verify_password() static in #745.
 static int set_password_hashed(const char *username, const char *password);
 
-// PBKDF2-HMAC-SHA256 work factor (#566). Chosen to land ~150-250ms per attempt
-// on the iMac14,4 soft-float target (measured ~0.0016ms/iter on the the build host/kvm64
-// build+VM host => ~80ms there; the real target is ~2.5-3x slower). SHA-256 is
-// pure integer math so the -mno-sse soft-float kernel target does not penalize
-// it. This is UX-bounded and sits below OWASP's 600k desktop guidance on
-// purpose: the constrained target cannot afford 600k (~1s) per login. The
-// random per-account salt, 0600 root-only SHADOW, and rate-limit/lockout below
-// are the compensating controls. Retune if the login feels sluggish on real hw.
-#define PBKDF2_ITERATIONS 50000u
-#define PBKDF2_SALT_LEN   16
-#define PBKDF2_DK_LEN     32
+// #secretuse: PBKDF2_ITERATIONS / PBKDF2_SALT_LEN / PBKDF2_DK_LEN and the work
+// factor's justification now live in crypto/pbkdf2.h, with the function, because
+// the encrypted secret store derives its key from the same password and a second
+// copy of a work factor is a work factor that drifts. Included at the top of this
+// file. The rate-limit and escalating lockout below are still the compensating
+// controls that header refers to.
 
 // External filesystem
 extern fat_fs_t g_fat_fs;
@@ -162,29 +159,25 @@ static int ct_streq(const char *a, const char *b) {
     return diff == 0;
 }
 
-// PBKDF2-HMAC-SHA256 with dkLen == hLen == 32 (a single output block, so no
-// block-index loop is needed). RFC 8018.
-static void pbkdf2_hmac_sha256(const uint8_t *pw, size_t pwlen,
-                               const uint8_t *salt, size_t saltlen,
-                               uint32_t iters, uint8_t out[PBKDF2_DK_LEN]) {
-    uint8_t U[32], T[32];
-    // U1 = HMAC(pw, salt || INT_BE32(1))
-    hmac_sha256_ctx_t ctx;
-    hmac_sha256_init(&ctx, pw, pwlen);
-    hmac_sha256_update(&ctx, salt, saltlen);
-    const uint8_t blk_idx[4] = { 0, 0, 0, 1 };
-    hmac_sha256_update(&ctx, blk_idx, 4);
-    hmac_sha256_final(&ctx, U);
-    memcpy(T, U, 32);
-    for (uint32_t i = 1; i < iters; i++) {
-        // U_c = HMAC(pw, U_{c-1})
-        hmac_sha256(pw, pwlen, U, 32, U);
-        for (int j = 0; j < 32; j++) T[j] ^= U[j];
-    }
-    memcpy(out, T, 32);
-    crypto_zero(U, sizeof(U));
-    crypto_zero(T, sizeof(T));
-}
+// #secretuse: pbkdf2_hmac_sha256() USED TO BE DEFINED HERE, file-static, and it
+// now lives in crypto/pbkdf2.c because the encrypted secret store derives its key
+// from the same login password and the alternative was a second PBKDF2.
+//
+// IT IS STILL INSIDE THIS MARKED REGION'S TEST COVERAGE, and that took work
+// rather than luck. crypto/pbkdf2_shadow_kat.sh extracts this region VERBATIM, so
+// moving code out of it would have silently stopped testing that code: the region
+// would still compile, the oracle would still print PASS, and the promoted
+// function would be covered by nothing. The oracle therefore now (a) also
+// compiles crypto/pbkdf2.c, (b) REFUSES to run if this region has re-defined the
+// function locally, and (c) carries a third build, -DPBKDF2_CORE_FAULT, that
+// faults the iteration loop IN THAT FILE and must be caught. (c) is the part that
+// is evidence rather than intention: without it the oracle could not tell a
+// promotion from a deletion.
+//
+// What did NOT move: make_pbkdf2_record() and verify_against_record() below stay
+// file-static, because the record format and the accept/reject decision are the
+// authenticator, and a policy bypass must not be reachable from another
+// translation unit (#745's reasoning for user_verify_password()).
 
 // Build a self-describing shadow record: "pbkdf2$<iters>$<salthex>$<hashhex>".
 static void make_pbkdf2_record(const char *password, const uint8_t *salt,
@@ -925,6 +918,17 @@ int users_authenticate(const char *username, const char *password) {
     if (user_verify_password(username, password) == 0) {
         s->failed_attempts = 0;
         s->lockout_until_ms = 0;
+        // #secretuse: THE ONE PLACE THE SECRET-STORE KEY IS BORN. This is the
+        // single authenticator chokepoint (see the block comment in users.h), so
+        // deriving here means there is exactly one code path on which the key can
+        // come into existence, and it is a path that has just PROVEN the password.
+        //
+        // It is NOT free: this is a second PBKDF2 over the same password, because
+        // the store's salt is independent of SHADOW's by design and the work
+        // therefore cannot be shared. seckey_on_authenticate() returns
+        // immediately for a user with no store and no legacy MFA.DB, which is most
+        // users, so the ordinary login is unchanged.
+        seckey_on_authenticate(username, password);
         return 0;
     }
 
@@ -1464,6 +1468,19 @@ int users_create_first_admin(const char *username, const char *user_password,
     bootlog_write("[USERS] first-boot: interactive account '%s' uid=%u, home '%s' owned by %u:%u; "
                   "system root uid=0 created with its OWN password (#745)",
                   username, (unsigned)admin_uid, home, (unsigned)admin_uid, (unsigned)admin_gid);
+
+    // [binmigrate] THE ACCOUNT IS NOW COMMITTED, so move the bootstrap
+    // session's per-account state into it. Everything above this line can
+    // still roll back with user_delete(), which is exactly why the migration
+    // is HERE and not inside user_create(): a migration performed before the
+    // commit would have moved the user's files into the home of an account
+    // that then ceased to exist.
+    //
+    // A no-op unless binmig_session_established() armed for THIS uid, so it
+    // costs a single atomic load on every other path, and it consumes the
+    // signal, so the other commit site (sys_user_create_pw) cannot repeat it.
+    { extern int binmig_on_account_committed(uint32_t uid);   // fs/binmigrate.h
+      (void)binmig_on_account_committed(admin_uid); }
     return 0;
 }
 
@@ -1530,10 +1547,88 @@ void users_make_home_skeleton(const char *home, uint32_t uid, uint32_t gid) {
     // /DOS/RA. Created here, with the other two, so it exists for accounts
     // that predate the change as well as for new ones; dos_overlay_prepare()
     // creates it on demand too, and both paths set the same 0750.
-    static const char *subs[] = { "DESKTOP", "DOCUMENT", "DOWNLOAD", "PICTURES",
+    // [filesui] DOCUMENTS and DOWNLOADS are PLURAL as of 2026-09-30, and the two
+    // singular names that were here are MIGRATED, not abandoned.
+    //
+    // They were singular, with the comment further up this function naming the
+    // labels "Documents/Downloads", on the stated grounds that FAT is 8.3-only.
+    // That grounds is stale: a home lives on the ext2 ROOT partition (#365),
+    // which has no 8.3 limit, and the FAT ESP carries boot assets only. So the
+    // name the user reads in Files, in the office file chooser, and in the
+    // download manager's status line disagreed with the directory all three of
+    // them opened, and the directory was the wrong half.
+    //
+    // WHY THE MIGRATION IS HERE. A fresh image has no accounts, so it has
+    // nothing to migrate. Any INSTALLED machine has a populated DOCUMENT and a
+    // populated DOWNLOAD (the download manager keeps its queue in the latter as
+    // DLMGR.QUE), and simply changing the constants would have left those
+    // directories on disk with every app looking somewhere else: the files are
+    // not deleted, they are ORPHANED, which is worse than the inconsistency
+    // being fixed because it is silent. This function already runs at account
+    // creation AND at every login, which makes it the one place the migration is
+    // guaranteed to be attempted for an account that predates the change.
+    static const char *subs[] = { "DESKTOP", "DOCUMENTS", "DOWNLOADS", "PICTURES",
                                   "MUSIC", "VIDEOS", "APPS", "CONFIG",
                                   "GAMES", "GAMES/NETHACK", "GAMES/SIMCITY",
                                   "GAMES/RA" };
+
+    // The migration, BEFORE the mkdir loop, or the loop would create an empty
+    // plural directory and the rename would then be refused for having a
+    // destination.
+    //
+    // fat_rename() on two ext2 paths is ext2_rename(), which for this exact case
+    // (same parent, destination absent) is an in-place RELINK: ext2_dir_add()
+    // publishes the new name against the SAME inode and only then does
+    // ext2_dir_remove() drop the old one, so no file data is copied and a crash
+    // between the two steps leaves two names for one complete directory rather
+    // than none. ext2_rename_selftest() proves the directory case specifically
+    // ("rename dir /RT/DA -> /RT/DB", kernel/fs/ext2.c).
+    //
+    // WHEN BOTH NAMES EXIST, NOTHING HAPPENS, DELIBERATELY. ext2_rename()
+    // refuses a directory-over-directory rename and changes nothing, so the
+    // attempt is safe, but this code does not then try to merge the two. A merge
+    // is a data-loss decision (which copy of a same-named file wins?) and a
+    // skeleton function that runs unattended on every login is the worst
+    // possible place to make one. Both directories stay, the plural one is what
+    // the UI shows, and the line below is the record that the other is there.
+    {
+        static const struct { const char *from, *to; } migr[] = {
+            { "DOCUMENT", "DOCUMENTS" },
+            { "DOWNLOAD", "DOWNLOADS" },
+        };
+        for (unsigned i = 0; i < sizeof(migr) / sizeof(migr[0]); i++) {
+            char oldp[160], newp[160];
+            int m = 0;
+            for (; home[m] && m < 120; m++) oldp[m] = home[m];
+            int base = m;
+            if (base > 0 && oldp[base - 1] != '/') oldp[base++] = '/';
+            for (int k = 0; k < base; k++) newp[k] = oldp[k];
+            int a = base, b = base;
+            for (int j = 0; migr[i].from[j] && a < 158; j++) oldp[a++] = migr[i].from[j];
+            for (int j = 0; migr[i].to[j]   && b < 158; j++) newp[b++] = migr[i].to[j];
+            oldp[a] = '\0'; newp[b] = '\0';
+
+            if (!fat_exists(&g_fat_fs, oldp)) continue;      // nothing to migrate
+            if (fat_exists(&g_fat_fs, newp)) {
+                // Both. Say so on the one channel that survives a reboot, and
+                // leave the user's data exactly where it is.
+                bootlog_write("[USERS] %s and %s BOTH exist; not merged (a merge is a "
+                              "data-loss decision). The UI shows %s.", oldp, newp, newp);
+                continue;
+            }
+            int rr = fat_rename(&g_fat_fs, oldp, newp);
+            if (rr == 0) {
+                // The perms entry moves with it: sys_rename() does this for a
+                // userland rename, and this path does not go through sys_rename.
+                perms_remove(oldp);
+                perms_set(newp, uid, gid, 0750);
+                bootlog_write("[USERS] migrated %s -> %s", oldp, newp);
+            } else {
+                bootlog_write("[USERS] could NOT migrate %s -> %s (rc=%d); the old "
+                              "directory is untouched", oldp, newp, rr);
+            }
+        }
+    }
     for (unsigned i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
         int m = 0;
         for (; home[m] && m < 120; m++) path[m] = home[m];

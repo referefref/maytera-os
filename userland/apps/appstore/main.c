@@ -57,6 +57,7 @@
 #include "../../libc/startmenu_reg.h"   // #<startmenu-rust> live Start-menu registration
 #include "../../libc/userconf.h"   // #745 per-user writable scratch path
 #include "../../libc/pkgdest.h"    // #745 per-user install destination confinement
+#include "../../libc/pkgman.h"     // INSTALL manifest resolution: exact + TREE rules
 #include "../../libc/pwd.h"        // #745 the session user's name, for the UI
 
 // #<startmenu-rust>: SYS_DESKTOP_MENU_RELOAD (syscall 300, #402) used to be
@@ -144,20 +145,154 @@ static char    g_manifest[128 * 1024];        // manifest.json text
 // home, via the shared userhome_path() join rather than a private copy of it.
 // ROOT IS A NO-OP BY CONSTRUCTION: /CONFIG/PASSWD gives root the home "/", so a
 // root session still uses exactly "/STOREDL.TMP" and its behaviour is unchanged.
+// #prewrite: userscratch_path(), NOT userhome_path().
+//
+// THE OLD FALLBACK WAS INERT ON EXACTLY THE MACHINE THE BUG APPEARS ON, which
+// is worth stating because it looked like a fix. It fired only when
+// userhome_path() FAILED TO FIT, a length problem. On a freshly built golden
+// there is no /CONFIG/PASSWD (#226/#202), so the session has no account,
+// userhome_root() resolves to "/" and userhome_path() SUCCEEDS, returning
+// "/STOREDL.TMP" through the success branch. The root is root:root 0755 and
+// since #676 an O_CREAT of a non-existent path is checked as a write to the
+// parent directory, so the open returned -13 and the store could not stage a
+// download at all before first-boot setup had run.
+//
+// userscratch_path() answers the same question honestly: the user's home when
+// there is one, and /TMP (01777, created and seeded by fs/perms.c) when there
+// is not. NOT CACHED ACROSS THE no-account -> account TRANSITION for the same
+// reason userhome_root() does not cache the bootstrap answer: the OOBE wizard
+// creates the first account while the desktop is already running, and a path
+// latched before that would pin the store to /TMP for the rest of the session.
 static const char *store_tmp_path(void) {
     static char p[192];
-    if (p[0] == 0) {
-        if (userhome_path(0, "STOREDL.TMP", p, sizeof(p)) != 0) {
-            // Only reachable if the home path does not fit, and a truncated
-            // path is a different file. Fall back to the historical location
-            // rather than writing somewhere unintended; the open below reports
-            // the real errno if that is not writable either.
+    static int  have_home = 0;
+    char home[192];
+    int now_home = (userhome_root(home, sizeof(home)) == 0 &&
+                    !(home[0] == '/' && home[1] == '\0'));
+    if (p[0] == 0 || now_home != have_home) {
+        if (userscratch_path("STOREDL.TMP", p, sizeof(p)) != 0) {
+            // Only reachable if the path does not fit, and a truncated path is
+            // a different file. Fall back to the historical location rather
+            // than writing somewhere unintended; the open reports the real
+            // errno if that is not writable either.
             strcpy(p, "/STOREDL.TMP");
         }
+        have_home = now_home;
     }
     return p;
 }
 #define STORE_TMP_PATH store_tmp_path()        // scratch for a streamed download
+
+// ---------------------------------------------------------------------------
+// THE ROLLBACK JOURNAL: why a half-applied install is worse than a refused one.
+//
+// MEASURED on the shipping golden (build 2495) with a deliberately hostile
+// package whose payload carried the member "evilpath/data/../../../CONFIG/
+// PWNED.TXT". The client refused it correctly: the traversal never escaped,
+// nothing was written outside the destination tree, and the status line said
+// "Package REFUSED (unsafe member path or type)". But the members that had
+// already been extracted BEFORE the hostile one was reached were still on the
+// volume afterwards, because unp_abort() closes and discards only the
+// destinations of the member being written when the stream aborts. Everything
+// completed by an earlier member had been closed cleanly and was nobody's job.
+//
+// So a refused package left a directory of its files behind, under a name of
+// its own choosing, with the store reporting a refusal. That is the worst of
+// both: the user is told nothing was installed, and something was. With a TREE
+// rule it also became much easier to reach, because a tree payload is hundreds
+// or thousands of members and the hostile one need not be first.
+//
+// The fix is a journal, not a bigger in-memory list: a ~1800-member package
+// cannot keep every destination in RAM in an app whose whole working set is
+// ~42KB by design. Each completed destination is APPENDED to a file next to
+// the download scratch; on any failure the journal is replayed and every path
+// in it is unlinked; on success it is deleted. Memory stays O(1) - one path at
+// a time - no matter how large the tree is.
+//
+// TWO HONEST LIMITS, stated rather than discovered later.
+//
+//  1. A destination that ALREADY EXISTED and was overwritten by this install is
+//     unlinked by the rollback, not restored. By the time the install fails the
+//     old bytes are already gone (the member was written straight over them),
+//     so the choice is between removing a file that is now wrong and leaving
+//     one. Removing it is the honest outcome: a truncated binary that is left
+//     behind is indistinguishable from a complete one to everything that runs
+//     it. The stronger design is to write every member to a temporary name and
+//     rename the whole set at the end; that is a real improvement and it is NOT
+//     what this does.
+//  2. Directories created by mkparents() are NOT removed. rmdir would look
+//     tidier and is a trap: /GAMES/NETHACK and /GAMES/SIMCITY are DELIBERATELY
+//     EMPTY writable state directories that must exist, so a rollback that
+//     rmdir'd every parent it found empty would delete them the first time a
+//     package wrote into one and then failed. An empty directory is inert; a
+//     missing one that the system requires is not.
+// ---------------------------------------------------------------------------
+static const char *store_undo_path(void) {
+    static char p[192];
+    if (p[0] == 0) {
+        if (userhome_path(0, "STOREUND.TMP", p, sizeof(p)) != 0)
+            strcpy(p, "/STOREUND.TMP");
+    }
+    return p;
+}
+
+static int g_undo_fd = -1;
+
+// Open a fresh journal for one install. A failure to open is NOT fatal: the
+// install proceeds without rollback rather than refusing to install at all,
+// and undo_rollback() then reports that it removed nothing, which is true.
+static void undo_begin(void) {
+    const char *u = store_undo_path();
+    sys_unlink(u);
+    g_undo_fd = sys_open(u, O_WRONLY | O_CREAT | O_TRUNC);
+}
+
+static void undo_record(const char *dst) {
+    if (g_undo_fd < 0 || !dst || !dst[0]) return;
+    int n = strlen(dst);
+    sys_write(g_undo_fd, dst, n);
+    sys_write(g_undo_fd, "\n", 1);
+}
+
+// The install succeeded: there is nothing to undo.
+static void undo_commit(void) {
+    if (g_undo_fd >= 0) { sys_close(g_undo_fd); g_undo_fd = -1; }
+    sys_unlink(store_undo_path());
+}
+
+// The install failed: remove everything it created. Returns how many paths were
+// removed, so the status line can say so instead of the user having to trust it.
+static int undo_rollback(void) {
+    if (g_undo_fd >= 0) { sys_close(g_undo_fd); g_undo_fd = -1; }
+    int fd = sys_open(store_undo_path(), O_RDONLY);
+    if (fd < 0) return 0;
+    char buf[1024];
+    char line[PKGDEST_MAX];
+    int ll = 0, removed = 0;
+    for (;;) {
+        long got = sys_read(fd, buf, sizeof(buf));
+        if (got <= 0) break;
+        for (long i = 0; i < got; i++) {
+            if (buf[i] == '\n') {
+                line[ll] = 0;
+                // A path longer than the buffer could only come from a corrupt
+                // journal, and unlinking a TRUNCATED path would remove a
+                // different file. Skip it rather than guess.
+                if (ll > 0 && ll < PKGDEST_MAX - 1) {
+                    if (sys_unlink(line) == 0) removed++;
+                }
+                ll = 0;
+            } else if (ll < PKGDEST_MAX - 1) {
+                line[ll++] = buf[i];
+            } else {
+                ll = PKGDEST_MAX;     // mark over-long; the check above skips it
+            }
+        }
+    }
+    sys_close(fd);
+    sys_unlink(store_undo_path());
+    return removed;
+}
 
 // ---------------------------------------------------------------------------
 // #745 PER-USER INSTALL (flow A of docs/APPSTORE_PER_USER_INSTALL_DESIGN.md).
@@ -1024,9 +1159,17 @@ typedef struct {
     const char *pkgid;
     const char *man;
     size_t      mlen;
-    int         fd;                  // open destination, -1 when idle
-    char        dest[PKGDEST_MAX];   // #745: CONFINED destination, never the raw one
-    int         count;               // files actually written
+    // A member can be named by SEVERAL manifest lines, and every shipping app
+    // package does exactly that (aichat installs /APPS/AICHAT and /APPS/aichat;
+    // mediaplayer names three). The old resolver returned on the first match,
+    // so the aliases were never written: the manifest said one thing and the
+    // installer did another, silently, and the launch-after-install step only
+    // arms on the lowercase alias that was being dropped. So the open
+    // destination is a SET, and every chunk is written to all of them.
+    int         nfd;                             // 0 == idle
+    int         fd[PKGMAN_MAX_DESTS];
+    char        dest[PKGMAN_MAX_DESTS][PKGDEST_MAX];  // CONFINED, never the raw ones
+    int         count;               // destination files actually written
     char        firstlaunch[PKGDEST_MAX];
     char        theme_dest[PKGDEST_MAX];
     int         write_err;
@@ -1038,6 +1181,10 @@ typedef struct {
     // refusal is not a disk error and must not be reported as one.
     char        reject_dest[PKGDEST_MAX];
     int         reject_rc;
+    // A pkgman_dest_all() refusal (malformed rule, unsafe member name) as
+    // opposed to a pkgdest_confine() one. They are different faults with
+    // different fixes, so they get different words on the status line.
+    int         man_rc;
     // #745: the first four PAYLOAD bytes of the member currently being
     // written, for the ELF check in unp_end(). Detected from the BYTES and not
     // from the destination path, for the reason kernel/proc/syscall.c:1899
@@ -1050,189 +1197,231 @@ typedef struct {
     char        chmod_dest[PKGDEST_MAX];
 } unp_sink_t;
 
-// Resolve an archive member name to its INSTALL destination.
-// INSTALL lines are "<src> -> <dest>", <src> being relative to "<id>/".
-static int install_dest_for(const char *man, size_t mlen, const char *pkgid,
-                            const char *member, char *dest, int destcap) {
-    int idl = strlen(pkgid);
-    if (strncmp(member, pkgid, idl) != 0 || member[idl] != '/') return 0;
-    const char *rel = member + idl + 1;
-    size_t p = 0;
-    while (p < mlen) {
-        char line[256]; int ll = 0;
-        while (p < mlen && man[p] != '\n' && ll < 255) line[ll++] = man[p++];
-        if (p < mlen) p++;
-        line[ll] = 0;
-        if (line[0] == '#' || line[0] == 0) continue;
-        char *arrow = strstr(line, "->");
-        if (!arrow) continue;
-        char src[128]; int si = 0;
-        char *s = line;
-        while (s < arrow && *s == ' ') s++;
-        while (s < arrow && *s != ' ' && si < 127) src[si++] = *s++;
-        src[si] = 0;
-        if (strcmp(src, rel) != 0) continue;
-        char *d = arrow + 2;
-        while (*d == ' ') d++;
-        int di = 0;
-        while (*d && *d != ' ' && *d != '\r' && di < destcap - 1) dest[di++] = *d++;
-        dest[di] = 0;
-        return dest[0] ? 1 : 0;
+// Close every open destination for the current member. `discard` also unlinks
+// them, which is what an aborted or refused member needs: a truncated file that
+// is left behind is indistinguishable from a complete one to everything that
+// reads it later.
+static void unp_close_all(unp_sink_t *u, int discard) {
+    for (int i = 0; i < u->nfd; i++) {
+        if (u->fd[i] >= 0) sys_close(u->fd[i]);
+        if (discard && u->dest[i][0]) sys_unlink(u->dest[i]);
+        u->fd[i] = -1;
     }
-    return 0;
+    u->nfd = 0;
 }
 
+// The member -> destination mapping now lives in userland/libc/pkgman.c, which
+// understands both the original exact rules and TREE rules ("packages/ ->
+// /GAMES/ASSAULTCUBE/packages/") so a package can carry a directory tree
+// instead of one hand-listed manifest line per file. It is a shared libc unit
+// rather than a static function here because the host-side hostile-input
+// battery (libc/tests/run_pkgman.sh) compiles the shipping translation unit,
+// and because the manifest's meaning must have ONE definition: `updated` reads
+// the same manifests.
 static int unp_member(void *ctx, const arc_member *m) {
     unp_sink_t *u = (unp_sink_t *)ctx;
     if (m->is_dir) return 1;
-    char dest[PKGDEST_MAX];
-    if (!install_dest_for(u->man, u->mlen, u->pkgid, m->name, dest, (int)sizeof(dest)))
-        return 1;                                  // not referenced by INSTALL: skip
-    if (dest[0] != '/') return 1;                  // destinations are absolute by design
 
-    // #745 CONFINE, and this is the single most security-relevant line in the
-    // install path. A package manifest can name ANY absolute destination; the
-    // only check that ever existed is the one immediately above. That was
-    // survivable while the signature was the sole control and root was the only
-    // installer. It is NOT survivable once this client starts REWRITING
-    // destinations into a per-user prefix, because a naive prefix join is
-    // steered by the very string it is prefixing:
-    //
-    //     "/HOME/ADMIN" + "/APPS/../../CONFIG/SHADOW" -> /CONFIG/SHADOW
-    //
-    // pkgdest_confine() canonicalizes FIRST against the root (so ".." can never
-    // rise above it) and only then joins the sandbox, which makes escape
-    // impossible by construction, then re-canonicalizes and requires the result
-    // to lie under the sandbox as an independent proof. It also enforces the
-    // installable-prefix allowlist and refuses the boot medium. See
-    // userland/libc/tests/run_pkgdest.sh for the hostile-input battery, which
-    // includes a negative arm proving the naive join really does escape.
-    //
-    // FAIL CLOSED. A refused destination aborts the whole install; it is never
-    // skipped, because a package that half-installed is not a package.
-    char cdest[PKGDEST_MAX];
-    int crc = pkgdest_confine(g_ins_home, dest, cdest, sizeof(cdest));
-    if (crc != PKGDEST_OK) {
+    // Resolve the member to EVERY destination the manifest names for it. A
+    // negative result is a manifest or member-name fault and FAILS the install;
+    // it is never treated as "skip this file", because a package that
+    // half-installed is not a package.
+    char raw[PKGMAN_MAX_DESTS][PKGMAN_DEST_MAX];
+    int n = pkgman_dest_all(u->man, (unsigned long)u->mlen, u->pkgid, m->name,
+                            raw, PKGMAN_MAX_DESTS);
+    if (n < 0) {
         u->write_err = 1;
         if (u->reject_dest[0] == 0) {
-            strncpy(u->reject_dest, dest, sizeof(u->reject_dest) - 1);
+            strncpy(u->reject_dest, m->name, sizeof(u->reject_dest) - 1);
             u->reject_dest[sizeof(u->reject_dest) - 1] = 0;
-            u->reject_rc = crc;
+            u->reject_rc = PKGDEST_E_ARG;      // a pkgman code, reported below
+            u->man_rc = n;
         }
         return -1;
     }
+    if (n == 0) return 1;                      // not referenced by INSTALL: skip
 
-    mkparents(cdest);
-    sys_unlink(cdest);
-    int fd = sys_open(cdest, O_WRONLY | O_CREAT | O_TRUNC);
-    if (fd < 0) {
-        u->write_err = 1;
-        if (u->fail_dest[0] == 0) {
-            strncpy(u->fail_dest, cdest, sizeof(u->fail_dest) - 1);
-            u->fail_dest[sizeof(u->fail_dest) - 1] = 0;
-            u->fail_rc = fd;
+    u->nfd = 0;
+    for (int i = 0; i < n; i++) {
+        if (raw[i][0] != '/') continue;         // destinations are absolute by design
+
+        // #745 CONFINE, and this is the single most security-relevant line in
+        // the install path. A package manifest can name ANY absolute
+        // destination. That was survivable while the signature was the sole
+        // control and root was the only installer. It is NOT survivable once
+        // this client REWRITES destinations into a per-user prefix, because a
+        // naive prefix join is steered by the very string it is prefixing:
+        //
+        //     "/HOME/ADMIN" + "/APPS/../../CONFIG/SHADOW" -> /CONFIG/SHADOW
+        //
+        // pkgdest_confine() canonicalizes FIRST against the root (so ".." can
+        // never rise above it) and only then joins the sandbox, which makes
+        // escape impossible by construction, then re-canonicalizes and requires
+        // the result to lie under the sandbox as an independent proof. It also
+        // enforces the installable-prefix allowlist and refuses the boot medium.
+        // See userland/libc/tests/run_pkgdest.sh for the hostile-input battery,
+        // which includes a negative arm proving the naive join really escapes.
+        //
+        // TREE RULES MAKE THIS STRICTLY MORE LOAD-BEARING, not less. Under exact
+        // matching the destination was a fixed string from the manifest. A tree
+        // rule CONCATENATES the archive member's own name onto it, so the path
+        // is now partly attacker-chosen. pkgman rejects a hostile member name in
+        // its own translation unit (run_pkgman.sh proves it), and this is the
+        // second, independent layer behind that.
+        //
+        // FAIL CLOSED. A refused destination aborts the whole install.
+        char cdest[PKGDEST_MAX];
+        int crc = pkgdest_confine(g_ins_home, raw[i], cdest, sizeof(cdest));
+        if (crc != PKGDEST_OK) {
+            u->write_err = 1;
+            if (u->reject_dest[0] == 0) {
+                strncpy(u->reject_dest, raw[i], sizeof(u->reject_dest) - 1);
+                u->reject_dest[sizeof(u->reject_dest) - 1] = 0;
+                u->reject_rc = crc;
+            }
+            unp_close_all(u, 1);
+            return -1;
         }
-        return -1;
+
+        mkparents(cdest);
+        sys_unlink(cdest);
+        int fd = sys_open(cdest, O_WRONLY | O_CREAT | O_TRUNC);
+        if (fd < 0) {
+            u->write_err = 1;
+            if (u->fail_dest[0] == 0) {
+                strncpy(u->fail_dest, cdest, sizeof(u->fail_dest) - 1);
+                u->fail_dest[sizeof(u->fail_dest) - 1] = 0;
+                u->fail_rc = fd;
+            }
+            unp_close_all(u, 1);
+            return -1;
+        }
+        u->fd[u->nfd] = fd;
+        strncpy(u->dest[u->nfd], cdest, PKGDEST_MAX - 1);
+        u->dest[u->nfd][PKGDEST_MAX - 1] = 0;
+        u->nfd++;
     }
-    u->fd = fd;
-    strncpy(u->dest, cdest, sizeof(u->dest) - 1);
-    u->dest[sizeof(u->dest) - 1] = 0;
+    if (u->nfd == 0) return 1;                 // every destination was skipped
     u->nmagic = 0;
     return 0;
 }
 static int unp_data(void *ctx, const uint8_t *d, size_t len) {
     unp_sink_t *u = (unp_sink_t *)ctx;
-    if (u->fd < 0) return -1;
+    if (u->nfd <= 0) return -1;
     // #745: keep the first four payload bytes for the ELF test in unp_end().
     // Written as a fill loop rather than a single memcpy because a member's
     // first chunk is not guaranteed to be at least four bytes long.
     for (size_t k = 0; k < len && u->nmagic < 4; k++)
         u->magic[u->nmagic++] = d[k];
-    size_t off = 0;
-    while (off < len) {
-        size_t take = len - off;
-        if (take > UNPACK_CHUNK) take = UNPACK_CHUNK;
-        if (sys_write(u->fd, d + off, (unsigned long)take) != (long)take) {
-            u->write_err = 1;
-            return -1;
+    for (int i = 0; i < u->nfd; i++) {
+        size_t off = 0;
+        while (off < len) {
+            size_t take = len - off;
+            if (take > UNPACK_CHUNK) take = UNPACK_CHUNK;
+            if (sys_write(u->fd[i], d + off, (unsigned long)take) != (long)take) {
+                u->write_err = 1;
+                if (u->fail_dest[0] == 0) {
+                    strncpy(u->fail_dest, u->dest[i], sizeof(u->fail_dest) - 1);
+                    u->fail_dest[sizeof(u->fail_dest) - 1] = 0;
+                }
+                return -1;
+            }
+            off += take;
         }
-        off += take;
     }
     return 0;
 }
 static int unp_end(void *ctx, const arc_member *m) {
     unp_sink_t *u = (unp_sink_t *)ctx;
     (void)m;
-    sys_close(u->fd);
-    u->fd = -1;
-    u->count++;
+    int nd = u->nfd;
+    for (int i = 0; i < nd; i++) sys_close(u->fd[i]);
+    u->nfd = 0;
+    u->count += nd;
 
-    // ---- #745 THE EXECUTE BIT -------------------------------------------
-    // Without this, a per-user install writes every byte correctly and then
-    // refuses to start, which reads as a completely different bug.
-    //
-    // spawn_impl() enforces X_OK on the binary for PRIV_USER callers (#700 B8,
-    // kernel/proc/syscall.c), and perms_on_create() stamps every newly created
-    // file 0644 (kernel/fs/perms.c). These member writes go through sys_open,
-    // NOT through SYS_PKG_WRITE, so pkg_write_stamp()'s existing ELF-detecting
-    // 0555 stamp (#689) never runs for them. Only STORE.DB and STORE.CFG use
-    // pkg_write. So the file is created non-executable and the launch is
-    // refused.
-    //
-    // 0555 and not 0755, deliberately mirroring #689: the installing user owns
-    // it and can delete and replace it (a write to the parent directory, which
-    // they have already passed), but cannot mutate in place the bytes of a
-    // binary that may already have been launched.
-    //
-    // THIS ALSO FIXES THE ROOT CASE, which was broken and unnoticed. A root
-    // install today leaves /APPS/<app> with a root:root 0644 entry, so a
-    // NON-root session cannot launch an app that root installed from the store:
-    // owner bits do not apply, group bits do not apply, and other is r-- with
-    // no x. chmod is applied in BOTH scopes for that reason.
-    //
-    // rk_chmod_route() sends an ext2/POSIX path to perms_chmod(), which lets a
-    // non-root caller chmod a file it OWNS. It owns this one: perms_on_create()
-    // recorded the creating process as owner when sys_open created it a moment
-    // ago. No privilege is needed and none is requested.
-    if (u->nmagic == 4 && u->magic[0] == 0x7F && u->magic[1] == 'E' &&
-        u->magic[2] == 'L' && u->magic[3] == 'F') {
-        if (chmod(u->dest, 0555) != 0 && u->chmod_dest[0] == 0) {
-            strncpy(u->chmod_dest, u->dest, sizeof(u->chmod_dest) - 1);
-            u->chmod_dest[sizeof(u->chmod_dest) - 1] = 0;
+    int is_elf = (u->nmagic == 4 && u->magic[0] == 0x7F && u->magic[1] == 'E' &&
+                  u->magic[2] == 'L' && u->magic[3] == 'F');
+
+    for (int i = 0; i < nd; i++) {
+        const char *dst = u->dest[i];
+
+        // The destination is complete and closed, so from here on it is this
+        // install's to undo. Recorded BEFORE the chmod and the launch-path
+        // bookkeeping below, because a failure in either still leaves the file
+        // on the volume and it still has to come back off.
+        undo_record(dst);
+
+        // ---- #745 THE EXECUTE BIT ---------------------------------------
+        // Without this, a per-user install writes every byte correctly and then
+        // refuses to start, which reads as a completely different bug.
+        //
+        // spawn_impl() enforces X_OK on the binary for PRIV_USER callers (#700
+        // B8, kernel/proc/syscall.c), and perms_on_create() stamps every newly
+        // created file 0644 (kernel/fs/perms.c). These member writes go through
+        // sys_open, NOT through SYS_PKG_WRITE, so pkg_write_stamp()'s existing
+        // ELF-detecting 0555 stamp (#689) never runs for them. Only STORE.DB
+        // and STORE.CFG use pkg_write. So the file is created non-executable
+        // and the launch is refused.
+        //
+        // 0555 and not 0755, deliberately mirroring #689: the installing user
+        // owns it and can delete and replace it (a write to the parent
+        // directory, which they have already passed), but cannot mutate in
+        // place the bytes of a binary that may already have been launched.
+        //
+        // THIS ALSO FIXES THE ROOT CASE, which was broken and unnoticed. A root
+        // install today leaves /APPS/<app> with a root:root 0644 entry, so a
+        // NON-root session cannot launch an app that root installed from the
+        // store: owner bits do not apply, group bits do not apply, and other is
+        // r-- with no x. chmod is applied in BOTH scopes for that reason.
+        //
+        // rk_chmod_route() sends an ext2/POSIX path to perms_chmod(), which lets
+        // a non-root caller chmod a file it OWNS. It owns this one:
+        // perms_on_create() recorded the creating process as owner when
+        // sys_open created it a moment ago. No privilege is needed and none is
+        // requested.
+        if (is_elf) {
+            if (chmod(dst, 0555) != 0 && u->chmod_dest[0] == 0) {
+                strncpy(u->chmod_dest, dst, sizeof(u->chmod_dest) - 1);
+                u->chmod_dest[sizeof(u->chmod_dest) - 1] = 0;
+            }
         }
-    }
 
-    int dl = strlen(u->dest);
-    if (u->theme_dest[0] == 0 && dl > 7 && strcmp(u->dest + dl - 7, ".mtheme") == 0) {
-        strncpy(u->theme_dest, u->dest, sizeof(u->theme_dest) - 1);
-        u->theme_dest[sizeof(u->theme_dest) - 1] = 0;
-    }
-    // #745: the launch path is now under the CONFINED applications directory,
-    // g_home_apps, which is "<home>/APPS" for a user session and exactly
-    // "/APPS" for a root one. Comparing against the literal "/APPS/" here would
-    // have silently found nothing for every per-user install, and the app would
-    // have installed correctly and never appeared in the Start menu.
-    {
-        int hal = strlen(g_ins_apps);
-        if (u->firstlaunch[0] == 0 && strncmp(u->dest, g_ins_apps, hal) == 0 &&
-            u->dest[hal] == '/') {
-            int lower = 1;
-            for (const char *c = u->dest + hal + 1; *c; c++)
-                if (*c >= 'A' && *c <= 'Z') { lower = 0; break; }
-            if (lower) {
-                strncpy(u->firstlaunch, u->dest, sizeof(u->firstlaunch) - 1);
-                u->firstlaunch[sizeof(u->firstlaunch) - 1] = 0;
+        int dl = strlen(dst);
+        if (u->theme_dest[0] == 0 && dl > 7 && strcmp(dst + dl - 7, ".mtheme") == 0) {
+            strncpy(u->theme_dest, dst, sizeof(u->theme_dest) - 1);
+            u->theme_dest[sizeof(u->theme_dest) - 1] = 0;
+        }
+        // #745: the launch path is now under the CONFINED applications
+        // directory, g_ins_apps, which is "<home>/APPS" for a user session and
+        // exactly "/APPS" for a root one. Comparing against the literal "/APPS/"
+        // here would have silently found nothing for every per-user install, and
+        // the app would have installed correctly and never appeared in the Start
+        // menu.
+        //
+        // This is also the step that the dropped alias broke: it arms only on an
+        // all-lowercase basename, which for every shipping app package is the
+        // SECOND manifest line, the one the old first-match-wins resolver never
+        // wrote. Fan-out is what makes this reachable at all.
+        {
+            int hal = strlen(g_ins_apps);
+            if (u->firstlaunch[0] == 0 && strncmp(dst, g_ins_apps, hal) == 0 &&
+                dst[hal] == '/') {
+                int lower = 1;
+                for (const char *c = dst + hal + 1; *c; c++)
+                    if (*c >= 'A' && *c <= 'Z') { lower = 0; break; }
+                if (lower) {
+                    strncpy(u->firstlaunch, dst, sizeof(u->firstlaunch) - 1);
+                    u->firstlaunch[sizeof(u->firstlaunch) - 1] = 0;
+                }
             }
         }
     }
     return 0;
 }
-// The stream failed with a destination still open: close it and remove the
-// truncated file rather than leaving a half-written binary on the volume.
+// The stream failed with destinations still open: close them and remove the
+// truncated files rather than leaving a half-written binary on the volume.
 static void unp_abort(void *ctx) {
-    unp_sink_t *u = (unp_sink_t *)ctx;
-    if (u->fd >= 0) { sys_close(u->fd); u->fd = -1; }
-    if (u->dest[0]) sys_unlink(u->dest);
+    unp_close_all((unp_sink_t *)ctx, 1);
 }
 static const arc_sink UNP_SINK = { unp_member, unp_data, unp_end, unp_abort };
 
@@ -1873,20 +2062,72 @@ static int install_pkg(int idx) {
         return -1;
     }
 
+    // Validate EVERY rule before extracting anything. A malformed rule found
+    // mid-stream would otherwise abort an install that had already written part
+    // of itself, and the status line would name one member rather than the
+    // manifest line that is actually wrong. This is cheap (the manifest is a
+    // few KB) and it is the difference between "line 7 is malformed" and a
+    // mystery half-install.
+    {
+        int mline = 0;
+        int mrc = pkgman_check_manifest(ms.buf, (unsigned long)ms.len, &mline);
+        if (mrc != 0) {
+            char nb[24];
+            strcpy(g_status, "REFUSED: malformed INSTALL manifest at line ");
+            fmt_long(mline, nb);
+            strncat(g_status, nb, sizeof(g_status) - strlen(g_status) - 1);
+            g_status_kind = 3;
+            if (src.from_file) sys_unlink(STORE_TMP_PATH);
+            return -1;
+        }
+    }
+
+    // Does this package need a client newer than this one? Asked HERE, after the
+    // manifest is out of the verified archive and before a single member is
+    // extracted, so the answer is "refused, and here is why" rather than the
+    // silent "Nothing installed" that a client too old to understand a rule has
+    // always produced. See pkgman.h for what this can and cannot fix.
+    {
+        int need = pkgman_min_client(ms.buf, (unsigned long)ms.len);
+        if (need < 0 || need > PKGMAN_CLIENT_GEN) {
+            char nb[24];
+            if (need < 0) {
+                strcpy(g_status, "REFUSED: unreadable #!mpkg-min-client declaration");
+            } else {
+                strcpy(g_status, "REFUSED: needs a newer MayteraOS (package wants client ");
+                fmt_long(need, nb);
+                strncat(g_status, nb, sizeof(g_status) - strlen(g_status) - 1);
+                strncat(g_status, ", this is ", sizeof(g_status) - strlen(g_status) - 1);
+                fmt_long(PKGMAN_CLIENT_GEN, nb);
+                strncat(g_status, nb, sizeof(g_status) - strlen(g_status) - 1);
+                strncat(g_status, ")", sizeof(g_status) - strlen(g_status) - 1);
+            }
+            g_status_kind = 3;
+            if (src.from_file) sys_unlink(STORE_TMP_PATH);
+            return -1;
+        }
+    }
+
     // ---- #613 pass 2: stream every mapped member straight to its destination.
     static unp_sink_t us;
     memset(&us, 0, sizeof(us));
-    us.pkgid = pk->id; us.man = ms.buf; us.mlen = ms.len; us.fd = -1;
+    us.pkgid = pk->id; us.man = ms.buf; us.mlen = ms.len; us.nfd = 0;
+    undo_begin();
     rc = run_stream(&src, &UNP_SINK, &us, 1);
     if (rc != ARC_OK) {
         if (us.reject_dest[0]) {
             // #745: a destination the CLIENT refused, not one the kernel did.
             // Name the path the package asked for (not the rewritten one, which
-            // would hide what the package tried to do) and the reason.
-            strcpy(g_status, "REFUSED destination ");
+            // would hide what the package tried to do) and the reason. A
+            // manifest/member fault (us.man_rc) and a confinement fault
+            // (us.reject_rc) are different problems, so they are worded
+            // differently: one is a bad package, the other is a package asking
+            // for somewhere it may not write.
+            strcpy(g_status, us.man_rc ? "REFUSED member " : "REFUSED destination ");
             strncat(g_status, us.reject_dest, sizeof(g_status) - strlen(g_status) - 1);
             strncat(g_status, ": ", sizeof(g_status) - strlen(g_status) - 1);
-            strncat(g_status, pkgdest_strerror(us.reject_rc),
+            strncat(g_status, us.man_rc ? pkgman_strerror(us.man_rc)
+                                        : pkgdest_strerror(us.reject_rc),
                     sizeof(g_status) - strlen(g_status) - 1);
         } else if (us.fail_dest[0]) {
             // #745: NAME THE PATH AND THE ERRNO. A -13 here is not a disk
@@ -1942,9 +2183,26 @@ static int install_pkg(int idx) {
         }
         g_status_kind = 3;
         if (src.from_file) sys_unlink(STORE_TMP_PATH);
+        // NOTHING PARTIAL SURVIVES A REFUSAL. Every destination this install
+        // completed before the failure is removed here. Appended to the status
+        // line rather than replacing it: the REASON for the refusal is what the
+        // user acts on, and the cleanup is what stops them wondering whether
+        // half a package is now on their machine.
+        {
+            int undone = undo_rollback();
+            if (undone > 0) {
+                char nb[24];
+                strncat(g_status, " [", sizeof(g_status) - strlen(g_status) - 1);
+                fmt_long(undone, nb);
+                strncat(g_status, nb, sizeof(g_status) - strlen(g_status) - 1);
+                strncat(g_status, " partial file(s) removed]",
+                        sizeof(g_status) - strlen(g_status) - 1);
+            }
+        }
         return -1;
     }
     if (src.from_file) sys_unlink(STORE_TMP_PATH);
+    undo_commit();
 
     char *man = ms.buf;
     size_t mlen = ms.len;
@@ -1959,12 +2217,16 @@ static int install_pkg(int idx) {
     // Fallback: if no lowercase alias was written, use the first /APPS/ dest
     // named by the manifest.
     //
-    // #745 AND THIS IS THE NORMAL PATH, NOT AN EDGE CASE. install_dest_for()
-    // returns the FIRST manifest line whose source matches, so a package that
-    // maps one member to both "/APPS/COUNTER" and "/APPS/counter" (which every
-    // app package in the repository does) only ever writes the FIRST, the
-    // uppercase one. The sink's own firstlaunch only records a LOWERCASE alias,
-    // so it is empty for those packages and this fallback always runs.
+    // #745 SAID THIS WAS "THE NORMAL PATH, NOT AN EDGE CASE", and it was, for a
+    // reason that has now been fixed one layer down. The old resolver returned
+    // the FIRST manifest line whose source matched, so a package mapping one
+    // member to both "/APPS/COUNTER" and "/APPS/counter" (which every app
+    // package in the repository does) only ever wrote the uppercase one, and
+    // the sink's firstlaunch, which arms only on a LOWERCASE alias, was always
+    // empty. pkgman_dest_all() now returns EVERY destination and the sink
+    // writes all of them, so the alias exists and firstlaunch is normally
+    // populated. This is therefore a genuine fallback again: it still runs for a
+    // package that names ONLY an uppercase destination (OpenArena is one).
     //
     // MEASURED BUG THIS FIXES: the fallback took the destination STRAIGHT OUT
     // OF THE MANIFEST, unconfined. On a per-user install that produced a

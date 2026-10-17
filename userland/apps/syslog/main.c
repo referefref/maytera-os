@@ -14,6 +14,7 @@
 // new read syscall in the kernel, which is out of scope here.
 #include "../../libc/maytera.h"
 #include "../../libc/gui.h"
+#include "../../libc/userconf.h"   // #peruser2: the export lands in the user's own space
 
 #define LOG_WIDTH       640
 #define LOG_HEIGHT      460
@@ -416,17 +417,33 @@ static void draw_log(void) {
     win_invalidate(window_handle);
 }
 
-// Export the currently filtered view to /SYSLOG.TXT (no system clipboard
-// syscall exists, so "Copy" writes a file the user can open/share).
+// Export the currently filtered view (no system clipboard syscall exists, so
+// "Copy" writes a file the user can open/share).
+//
+// #peruser2: the destination was the literal "/SYSLOG.TXT" at the ext2 root,
+// which is root-owned, so the Copy button did nothing for a non-root session and
+// said nothing. It is a DOCUMENT at the top of the user's space, so
+// userhome_open_write(NULL, ...) and not userconf_*: root's home is "/", so a
+// root session still writes exactly /SYSLOG.TXT.
+//
+// NOTE what is NOT moved: the log this app READS is "/LOG.TXT", the kernel's
+// system log. That is system state with one writer in Ring 0 and many readers,
+// not a per-user file, and a per-user copy of it would be empty.
 static void copy_to_file(void) {
-    int fd = sys_open("/SYSLOG.TXT", O_WRONLY | O_CREAT | O_TRUNC);
-    if (fd < 0) return;
-    for (int i = 0; i < filtered_count; i++) {
+    int fd = userhome_open_write(0, "SYSLOG.TXT");
+    if (fd < 0) return;                     // reported by the open
+    int rc = 0;
+    for (int i = 0; i < filtered_count && rc == 0; i++) {
         int idx = filtered[i];
-        sys_write(fd, log_text[idx], strlen(log_text[idx]));
-        sys_write(fd, "\n", 1);
+        unsigned long l = strlen(log_text[idx]);
+        if ((unsigned long)sys_write(fd, log_text[idx], l) != l) rc = -1;
+        else if (sys_write(fd, "\n", 1) != 1) rc = -1;
     }
-    sys_close(fd);
+    // Always close through the shared completer so the fsync and the close are
+    // checked and the fd is closed on every path. A zero-length final write is
+    // the documented way to say "nothing more to add".
+    if (userconf_finish_write(fd, "", 0) != 0) rc = -1;
+    if (rc != 0) uc_report_write_refusal("syslog_copy", "<home>/SYSLOG.TXT", rc);
 }
 
 // Hit-test a toolbar button by toolbar-local coords.

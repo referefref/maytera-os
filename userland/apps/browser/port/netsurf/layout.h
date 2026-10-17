@@ -17,8 +17,13 @@
  *                              size of the real job)
  *   - position: absolute  (#245 engabspos: out-of-flow, placed by top/left
  *                          (bounded right/bottom) against the nearest
- *                          positioned ancestor / ICB, flat z-index stacking;
- *                          nested stacking contexts deferred, see the plan doc)
+ *                          positioned ancestor / ICB)
+ *   - CSS stacking contexts (#245 engstack: a real stacking-context TREE,
+ *                          painted per CSS 2.1 appendix E, so a nested
+ *                          z-index is scoped to its parent context and a
+ *                          negative z-index paints behind in-flow content.
+ *                          See paintorder.h; opacity/transform/filter as
+ *                          context triggers are still deferred)
  *   - position: fixed / sticky  (fixed shares the absolute path but does not
  *                                re-pin to the viewport on scroll; sticky static)
  *   - outline-offset  (#245 engoutline: the libcss build in this port has NO
@@ -190,14 +195,19 @@ typedef struct layout_item {
 	int form_kind;     /* 0 none, 1 text field, 2 submit/button */
 	char field_name[64];  /* <input name=> */
 	/*
-	 * engabspos (#245): paint-order key for CSS stacking. 0 for in-flow,
-	 * non-positioned content, so a page with no positioned boxes keeps every
-	 * item at 0 and the stable z-sort in layout_document() is skipped (AE=0).
-	 * A positioned box stamps its own items with ZORDER_BASE + z-index, so
-	 * they paint after in-flow content, ordered by z-index with document
-	 * order breaking ties.
+	 * engstack (#245): the PAINT GROUP this item belongs to, an index into the
+	 * stacking-context tree paintorder.c orders. 0 is the ROOT context, which
+	 * is what item_new()'s memset already leaves, so a page with no positioned
+	 * box carries the inert value on every item without a single extra write
+	 * and the sort in layout_document() is skipped entirely (AE=0, structurally
+	 * rather than by measurement).
+	 *
+	 * This REPLACED engabspos's `zorder`, a single global ZORDER_BASE + z-index
+	 * key. That key is correct for exactly one stacking context and wrong the
+	 * moment they nest, because a child's z-index must be scoped to its parent
+	 * context; the plan doc named it as the seam to replace rather than extend.
 	 */
-	int zorder;
+	int pg;
 } layout_item;
 
 /*
@@ -208,6 +218,32 @@ typedef struct layout_item {
  * persistent per-container offset by array index across relayouts.
  */
 #define LAYOUT_MAX_SCROLLS 32
+/*
+ * engstack (#245): the stacking-context tree the LAST layout built, for the
+ * harness dump.
+ *
+ * The dump can already SEE paint order, because the painter walks the item array
+ * by index and the dumper prints it in that order, so the sequence of box lines
+ * is the paint order. What it cannot show is the STRUCTURE that produced that
+ * order, and two boxes with identical geometry are indistinguishable without it.
+ * These three accessors report the structure.
+ *
+ * layout_stack_groups() returns 1 when the page had no positioned box at all,
+ * and the dumper prints nothing in that case, which is what keeps the
+ * no-position corpus byte-identical.
+ */
+int layout_stack_groups(void);
+int layout_stack_overflowed(void);
+int layout_stack_group(int g, int *parent, int *z, int *is_ctx, int *own_idx);
+/*
+ * Run the paint-order self-test (paintorder.c). Exposed through layout.h so the
+ * app does not have to include the engine's internal header. Returns the number
+ * of FAILING cases and calls report() once per case.
+ */
+int layout_stack_selftest(void (*report)(const char *line));
+/* md5 of paintorder.c + paintorder.h + layout.h, injected by the build. */
+const char *layout_stack_stamp(void);
+
 typedef struct scroll_box {
 	int content_x;      /* content box left  (absolute, pre page-scroll) */
 	int content_y;      /* content box top   (absolute, pre page-scroll) */

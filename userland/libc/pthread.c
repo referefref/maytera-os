@@ -458,16 +458,61 @@ int pthread_mutex_destroy(pthread_mutex_t *mutex) {
     return 0;
 }
 
+// #245 jsdom: DOES THIS MUTEX TYPE EVER CONSULT mutex->owner?
+//
+// THE DEFECT THIS EXISTS FOR, measured on 2026-10-04. pthread_self() is an
+// unconditional syscall0(SYS_GETTID), and pthread_mutex_lock(),
+// pthread_mutex_trylock() and pthread_mutex_unlock() each called it FIRST
+// THING, on every call, for every mutex type. malloc() and free() each take
+// g_heap_lock (userland/libc/stdlib.c), so EVERY malloc/free pair paid FOUR
+// kernel round trips to look up a number that cannot change for the life of a
+// thread. Every Ring 3 app in the tree pays it, because it is in the shared
+// allocator.
+//
+// It was found by elimination, in the browser, after the two SUPERLINEAR terms
+// in the same path had been fixed by others: the script-built DOM path is now
+// linear in node count, but still runs about 20x slower in the OS than a hosted
+// build of the identical engine sources. The control that made it attributable
+// is that a JS loop which allocates NOTHING runs at the SAME SPEED in both
+// (0.018 vs 0.02 us/iteration), so neither the interpreter nor the CPU was the
+// gap; everything that allocates was 20x.
+//
+// WHY SKIPPING IT IS SAFE AND NOT A TRADE. `owner` is READ in exactly three
+// places in this file: the RECURSIVE branch of lock(), the RECURSIVE branch of
+// trylock(), and the ERRORCHECK branch of unlock(). For a NORMAL mutex, which
+// is PTHREAD_MUTEX_DEFAULT and what every mutex in the shared libc uses, the
+// field is WRITE-ONLY; grepped across all of userland, nothing reads it. The
+// only other readers in the tree are apps/chess/chess_pthread.c and
+// apps/ide/ide_pthread.c, which are FORKED private copies of this file and are
+// not affected by this change either way (that they exist at all is a separate
+// problem, the same shape as the forked allocator in the CPython port).
+//
+// So the thread id is now fetched only on the paths that actually consult it.
+// RECURSIVE and ERRORCHECK mutexes behave exactly as before, which
+// userland/apps/allocost's correctness section proves with a RED arm.
+//
+// `owner` is left at 0 for a NORMAL mutex rather than set to a stale value,
+// because 0 is already this struct's "unowned" and a type that does not track
+// ownership should not claim to.
+static inline int mutex_tracks_owner(const pthread_mutex_t *mutex) {
+    return mutex->type == PTHREAD_MUTEX_RECURSIVE ||
+           mutex->type == PTHREAD_MUTEX_ERRORCHECK;
+}
+
 int pthread_mutex_lock(pthread_mutex_t *mutex) {
     if (!mutex) return EINVAL;
 
-    unsigned int self = pthread_self();
+    const int tracks_owner = mutex_tracks_owner(mutex);
+    unsigned int self = 0;
 
     // Handle recursive mutex
-    if (mutex->type == PTHREAD_MUTEX_RECURSIVE) {
-        if (mutex->owner == self) {
-            mutex->recursive_count++;
-            return 0;
+    if (tracks_owner) {
+        self = pthread_self();
+        if (mutex->type == PTHREAD_MUTEX_RECURSIVE) {
+            if (mutex->owner == self) {
+                mutex->recursive_count++;
+                return 0;
+            }
         }
     }
 
@@ -487,26 +532,30 @@ int pthread_mutex_lock(pthread_mutex_t *mutex) {
         }
     }
 
-    mutex->owner = self;
+    if (tracks_owner) mutex->owner = self;   // #245 jsdom, see mutex_tracks_owner
     return 0;
 }
 
 int pthread_mutex_trylock(pthread_mutex_t *mutex) {
     if (!mutex) return EINVAL;
 
-    unsigned int self = pthread_self();
+    const int tracks_owner = mutex_tracks_owner(mutex);
+    unsigned int self = 0;
 
     // Handle recursive mutex
-    if (mutex->type == PTHREAD_MUTEX_RECURSIVE) {
-        if (mutex->owner == self) {
-            mutex->recursive_count++;
-            return 0;
+    if (tracks_owner) {
+        self = pthread_self();
+        if (mutex->type == PTHREAD_MUTEX_RECURSIVE) {
+            if (mutex->owner == self) {
+                mutex->recursive_count++;
+                return 0;
+            }
         }
     }
 
     // Try to acquire lock (0 -> 1)
     if (atomic_cas(&mutex->lock, 0, 1)) {
-        mutex->owner = self;
+        if (tracks_owner) mutex->owner = self;   // #245 jsdom
         return 0;
     }
 
@@ -516,11 +565,11 @@ int pthread_mutex_trylock(pthread_mutex_t *mutex) {
 int pthread_mutex_unlock(pthread_mutex_t *mutex) {
     if (!mutex) return EINVAL;
 
-    unsigned int self = pthread_self();
-
-    // Check ownership for errorcheck mutex
+    // Check ownership for errorcheck mutex. #245 jsdom: the thread id is read
+    // HERE, inside the one branch that uses it, instead of unconditionally at
+    // the top; see mutex_tracks_owner above for why that is the whole fix.
     if (mutex->type == PTHREAD_MUTEX_ERRORCHECK) {
-        if (mutex->owner != self) {
+        if (mutex->owner != pthread_self()) {
             return EPERM;
         }
     }

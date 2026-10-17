@@ -82,6 +82,14 @@ int jpeg_parse_headers(const uint8_t *data, uint32_t len, jpeg_hdr_t *out);
  *
  * The resulting pixel buffer uses BGRA format compatible with the framebuffer.
  */
+/* CWE-834: cap on progressive-JPEG SOS (start-of-scan) count. Each SOS re-runs
+ * a whole-image coefficient pass, and the count is attacker-controlled (~10
+ * bytes buys another pass), so an unbounded decoder burns Ring 0 for minutes on
+ * a single <1.5MB image (MEASURED: 136.8 s). 256 is far above any real encoder
+ * (<~40 scans) and bounds the worst case to ~0.2-0.3 s. Shared by jpeg.c (the
+ * enforcement) and jpeg_selftest.c (the boundary self-test). */
+#define JPEG_PROG_MAX_SCANS  256
+
 int image_load_jpeg(const void *data, uint32_t size, image_t *img);
 
 /**

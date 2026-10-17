@@ -28,6 +28,10 @@ uint64_t pmm_get_total_pages(void);
 uint64_t pmm_get_free_pages(void);
 uint64_t pmm_get_used_pages(void);
 
+// #heapinvptr: how many pmm_free_page() calls have found the page ALREADY free.
+// A non-zero value means a release path ran twice over the same memory.
+uint64_t pmm_double_free_count(void);
+
 // Debug: print memory statistics
 void pmm_print_stats(void);
 

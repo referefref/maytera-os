@@ -52,6 +52,7 @@
 
 #include "types.h"
 #include "gui_list.h"
+#include "contract.h"
 
 // A single row in an open menu. label == NULL marks a separator: a thin
 // rule with no hit target (id/enabled are ignored). A disabled row is drawn
@@ -72,6 +73,24 @@ typedef struct {
     // the mark is drawn inside the existing MENU_PAD_X gutter, so no popup
     // changes width and no already-adopted menu changes appearance.
     bool        checked;
+
+    // ---- contract exposure (docs/CONTRACT_COVERAGE_PLAN.md task 3 phase 4) --
+    // TRAILING FIELDS, same precedent as `checked` just above: every existing
+    // brace initialiser in the tree (Editor's four menus, Terminal's,
+    // gui_filedlg.h's) is POSITIONAL and shorter than this, so every row that
+    // does not opt in keeps tok == 0 / afn == 0, which reads as "not exposed".
+    //
+    // This is the SAME table gui_menu_bar_draw()/gui_menu_bar_click() already
+    // read: an app's on_menu() now reads these through menu_ctl_dispatch()/
+    // menu_ctl_project() instead of switching on id, the same move otb_item_t
+    // just made (otoolbar.h) for the toolbar side of the same apps.
+    const char        *tok;   // dotted contract item name, 0 = not exposed
+    int               (*afn)(const struct ct_item *it, int argc, char **argv,
+                             char *out, int ocap);   // required when tok != 0
+    const char        *desc;  // one-line contract description (>=12 chars)
+    unsigned char       risk; // CT_SAFE or CT_GUARDED; meaningless if tok==0
+    const char         *cap;  // aicap capability id; set iff risk==CT_GUARDED
+    const struct ct_terms *terms; // timing/success/depth/promise; set if tok
 } gui_menu_item_t;
 
 // One top-level menu ("File", "Edit", ...) and its item table.
@@ -279,5 +298,14 @@ void gui_menu_leave(gui_menu_bar_t *bar);
 static inline bool gui_menu_is_open(const gui_menu_bar_t *bar) {
     return bar && bar->open >= 0;
 }
+
+
+// ---- contract projection + generic dispatch (task 3 phase 4) --------------
+// See gui_menu.c for the full rationale; the mirror of otb_ctl_count()/
+// otb_ctl_project()/otb_ctl_dispatch() (otoolbar.h) for menu item tables.
+int menu_ctl_count(const gui_menu_item_t *items, int n);
+int menu_ctl_project(const gui_menu_item_t *items, int n, int idx, ct_item_t *out);
+int menu_ctl_dispatch(const gui_menu_item_t *items, int n, int id,
+                      char *out, int ocap, int *outcode);
 
 #endif // _GUI_MENU_H

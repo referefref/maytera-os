@@ -93,6 +93,22 @@ typedef struct {
 // comfortably covers real content (AssaultCube textures, web/album art).
 #define JPEG_PROG_MAX_COEFF_BYTES  (64ULL * 1024 * 1024)
 
+// MAYTERA-SEC (CWE-834 uncontrolled resource amplification): a progressive
+// JPEG's SOS (start-of-scan) count is attacker-controlled, and EVERY scan
+// re-runs a whole-image block pass over d->coeff[]. Each SOS costs as little as
+// ~10 bytes (a DC-refinement header with no entropy payload), so a single file
+// under the 1.5 MB image cap can carry ~157k scans. MEASURED in-OS on an
+// unbounded build: one such 1572856-byte 4096x4096 file burned 136.8 s of
+// Ring-0 CPU (34209 ticks at 250 Hz) before returning Success. The decode
+// terminates, so it is amplification rather than an infinite loop, but it is a
+// genuine remote DoS. A real progressive JPEG uses well under ~40 scans even
+// from the most aggressive encoders (DC first + DC refine, then a handful of
+// AC band/refinement scans per component); 256 is >6x that headroom while
+// bounding the amplification to 256 whole-image passes (the same 4096x4096
+// grayscale case then returns in ~0.2 s). A file exceeding this is pathological
+// and is rejected UNSUPPORTED rather than decoded. The constant lives in
+// jpeg.h so the boundary self-test (jpeg_selftest.c) shares the exact value.
+
 // Zigzag order for DCT coefficients
 static const uint8_t zigzag[64] = {
      0,  1,  8, 16,  9,  2,  3, 10,
@@ -1318,6 +1334,7 @@ static int jpeg_decode_progressive(jpeg_decoder_t *d, const uint8_t *data,
     d->prog = 1;
 
     int sof_seen = 0;
+    int nscans = 0;
     for (;;) {
         int m = jpeg_prog_next_marker(d);
         if (m < 0) break;
@@ -1334,6 +1351,9 @@ static int jpeg_decode_progressive(jpeg_decoder_t *d, const uint8_t *data,
             case 0xDD: ret = prog_parse_dri(d); break;
             case 0xDA:  // SOS
                 if (!sof_seen) return JPEG_ERR_CORRUPT;
+                // CWE-834: bound the attacker-controlled scan count. See
+                // JPEG_PROG_MAX_SCANS above (measured 136.8 s unbounded).
+                if (++nscans > JPEG_PROG_MAX_SCANS) return JPEG_ERR_UNSUPPORTED;
                 ret = prog_parse_sos_header(d);
                 if (ret == JPEG_SUCCESS) ret = jpeg_decode_scan_prog(d);
                 break;

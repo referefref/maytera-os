@@ -70,10 +70,11 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 if [ -d "$HERE/patches" ]; then
     for p in "$HERE"/patches/*.patch; do
         [ -e "$p" ] || continue
-        # every patch is written against libhubbub's tree root for now; if a
-        # future patch targets another library, add its dir to this case.
+        # the target library is named in the patch filename; add a line here
+        # when a patch first touches a library that is not yet listed.
         case $(basename "$p") in
             *libhubbub*) tgt=$DEST/netsurf-port/libhubbub ;;
+            *libdom*)    tgt=$DEST/netsurf-port/libdom ;;
             *)  echo "patch $(basename "$p"): no target library in its name" >&2
                 exit 1 ;;
         esac

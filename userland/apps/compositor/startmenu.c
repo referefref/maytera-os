@@ -276,7 +276,12 @@ static void sm_favdebug_file(const char *tag, int old_fav, int old_rec, bool bro
     k = " cb="; for (; *k; k++) b[q++] = *k;
     sm_favdebug_hex(b, &q, g_fdbg.canary_b);
     b[q++] = '\n';
-    int fd = sys_open("/FAVDEBUG.OUT", 0x1 | 0x40 | 0x400);   // O_WRONLY|O_CREAT|O_APPEND
+    // #peruserrows: was the /FAVDEBUG.OUT literal at the root-owned ext2 root,
+    // which the uid-1000 compositor cannot create, so a FAVDEBUG=1 build's file
+    // mirror never appeared and only the serial half of this instrument worked.
+    char fdp[192];
+    if (userscratch_path("FAVDEBUG.OUT", fdp, sizeof(fdp)) != 0) return;
+    int fd = sys_open(fdp, 0x1 | 0x40 | 0x400);   // O_WRONLY|O_CREAT|O_APPEND
     if (fd >= 0) { sys_write(fd, b, (unsigned long)q); sys_close(fd); }
 }
 static void sm_favdebug_check(const char *tag) {
@@ -477,6 +482,21 @@ static int sm_find_item_by_path(const char *path) {
             return i;
     }
     return -1;
+}
+
+// [deadbtn] Shared failure-report helper for compositor_spawn_app(): both
+// launch chokepoints below (the Start Menu's own click path in
+// sm_launch_item(), and the dock/pinned-icon path in startmenu_launch_path())
+// used to call compositor_spawn_app() and ignore its <0-on-failure return, so
+// an app promised by a menu entry or a pinned icon but absent from this build
+// (e.g. the Python entry on a public image that does not build PYTHON.ELF)
+// did nothing visible at all. Fixed once, here, instead of twice separately,
+// the way this file's own sm_launch_item() comment already warns against
+// ("exactly one launch switch instead of three copies drifting apart").
+static void sm_report_launch_failure(const char *path) {
+    int mi = sm_find_item_by_path(path);
+    const char *label = (mi >= 0 && g_menu_items[mi].name[0]) ? g_menu_items[mi].name : path;
+    notify_post("Cannot open program", label, NOTIFY_ERROR);
 }
 
 static int sm_find_item_by_name(const char *name) {
@@ -819,7 +839,9 @@ static int sp_kv(const char *b, const char *key, int def) {
 }
 
 static void sm_load_prefs(void) {
-    int fd = sys_open("/CONFIG/STARTMENU.PREFS", 0);
+    // #peruser2: per-user first, then /CONFIG, then the pre-existing root
+    // fallback. Settings writes <home>/CONFIG/STARTMENU.PREFS in the same commit.
+    int fd = userconf_open_read("STARTMENU.PREFS", "/CONFIG/STARTMENU.PREFS");
     if (fd < 0) fd = sys_open("/STARTMENU.PREFS", 0);
     if (fd < 0) return;
     static char b[256];
@@ -1137,10 +1159,20 @@ static void sm_launch_item(int idx) {
         case LAUNCH_DOS:   dos_run_titled(path, it->name);   break;
         default:
             if (path[0] == '@' && path[1] == 'R') {
-                int fd = sys_open("/RECYVIEW.FLG", 0x41);
-                if (fd >= 0) { sys_write(fd, "1", 1); sys_close(fd); }
+                // #peruser2: <home>/RECYVIEW.FLG. The literal was at the
+                // root-owned ext2 root, so this one-shot sentinel could not be
+                // created by a non-root session and the menu item opened Files
+                // at the default folder instead of the bin, with no error.
+                // The Files-side consumer moves in the same commit.
+                int fd = userhome_open_write(0, "RECYVIEW.FLG");
+                if (userconf_finish_write(fd, "1", 1) != 0) {
+                    // Reported through sys_bootlog; Files will simply open at
+                    // its default folder, which is the pre-existing behaviour.
+                }
                 sys_spawn("/APPS/FILES");
-            } else compositor_spawn_app(path);   // (ncursespty) routes MyMan/Rogue/Angband via Terminal's pty
+            } else if (compositor_spawn_app(path) < 0) {
+                sm_report_launch_failure(path);   // [deadbtn]
+            }   // (ncursespty) routes MyMan/Rogue/Angband via Terminal's pty
             break;
     }
     sm_record_recent(path);
@@ -1374,10 +1406,20 @@ void startmenu_launch_path(const char *path, int launch_type) {
         }
         default:
             if (path[0] == '@' && path[1] == 'R') {
-                int fd = sys_open("/RECYVIEW.FLG", 0x41);
-                if (fd >= 0) { sys_write(fd, "1", 1); sys_close(fd); }
+                // #peruser2: <home>/RECYVIEW.FLG. The literal was at the
+                // root-owned ext2 root, so this one-shot sentinel could not be
+                // created by a non-root session and the menu item opened Files
+                // at the default folder instead of the bin, with no error.
+                // The Files-side consumer moves in the same commit.
+                int fd = userhome_open_write(0, "RECYVIEW.FLG");
+                if (userconf_finish_write(fd, "1", 1) != 0) {
+                    // Reported through sys_bootlog; Files will simply open at
+                    // its default folder, which is the pre-existing behaviour.
+                }
                 sys_spawn("/APPS/FILES");
-            } else compositor_spawn_app(path);   // (ncursespty) same routing as sm_launch_item() - dock/pinned icons
+            } else if (compositor_spawn_app(path) < 0) {
+                sm_report_launch_failure(path);   // [deadbtn]
+            }   // (ncursespty) same routing as sm_launch_item() - dock/pinned icons
             break;
     }
     sm_record_recent(path);

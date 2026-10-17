@@ -8,9 +8,10 @@
 // the four Stage 2 properties:
 //   (b) MARKED FROM FIRST INSTRUCTION: its first FS syscalls are already
 //       enforced - an in-scope write SUCCEEDS (a live grant it never asked for)
-//       while an out-of-scope write and any delete are refused BY THE KERNEL.
+//       while an out-of-scope write is refused BY THE KERNEL and a delete is
+//       REDIRECTED into the Recycle Bin (it succeeds; the bytes survive).
 //   (c) NO SELF-EXIT: escrow_exit() (raw SYS_ESCROW_EXIT) is REFUSED, and the
-//       mark still holds afterwards (a delete is still denied).
+//       mark still holds afterwards (an out-of-scope write is still denied).
 //   (d) FORK INHERITANCE: a forked child is ALSO enforced - the kernel refuses
 //       the child's out-of-scope write and delete via raw syscall, while the
 //       child's in-scope write under the inherited grant succeeds.
@@ -57,12 +58,21 @@ int main(void) {
     // very first mutations are therefore already enforced.
     int b_inscope = (r_creat(SC "/mark.txt") >= 0);        // in-scope -> ALLOW
     int b_outw    = (r_open_w(OUTF) < 0);                  // out-of-scope -> DENY
-    int b_del     = (r_unlink(SC "/mark.txt") < 0);        // any delete -> DENY
-    int b_intact  = exists(SC "/mark.txt") && !exists(OUTF);
+    // 2026-10-03: a delete is no longer REFUSED. It SUCCEEDS and the kernel
+    // redirects the bytes into the user's Recycle Bin, which is what the owner
+    // asked for: the AI can delete, the user is told, and it can be undeleted.
+    // What is proven here is that the call took effect; /APPS/ESCRVT proves the
+    // bytes are recoverable, the index row attributes it, and the AI can put it
+    // back. Splitting it that way keeps ONE full proof instead of four partial
+    // ones.
+    int b_del     = (r_unlink(SC "/mark.txt") == 0) && !exists(SC "/mark.txt");
+    // The refused ops had no effect. mark.txt is deliberately NOT checked here
+    // any more: the delete above legitimately removed it from its path.
+    int b_intact  = !exists(OUTF);
     int marked    = b_inscope && b_outw && b_del && b_intact;
     line("MARKED.in-scope-write-ok(first instruction)", b_inscope);
     line("MARKED.out-of-scope-write-refused",           b_outw);
-    line("MARKED.delete-refused(no-delete invariant)",  b_del);
+    line("MARKED.delete-REDIRECTED-to-recycle-bin(not destroyed)", b_del);
     line("MARKED.refused-ops-had-no-effect",            b_intact);
     line("MARKED-FROM-FIRST-INSTRUCTION",               marked);
 
@@ -70,7 +80,11 @@ int main(void) {
     int x         = escrow_exit();          // raw SYS_ESCROW_EXIT
     int c_refused = (x != 0);               // must be refused (ESCROW_E_LOCKED)
     // and enforcement must STILL hold after the refused exit attempt
-    int c_still   = (r_unlink(SC "/mark.txt") < 0) && (r_open_w(OUTF) < 0);
+    // Still enforced after the refused exit attempt. The out-of-scope write is
+    // the signal now that a delete is no longer a refusal.
+    r_creat(SC "/mark2.txt");
+    int c_still   = (r_open_w(OUTF) < 0) && !exists(OUTF) &&
+                    (r_unlink(SC "/mark2.txt") == 0) && !exists(SC "/mark2.txt");
     int noexit    = c_refused && c_still;
     line("NO-SELF-EXIT.escrow_exit-refused", c_refused);
     line("NO-SELF-EXIT.still-enforced-after", c_still);
@@ -82,12 +96,14 @@ int main(void) {
     if (kid == 0) {
         // CHILD. We inherited the mark + the same grant binding.
         int k_out = (r_open_w(OUTF) < 0);                 // out-of-scope -> DENY
-        int k_del = (r_unlink(SC "/mark.txt") < 0);       // delete -> DENY
+        // The child's delete is redirected exactly like its parent's.
+        r_creat(SC "/kid.txt");
+        int k_del = (r_unlink(SC "/kid.txt") == 0) && !exists(SC "/kid.txt");
         int k_in  = (r_creat(SC "/child.txt") >= 0);      // in-scope -> ALLOW
-        int k_intact = exists(SC "/mark.txt") && !exists(OUTF);
+        int k_intact = !exists(OUTF);
         int k_ok = k_out && k_del && k_in && k_intact;
         cline("out-of-scope-write-refused", k_out);
-        cline("delete-refused",             k_del);
+        cline("delete-REDIRECTED-to-recycle-bin", k_del);
         cline("in-scope-write-ok(inherited grant)", k_in);
         cline("INHERITED-AND-ENFORCED",     k_ok);
         say(k_ok ? "ESCROW2T-CHILD: RESULT PASS\n" : "ESCROW2T-CHILD: RESULT FAIL\n");

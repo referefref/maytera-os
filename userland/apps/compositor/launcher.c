@@ -19,6 +19,7 @@
 #include "compositor.h"
 #include "../../libc/syscall.h"
 #include "../../libc/notify.h"
+#include "../../libc/userconf.h"   // #peruserrows: userconf_open_write/_path/_protect
 
 // From main.c: (re)launch / enable the AI Chat dock app that fulfils the prompt.
 void aichat_set_enabled(int on);
@@ -75,12 +76,38 @@ static void launcher_submit(const char *prompt) {
     if (!prompt || !prompt[0]) return;
 
     // Write the prompt to the hand-off file the AI Chat dock polls (#185/#292).
-    int fd = sys_open("/CONFIG/AIASK.TXT", 0x41 | 0x200 /* O_WRONLY|O_CREAT|O_TRUNC */);
-    if (fd >= 0) {
+    //
+    // #peruserrows: THIS WROTE /CONFIG/AIASK.TXT, AND IT COULD NOT WORK. /CONFIG
+    // is root-owned 0711 (SHADOW, MFA.DB, PERMS.DB, the consent store) and the
+    // compositor runs as uid 1000, so the open returned -13 for every normal
+    // session: the Spotlight-style launcher accepted a prompt, said "Working on
+    // your request...", enabled the dock, and handed it nothing. /CONFIG is not
+    // to be loosened; the caller is what changed. userconf_open_write() resolves
+    // <home>/CONFIG/AIASK.TXT, and root's home is "/", so a root session still
+    // writes exactly /CONFIG/AIASK.TXT. aichat reads the per-user copy first and
+    // falls back to the legacy path, so the two ends cannot miss each other.
+    char askp[224];
+    int fd = userconf_open_write("AIASK.TXT");
+    if (fd < 0) {
+        // AND IT NO LONGER CLAIMS SUCCESS IT DID NOT HAVE. A refused hand-off
+        // used to be indistinguishable from a working one, which is the whole
+        // bug family this ticket exists for: the toast is the only thing the
+        // user ever sees, so it has to be the truth.
+        notify_post("AI Assistant",
+                    "Could not hand the request over: the prompt file could not be written.",
+                    NOTIFY_ERROR);
+        launcher_close();
+        return;
+    }
+    {
         int n = 0; while (prompt[n]) n++;
         sys_write(fd, prompt, (unsigned long)n);
         sys_write(fd, "\n", 1);
         sys_close(fd);
+        // The prompt is what the user typed. 0600 it, for the same reason
+        // userconf_protect() exists: a per-user directory is necessary and not
+        // sufficient, because perms_on_create() stamps the system default mode.
+        if (userconf_path("AIASK.TXT", askp, sizeof(askp)) == 0) userconf_protect(askp);
     }
 
     // Make sure the dock app is running/enabled so it consumes the file, opens

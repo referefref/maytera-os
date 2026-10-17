@@ -1,0 +1,53 @@
+<html><head><title>245 vma scale</title></head><body style="font-family:sans-serif">
+<!--
+  vma_scale_browser.html - #245: the END-TO-END arm of the kernel VMA scaling
+  work, run in the SHIPPING browser, on a real boot, against the real kernel.
+
+  run_vma_scale.sh proves the mechanism on the kernel's own list code with a
+  deterministic counter. This proves the mechanism was the thing a real page
+  was actually paying for, which a counter cannot.
+
+  HOW TO RUN IT (no mouse, no GUI automation; #334):
+    1. Clone the golden to a throwaway VM (see blame.md: the args-attached LV
+       needs `lvchange -ay` or OVMF hangs with no serial).
+    2. Put this file on the ext2 root as /TEST.HTML. The browser loads /TEST.HTML
+       automatically on startup when it exists (userland/apps/browser/main.c).
+    3. Put "/APPS/BROWSER" in ext2 /CONFIG/AUTORUN.CFG, so it launches itself
+       once the compositor has presented a frame.
+    4. Boot, wait for the serial [HB] `top=` field to stop naming BROWSER, then
+       `qm monitor <id> <<< 'screendump out.ppm'`. The four numbers are rendered
+       into the page; console.log is NOT wired to serial (js_run_document is
+       called with a NULL logbuf), which is why the result is on screen.
+
+  FOUR EQUAL BATCHES. Each allocates the same number of retained DOM nodes, so
+  the only thing that differs between them is how much heap is ALREADY mapped.
+  Equal times mean per-allocation cost is independent of heap size. Rising times
+  are the superlinear term. Nothing is inserted into the tree: b93cab6d showed
+  that RETENTION, not insertion, is what makes this shape go quadratic, and
+  keeping the tree flat also keeps the #deepdom depth cap out of the measurement.
+
+  MEASURED 2026-10-02, golden 2551's image, same userland both arms, ONLY the
+  kernel differing (do_mmap coalescing on vs off):
+    coalesce OFF   b1=2000ms b2=7000ms b3=12000ms b4=11000ms, 32768 VMAs
+    coalesce ON    b1=1000ms b2=1000ms b3= 2000ms b4= 1000ms, 0 VMA reports
+  Date.now() has 1 s granularity here, which is why the batches are 100000 nodes.
+-->
+<h1>#245 DOM allocation scaling</h1>
+<h2 id="r">running...</h2>
+<script>
+var keep = [];
+function run(n) {
+  var t0 = Date.now();
+  var a = [];
+  for (var i = 0; i < n; i++) a.push(document.createElement('div'));
+  keep.push(a);
+  return Date.now() - t0;
+}
+var r1 = run(100000);
+var r2 = run(100000);
+var r3 = run(100000);
+var r4 = run(100000);
+document.getElementById('r').textContent =
+  'b1=' + r1 + 'ms b2=' + r2 + 'ms b3=' + r3 + 'ms b4=' + r4 + 'ms';
+</script>
+</body></html>

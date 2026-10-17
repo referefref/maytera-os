@@ -102,6 +102,38 @@ static uint64_t s_th_lock_at_ms = 0;
 // would always land inside that window and prove nothing.
 static uint64_t s_th_pcclick_at_ms = 0;
 static int32_t  s_th_pcclick_x = 0, s_th_pcclick_y = 0;
+// (#flowfix) Same idiom again, for LAUNCHDRAG below: a just-spawned app's
+// window does not exist (and cannot be hit) in the SAME testhook_poll() call
+// that calls sys_spawn() for it - it needs real wall-clock time to reach its
+// own main loop and create its window. Deferring the drag onto a later poll,
+// once uptime_ms() has actually advanced past spawn time, is what makes
+// "launch an app, then drag inside it" provable in one boot / one
+// /TESTHOOK.CMD, with no live second write to the running guest's disk (the
+// PANELLOCK comment above records that path as unsafe/racy).
+// Phased, not a single-poll burst: the first attempt injected MOVE+DOWN+4
+// intermediate MOVEs+UP (7 events) in one testhook_poll() call, all enqueued
+// into the target app's window event queue within microseconds of each
+// other. The ghost preview (flowedit's own drag-in-progress render) proved
+// DOWN and the MOVEs were received and processed - the node followed the
+// cursor to the drop point - but the final UP was never acted on (status bar
+// stayed "Drop to add", no node committed), consistent with a queue that
+// drops once a producer bursts past a bound the app's own 100ms-poll loop
+// has no chance to drain in between. Spacing DOWN / MOVE / UP across THREE
+// separate deferred ticks, each firing only after the one before has had
+// real wall-clock time to be polled and drained, removes that burst entirely
+// and is also more faithful to what an actual mouse drag delivers.
+static uint64_t s_th_drag_down_ms = 0, s_th_drag_move_ms = 0, s_th_drag_up_ms = 0;
+static int32_t  s_th_drag_x1 = 0, s_th_drag_y1 = 0, s_th_drag_x2 = 0, s_th_drag_y2 = 0;
+// One-shot guard, same reason SPAWNLOOP has s_sl_armed: an offline-baked
+// /TESTHOOK.CMD can outlive the poll loop's own truncate-then-unlink attempt
+// (measured THIS session - root-owned file written via a host-side ext2
+// mount before boot re-fired LAUNCHDRAG every single testhook_poll() call
+// for the VM's entire uptime: hundreds of /APPS/FLOW spawns, and the
+// re-arm each frame pushed s_th_drag_at_ms forward forever so the drag
+// itself never fired). Without this, "launch once, drag once" is not a
+// property LAUNCHDRAG can promise on exactly the delivery path its own
+// top-of-file comment documents as the common one.
+static int      s_th_launchdrag_armed = 0;
 // (#sqearlyexit) SPAWNLOOP: relaunch one app N times on a wall-clock cadence,
 // killing the previous instance first. Exists because the defect being chased
 // is an INTERMITTENT failure during app STARTUP, so the only useful harness is
@@ -753,6 +785,22 @@ static int th_close_by_title(const char *want) {
 }
 
 void testhook_poll(void) {
+    if (s_th_drag_down_ms != 0 && uptime_ms() >= s_th_drag_down_ms) {
+        s_th_drag_down_ms = 0;
+        sys_inject_mouse(s_th_drag_x1, s_th_drag_y1, MOUSE_EVENT_MOVE, 0);
+        sys_inject_mouse(s_th_drag_x1, s_th_drag_y1, MOUSE_EVENT_DOWN, 1);
+        th_logf("OK LAUNCHDRAG down %d %d", s_th_drag_x1, s_th_drag_y1);
+    }
+    if (s_th_drag_move_ms != 0 && uptime_ms() >= s_th_drag_move_ms) {
+        s_th_drag_move_ms = 0;
+        sys_inject_mouse(s_th_drag_x2, s_th_drag_y2, MOUSE_EVENT_MOVE, 0);
+        th_logf("OK LAUNCHDRAG move %d %d", s_th_drag_x2, s_th_drag_y2);
+    }
+    if (s_th_drag_up_ms != 0 && uptime_ms() >= s_th_drag_up_ms) {
+        s_th_drag_up_ms = 0;
+        sys_inject_mouse(s_th_drag_x2, s_th_drag_y2, MOUSE_EVENT_UP, 1);
+        th_logf("OK LAUNCHDRAG up %d %d", s_th_drag_x2, s_th_drag_y2);
+    }
     if (s_th_lock_at_ms != 0 && uptime_ms() >= s_th_lock_at_ms) {
         s_th_lock_at_ms = 0;
         lock_enter();
@@ -1348,6 +1396,98 @@ void testhook_poll(void) {
         return;
     }
 
+    // #flowfix verification-only verbs (never shipped, same TESTHOOK gate as
+    // every other verb in this file). ICON/MENUITEM drive a compositor-owned
+    // NAME; they cannot reach into an arbitrary third-party app's own content
+    // area (e.g. Maytera Flow's canvas/palette), and QEMU's relative-mouse
+    // injection does not land reliably at a chosen pixel (blame.md #334/
+    // #440 - the same reason vnc.c exists). These call sys_inject_mouse()
+    // directly - the IDENTICAL path vnc_inject_pointer() uses and a real
+    // PS/2 click ultimately reaches via main.c - at an absolute SCREEN pixel
+    // coordinate, so a test can click/drag inside ANY window's content by
+    // pixel without depending on VNC reverse-connect plumbing at all.
+    if (strcmp(verb, "RAWCLICK") == 0) {
+        // RAWCLICK <x> <y> - move, left-down, left-up at (x,y).
+        char *t = arg, *f[2]; int nf = 0;
+        while (*t && nf < 2) {
+            while (*t == ' ') t++;
+            if (!*t) break;
+            f[nf++] = t;
+            while (*t && *t != ' ') t++;
+            if (*t) *t++ = '\0';
+        }
+        if (nf < 2) { th_log("ERR RAWCLICK needs <x> <y>"); return; }
+        int x = th_atoi(f[0]), y = th_atoi(f[1]);
+        sys_inject_mouse(x, y, MOUSE_EVENT_MOVE, 0);
+        sys_inject_mouse(x, y, MOUSE_EVENT_DOWN, 1);
+        sys_inject_mouse(x, y, MOUSE_EVENT_UP, 1);
+        th_logf("OK RAWCLICK %d %d", x, y);
+        return;
+    }
+    if (strcmp(verb, "RAWDRAG") == 0) {
+        // RAWDRAG <x1> <y1> <x2> <y2> - the exact press/move/release sequence
+        // a real click-and-drag gesture delivers to on_mouse_down/
+        // on_mouse_move/on_mouse_up: move to (x1,y1), left-down, a few
+        // intermediate moves toward (x2,y2) (some apps' drag state depends on
+        // seeing motion, not just a start and end point), then left-up at
+        // (x2,y2). One synchronous testhook_poll() call, no sleep (#426).
+        char *t = arg, *f[4]; int nf = 0;
+        while (*t && nf < 4) {
+            while (*t == ' ') t++;
+            if (!*t) break;
+            f[nf++] = t;
+            while (*t && *t != ' ') t++;
+            if (*t) *t++ = '\0';
+        }
+        if (nf < 4) { th_log("ERR RAWDRAG needs <x1> <y1> <x2> <y2>"); return; }
+        int x1 = th_atoi(f[0]), y1 = th_atoi(f[1]);
+        int x2 = th_atoi(f[2]), y2 = th_atoi(f[3]);
+        sys_inject_mouse(x1, y1, MOUSE_EVENT_MOVE, 0);
+        sys_inject_mouse(x1, y1, MOUSE_EVENT_DOWN, 1);
+        for (int i = 1; i <= 4; i++) {
+            int mx = x1 + (x2 - x1) * i / 4;
+            int my = y1 + (y2 - y1) * i / 4;
+            sys_inject_mouse(mx, my, MOUSE_EVENT_MOVE, 0);
+        }
+        sys_inject_mouse(x2, y2, MOUSE_EVENT_UP, 1);
+        th_logf("OK RAWDRAG %d %d -> %d %d", x1, y1, x2, y2);
+        return;
+    }
+    if (strcmp(verb, "LAUNCHDRAG") == 0) {
+        // LAUNCHDRAG <path> <delayms> <x1> <y1> <x2> <y2> - spawn <path> now,
+        // then fire the identical RAWDRAG sequence <delayms> of REAL wall
+        // clock later (see s_th_drag_at_ms above for why the delay is
+        // required). Makes "launch an app from a cold TESTHOOK.CMD, then
+        // drag inside its own window" provable from ONE offline-baked
+        // command / one boot - no live second write to the guest's disk.
+        char *t = arg, *f[6]; int nf = 0;
+        while (*t && nf < 6) {
+            while (*t == ' ') t++;
+            if (!*t) break;
+            f[nf++] = t;
+            while (*t && *t != ' ') t++;
+            if (*t) *t++ = '\0';
+        }
+        if (nf < 6) { th_log("ERR LAUNCHDRAG needs <path> <delayms> <x1> <y1> <x2> <y2>"); return; }
+        if (s_th_launchdrag_armed) return;   // silent: a re-fire must not spawn/re-arm again
+        s_th_launchdrag_armed = 1;
+        sys_spawn(f[0]);
+        int delayms = th_atoi(f[1]);
+        if (delayms < 200) delayms = 200;
+        s_th_drag_x1 = th_atoi(f[2]); s_th_drag_y1 = th_atoi(f[3]);
+        s_th_drag_x2 = th_atoi(f[4]); s_th_drag_y2 = th_atoi(f[5]);
+        // Phased (see s_th_drag_down_ms's declaration comment): down at
+        // delayms, move at +400ms, up at +800ms - each a real wall-clock
+        // tick apart so the target app's own event loop drains one before
+        // the next is injected.
+        { uint64_t base = uptime_ms() + (uint64_t)delayms;
+          s_th_drag_down_ms = base;
+          s_th_drag_move_ms = base + 400;
+          s_th_drag_up_ms   = base + 800; }
+        th_logf("OK LAUNCHDRAG armed path=%s delay=%d", f[0], delayms);
+        return;
+    }
+
     // #dosfspacing verification-only verb: DOSRUN <path> - the exact call the
     // Start menu makes to launch a bundled DOS game (dos_run(), SYS_DOS_RUN,
     // startmenu.c LAUNCH_DOS case), used here instead of a generic LAUNCH so
@@ -1519,6 +1659,69 @@ void testhook_poll(void) {
         int r = wm_set_bounds(target, nx, ny, tw, th_, 0);
         g_needs_redraw = true;
         th_logf("OK WINPOS %s x=%d y=%d r=%d", name, (int)nx, (int)ny, r);
+        return;
+    }
+
+    // (#glassrevert) The WINPOS sibling this verification pass needed and
+    // did not have: a mouse-free way to drive a REAL EVENT_RESIZE into a
+    // named app, by app_id (falling back to a title substring - the same
+    // two-stage lookup WINPOS/WINCLOSE above use). Keeps the window's
+    // current (x,y) and only changes (w,h), so this is a pure resize via
+    // the exact same wm_set_bounds() path a corner drag calls (#334: real
+    // mouse drag coordinates do not land reliably in this harness, so this
+    // exercises the identical compositor entry point a drag would, just
+    // from a scripted width/height instead of a tracked cursor). Call it
+    // several times in a row with slightly different sizes to approximate
+    // the burst of EVENT_RESIZE events a real drag produces.
+    // Format: "WINSIZE <name> <w> <h>". Never shipped (TESTHOOK gate).
+    if (strcmp(verb, "WINSIZE") == 0) {
+        char name[32]; int ni = 0;
+        const char *sp = arg;
+        while (*sp && *sp != ' ' && ni < (int)sizeof(name) - 1) name[ni++] = *sp++;
+        name[ni] = '\0';
+        while (*sp == ' ') sp++;
+        int32_t nw = th_atoi(sp);
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int32_t nh = th_atoi(sp);
+
+        if (name[0] == '\0') { th_log("ERR WINSIZE needs a name"); return; }
+        wm_window_info_t wins[16];
+        int n = wm_get_windows(wins, 16);
+        if (n < 0) n = 0;
+        int target = -1, tx = 0, ty = 0;
+        for (int i = 0; i < n && target < 0; i++) {
+            if (wins[i].app_id[0] == '\0') continue;
+            int j = 0;
+            for (; name[j] && wins[i].app_id[j]; j++) {
+                char a = name[j], b = wins[i].app_id[j];
+                if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+                if (b >= 'a' && b <= 'z') b = (char)(b - 32);
+                if (a != b) break;
+            }
+            if (name[j] == '\0' && wins[i].app_id[j] == '\0') { target = wins[i].id; tx = wins[i].x; ty = wins[i].y; }
+        }
+        if (target < 0) {
+            for (int i = 0; i < n && target < 0; i++) {
+                const char *t = wins[i].title, *want = name;
+                for (const char *h = t; *h; h++) {
+                    const char *hh = h, *nn = want;
+                    while (*hh && *nn) {
+                        char a = *hh, b = *nn;
+                        if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                        if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+                        if (a != b) break;
+                        hh++; nn++;
+                    }
+                    if (!*nn) { target = wins[i].id; tx = wins[i].x; ty = wins[i].y; break; }
+                }
+            }
+        }
+        if (target < 0) { th_log("ERR WINSIZE not found"); return; }
+        if (nw <= 0 || nh <= 0) { th_log("ERR WINSIZE needs w>0 h>0"); return; }
+        int r = wm_set_bounds(target, tx, ty, nw, nh, 0);
+        g_needs_redraw = true;
+        th_logf("OK WINSIZE %s w=%d h=%d r=%d", name, (int)nw, (int)nh, r);
         return;
     }
 

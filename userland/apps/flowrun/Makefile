@@ -31,6 +31,21 @@ LIBYAML = $(PORTS_DIR)/lib/libyaml.a
 # Default target
 all: $(TARGET)
 
+# BUILD the libyaml port, do not assume it is there. userland/ports/out/ is
+# gitignored build output, so a clean checkout has neither
+# $(PORTS_DIR)/include/yaml.h nor $(PORTS_DIR)/lib/libyaml.a. Without this rule
+# the FIRST COMPILE fails with "yaml.h: No such file or directory", which reads
+# like a missing system header rather than a port nobody built, and this app is
+# then simply ABSENT from the image. The only thing in the tree that built
+# libyaml was userland/apps/yamltest, a TEST app that build.sh reaches
+# alphabetically after every shipping consumer. Same rule
+# userland/apps/zstdtest/Makefile already uses for libzstd.
+PORTS_SRC = ../../ports
+$(LIBYAML):
+	@echo "$(TARGET): libyaml.a not built yet; running the ports driver"
+	bash $(PORTS_SRC)/mports.sh build libyaml
+
+
 # Link the executable. libyaml before libc so its malloc/memcpy references
 # resolve out of libc.a.
 $(TARGET): $(OBJS) $(CRT0) $(LIBC) $(LIBYAML)
@@ -39,7 +54,7 @@ $(TARGET): $(OBJS) $(CRT0) $(LIBC) $(LIBYAML)
 	@ls -l $(TARGET)
 
 # Compile C source
-%.o: %.c flow.h
+%.o: %.c flow.h | $(LIBYAML)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Network-independent HOST unit test of the parser + marshaller + executor.

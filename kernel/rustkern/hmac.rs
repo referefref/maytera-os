@@ -27,6 +27,16 @@
 //                                     HMAC-DRBG (crypto/csprng.c) one-shot
 //     hmac_sha384_rs (B=128, D=48) - TLS 1.3 SHA-384 cipher-suite Finished
 //     hmac_md5_rs    (B=64,  D=16) - HMAC-MD5 (NTLM/SMB auth in net/smb.c)
+//     hmac_sha1_rs   (B=64,  D=20) - HMAC-SHA1, for kernel-side RFC 6238 TOTP.
+//                                     NEW code, not a port: there is no C twin
+//                                     and no strangler flag, so the live
+//                                     hmac_sha1() (crypto/sha1.c) is a plain
+//                                     one-line forward to it. SHA-1 is
+//                                     collision-broken and is here ONLY because
+//                                     RFC 6238 and every authenticator app
+//                                     require HMAC-SHA1, which the collision
+//                                     attacks do not break; rustkern/sha1.rs's
+//                                     header states that in full.
 // The kernel's INCREMENTAL streaming HMAC (hmac_*_init/update/final, used by the
 // CSPRNG's per-field DRBG update) stays C for now; only the one-shot public
 // symbols cross to Rust this phase. The original one-shots are kept as
@@ -59,6 +69,17 @@ extern "C" {
     fn md5_init(ctx: *mut u8);
     fn md5_update(ctx: *mut u8, data: *const u8, len: usize);
     fn md5_final(ctx: *mut u8, out: *mut u8);
+    // SHA-1 is the exception to the paragraph above: it has NO C half at all.
+    // init/update/final live in rustkern/sha1.rs and are declared here through
+    // extern "C" for the same reason the others are, namely that
+    // hmac_construct() takes the hash as three C-ABI function pointers. The
+    // symbols resolve inside this same crate at link time. Declaring them
+    // rather than calling crate::sha1:: directly keeps ONE calling convention
+    // in this file, so the hash triple is interchangeable whichever language
+    // it came from.
+    fn sha1_init(ctx: *mut u8);
+    fn sha1_update(ctx: *mut u8, data: *const u8, len: usize);
+    fn sha1_final(ctx: *mut u8, out: *mut u8);
 }
 
 type HmacInit = unsafe extern "C" fn(*mut u8);
@@ -221,6 +242,43 @@ pub extern "C" fn hmac_md5_rs(
         hmac_construct(
             md5_init, md5_update, md5_final,
             64, 16, key, key_len, data, data_len, mac,
+        );
+    }
+}
+
+/// HMAC-SHA1 one-shot (RFC 2104), B=64 D=20. crypto/sha1.c exposes the live
+/// hmac_sha1() name over this. Consumer: kernel-side RFC 6238 TOTP, whose
+/// algorithm is HMAC-SHA1 by specification and by what every authenticator app
+/// in the field actually speaks.
+///
+/// SHA-1 is collision-broken (SHAttered 2017) and must never be used here as a
+/// digest over attacker-chosen data. HMAC-SHA1 is a different question and is
+/// not affected by those attacks: HMAC rests on the keyed compression function
+/// as a PRF, not on collision resistance. See rustkern/sha1.rs's file header.
+/// This is NOT a general-purpose MAC for new code; new code uses hmac_sha256_rs.
+///
+/// There is no hmac_sha1_c and no -DRUST_HMAC_SHA1: nothing to switch between.
+/// What replaces the differential is a known-answer test, RFC 2202
+/// TC1/TC2/TC6/TC7 on every boot (sha1_selftest_rs) plus the full set with a
+/// proven RED in crypto/sha1_hmac_kat.sh.
+/// # Safety: `mac` has 20 writable bytes; key/data obey the hmac_construct
+/// contract.
+#[no_mangle]
+pub extern "C" fn hmac_sha1_rs(
+    key: *const u8,
+    key_len: usize,
+    data: *const u8,
+    data_len: usize,
+    mac: *mut u8,
+) {
+    // SAFETY: sha1_init/update/final are the matching triple for B=64, D=20
+    // (rustkern/sha1.rs); caller guarantees mac points to 20 writable bytes and
+    // key/data to their stated lengths. Bounded scratch inside hmac_construct,
+    // whose 256-byte opaque ctx buffer comfortably holds the 96-byte sha1_ctx_t.
+    unsafe {
+        hmac_construct(
+            sha1_init, sha1_update, sha1_final,
+            64, 20, key, key_len, data, data_len, mac,
         );
     }
 }

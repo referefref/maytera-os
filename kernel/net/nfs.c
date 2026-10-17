@@ -336,6 +336,35 @@ static int nfs_create_client(nfs_mount_t *mount) {
 }
 
 // Lookup a path component
+// #749 (secondary): SAY WHY.
+//
+// Every NFS operation below had the server's exact answer in hand and threw it
+// away. `return -(int)status` collapses NFS3ERR_PERM, which is 1, onto the
+// same -1 that a kmalloc failure, a connect failure and an XDR decode failure
+// all return, and no caller logged the status. nfs_strerror() has existed in
+// this file the whole time and was called from nowhere on a failure path.
+//
+// MEASURED 2026-10-03, golden 2564 against nfs-ganesha: GETATTR, LOOKUP and
+// CREATE each came back `accepted (0) / RPC executed successfully (0)` with
+// NFS3 status 1 (NFS3ERR_PERM). The server was telling us plainly that it
+// could not open its own filehandle. What the user saw was:
+//
+//     [NFSTEST] opendir FAILED
+//
+// A hang gives the user nothing to act on; so does an unexplained failure, and
+// this one cost a whole investigation to recover information the kernel had
+// already received. One line at the point of receipt is the fix.
+//
+// Written in C, not Rust: there is no new logic here. It routes an existing C
+// mapping (nfs_strerror) to the existing C logger at existing C error sites.
+// An FFI round trip to format a kprintf would add a language boundary and
+// nothing else.
+static int nfs_fail(const char *op, uint32_t status) {
+    kprintf("[NFS] %s: server answered NFS3 status %u (%s)\n",
+            op, status, nfs_strerror((nfs3_status_t)status));
+    return -(int)status;
+}
+
 static int nfs_lookup_one(nfs_mount_t *mount, nfs_fh3_t *dir_fh, 
                          const char *name, nfs_fh3_t *result_fh,
                          nfs_fattr3_t *attrs) {
@@ -368,7 +397,7 @@ static int nfs_lookup_one(nfs_mount_t *mount, nfs_fh3_t *dir_fh,
     
     if (status != NFS3_OK) {
         rpc_destroy_client(client);
-        return -(int)status;
+        return nfs_fail("GETATTR (LOOKUP of a path component)", status);
     }
     
     // Decode result file handle
@@ -481,7 +510,7 @@ static int nfs_getattr_fh(nfs_mount_t *mount, nfs_fh3_t *fh, nfs_fattr3_t *attrs
     
     if (status != NFS3_OK) {
         rpc_destroy_client(client);
-        return -(int)status;
+        return nfs_fail("GETATTR", status);
     }
     
     // Decode fattr3
@@ -630,7 +659,7 @@ ssize_t nfs_read(int fd, void *buffer, size_t count) {
     
     if (status != NFS3_OK) {
         rpc_destroy_client(client);
-        return -(int)status;
+        return nfs_fail("READ", status);
     }
     
     // Skip post_op_attr
@@ -715,7 +744,7 @@ ssize_t nfs_write(int fd, const void *buffer, size_t count) {
     
     if (status != NFS3_OK) {
         rpc_destroy_client(client);
-        return -(int)status;
+        return nfs_fail("WRITE", status);
     }
     
     // Decode WRITE3resok. It begins with file_wcc (wcc_data), which the
@@ -846,7 +875,7 @@ int nfs_setattr(const char *path, nfs_sattr3_t *sattr) {
     xdr_uint32(reply, &status);
     
     rpc_destroy_client(client);
-    return (status == NFS3_OK) ? 0 : -(int)status;
+    return (status == NFS3_OK) ? 0 : nfs_fail("SETATTR", status);
 }
 
 // ============================================================================
@@ -929,7 +958,7 @@ static int nfs_fetch_dir_entries(nfs_dir_t *dir) {
     
     if (status != NFS3_OK) {
         rpc_destroy_client(client);
-        return -(int)status;
+        return nfs_fail("READDIRPLUS", status);
     }
     
     // Skip dir_attributes (post_op_attr)
@@ -1083,7 +1112,7 @@ int nfs_mkdir(const char *path, uint32_t mode) {
     xdr_uint32(reply, &status);
     
     rpc_destroy_client(client);
-    return (status == NFS3_OK) ? 0 : -(int)status;
+    return (status == NFS3_OK) ? 0 : nfs_fail("MKDIR", status);
 }
 
 int nfs_rmdir(const char *path) {
@@ -1138,7 +1167,7 @@ int nfs_rmdir(const char *path) {
     xdr_uint32(reply, &status);
     
     rpc_destroy_client(client);
-    return (status == NFS3_OK) ? 0 : -(int)status;
+    return (status == NFS3_OK) ? 0 : nfs_fail("RMDIR", status);
 }
 
 // ============================================================================
@@ -1220,7 +1249,7 @@ int nfs_create(const char *path, uint32_t mode) {
     xdr_uint32(reply, &status);
     
     rpc_destroy_client(client);
-    return (status == NFS3_OK) ? 0 : -(int)status;
+    return (status == NFS3_OK) ? 0 : nfs_fail("CREATE", status);
 }
 
 int nfs_remove(const char *path) {
@@ -1275,7 +1304,7 @@ int nfs_remove(const char *path) {
     xdr_uint32(reply, &status);
     
     rpc_destroy_client(client);
-    return (status == NFS3_OK) ? 0 : -(int)status;
+    return (status == NFS3_OK) ? 0 : nfs_fail("REMOVE", status);
 }
 
 int nfs_rename(const char *oldpath, const char *newpath) {
@@ -1340,7 +1369,7 @@ int nfs_rename(const char *oldpath, const char *newpath) {
     xdr_uint32(reply, &status);
     
     rpc_destroy_client(client);
-    return (status == NFS3_OK) ? 0 : -(int)status;
+    return (status == NFS3_OK) ? 0 : nfs_fail("RENAME", status);
 }
 
 int nfs_symlink(const char *target, const char *linkpath) {
@@ -1403,7 +1432,7 @@ int nfs_symlink(const char *target, const char *linkpath) {
     xdr_uint32(reply, &status);
     
     rpc_destroy_client(client);
-    return (status == NFS3_OK) ? 0 : -(int)status;
+    return (status == NFS3_OK) ? 0 : nfs_fail("SYMLINK", status);
 }
 
 int nfs_readlink(const char *path, char *buffer, size_t size) {
@@ -1439,7 +1468,7 @@ int nfs_readlink(const char *path, char *buffer, size_t size) {
     
     if (status != NFS3_OK) {
         rpc_destroy_client(client);
-        return -(int)status;
+        return nfs_fail("READLINK", status);
     }
     
     // Skip post_op_attr
@@ -1506,7 +1535,7 @@ int nfs_link(const char *existing, const char *new_path) {
     xdr_uint32(reply, &status);
     
     rpc_destroy_client(client);
-    return (status == NFS3_OK) ? 0 : -(int)status;
+    return (status == NFS3_OK) ? 0 : nfs_fail("LINK", status);
 }
 
 // ============================================================================
@@ -1540,7 +1569,7 @@ int nfs_fsinfo(const char *path, nfs_fsinfo3_t *info) {
     
     if (status != NFS3_OK) {
         rpc_destroy_client(client);
-        return -(int)status;
+        return nfs_fail("FSINFO", status);
     }
     
     // Skip post_op_attr
@@ -1591,7 +1620,7 @@ int nfs_fsstat(const char *path, nfs_fsstat3_t *stat) {
     
     if (status != NFS3_OK) {
         rpc_destroy_client(client);
-        return -(int)status;
+        return nfs_fail("FSSTAT", status);
     }
     
     // Skip post_op_attr

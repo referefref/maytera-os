@@ -28,8 +28,10 @@
 #include "net/arp.h"
 #include "net/dhcp.h"
 #include "net/https.h"
+#include "net/smb.h"           // SMB2 message-signing policy constants for the boot ABI lock
 #include "fs/fat.h"
-#include "fs/ext2.h"          // #610: on-device fsck + dirty detection
+#include "fs/ext2.h"
+#include "fs/fsenoent.h"   // #aicappersist          // #610: on-device fsck + dirty detection
 #include "fs/fat_readahead.h"
 #include "fs/bootlog.h"           // #307 real-hw: persistent /BOOTLOG.TXT
 #include "fs/bootstage.h"         // #ASUSDIAG: named checkpoints to every channel that exists yet
@@ -50,6 +52,7 @@
 #include "fs/perms.h"
 #include "security/selftest_registry.h"  // #PERMSKIP
 #include "proc/users.h"
+#include "proc/secretuse.h"   // #secretuse: secretuse_selftest()
 #include "proc/pwpolicy.h"
 #include "proc/services.h"
 #include <stdarg.h>
@@ -1207,6 +1210,34 @@ static void desktop_session_thread(void *arg) {
 
     // Set session identity and create home directory
     desktop_set_session(login_result.uid, login_result.gid);
+    // [noaccount] The Recycle Bin directory can already exist, stamped with
+    // whatever uid was current when the escrow layer first asked whether a bin
+    // was usable - which on an untouched machine is the boot self-test, before
+    // this line, with the session uid still 0. Correct it now that the session
+    // is known. Same perms_get-then-set-only-if-different idiom as the home
+    // claim below, and like that one it is a no-op on a machine where the
+    // ownership is already right.
+    { extern void recycle_session_changed(void);   // fs/recycle_fs.h
+      recycle_session_changed(); }
+    // [binmigrate] AND RECORD WHETHER THIS SESSION HAS AN ACCOUNT AT ALL.
+    //
+    // This is the only moment the fact is knowable. The #OOBEAUTH bootstrap
+    // session runs at FIRST_ADMIN_UID with NO user-table entry, so [noaccount]
+    // resolves all of its per-account state (the Recycle Bin and its index
+    // among 67 such files) under "/TMP/CONFIG". The setup wizard then creates
+    // the account AT THE SAME UID with a home of /HOME/<NAME8>, and from that
+    // instant the identical accessor answers somewhere else for the same live
+    // session. Asking "did this session have an entry" afterwards is
+    // impossible: it has one by then. So it is recorded here and consumed by
+    // whichever account-creation path commits that uid (fs/binmigrate.c).
+    //
+    // has_entry comes from a real user_lookup_uid(), NEVER from comparing the
+    // home string against "/": root's own entry SAYS its home is "/", which is
+    // [noaccount]'s recorded lesson and the reason that rule needed no uid-0
+    // escape hatch.
+    { extern void binmig_session_established(uint32_t uid, int has_entry);  // fs/binmigrate.h
+      binmig_session_established(login_result.uid,
+                                 user_lookup_uid(login_result.uid) ? 1 : 0); }
     if (login_result.home[0]) {
         fat_mkdir(&g_fat_fs, login_result.home);
         // #745: mkdir alone left the home ROOT-OWNED, so at uid 0 it worked
@@ -2237,6 +2268,31 @@ void kernel_main(boot_info_t *boot_info) {
     // reported from has NO SERIAL PORT, and the whole diagnosis turns on one bit
     // (Status Register B bit 2). The raw register bytes go out too, so the
     // encoding is checkable without trusting our own decoder.
+    // ====================================================================
+    // SMB 3.1.1 PRE-AUTHENTICATION INTEGRITY (#smbpreauth).
+    //
+    // Proves, on every boot including the golden: the running SHA-512 is
+    // seeded with sixty-four zero bytes and folded as H = SHA512(H || msg);
+    // the four 3.1.1 KDF labels produce the keys a REAL Samba 4.17.12 session
+    // was signed with; the negotiate-context blob is built byte for byte; every
+    // refusal arm fires with its own code; and -- case 23 -- flipping ONE BIT
+    // of one handshake message changes all three derived keys, which is the
+    // only property that makes any of the rest worth having.
+    // ====================================================================
+    {
+        extern uint32_t smbpreauth_selftest_rs(void);
+        extern int32_t  smbpreauth_floor_abi_check(uint32_t, uint32_t);
+        uint32_t pbad = smbpreauth_selftest_rs();
+        int32_t  pabi = smbpreauth_floor_abi_check(SMB_PREAUTH_FLOOR_NONE,
+                                                   SMB_PREAUTH_FLOOR_311);
+        kprintf("[SMBPREAUTH] SMB 3.1.1 pre-auth integrity selftest: %s (first "
+                "failing case %u), floor ABI %s\n",
+                pbad == 0 ? "PASS" : "FAIL", pbad,
+                pabi == 0 ? "locked" : "DRIFTED");
+        bootlog_write("[SMBPREAUTH] pre-auth integrity selftest %s case=%u abi=%d",
+                      pbad == 0 ? "PASS" : "FAIL", pbad, (int)pabi);
+    }
+
     {
         extern void rtc_mode_report(void);
         rtc_mode_report();
@@ -2258,6 +2314,206 @@ void kernel_main(boot_info_t *boot_info) {
                 fbad == 0 ? "PASS" : "FAIL", fbad);
         bootlog_write("[FSTAT] kind selftest %s mism=%u",
                       fbad == 0 ? "PASS" : "FAIL", fbad);
+    }
+    {   // #747: the open-PLAN policy (rustkern/fdopenpolicy.rs). ABSOLUTE
+        // assertions over the real C decoder (open_mode_decode_c), not an
+        // equivalence differential: the thing being removed is four
+        // hand-written answers to one question, three of them wrong, so an
+        // agreement test between two of them would have passed throughout.
+        //
+        // THE ROW THAT MATTERS: a plain O_RDWR open of an existing file must
+        // PRESERVE its contents. On SMB, NFS and /MNT it did not, and a 4-byte
+        // write to a 1 MB file left 4 bytes.
+        extern uint32_t fd_open_plan_selftest_rs(void);
+        uint32_t obad = fd_open_plan_selftest_rs();
+        kprintf("[FDOPEN] open-plan policy selftest: %s (%u mismatches)\n",
+                obad == 0 ? "PASS" : "FAIL", obad);
+        bootlog_write("[FDOPEN] open-plan selftest %s mism=%u",
+                      obad == 0 ? "PASS" : "FAIL", obad);
+    }
+    {   // [noaccount] WHERE THIS SESSION'S PER-ACCOUNT STATE LIVES
+        // (rustkern/userconf.rs). ABSOLUTE assertions, not a differential:
+        // the defect was TWO sites each deciding the home for themselves, so a
+        // test that only proved they agree would have passed while both were
+        // wrong. The row that matters is case 1: a session with NO user-table
+        // entry resolves to /TMP, not to "/", because "/" is root-owned 0755
+        // and Ring 3 cannot create a single name in it. Case 2 is the one a
+        // naive "home != /" rule fails: root's own entry SAYS "/".
+        extern uint32_t userconf_state_root_selftest_rs(void);
+        uint32_t sbad = userconf_state_root_selftest_rs();
+        kprintf("[USERCONF] state-root selftest: %s (%u failing cases)\n",
+                sbad == 0 ? "PASS" : "FAIL", sbad);
+        bootlog_write("[USERCONF] state-root selftest %s bad=%u",
+                      sbad == 0 ? "PASS" : "FAIL", sbad);
+    }
+    {   // [binmigrate] WHAT HAPPENS TO THAT STATE WHEN THE SESSION GETS AN
+        // ACCOUNT (rustkern/binmigrate.rs). The block above proves the state
+        // root is resolved correctly at both ends of the window; this one
+        // proves the disposition that carries the FILES across it. The case
+        // that matters is the one with no safe answer available: an occupied
+        // destination that is not a row log must be SKIPPED, never clobbered,
+        // because the destination is the new account's own home.
+        //
+        // ALWAYS RUNS, including on a production golden, for recycle_selftest's
+        // stated reason: it costs microseconds and one line, and the line's
+        // absence from a boot log is the only cheap evidence that this work is
+        // not in the kernel being looked at. It also prints the live armed uid,
+        // which is the one number that says whether this machine is inside the
+        // first-boot window.
+        extern void binmig_selftest(void);   // fs/binmigrate.h
+        binmig_selftest();
+    }
+    {   // #749: the SMB2 message sequence and credit window
+        // (rustkern/smbseq.rs). ABSOLUTE assertions, not a differential: what
+        // was wrong was the ABSENCE of a rule (a bare `conn->message_id++`
+        // with nothing tying it to the connection), and two implementations of
+        // nothing agree perfectly.
+        //
+        // The case numbers are the rules, so a FAIL names the one that broke.
+        // Case 4 is the ticket itself: a sequence that has reached MessageId
+        // 136 and is then re-bound to a NEW socket must produce 0, because the
+        // server's window restarted at 0 and it TERMINATES the connection
+        // otherwise. Case 6 is the Samba window rule (granted = 1 during the
+        // handshake, measured on the wire) that makes a single slipped id
+        // fatal. Case 8 is the misdiagnosis: a response carrying someone
+        // else's MessageId must be reported as a mismatch, not as a verdict on
+        // our password.
+        extern uint32_t smbseq_selftest_rs(void);
+        uint32_t sbad = smbseq_selftest_rs();
+        kprintf("[SMBSEQ] SMB2 message-sequence selftest: %s (first failing "
+                "case %u)\n", sbad == 0 ? "PASS" : "FAIL", sbad);
+        bootlog_write("[SMBSEQ] message-sequence selftest %s case=%u",
+                      sbad == 0 ? "PASS" : "FAIL", sbad);
+    }
+    {   // #749 pass 2: the SMB session IDENTITY policy (rustkern/smbident.rs).
+        // ABSOLUTE assertions, not a differential: there is no C twin, because
+        // what is being removed is the ABSENCE of a check. Case 3 is the
+        // ticket (a named user answered with a guest session came up as a
+        // working mount). Case 7 is SMB2_SESSION_FLAG_IS_NULL, which appeared
+        // in net/smb.h and in no .c file in the kernel. Case 9 is the
+        // false-alarm guard: the on-demand /SMB mount asks for "guest" with an
+        // empty secret, and if that counted as downgraded every
+        // credential-free share in the system would stop mounting.
+        extern uint32_t smbident_selftest_rs(void);
+        uint32_t ibad = smbident_selftest_rs();
+        kprintf("[SMBIDENT] SMB session-identity selftest: %s (first failing "
+                "case %u)\n", ibad == 0 ? "PASS" : "FAIL", ibad);
+        bootlog_write("[SMBIDENT] session-identity selftest %s case=%u",
+                      ibad == 0 ? "PASS" : "FAIL", ibad);
+    }
+    {   // SMB2 MESSAGE SIGNING (rustkern/smbsign.rs). ABSOLUTE assertions
+        // against CROSS-IMPLEMENTATION known answers, not a differential:
+        // there is no C twin, because what is being removed is the total
+        // ABSENCE of signing (`signing_required` was written once in
+        // net/smb.c and read by nothing in any file, and `session_key` was
+        // declared and never written).
+        //
+        // The vectors are RFC 4493 (AES-CMAC) and RFC 4231 (HMAC-SHA256)
+        // reached through the real entry points, plus a signing key and two
+        // signatures produced by an independent implementation of MS-SMB2
+        // 3.1.4.1/3.1.4.2. Case 1 is the SP800-108 key derivation, where one
+        // misplaced NUL in a 29-byte input changes every output byte. Cases 9
+        // and 11 are the RED arms that matter: a response with one flipped bit
+        // in its BODY, and one in its HEADER STATUS, must be REFUSED. Case 12
+        // is the cheapest attack, stripping the signature entirely. Cases 52
+        // to 63 run the same green and red arms through smbsign_check_response,
+        // which is the function net/smb.c actually calls, because a module
+        // whose internals are tested and whose entry point is not is the shape
+        // of several past defects in this tree.
+        //
+        // AND THE LINE REPORTS HOW MANY CASES RAN, NOT ONLY PASS OR FAIL.
+        // The test stops at the first failure, so one stale expectation
+        // silently removes every case after it. Case 25's comparison was left
+        // pointing at a return code smbsign_begin() had stopped using (commit
+        // 1a96ca71), so cases 26 to 80, 55 of them, did not execute on golden
+        // 2581 while the line said "FAIL (first failing case 25)" as though
+        // one check were broken rather than 55 unrun. MEASURED on a real boot
+        // of 2581, not inferred. "25/80" and "80/80" are different at a
+        // glance; "FAIL" and "PASS" are not.
+        extern uint32_t smbsign_selftest_rs(uint32_t *ran_out);
+        extern uint32_t smbsign_selftest_cases_rs(void);
+        extern int32_t  smbsign_policy_abi_check(uint32_t, uint32_t);
+        uint32_t gran = 0;
+        uint32_t gtot = smbsign_selftest_cases_rs();
+        uint32_t gbad = smbsign_selftest_rs(&gran);
+        int32_t  gabi = smbsign_policy_abi_check(SMB_SIGN_POLICY_ENABLED,
+                                                 SMB_SIGN_POLICY_REQUIRED);
+        //
+        // The two structural codes are reported in words, not as a case
+        // number, because 8080 printed where a case number belongs reads as
+        // nonsense and nonsense gets ignored. 9000+n means the n-th case to
+        // run did not claim to be case n (someone inserted a case and did not
+        // renumber), and 8000+n means every case passed but n of them ran
+        // where SMBSIGN_SELFTEST_CASES declares a different number (someone
+        // added or deleted a case and did not update the total).
+        if (gbad == 0) {
+            kprintf("[SMBSIGN] SMB2 message-signing selftest: %u/%u cases "
+                    "PASS, policy ABI %s\n", gran, gtot,
+                    gabi == 0 ? "locked" : "DRIFTED");
+        } else if (gbad >= 9000) {
+            kprintf("[SMBSIGN] SMB2 message-signing selftest: FAIL, cases are "
+                    "MISNUMBERED at position %u (code %u), policy ABI %s\n",
+                    gbad - 9000, gbad, gabi == 0 ? "locked" : "DRIFTED");
+        } else if (gbad >= 8000) {
+            kprintf("[SMBSIGN] SMB2 message-signing selftest: FAIL, every case "
+                    "passed but %u ran where %u are declared (code %u), "
+                    "policy ABI %s\n",
+                    gbad - 8000, gtot, gbad,
+                    gabi == 0 ? "locked" : "DRIFTED");
+        } else {
+            kprintf("[SMBSIGN] SMB2 message-signing selftest: FAIL at case %u "
+                    "of %u, so %u case(s) DID NOT RUN, policy ABI %s\n",
+                    gbad, gtot, gtot > gbad ? gtot - gbad : 0,
+                    gabi == 0 ? "locked" : "DRIFTED");
+        }
+        bootlog_write("[SMBSIGN] message-signing selftest %s ran=%u/%u case=%u abi=%d",
+                      gbad == 0 ? "PASS" : "FAIL", gran, gtot, gbad, (int)gabi);
+    }
+    {   // AES-CCM (rustkern/aesccm.rs), the one new crypto primitive SMB3
+        // encryption needed. RFC 3610's OWN published vectors, which nothing
+        // in this tree produced, plus the refusal arms: a flipped ciphertext
+        // byte, a flipped tag byte and a flipped AAD byte must each be
+        // REFUSED, and a refused decryption must leave no plaintext behind.
+        // The AAD case is the one a round-trip test cannot see, and it is
+        // where the SMB transform header's size and SessionId live.
+        extern uint32_t aesccm_selftest_rs(void);
+        uint32_t cbad = aesccm_selftest_rs();
+        kprintf("[AESCCM] AES-CCM selftest: %s (first failing case %u)\n",
+                cbad == 0 ? "PASS" : "FAIL", cbad);
+        bootlog_write("[AESCCM] AES-CCM selftest %s case=%u",
+                      cbad == 0 ? "PASS" : "FAIL", cbad);
+    }
+    {   // SMB3 ENCRYPTION (rustkern/smbcrypt.rs). ABSOLUTE assertions against
+        // CROSS-IMPLEMENTATION known answers, not a differential: there is no
+        // C twin, because what is being removed is the total ABSENCE of
+        // encryption (measured on golden 2576, the test file's contents were
+        // readable three times over in a packet capture).
+        //
+        // Case 1 is the key schedule, where swapping "ServerIn " for
+        // "ServerOut" or dropping the trailing space passes every round-trip
+        // test and talks to no server. Case 2 is the full wire framing against
+        // a header and ciphertext produced by an independent implementation
+        // whose own encrypted TREE_CONNECT, CREATE and READ were accepted by a
+        // real Samba. Cases 5 to 11 are the RED arms: a flipped ciphertext
+        // byte, a flipped tag, a truncated frame, a lying size field, a frame
+        // aimed at another session and one claiming AES-GCM must each be
+        // refused BY NAME. Cases 12 to 14 are the downgrade rule. Case 17
+        // onwards assert that the three policy values BEHAVE DIFFERENTLY,
+        // which is the lesson from the signing work, where a carefully
+        // written smbsign_requires() had no caller and both settings refused
+        // the same things.
+        extern uint32_t smbcrypt_selftest_rs(void);
+        extern int32_t  smbcrypt_policy_abi_check(uint32_t, uint32_t, uint32_t);
+        uint32_t ebad = smbcrypt_selftest_rs();
+        int32_t  eabi = smbcrypt_policy_abi_check(SMB_CRYPT_POLICY_OFF,
+                                                  SMB_CRYPT_POLICY_ENABLED,
+                                                  SMB_CRYPT_POLICY_REQUIRED);
+        kprintf("[SMBCRYPT] SMB3 encryption selftest: %s (first failing case "
+                "%u), policy ABI %s\n",
+                ebad == 0 ? "PASS" : "FAIL", ebad,
+                eabi == 0 ? "locked" : "DRIFTED");
+        bootlog_write("[SMBCRYPT] encryption selftest %s case=%u abi=%d",
+                      ebad == 0 ? "PASS" : "FAIL", ebad, (int)eabi);
     }
     {   // #111: the pipe WRITE-side decision machine (rustkern/pipewr.rs).
         // ABSOLUTE assertions, not a differential: there is no C twin (the old
@@ -2318,6 +2574,14 @@ void kernel_main(boot_info_t *boot_info) {
         long dr = drag_selftest_rs();
         kprintf("[DRAG-SELFTEST] %s (mask=0x%lx)\n", dr == 0 ? "PASS" : "FAIL", dr);
     }
+
+    // #smbdisk: the on-disk SMB credential encoding (nt$<32 hex>). Proves the
+    // round trip against the published MS-NLMP NTOWFv1 vector AND that every
+    // malformed form is REFUSED, because a short or non-hex field accepted here
+    // would authenticate with a hash nobody chose. It runs on every boot
+    // including the golden: crypto/run-all-kats.sh cannot host a Rust-crate
+    // test, so the boot path is what stops this one rotting (blame.md, #514).
+    { extern void nt_secret_selftest(void); nt_secret_selftest(); }
 
     // (#194) x86_16 interpreter 386-opcode self-test (one line PASS/FAIL at boot).
     extern int x86_16_selftest_386(void);
@@ -2471,6 +2735,10 @@ void kernel_main(boot_info_t *boot_info) {
     {
         boot_stage(BSTAGE_FSCK);
         ext2_fsck_selftest();
+    // #aicappersist: the ENOENT instrument's ABI lock + classifier self-test.
+    // Runs beside the fsck FFI lock for the same reason: a drifted verdict table
+    // would mislabel the one line the instrument exists to produce.
+    fsenoent_boot_selftest();
         int skip  = (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/NOFSCK")) ? 1 : 0;
         // #610: /FSCKBENCH on the ESP runs the check twice (display on, then
         // off) to MEASURE what the progress display costs. Off by default.
@@ -3003,6 +3271,36 @@ void kernel_main(boot_info_t *boot_info) {
                                 "encoding fix OFF (control arm)");
               } else {
                   bootlog_write("[75] gate: on_cpu encoding fix ON (default)");
+              } }
+            // #heapinvptr: the slot-double-release reproducer. Same
+            // one-binary-two-arms shape as /WAKELOSS.TXT below, so the arm with
+            // the reproducer and the arm without are the same kernel bytes.
+            // #heapinvptr CONTROL ARM for the orphan-kernel-stack detector.
+            { extern int g_kstack_orphan_refuse;
+              if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/NOKSTKORPH.TXT")) {
+                  g_kstack_orphan_refuse = 0;
+                  kprintf("[MAIN] #heapinvptr: /NOKSTKORPH.TXT present, an orphaned "
+                          "kernel stack is passed to kfree() as before, so it is "
+                          "reported as an invalid HEAP pointer (control arm)\n");
+                  bootlog_write("[KSTACK] gate: orphan refusal OFF (control arm)");
+              } else {
+                  bootlog_write("[KSTACK] gate: orphan refusal ON (default)");
+              } }
+            { extern int g_slotdbl_gate;
+              if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/SLOTDBL.TXT")) {
+                  g_slotdbl_gate = 1;
+                  kprintf("[MAIN] #heapinvptr: /SLOTDBL.TXT present, the process-slot "
+                          "double-release reproducer will run with the deferred "
+                          "device init\n");
+                  bootlog_write("[SLOTDBL] gate: reproducer ARMED");
+              } }
+            { extern int g_heapzdbl_gate;
+              if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/HEAPZDBL.TXT")) {
+                  g_heapzdbl_gate = 1;
+                  kprintf("[MAIN] #heapdbl: /HEAPZDBL.TXT present, BOTH causes of a "
+                          "`magic=0x0` kfree refusal will be produced on demand so "
+                          "the [HEAPZERO] classifier can be seen to separate them\n");
+                  bootlog_write("[HEAPZDBL] gate: reproducer ARMED");
               } }
             { extern int g_wakeloss_gate;
               if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/WAKELOSS.TXT")) {
@@ -3950,8 +4248,73 @@ void kernel_main(boot_info_t *boot_info) {
     { extern int ecdsa_verify_selftest(void); ecdsa_verify_selftest(); }  // #659 (crypkat): RFC6979 P-256 ECDSA verify KAT (accept+forgery-reject); the TLS X.509 cert-signature verifier
     { extern int pbkdf2_shadow_selftest(void); pbkdf2_shadow_selftest(); }  // authkat: PBKDF2-HMAC-SHA256 KAT + SHADOW verify_against_record accept/reject; the local-login/SHADOW password trust anchor
     { extern int chacha20_poly1305_selftest(void); chacha20_poly1305_selftest(); }  // aeadkat: RFC8439 ChaCha20-Poly1305 AEAD KAT (accept + tamper-reject); the TLS1.3 record data plane
+    // #secretuse: the encrypted-secret-store container (rustkern/secstore.rs).
+    // Returns 0 or the CASE NUMBER that failed, so a bad build names itself on
+    // serial instead of just saying "failed". Fourteen of its fifteen cases are
+    // REFUSALS (wrong key, flipped ciphertext, flipped tag, a rewritten KDF
+    // iteration count, a swapped salt, a truncation, a short output buffer),
+    // because an AEAD that has only ever been seen to round-trip successfully
+    // is not evidence of anything. It runs on EVERY boot including the golden:
+    // a check that only runs when someone remembers to run it is
+    // indistinguishable from no check.
+    {
+        extern int secstore_selftest_rs(void);
+        int sc = secstore_selftest_rs();
+        if (sc != 0) {
+            kprintf("[SECSTORE] SELFTEST FAILED at case %d\n", sc);
+            bootlog_write("[SECSTORE] SELFTEST FAILED at case %d", sc);
+        } else {
+            kprintf("[SECSTORE] selftest OK (15 cases: 1 round trip, 14 refusals)\n");
+        }
+    }
     { extern int x25519_selftest(void); x25519_selftest(); }  // ecdhkat: RFC7748 X25519 ECDH KAT (5.2 scalarmult + 6.1 DH-agreement + negatives); the TLS1.3 key_share / TLS1.2 x25519-ECDHE shared secret
     { extern int rsa_verify_selftest(void); rsa_verify_selftest(); }  // secroad2: RSA PKCS#1 v1.5 SHA-256 cert-signature verify KAT (accept+forgery-reject); the X.509 RSA-cert trust anchor (cert_store.c)
+
+    // #secretuse: SHA-1 + HMAC-SHA1 (rustkern/sha1.rs, HMAC through the shared
+    // rustkern/hmac.rs construction) known-answer test. This primitive is NEW
+    // code with no C twin, so there is no [RUST-DIFF] differential to run: a
+    // KAT is the only thing that can show the digest really is SHA-1 rather
+    // than merely compiling and linking. Published RFC 3174 / FIPS 180-2
+    // vectors plus the 55/56/57/63/64/65-byte length-padding boundary and a
+    // split-update streaming case, plus RFC 2202 HMAC-SHA1 TC1/TC2/TC6/TC7
+    // (TC6/TC7 keys exceed the block, the K' = H(key) branch). The
+    // one-million-'a' vector is deliberately NOT here (~15625 compressions on
+    // every boot of every machine); crypto/sha1_hmac_kat.sh runs it on the host
+    // and proves the oracle can go RED. BOTH numbers are printed: a PASS with
+    // zero checks is vacuous, so sha1_selftest_rs returns -1 if nothing ran.
+    {
+        extern int32_t sha1_selftest_rs(uint32_t *out_checks);
+        uint32_t s1checks = 0;
+        int32_t s1rc = sha1_selftest_rs(&s1checks);
+        kprintf("[SHA1] selftest %s (%u checks, rc=%d)\n",
+                s1rc == 0 ? "PASS" : "FAIL", s1checks, s1rc);
+        bootlog_write("[SHA1] selftest %s checks=%u rc=%d",
+                      s1rc == 0 ? "PASS" : "FAIL", s1checks, s1rc);
+    }
+    // #secretuse: the SECRET-USE PROXY's arithmetic and its keyring invariants.
+    // rustkern/totp.rs runs RFC 6238 Appendix B (SHA1 and SHA256 arms, all six
+    // published times each), RFC 4648 section 10, and every refusal: bad base32,
+    // non-canonical padding bits, a store row with the wrong field count, digits
+    // outside {6,8}, an unknown algorithm, a truncated store, a name too long for
+    // its buffer, and an UNDECLARED secret class failing to inherit the login key.
+    // proc/secretuse.c then checks what Rust cannot see: that an unknown uid has
+    // no keyring slot, that the sleepable mutex is exclusive and releases, and
+    // that clearing a slot really clears the key.
+    //
+    // BOTH numbers are printed. A self-test that returns 0 having run ZERO checks
+    // is VACUOUS, which is the shape found in the contract work this week
+    // (promise=fulfilled, paths=0/0), so the count is reported and a zero is a
+    // FAIL rather than a pass.
+    {
+        uint32_t suchecks = 0;
+        int surc = secretuse_selftest(&suchecks);
+        int suok = (surc == 0 && suchecks > 0);
+        kprintf("[SECRET] selftest %s (%u checks, rc=%d)\n",
+                suok ? "PASS" : "FAIL", suchecks, surc);
+        bootlog_write("[SECRET] selftest %s checks=%u rc=%d",
+                      suok ? "PASS" : "FAIL", suchecks, surc);
+    }
+
     extern void xdr_rust_selftest(void);
     xdr_rust_selftest();
 
@@ -5032,10 +5395,35 @@ void kernel_main(boot_info_t *boot_info) {
     // to clobber an occupied slot or remove a non-empty directory. No-op on a
     // production golden.
     { extern void escrow_undo_selftest(void); escrow_undo_selftest(); }
+    // The Recycle Bin policy self-test. ALWAYS RUNS, including on a production
+    // golden, unlike the four escrow verifiers above it that are gated behind
+    // marker files nothing creates. It is microseconds and one line, and its
+    // absence from a boot log is the only cheap evidence that this code is not
+    // in the kernel you are looking at.
+    { extern void recycle_selftest(void); recycle_selftest(); }
     // #305 Stage 5A immutable-core verifier (only under -DESCROW_CORE_SELFTEST).
     { extern void escrow_core_seal_text(void); escrow_core_seal_text(); }  // #305 keystone: seal .text RO late (default ON, /CONFIG/ESCROWSEAL.OFF kill-switch)
     { extern void escrow_core_selftest(void); escrow_core_selftest(); }
     { extern void escrow4_start_deferred_test(void); escrow4_start_deferred_test(); }
+
+    // The UNCOOPERATIVE-ACTOR verifier for the recycling AI delete. No-op
+    // unless /CONFIG/ESCRVT.TEST exists (present on no production golden).
+    // Spawns /APPS/ESCRVT already-marked and LOCKED, which then deliberately
+    // attempts each of the four escapes (self-exit, spawn a helper, raw
+    // syscall, rmdir) and proves the delete is REDIRECTED into the Recycle Bin
+    // rather than destroying anything, that the index row attributes it to the
+    // AI with a timestamp, and that the AI can undelete it.
+    { extern void escrvt_start_deferred_test(void); escrvt_start_deferred_test(); }
+
+    // [binmigrate] gated first-boot Recycle Bin migration prover. No-op unless
+    // /CONFIG/BINMIG.TEST exists (present on no production golden). It deletes
+    // a file through recycle_capture() while the machine is still a no-account
+    // bootstrap session, creates the first account through
+    // users_create_first_admin(), and then asks userconf_kpath() where the bin
+    // is and whether the deleted bytes and their index row are still there. It
+    // CREATES AN ACCOUNT, which is why it is gated and why the harness runs it
+    // against a copy of a golden.
+    { extern void binmig_start_deferred_test(void); binmig_start_deferred_test(); }
 
     // #708 gated AI safe-eject device-executor verifier. No-op unless
     // /CONFIG/AIEJECT.TEST exists (present on no production golden). Launches
@@ -5043,6 +5431,56 @@ void kernel_main(boot_info_t *boot_info) {
     // removable volume (flush+unmount+stop, busy-refuse, forbidden-verb,
     // boot-disk-never-target).
     { extern void aieject_start_deferred_test(void); aieject_start_deferred_test(); }
+
+    // #fdreclaim gated legacy-fd-slot leak/reclaim oracle. No-op unless
+    // /CONFIG/FDRECLAIM.TEST exists (present on no production golden). Launches
+    // /APPS/FDPROBE repeatedly and reports the free-slot ceiling after each
+    // process death, which is the only direct evidence that a dead process's
+    // slots come back. /CONFIG/FDRECLAIM.OFF restores the pre-fix leak so the
+    // same kernel can be measured both ways.
+    { extern void fdreclaim_start_deferred_test(void); fdreclaim_start_deferred_test(); }
+
+    // [renamevol] #246 gated ORDINARY-USER removable-volume rename / permission
+    // verifier. No-op unless /CONFIG/USBRNT.TEST exists (present on no
+    // production golden). Launches /APPS/USBRNT **UNMARKED**, which is the
+    // whole point: the four escrow provers above are spawned already marked, so
+    // their destructive syscalls are intercepted before they reach the
+    // filesystem and they cannot tell "the escrow layer refused this" from "the
+    // filesystem could not find the path". This one measures what a normal
+    // Ring-3 process can do to a mounted USB stick, and its last arm drops to
+    // uid 1000 to exercise the destination-removal permission gate that uid 0
+    // skips by design.
+    { extern void usbrnt_start_deferred_test(void); usbrnt_start_deferred_test(); }
+    // [openperm] #246 gated OPEN-vs-DELETE permission verifier for a mounted
+    // removable volume. No-op unless /CONFIG/USBOPN.TEST exists (present on no
+    // production golden). It asks the one question the two subsystems disagreed
+    // about: sys_open_k() has a deliberate #250 carve-out that skips the
+    // permission check entirely for a removable path, while sys_unlink(),
+    // sys_rmdir() and sys_rename() enforce there since [renamevol]. So you
+    // could be refused permission to DELETE another user's file on a stick and
+    // permitted to OPEN it with O_TRUNC and blank it. Every arm is an
+    // ALLOW-and-DENY pair on the SAME verb in the SAME directory differing only
+    // in who owns the target, and the whole suite runs twice from one function,
+    // once on the root filesystem as a control and once on the volume.
+    //
+    // MUST NOT be armed in the same boot as USBRNT: both launchers write the
+    // mount point's permission row and they disagree about it on purpose. See
+    // the header of proc/usbopn_vmtest.c.
+    { extern void usbopn_start_deferred_test(void); usbopn_start_deferred_test(); }
+
+    // [provetwo] #246: the PKGRDR verifier. Gated on /CONFIG/PKGRDR.TEST, so
+    // this is a silent no-op on every shipping image. It asks whether the two
+    // [volaudit] permission fixes that shipped UNPROVEN in golden 2575 are real
+    // on a mounted removable volume: SYS_PKG_WRITE's pkg_write_permit() and
+    // shell output redirection's open_redir_file(). Each arm is a PAIR, a deny
+    // and an allow differing only in who owns the target, because this
+    // subsystem has already produced two near-false-passes where a refusal came
+    // from the wrong gate. See the header of proc/pkgrdr_vmtest.c.
+    //
+    // MUST NOT be armed in the same boot as USBRNT, which overwrites the mount
+    // point's permission row; this launcher reads that row and does not write
+    // it.
+    { extern void pkgrdr_start_deferred_test(void); pkgrdr_start_deferred_test(); }
 
     // #702 real-hardware defensive hardening: kick off audio hardware
     // probing (HDA controller reset/CORB-RIRB/codec parse, #71 MSI arm) on
@@ -5059,6 +5497,14 @@ void kernel_main(boot_info_t *boot_info) {
         // actively scheduling - and starting it here puts it in the same
         // regime rather than a quiet one. No-op unless /WAKELOSS.TXT is present.
         { extern void wakeloss_start(void); wakeloss_start(); }
+        // #heapinvptr: the process-slot double-release reproducer. No-op unless
+        // /SLOTDBL.TXT is present.
+        { extern void slotdbl_start(void); slotdbl_start(); }
+        // #heapdbl: both causes of a `magic=0x0` kfree refusal, on demand, so the
+        // classifier is PROVEN to discriminate on real heap state and not only on
+        // the synthetic counts its own self-test uses. No-op unless
+        // /HEAPZDBL.TXT is present.
+        { extern void heapzdbl_start(void); heapzdbl_start(); }
     }
 
     // #426: prove the timed wait-queue primitive on THIS build at boot. Spawns
@@ -5290,7 +5736,7 @@ void kernel_shell(void) {
                         shell_print("  splash  - Show boot splash screen\n");
                         shell_print("\nPress Ctrl+C to cancel running commands\n");
                     } else if (strcmp(command_buffer, "hblog") == 0) {
-                        // #748: the heartbeat ring is RAM-resident between its
+                        // #749: the heartbeat ring is RAM-resident between its
                         // 30-minute flushes, so give it a reader that does not
                         // touch the disk at all. Printing it is free; the point
                         // of the change was to stop WRITING it 1800 times an

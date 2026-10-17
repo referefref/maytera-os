@@ -37,7 +37,19 @@ int draw_w(void) { return g_prev_px ? g_prev_w : g_doc.w; }
 int draw_h(void) { return g_prev_px ? g_prev_h : g_doc.h; }
 
 // Called once from main() after doc_new(). Each registrar adds its ops.
+//
+// IDEMPOTENT (#<config-ref>). It used to be called from exactly one place
+// (ui_splash step 4), so "called once" was true by inspection. The contract
+// projection now needs the registry populated on the SPAWNED --contract path
+// too, which returns from main() before the splash ever runs, so
+// PAINT_CONTRACT.load() calls this as well. studio_register() appends without
+// dedup, so a second call would have listed all 300-odd ops twice and the
+// projection would have declared every filter twice. Guarding here rather than
+// at each caller keeps it one fact in one place.
+static int g_registered = 0;
 void studio_register_all(void) {
+    if (g_registered) return;
+    g_registered = 1;
     color_register_all();
     fx_blur_register_all();
     fx_enhance_register_all();
@@ -56,4 +68,45 @@ void studio_register_all(void) {
     fx_stylize_register_all();
     fx_texture_register_all();
     fx_pixelate_register_all();
+}
+
+// ---------------------------------------------------------------------------
+// The ONE non-interactive apply path (#<config-ref>).
+//
+// ui.c's run_op() either applies a zero-parameter op immediately or OPENS THE
+// PARAMETER DIALOG and waits for a person. A contract call has no person, so it
+// needs the apply without the dialog, with the parameters supplied. This is the
+// same three steps run_op() and pd_commit() both perform (undo_push, apply,
+// mark dirty), in one place, so a headless call and a dialog OK cannot diverge
+// into two different notions of "applying a filter".
+//
+// Parameters not supplied take the op's declared default, and each supplied one
+// is CLAMPED to the op's own declared [min,max]: p[] indexes per-pixel loops and
+// lookup tables, and an out-of-range value from a caller is INPUT, exactly as
+// contract_load_cfg() treats a config file as input.
+//
+// HONEST LIMIT, and the projection says so per row: SP_CURVE and SP_KERNEL
+// parameters are ui.c-owned interactive state (the tone-curve editor and the 5x5
+// convolution grid). A headless call gets whatever those editors currently hold,
+// which in a freshly spawned process is their reset default. Such ops are
+// projected with CT_TF_LIVE_ONLY for that reason.
+int studio_op_apply_params(int i, const int *vals, int nvals) {
+    const studio_op_t *op = studio_op_get(i);
+    if (!op || !op->apply) return -1;
+    if (g_doc.nlayers <= 0) return -2;          // no drawable: a spawned copy
+    int p[STUDIO_MAX_PARAMS];
+    int np = op->nparams; if (np > STUDIO_MAX_PARAMS) np = STUDIO_MAX_PARAMS;
+    for (int k = 0; k < np; k++) {
+        int v = (vals && k < nvals) ? vals[k] : op->params[k].def;
+        if (op->params[k].type != SP_COLOR) {   // SP_COLOR's def is 0xRRGGBB, not a range
+            if (v < op->params[k].min) v = op->params[k].min;
+            if (v > op->params[k].max) v = op->params[k].max;
+        }
+        p[k] = v;
+    }
+    undo_push(op->name);
+    int rc = op->apply(np > 0 ? p : (const int *)0);
+    g_doc.comp_dirty = 1;
+    g_doc.modified = 1;
+    return rc;
 }

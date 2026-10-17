@@ -1,4 +1,8 @@
 name: agentdemo
+# The Library catalog in /APPS/FLOW shows this line. It is part of the
+# additive optional schema: flow.c skips unknown top-level keys, so the
+# runner ignores it.
+description: "Bounded agent-promise loop terminating on objective"
 # A bounded AGENT-PROMISE loop ("promise completion"). The agent runs its
 # perceive->decide->act body repeatedly until a TERMINATION PROMISE is met, then
 # reports the reason. This demo is deterministic and needs no network so

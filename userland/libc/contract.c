@@ -59,7 +59,16 @@ static void ct_emit(const char *s) {
 
 static void ct_line(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void ct_line(const char *fmt, ...) {
-    char b[512];
+    // 1536, NOT 512. MEASURED: adding the contract terms (#<config-ref>) pushed a
+    // describe row past 512 and ct_line silently TRUNCATED it, which is the worst
+    // possible failure for a describe: the line still parses, it just stops
+    // mid-field, so a consumer reads a row that is missing its desc or half its
+    // promise and has no way to tell. The worst case a row can produce is
+    // name 64 + bounds/options 256 + cfgkey 24 + cap 80 + needs 192 + terms 512 +
+    // desc 128 plus the literal field names, about 1376 bytes. Caught by the
+    // host test asserting a described row still carries BOTH its promise and its
+    // desc, which is the assertion to keep if this line ever grows again.
+    char b[1536];
     __builtin_va_list ap;
     __builtin_va_start(ap, fmt);
     vsnprintf(b, sizeof(b), fmt, ap);
@@ -282,6 +291,221 @@ int contract_load_cfg(const ct_contract_t *c, const char *name,
 // Authorization. ONE site, so #305's move of this into the immutable core is
 // mechanical, exactly as aicap.h promises for the AI tool loop.
 // ---------------------------------------------------------------------------
+
+// ===========================================================================
+// THE CONTRACT TERMS (#<config-ref>): derive, bound, and REFUSE rather than hang.
+// See contract.h for why these three terms and why most rows declare none.
+// ===========================================================================
+
+static ct_promise_open_fn   g_prom_open   = 0;
+static ct_promise_settle_fn g_prom_settle = 0;
+static int                  g_serving_live = 0;
+
+void contract_set_promise_backend(ct_promise_open_fn open_fn,
+                                  ct_promise_settle_fn settle_fn) {
+    g_prom_open = open_fn; g_prom_settle = settle_fn;
+}
+int  contract_serving_live(void) { return g_serving_live; }
+void contract_set_serving_live(int on) { g_serving_live = on ? 1 : 0; }
+
+int contract_terms_of(const ct_item_t *it, ct_terms_t *out) {
+    if (!it || !out) return 0;
+    if (it->terms) { *out = *it->terms; return 1; }
+
+    // DERIVED. Not a default: for a value row each of these follows from what
+    // the row already declares, so a hand-written copy could only ever be a
+    // second version of the same fact. An ACTION row is not derivable and
+    // returns 0, which the engine treats as unbounded.
+    memset(out, 0, sizeof(*out));
+    switch (it->type) {
+    case CT_BOOL:
+    case CT_INT:
+    case CT_ENUM:
+        out->timing      = CT_TIME_INSTANT;
+        out->budget_ms   = CT_TIME_MS_INSTANT;
+        out->success     = CT_SUCC_ITEM;
+        out->success_ref = it->name;          // read it back: it equals what you wrote
+        out->depth       = it->cfgkey ? CT_DEPTH_PREF : CT_DEPTH_VIEW;
+        out->failures    = CT_FAIL_RANGE | (it->risk == CT_SAFE ? 0u : CT_FAIL_DENIED);
+        return 1;
+    case CT_STR:
+        out->timing    = CT_TIME_INSTANT;
+        out->budget_ms = CT_TIME_MS_INSTANT;
+        out->success   = CT_SUCC_RC;          // a read either answered or did not
+        out->depth     = CT_DEPTH_VIEW;
+        out->failures  = (it->risk == CT_SAFE ? 0u : CT_FAIL_DENIED);
+        return 1;
+    default:
+        return 0;                             // CT_ACTION: must be declared
+    }
+}
+
+int contract_budget_ms(const ct_item_t *it) {
+    ct_terms_t t;
+    if (!contract_terms_of(it, &t)) return 0;
+    if (t.budget_ms) return (int)t.budget_ms;
+    switch (t.timing) {
+    case CT_TIME_INSTANT: return CT_TIME_MS_INSTANT;
+    case CT_TIME_FAST:    return CT_TIME_MS_FAST;
+    case CT_TIME_SLOW:    return CT_TIME_MS_SLOW;
+    case CT_TIME_LONG:    return CT_TIME_MS_LONG;
+    default:              return 0;   // UNSPEC / UNBOUNDED: do not wait
+    }
+}
+
+static const char *ct_timename(int t) {
+    switch (t) {
+    case CT_TIME_INSTANT:   return "instant";
+    case CT_TIME_FAST:      return "fast";
+    case CT_TIME_SLOW:      return "slow";
+    case CT_TIME_LONG:      return "long";
+    case CT_TIME_UNBOUNDED: return "unbounded";
+    default:                return "unspecified";
+    }
+}
+static const char *ct_succname(int s) {
+    switch (s) {
+    case CT_SUCC_RC:    return "return-code-only";
+    case CT_SUCC_ITEM:  return "item";
+    case CT_SUCC_PATH:  return "path";
+    case CT_SUCC_ARMED: return "armed";
+    default:            return "unspecified";
+    }
+}
+static const char *ct_depthname(int d) {
+    switch (d) {
+    case CT_DEPTH_VIEW:   return "view";
+    case CT_DEPTH_PREF:   return "pref";
+    case CT_DEPTH_DOC:    return "doc";
+    case CT_DEPTH_FS:     return "fs";
+    case CT_DEPTH_SYSTEM: return "system";
+    default:              return "unspecified";
+    }
+}
+
+const char *contract_failures_str(unsigned int mask, char *out, int ocap) {
+    static const struct { unsigned int bit; const char *nm; } tbl[] = {
+        { CT_FAIL_DENIED, "denied" }, { CT_FAIL_RANGE, "range" },
+        { CT_FAIL_NOTFOUND, "notfound" }, { CT_FAIL_BUSY, "busy" },
+        { CT_FAIL_NOSPACE, "nospace" }, { CT_FAIL_IO, "io" },
+        { CT_FAIL_NEEDSLIVE, "needslive" }, { CT_FAIL_TIMEOUT, "timeout" },
+        { CT_FAIL_UNSUPPORTED, "unsupported" }, { CT_FAIL_PARTIAL, "partial" },
+    };
+    int o = 0;
+    if (ocap > 0) out[0] = 0;
+    for (unsigned i = 0; i < sizeof(tbl) / sizeof(tbl[0]); i++) {
+        if (!(mask & tbl[i].bit)) continue;
+        o += snprintf(out + o, (size_t)(ocap - o), "%s%s", o ? "|" : "", tbl[i].nm);
+        if (o >= ocap - 1) break;
+    }
+    return out;
+}
+
+// Emit the terms of one row as flow-map fields, appended to the describe line.
+// Written for EVERY row including a derived one, because a consumer must not
+// have to know which rows derive: "timing: instant" is true either way, and an
+// absent field would read as "no bound stated" when a bound is known.
+// APPEND WITH THE REMAINING ROOM, NEVER WITH (ocap - o).
+//
+// snprintf() returns the length it WOULD have written, so `o` can exceed ocap on
+// a truncating call. `(size_t)(ocap - o)` is then a negative int widened to a
+// huge size_t, and the next snprintf believes it has 18 exabytes of buffer. The
+// strings here are bounded well under 512 today, so this was not reachable, but
+// "not reachable today" is how the next field-widening turns a describe into a
+// stack overwrite. ct_apnd caps the length and clamps `o`, so the arithmetic
+// cannot go negative no matter what a row declares.
+static int ct_apnd(char *out, int o, int ocap, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+static int ct_apnd(char *out, int o, int ocap, const char *fmt, ...) {
+    if (o < 0) o = 0;
+    if (o >= ocap - 1) return ocap - 1;        // full: keep the NUL, write nothing
+    // __builtin_va_* to match ct_line() above: this TU is freestanding and does
+    // not include stdarg.h, and adding an include for one function would be a
+    // second way of doing the same thing in the same file.
+    __builtin_va_list ap;
+    __builtin_va_start(ap, fmt);
+    int n = vsnprintf(out + o, (size_t)(ocap - o), fmt, ap);
+    __builtin_va_end(ap);
+    if (n < 0) return o;
+    o += n;
+    if (o > ocap - 1) o = ocap - 1;            // it truncated; stop believing n
+    return o;
+}
+
+static void ct_terms_fields(const ct_item_t *it, char *out, int ocap) {
+    ct_terms_t t;
+    if (ocap > 0) out[0] = 0;
+    if (ocap < 8) return;
+    if (!contract_terms_of(it, &t)) {
+        ct_apnd(out, 0, ocap, ", timing: unspecified, budget_ms: 0, "
+                "success: unspecified, depth: unspecified, failures: []");
+        return;
+    }
+    char fails[128]; contract_failures_str(t.failures, fails, (int)sizeof(fails));
+    char flags[48]; int fo = 0; flags[0] = 0;
+    if (t.tflags & CT_TF_LIVE_ONLY) fo = ct_apnd(flags, fo, (int)sizeof(flags), "%slive-only", fo ? "|" : "");
+    if (t.tflags & CT_TF_ASYNC)     fo = ct_apnd(flags, fo, (int)sizeof(flags), "%sasync", fo ? "|" : "");
+    if (t.tflags & CT_TF_MODAL)     fo = ct_apnd(flags, fo, (int)sizeof(flags), "%smodal", fo ? "|" : "");
+    int o = ct_apnd(out, 0, ocap,
+                    ", timing: %s, budget_ms: %d, tflags: [%s], success: %s",
+                    ct_timename(t.timing), contract_budget_ms(it), flags,
+                    ct_succname(t.success));
+    if (t.success_ref)
+        o = ct_apnd(out, o, ocap, ", success_ref: %s", t.success_ref);
+    o = ct_apnd(out, o, ocap, ", depth: %s, failures: [%s]",
+                ct_depthname(t.depth), fails);
+    if (t.promise) {
+        o = ct_apnd(out, o, ocap, ", promise: {scope: %s, ttl: %ld, posts: [",
+                    t.promise->scope_tmpl ? t.promise->scope_tmpl : "",
+                    t.promise->ttl_secs);
+        if (t.promise->posts) {
+            int first = 1;
+            for (const ct_post_t *ps = t.promise->posts; ps->kind != CT_POST_END; ps++) {
+                const char *kn = ps->kind == CT_POST_PATH  ? "path"
+                               : ps->kind == CT_POST_MOVED ? "moved" : "item";
+                o = ct_apnd(out, o, ocap, "%s%s:%s", first ? "" : "|",
+                            kn, ps->a ? ps->a : "");
+                first = 0;
+                if (o >= ocap - 4) break;      // leave room for the closer
+            }
+        }
+        o = ct_apnd(out, o, ocap, "]}");
+    }
+    (void)o;
+}
+
+// Is this action safe to run in THIS invocation? A caller on the spawn path
+// waits on an UNBOUNDED sys_waitpid() (ctinvoke.c; the kernel ignores WNOHANG),
+// so an action that has told us it may never return must be refused HERE, where
+// there is still somebody to tell, rather than allowed to wedge the caller. On
+// the live path the caller already has a bounded wait (contract_invoke_live's
+// CTLIVE_WAIT_MS -> CT_LIVE_TIMEOUT), so the same action is allowed.
+static int ct_timing_refusal(const ct_item_t *it, char *why, int wcap) {
+    ct_terms_t t;
+    if (!contract_terms_of(it, &t)) {
+        snprintf(why, (size_t)wcap,
+                 "action declares no timing term, so no caller can bound it; "
+                 "declare ct_terms_t.timing (contract.h)");
+        return 1;
+    }
+    if (contract_serving_live()) return 0;   // bounded by the live transport
+    if (t.tflags & CT_TF_MODAL) {
+        snprintf(why, (size_t)wcap,
+                 "modal: it opens a dialog and waits for a person, and a spawned "
+                 "contract process has no window and nobody to answer it. Deliver "
+                 "it to a RUNNING instance (contract_invoke_live)");
+        return 1;
+    }
+    if (t.timing == CT_TIME_UNBOUNDED) {
+        snprintf(why, (size_t)wcap,
+                 "timing: unbounded, and the spawn path waits with no timeout "
+                 "(sys_waitpid ignores WNOHANG). Deliver it to a RUNNING instance "
+                 "(contract_invoke_live), which does have a bounded wait");
+        return 1;
+    }
+    return 0;
+}
+
 int contract_authorize(const ct_contract_t *c, const ct_item_t *it,
                        const char *args, char *reason, int rcap) {
     if (it->risk == CT_DENIED) {
@@ -361,9 +585,14 @@ static void ct_describe(const ct_contract_t *c) {
             }
         }
         snprintf(needsbuf + nb, sizeof(needsbuf) - nb, "]");
-        ct_line("  - {name: %s, type: %s, access: %s, risk: %s%s%s%s%s, desc: %s}\n",
+        // #<config-ref>: the TERMS, on every row. A consumer must be able to read
+        // timing/success/depth without knowing whether the row declared them or
+        // the engine derived them, so they are always emitted.
+        char termsbuf[512];
+        ct_terms_fields(&it, termsbuf, (int)sizeof(termsbuf));
+        ct_line("  - {name: %s, type: %s, access: %s, risk: %s%s%s%s%s%s, desc: %s}\n",
                 it.name, ct_typename(it.type), ct_access_str(it.access),
-                ct_riskname(it.risk), extra, keybuf, capbuf, needsbuf,
+                ct_riskname(it.risk), extra, keybuf, capbuf, needsbuf, termsbuf,
                 it.desc ? it.desc : "");
     }
 }
@@ -479,6 +708,12 @@ static int ct_do_set(const ct_contract_t *c, const char *name, const char *valst
                 ct_codename(CT_ERR_FAILED), name);
         return CT_ERR_FAILED;
     }
+    // The ROW's own writer first, then the app-wide one. A row that names a
+    // commitfn is saying "commit() does not persist me"; running it before
+    // commit() means an app whose commit() recomputes a change-signature from
+    // its own file (Settings does exactly that) sees the new value already on
+    // disk rather than one launch behind it.
+    if (it.commitfn) it.commitfn();
     if (c->commit) c->commit();
 
     // Read the value BACK through the same accessor rather than echoing what
@@ -510,6 +745,18 @@ static int ct_do_call(const ct_contract_t *c, const char *name,
         size_t l = 0; while (args[l]) l++;
         snprintf(args + l, sizeof(args) - l, i ? " %s" : "%s", argv[i]);
     }
+    // #<config-ref> TIMING, BEFORE authorization and before any work: refuse an
+    // action that has declared it may not return, instead of letting the caller
+    // block on it. This is the half of the #469m hang that contract_declared()
+    // could not close: that guard rejects an app the index does not name, and
+    // this one rejects an action the app itself says is unbounded or modal.
+    char why[192]; why[0] = 0;
+    if (ct_timing_refusal(&it, why, (int)sizeof(why))) {
+        ct_audit(c, &it, args, CT_ERR_DENIED, "call-timing-refused");
+        ct_line("err code=%s name=%s detail=%s\n", ct_codename(CT_ERR_DENIED), name, why);
+        return CT_ERR_DENIED;
+    }
+
     char reason[192]; reason[0] = 0;
     int arc = contract_authorize(c, &it, args, reason, (int)sizeof(reason));
     if (arc != CT_OK) {
@@ -517,16 +764,62 @@ static int ct_do_call(const ct_contract_t *c, const char *name,
         ct_line("err code=%s name=%s detail=%s\n", ct_codename(arc), name, reason);
         return arc;
     }
+
+    // #<config-ref> THE PROMISE. A row that declares filesystem postconditions
+    // runs INSIDE an escrow contract: the kernel scopes the writes and refuses
+    // every delete, and the escrow's own postcondition oracle then says whether
+    // what was promised actually holds. FAIL CLOSED when no backend is
+    // registered: running the action anyway would leave the declaration
+    // unverified, and an unverified promise is a claim a caller will believe.
+    ct_terms_t tm; int have_tm = contract_terms_of(&it, &tm);
+    int promised = (have_tm && tm.promise != 0);
+    if (promised) {
+        if (!g_prom_open || !g_prom_settle) {
+            ct_audit(c, &it, args, CT_ERR_DENIED, "call-promise-no-backend");
+            ct_line("err code=%s name=%s detail=%s\n", ct_codename(CT_ERR_DENIED), name,
+                    "this action declares a promise but the app registered no promise "
+                    "backend; call contract_use_escrow_promises() (libc/ctpromise.h) "
+                    "before contract_cli(), or the postconditions go unverified");
+            return CT_ERR_DENIED;
+        }
+        char pwhy[192]; pwhy[0] = 0;
+        if (g_prom_open(c, &it, argc, argv, pwhy, (int)sizeof(pwhy)) != 0) {
+            ct_audit(c, &it, args, CT_ERR_DENIED, "call-promise-open-failed");
+            ct_line("err code=%s name=%s detail=promise-not-opened: %s\n",
+                    ct_codename(CT_ERR_DENIED), name, pwhy[0] ? pwhy : "escrow refused");
+            return CT_ERR_DENIED;
+        }
+    }
+
     char out[384]; out[0] = 0;
     int rc = it.actfn(&it, argc, argv, out, (int)sizeof(out));
+
+    // Settle the promise BEFORE commit(): commit() persists preferences under
+    // /CONFIG or the user's home, which is outside the escrow scope, and the
+    // kernel would (correctly) refuse that write while the contract is still
+    // marked. Order matters and this is the one place it is decided.
+    char how[192]; how[0] = 0; int verdict = 0;
+    if (promised) verdict = g_prom_settle(c, &it, how, (int)sizeof(how));
+
     if (c->commit) c->commit();
-    ct_audit(c, &it, args, rc == 0 ? CT_OK : CT_ERR_FAILED, "call");
+    ct_audit(c, &it, args, rc == 0 ? CT_OK : CT_ERR_FAILED, promised ? how : "call");
     if (rc != 0) {
-        ct_line("err code=%s name=%s detail=%s\n",
-                ct_codename(CT_ERR_FAILED), name, out[0] ? out : "action-failed");
+        ct_line("err code=%s name=%s detail=%s%s%s\n",
+                ct_codename(CT_ERR_FAILED), name, out[0] ? out : "action-failed",
+                promised ? " promise=" : "", promised ? how : "");
         return CT_ERR_FAILED;
     }
-    ct_line("ok name=%s%s%s\n", name, out[0] ? " result=" : "", out[0] ? out : "");
+    // A PROMISED action that returned 0 but whose postconditions do not hold is
+    // NOT a success. This is the whole point of the success/promise terms: the
+    // return code is the action's opinion of itself, and the promise is a fact
+    // somebody else checked.
+    if (promised && verdict != 0) {
+        ct_line("err code=%s name=%s detail=promise-unmet result=%s promise=%s\n",
+                ct_codename(CT_ERR_FAILED), name, out[0] ? out : "(none)", how);
+        return CT_ERR_FAILED;
+    }
+    ct_line("ok name=%s%s%s%s%s\n", name, out[0] ? " result=" : "", out[0] ? out : "",
+            promised ? " promise=" : "", promised ? how : "");
     return CT_OK;
 }
 

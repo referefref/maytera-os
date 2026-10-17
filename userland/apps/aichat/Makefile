@@ -32,23 +32,38 @@ LIBYAML = $(PORTS_DIR)/lib/libyaml.a
 
 all: $(TARGET)
 
+# BUILD the libyaml port, do not assume it is there. userland/ports/out/ is
+# gitignored build output, so a clean checkout has neither
+# $(PORTS_DIR)/include/yaml.h nor $(PORTS_DIR)/lib/libyaml.a. Without this rule
+# the FIRST COMPILE fails with "yaml.h: No such file or directory", which reads
+# like a missing system header rather than a port nobody built, and this app is
+# then simply ABSENT from the image. The only thing in the tree that built
+# libyaml was userland/apps/yamltest, a TEST app that build.sh reaches
+# alphabetically after every shipping consumer. Same rule
+# userland/apps/zstdtest/Makefile already uses for libzstd.
+PORTS_SRC = ../../ports
+$(LIBYAML):
+	@echo "$(TARGET): libyaml.a not built yet; running the ports driver"
+	bash $(PORTS_SRC)/mports.sh build libyaml
+
+
 # libyaml before libc so its malloc/memcpy references resolve out of libc.a.
 $(TARGET): $(OBJS) $(CRT0) $(LIBC) $(LIBYAML)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) $(OBJS) $(LIBYAML) $(LIBC)
 	@echo "Built $(TARGET)"
 	@ls -l $(TARGET)
 
-main.o: main.c conv.h flowgen.h $(FLOWRUN_DIR)/flow.h
+main.o: main.c conv.h flowgen.h $(FLOWRUN_DIR)/flow.h | $(LIBYAML)
 	$(CC) $(CFLAGS) -c main.c -o main.o
 
-conv.o: conv.c conv.h
+conv.o: conv.c conv.h | $(LIBYAML)
 	$(CC) $(CFLAGS) -c conv.c -o conv.o
 
-flowgen.o: flowgen.c flowgen.h $(FLOWRUN_DIR)/flow.h
+flowgen.o: flowgen.c flowgen.h $(FLOWRUN_DIR)/flow.h | $(LIBYAML)
 	$(CC) $(CFLAGS) -c flowgen.c -o flowgen.o
 
 # The reused runner core, compiled here from its single source of truth.
-flow.o: $(FLOWRUN_DIR)/flow.c $(FLOWRUN_DIR)/flow.h
+flow.o: $(FLOWRUN_DIR)/flow.c $(FLOWRUN_DIR)/flow.h | $(LIBYAML)
 	$(CC) $(CFLAGS) -c $(FLOWRUN_DIR)/flow.c -o flow.o
 
 # Network-independent HOST unit test of the workflow-generation VALIDATION path

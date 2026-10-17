@@ -173,7 +173,36 @@ typedef struct {
     uint32_t file_size;
     uint32_t position;          // Current read position
     uint8_t  attr;
-    char     name[256];
+    // [noaccount] WAS `char name[256]` HOLDING THE BASENAME, and the rename is
+    // the point: this now holds the ABSOLUTE path the handle was opened with.
+    //
+    // RENAMED RATHER THAN REDEFINED so the COMPILER enumerates every reader
+    // instead of a person grepping for one. A field whose meaning changes
+    // under its old name is a silent change at every site that still reads it;
+    // there turned out to be exactly three in the whole kernel, and all three
+    // are in this change.
+    //
+    // WHY IT HAD TO STOP BEING THE BASENAME. Three of the four legacy fd
+    // families already carry the absolute path on the descriptor row
+    // (ext2_fd_t::path, smb_fd_t::path, aux_fd_t::mnt + ::rel). FAT was the
+    // one that did not, so advlock_resolve_fd() answered "LETTER.TXT" for a
+    // file that might be at /USB0/DOCS/LETTER.TXT, and TWO protections were
+    // built on top of that answer:
+    //   * the Recycle Bin index is keyed on the absolute path, so a marked AI
+    //     partially overwriting a file on a USB stick or the boot partition
+    //     was REFUSED outright rather than captured. Fail closed, nothing
+    //     destroyed, but a real restriction on a real feature.
+    //   * the ftruncate pre-image hook was BLIND on this family: a marked AI
+    //     shrinking a file there kept no copy at all.
+    // Both close by the handle simply knowing where its file is.
+    //
+    // EMPTY MEANS "NOT KNOWN", AND IS NEVER A TRUNCATED PATH. A path longer
+    // than this buffer, or one that is not absolute, leaves this empty rather
+    // than storing a prefix: a truncated path names a DIFFERENT file, and the
+    // things reading it decide where to file a user's data. Readers must treat
+    // empty as "cannot name this handle" and fail closed, exactly as the whole
+    // FAT family did before this change.
+    char     path[256];
     int      is_dir;
     int      open;
     uint32_t dirent_lba;        // absolute LBA of the sector holding this file's
@@ -285,6 +314,15 @@ void fat_unmount(fat_fs_t *fs);
 
 // Open file/directory
 int fat_open(fat_fs_t *fs, const char *path, fat_file_t *file);
+
+// [usbescrow] #246: stamp the ABSOLUTE path on a handle that had to be opened
+// with a volume-relative one. Only the fd layer's removable-volume branch needs
+// this: it opens against the volume's own fat_fs_t with the volume's own
+// relative path, so the handle would otherwise carry a path naming a different
+// file in the root directory. See the contract in fat.c. A path that is not
+// absolute, or does not fit, leaves the handle's path EMPTY (never a prefix),
+// which every reader already treats as "cannot name this handle: fail closed".
+void fat_handle_set_abs_path(fat_file_t *file, const char *abspath);
 
 // Close file
 void fat_close(fat_file_t *file);

@@ -870,6 +870,7 @@ void damage_reset(void);
 void damage_add(int x, int y, int w, int h);
 int  damage_count(void);
 int  damage_get(int i, int *x, int *y, int *w, int *h);
+void damage_drop_inside(int x, int y, int w, int h);   // #idleclock: discard fully-occluded rects
 
 // draw.c - Drawing primitives
 void draw_fill_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color);
@@ -1062,8 +1063,10 @@ int  text_width(const char *text);
 int  text_width_large(const char *text, int scale);
 void draw_putpixel(int32_t x, int32_t y, uint32_t color);
 
-// Remote screen capture (screenshot.c). screenshot_poll() runs once per frame
-// and captures when /SCREENSHOT.REQ appears; screenshot_capture() writes a
+// Remote screen capture (screenshot.c). CORRECTED #peruserrows: screenshot_poll()
+// runs once per frame and dequeues from the KERNEL-MEDIATED queue
+// (SYS_SCREENSHOT_POLL). It has not watched for a /SCREENSHOT.REQ file since
+// MAYTERA-SEC-2026-0035 deleted that trigger. screenshot_capture() writes a
 // downscaled 8-bit BMP of the current composited backbuffer to `path`.
 void screenshot_poll(void);
 int  screenshot_capture(const char *path);

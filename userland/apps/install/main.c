@@ -158,8 +158,7 @@ static void build_palette(void) {
     gui_style_sync_from_theme();
 
     uint32_t wb  = theme_color(THEME_COLOR_WINDOW_BG);
-    uint32_t acc = theme_color(THEME_COLOR_ACCENT);
-    if (!acc) acc = 0x00336666;
+    uint32_t acc = theme_color(THEME_COLOR_ACCENT);   // [filesui] zero test removed: 0 is BLACK, never unset (libc/theme.h).
     T.dark = is_dark(wb);
 
     // Same two seed greys Files uses (fp_content / fp_field), tinted 5-6% toward
@@ -205,8 +204,8 @@ static void build_palette(void) {
                                        theme_color(THEME_COLOR_WINDOW_BORDER) : acc,
                                        T.card, T.inner, GUI_AIM_NONTEXT);
     {
-        uint32_t e = theme_color(THEME_COLOR_ERROR);   if (!e) e = 0x00CC0000;
-        uint32_t g = theme_color(THEME_COLOR_SUCCESS); if (!g) g = 0x00006600;
+        uint32_t e = theme_color(THEME_COLOR_ERROR);   // [filesui] zero test removed: 0 is BLACK, never unset (libc/theme.h).
+        uint32_t g = theme_color(THEME_COLOR_SUCCESS);
         T.danger      = gui_ensure_contrast(e, T.card, GUI_FLOOR_TEXT);
         T.danger_soft = mix_pct(T.card, e, T.dark ? 24 : 12);
         T.danger_ink  = gui_ensure_contrast(e, T.danger_soft, GUI_FLOOR_TEXT);

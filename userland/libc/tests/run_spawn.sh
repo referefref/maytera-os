@@ -39,7 +39,7 @@ num_from() {   # $1 = file, $2 = macro
 
 echo "=== ARM 1: syscall numbers agree between userland and kernel ==="
 declare -A NUM
-for m in SYS_OPEN SYS_CLOSE SYS_READ SYS_SPAWN_ARGS SYS_SPAWN_REDIR SYS_WAITPID; do
+for m in SYS_OPEN SYS_CLOSE SYS_READ SYS_SPAWN_ARGS SYS_SPAWN_REDIR SYS_SPAWN_ENV SYS_WAITPID; do
     u=$(num_from "$UH" "$m")
     k=$(num_from "$KH" "$m")
     if [ -z "$u" ] || [ -z "$k" ]; then
@@ -73,6 +73,8 @@ check_disp "SYS_SPAWN_ARGS(path, argv, argc)" \
     'sys_spawn_args((const char *)arg1, (char **)arg2, (int)arg3);'
 check_disp "SYS_SPAWN_REDIR(path, argv, argc, infile, outfile, append)" \
     'sys_spawn_redir((const char *)arg1, (char **)arg2, (int)arg3,'
+check_disp "SYS_SPAWN_ENV(req)" \
+    'sys_spawn_env((const sc_spawn_req_t *)arg1);'
 check_disp "SYS_WAITPID(pid, status)" \
     'proc_wait((int)arg1, (int *)arg2);'
 [ $rc_all -eq 0 ] || { echo "RESULT: FAIL - dispatcher shape changed"; exit 1; }
@@ -97,6 +99,22 @@ cat > "$D/helper_say.c" <<'EOF'
 int main(void) { const char *s = "hello-from-spawn\n";
                  return write(1, s, strlen(s)) < 0; }
 EOF
+cat > "$D/helper_env.c" <<'EOF'
+// #112: reports what the SPAWNED child's environment actually contains, which
+// is the only way to prove an environment propagated rather than merely that a
+// syscall was issued with the right argument.
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+int main(void) {
+    const char *v = getenv("FOO");
+    char out[300];
+    strcpy(out, "env:");
+    strcat(out, v ? v : "(unset)");
+    strcat(out, "\n");
+    return write(1, out, strlen(out)) < 0;
+}
+EOF
 cat > "$D/helper_cat.c" <<'EOF'
 #include <unistd.h>
 #include <string.h>
@@ -109,7 +127,7 @@ int main(void) {
     return write(1, out, strlen(out)) < 0;
 }
 EOF
-for h in helper_exit7 helper_exit3 helper_say helper_cat; do
+for h in helper_exit7 helper_exit3 helper_say helper_cat helper_env; do
     gcc -O1 -o "$D/$h" "$D/$h.c" 2>"$D/cc.$h.log" || {
         echo "  helper $h failed to build:"; sed -n 1,10p "$D/cc.$h.log"; exit 2; }
 done
@@ -124,7 +142,7 @@ UUT_FLAGS="-m64 -ffreestanding -fno-builtin -nostdinc -fno-stack-protector \
            -mno-red-zone -Wall -Wextra -Werror -O1 -g -isystem $GCCINC -I$LIBC"
 
 DEFS=""
-for m in SYS_OPEN SYS_CLOSE SYS_READ SYS_SPAWN_ARGS SYS_SPAWN_REDIR SYS_WAITPID; do
+for m in SYS_OPEN SYS_CLOSE SYS_READ SYS_SPAWN_ARGS SYS_SPAWN_REDIR SYS_SPAWN_ENV SYS_WAITPID; do
     DEFS="$DEFS -DM_${m}=${NUM[$m]}"
 done
 

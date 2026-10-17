@@ -297,19 +297,100 @@ const fn rule(dir: u8, action: u8, proto: u8, port: u16) -> FwRule {
 }
 const NORULE: FwRule = rule(0, 0, 0, 0);
 
+// ===========================================================================
+// #kfirewall: THE SSHD AND ITS INBOUND ALLOWANCE ARE ONE DECISION, SO THEY ARE
+// ONE FACT.
+//
+// The block above records the rule that used to sit in DEFAULT_CFG, why it was
+// removed, and the condition for its return: "WHEN THE SERVER COMES BACK, THIS
+// RULE COMES BACK WITH IT, and the two moves belong in one commit."
+//
+// That was a convention, and a convention that depends on remembering is not a
+// control. This tree says so twice over in code that exists for exactly that
+// reason: tools/buildq/buildq serialises the build slot because "one at a time"
+// as a documented rule was not enough, and tools/worktree/mwt gives every agent
+// its own index because "scoped git add, never -A" was documented, agents were
+// told it explicitly, and it still failed three times.
+//
+// So the pairing is DERIVED rather than remembered. `--cfg maytera_sshd` is set
+// by kernel/Makefile from the same MAYTERA_SSHD=1 that decides whether
+// net/ssh/ssh2_server.c is compiled at all. The inbound allowance therefore
+// exists IF AND ONLY IF the server exists. There is one fact, so there is
+// nothing for the two halves to disagree about, and forgetting is not an
+// available failure.
+//
+// WHICH FAILURE THIS PREVENTS, concretely, because it is not symmetric. Ship
+// the server without the rule and the sshd binds, logs "listening on port 22",
+// and every inbound SYN is dropped by the inbound DENY policy. On a machine
+// with no usable serial port (the owner's iMac, which is the whole reason
+// remote debugging is wanted) the visible symptom is a listener that answers
+// nothing, and the first thing anyone reaches for is turning the firewall off.
+// A firewall whose first encounter with its user teaches them to disable it is
+// worse than none.
+//
+// WHY THIS IS NOT "default-allow for anything that listens", which A6 of
+// docs/OPEN_BACKLOG.md rightly warns against, and which would repeat the shape
+// of the original defect one layer down. Nothing here reacts to a service
+// RUNNING. The trigger is a human deliberately building a non-default kernel
+// with a server in it, which is a decision, made once, in a commit. It is still
+// not consent to LISTEN: /CONFIG/SSHD.CFG enable=1 remains separately required,
+// and without it this allowance leads to a port that is reachable and answered
+// by nothing. That residue is accepted and stated rather than papered over: it
+// costs a closed-vs-filtered distinction to a port scanner, against preventing
+// the failure in the paragraph above.
+//
+// WHAT IS STILL NOT COVERED. /CONFIG/SSHD.CFG can move the listener with
+// `port=`, and a compile-time constant cannot know a runtime file. That residue
+// is handled where it first becomes knowable, at bind time: ssh_server_start()
+// asks fw_admits_in_tcp_rs() about the port it ACTUALLY bound and says so
+// loudly if the policy would drop it. It warns and does not open, because a
+// process binding a port is not authority to amend policy.
+// ===========================================================================
+
+/// The port the compiled-in default policy opens for the sshd, and the port
+/// ssh.h documents as its default. `/CONFIG/SSHD.CFG port=` can move the real
+/// listener; see the bind-time check named above.
+pub const SSHD_PORT: u16 = 22;
+
+#[cfg(maytera_sshd)]
+const SSHD_IN_RULE: FwRule = rule(FW_DIR_IN as u8, ACT_ALLOW, RP_TCP, SSHD_PORT);
+#[cfg(maytera_sshd)]
+const SSHD_RULE_COUNT: u8 = 1;
+#[cfg(not(maytera_sshd))]
+const SSHD_IN_RULE: FwRule = NORULE;
+#[cfg(not(maytera_sshd))]
+const SSHD_RULE_COUNT: u8 = 0;
+
 const DEFAULT_CFG: FwConfig = FwConfig {
     version: FW_CFG_VERSION,
     enabled: 1,
     pol_in: ACT_DENY,
     pol_out: ACT_ALLOW,
-    rule_count: 3,
+    // The three outbound allowances are unconditional; the fourth slot is the
+    // sshd allowance and is NORULE (all zero, and past rule_count) when no
+    // server is compiled in, so a default kernel's policy is byte-for-byte what
+    // it was before this change.
+    rule_count: 3 + SSHD_RULE_COUNT,
     rules: [
         rule(FW_DIR_OUT as u8, ACT_ALLOW, RP_TCP, 80),
         rule(FW_DIR_OUT as u8, ACT_ALLOW, RP_TCP, 443),
         rule(FW_DIR_OUT as u8, ACT_ALLOW, RP_UDP, 53),
-        NORULE, NORULE, NORULE, NORULE, NORULE, NORULE, NORULE, NORULE, NORULE,
+        SSHD_IN_RULE,
+        NORULE, NORULE, NORULE, NORULE, NORULE, NORULE, NORULE, NORULE,
     ],
 };
+
+// Compile-time lock on the derivation, evaluated by rustc on DEFAULT_CFG with
+// the REAL rule_action() the packet path uses. If a future hand edit adds or
+// removes the inbound sshd allowance without MAYTERA_SSHD moving with it, THE
+// KERNEL DOES NOT BUILD. This is the sentence in the block above, promoted from
+// prose into something that cannot be ignored.
+const _: () = assert!(
+    (rule_action(&DEFAULT_CFG, FW_DIR_IN, RP_TCP, SSHD_PORT) == ACT_ALLOW)
+        == cfg!(maytera_sshd),
+    "DEFAULT_CFG must admit inbound TCP on SSHD_PORT if and only if the sshd is \
+     compiled in (MAYTERA_SSHD / --cfg maytera_sshd). Change both or neither."
+);
 
 // ===========================================================================
 // Published policy: double-buffered, one atomic index.
@@ -460,6 +541,63 @@ unsafe fn be16(p: *const u8, off: usize) -> u16 {
     ((*p.add(off) as u16) << 8) | (*p.add(off + 1) as u16)
 }
 
+/// THE rule resolution, and the ONLY one. "First match wins, in file order; if
+/// no rule matches, the default policy for that direction applies" is the whole
+/// semantics the UI claims, and this is the single place it is expressed.
+///
+/// THREE CALLERS, ONE ANSWER, WHICH IS THE POINT. fw_decide() below asks it
+/// about a packet; fw_admits_in_tcp_rs() asks it about a port on behalf of a
+/// service that is about to bind; and the `const _` assertion beside
+/// DEFAULT_CFG asks it at COMPILE TIME. A6 of docs/OPEN_BACKLOG.md asks for one
+/// chokepoint for the same reason wq_may_block() was collapsed to one
+/// definition: two places that decide whether a packet is allowed is how they
+/// come to disagree. A separate "does the policy allow port N" helper would
+/// have been a second such place, and the first thing it would have got wrong
+/// is first-match-wins when a deny precedes an allow for the same port.
+///
+/// `const fn` so rustc can evaluate it on DEFAULT_CFG at build time; it is an
+/// ordinary call at run time. `dport` is the DESTINATION port of the
+/// flow-OPENING packet in both directions (see PORT SEMANTICS in the header).
+const fn rule_action(cfg: &FwConfig, dir: u32, rp: u8, dport: u16) -> u8 {
+    let mut n = cfg.rule_count as usize;
+    if n > FW_MAX_RULES {
+        n = FW_MAX_RULES;
+    }
+    let mut i = 0;
+    while i < n {
+        let r = &cfg.rules[i];
+        if r.dir as u32 == dir && r.proto == rp && r.port == dport {
+            return r.action; // first match wins
+        }
+        i += 1;
+    }
+    if dir == FW_DIR_IN { cfg.pol_in } else { cfg.pol_out }
+}
+
+/// Would a NEW inbound TCP connection to local port `port` be admitted by the
+/// policy in force? 1 = yes, 0 = the filter would drop the SYN.
+///
+/// A PURE QUERY, and that is load-bearing. It reads the published config and
+/// nothing else: no conntrack slot is probed or created, no counter moves, no
+/// lock is taken. So a service may ask about its own port without the asking
+/// changing any answer, and in particular without manufacturing a flow. The
+/// obvious alternative, handing fw_filter_rs() a synthetic SYN, would have
+/// inserted a conntrack entry for a connection that does not exist.
+///
+/// IT ANSWERS ABOUT NEW FLOWS ONLY, which is the question a listener has. An
+/// ESTABLISHED flow passes on the conntrack fast path without consulting the
+/// rules at all, so a 0 here never means "no traffic can reach this port", it
+/// means "an unsolicited connection to it will be dropped". Safe from any
+/// context: no allocation, no blocking, no I/O.
+#[no_mangle]
+pub extern "C" fn fw_admits_in_tcp_rs(port: u16) -> i32 {
+    let cfg = cfg_read();
+    if cfg.enabled == 0 {
+        return PASS; // disabled means disabled, the same answer fw_decide gives
+    }
+    if rule_action(cfg, FW_DIR_IN, RP_TCP, port) == ACT_DENY { DROP } else { PASS }
+}
+
 /// The whole filter. `dir` is FW_DIR_IN/FW_DIR_OUT, `peer_ip` is the REMOTE
 /// address in HOST byte order (source for inbound, destination for outbound),
 /// `frag_off` is the IPv4 fragment offset field in 8-byte units (0 for a
@@ -537,16 +675,7 @@ unsafe fn fw_decide(
     // NEW. The rule port is the DESTINATION port of the opening packet, in
     // both directions - see PORT SEMANTICS in the header block.
     let rp = if proto == IPP_TCP { RP_TCP } else { RP_UDP };
-    let mut action = if dir == FW_DIR_IN { cfg.pol_in } else { cfg.pol_out };
-    let n = cfg.rule_count as usize;
-    let n = if n > FW_MAX_RULES { FW_MAX_RULES } else { n };
-    for i in 0..n {
-        let r = &cfg.rules[i];
-        if r.dir as u32 == dir && r.proto == rp && r.port == dport {
-            action = r.action;
-            break; // first match wins
-        }
-    }
+    let action = rule_action(cfg, dir, rp, dport);
 
     if dir == FW_DIR_IN {
         STATS.new_in += 1;
@@ -1111,6 +1240,47 @@ pub unsafe extern "C" fn fw_selftest_rs() -> i32 {
     if fw_parse_cfg_rs(empty.as_ptr(), empty.len() as u32, &mut ec) != -2 {
         fails += 1;
     }
+
+    // 19. fw_admits_in_tcp_rs(), the query ssh_server_start() asks before it
+    //     trusts its own listener. A bind-time warning is only worth having if
+    //     it can be neither a false alarm nor a false reassurance, so both
+    //     answers are driven here against a known policy.
+    let mut q = FwConfig {
+        version: FW_CFG_VERSION,
+        enabled: 1,
+        pol_in: ACT_DENY,
+        pol_out: ACT_ALLOW,
+        rule_count: 2,
+        rules: [NORULE; FW_MAX_RULES],
+    };
+    //     FIRST MATCH WINS, and this is the vector that proves it: a deny for
+    //     port 22 placed BEFORE an allow for the same port must still deny. It
+    //     is the case a second, separately written rule walk gets wrong.
+    q.rules[0] = rule(FW_DIR_IN as u8, ACT_DENY, RP_TCP, SSHD_PORT);
+    q.rules[1] = rule(FW_DIR_IN as u8, ACT_ALLOW, RP_TCP, SSHD_PORT);
+    if fw_install_rs(&q) != 0 { fails += 1; }
+    if fw_admits_in_tcp_rs(SSHD_PORT) != want(DROP) { fails += 1; }
+    //     Swap the order and the same two rules admit it.
+    q.rules[0] = rule(FW_DIR_IN as u8, ACT_ALLOW, RP_TCP, SSHD_PORT);
+    q.rules[1] = rule(FW_DIR_IN as u8, ACT_DENY, RP_TCP, SSHD_PORT);
+    if fw_install_rs(&q) != 0 { fails += 1; }
+    if fw_admits_in_tcp_rs(SSHD_PORT) != want(PASS) { fails += 1; }
+    // 20. A port no rule mentions falls to the inbound policy, DENY here. This
+    //     is the state a default image is in for every port but the sshd's.
+    if fw_admits_in_tcp_rs(2222) != want(DROP) { fails += 1; }
+    // 21. Disabled admits everything, the same answer fw_decide gives, so the
+    //     bind-time check cannot cry wolf on a machine with the filter off.
+    q.enabled = 0;
+    if fw_install_rs(&q) != 0 { fails += 1; }
+    if fw_admits_in_tcp_rs(SSHD_PORT) != want(PASS) { fails += 1; }
+    // 22. THE DERIVATION, checked at run time as well as at compile time. The
+    //     `const _` assertion beside DEFAULT_CFG already makes a mismatch a
+    //     build failure; this makes it visible on the boot line too, so the
+    //     pairing is reported by the machine that is running rather than only
+    //     by the machine that built it.
+    if fw_install_rs(&DEFAULT_CFG) != 0 { fails += 1; }
+    let admits_sshd = fw_admits_in_tcp_rs(SSHD_PORT) == PASS;
+    if admits_sshd != cfg!(maytera_sshd) { fails += 1; }
 
     // Restore. The self-test must leave no trace on the live machine.
     let _ = fw_install_rs(&saved);

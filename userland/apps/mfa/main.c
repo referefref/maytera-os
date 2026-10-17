@@ -1,21 +1,49 @@
-// main.c - MayteraOS MFA / TOTP authenticator (#271)
-// RFC 6238 time-based one-time passwords. Self-contained crypto in totp.c.
-// Styled to match Settings (theme-following palette + TTF text).
+// main.c - MayteraOS MFA / TOTP authenticator (#271, rebuilt on the secret-use
+// proxy at #secretuse).
 //
-// SECURITY NOTE: account secrets are persisted to /CONFIG/MFA.DB in a lightly
-// obfuscated form (XOR scramble below). This is NOT real encryption; it only
-// stops the secret being trivially readable. There is no passphrase / KDF.
+// ===========================================================================
+// THIS APP NO LONGER HOLDS THE SECRETS, AND THAT IS THE ENTIRE POINT.
+// ===========================================================================
+// It used to. Every enrolled TOTP shared secret was in this process's memory and
+// on disk under a single fixed XOR byte (`#define OBF_KEY 0x5A`), and this file
+// computed the codes with its own private SHA-1, HMAC, base32 and truncation in
+// totp.c. The app's own status line said "Secrets stored obfuscated (not
+// encrypted)", which was honest and was also the problem: a fixed single-byte XOR
+// is not a key, it is a formatting convention, so anything that could read the
+// file WAS the second factor.
 //
-// TIME NOTE: this OS's sys_time() returns SECONDS SINCE BOOT, not Unix epoch
-// time, so it is useless for TOTP. We build a real UTC Unix timestamp from the
-// RTC (date + time) syscalls instead. The RTC is assumed to be UTC.
+// Now the kernel holds them in an authenticated container encrypted under a key
+// derived from the user's login password, and this app asks for A CODE through
+// SYS_SECRET_USE. What was DELETED in the same change is what makes that real:
+//   * db_load() / db_save()          - the app no longer reads or writes the store
+//   * base32_encode / base32_decode  - it never sees a seed to encode
+//   * totp.c / totp.h / totp_test.c  - SHA-1, HMAC-SHA1/256, TOTP, all gone
+//   * account_t.secret[64]           - there is no field to put a secret in
+//   * the RTC epoch clock            - the kernel owns the counter now
+//
+// A missing "read the secret" syscall would prove nothing on its own while this
+// app still read the file. The deletions above are the proof; the container's
+// file is root-only, so there is no route left, not merely no convenience.
+//
+// WHAT THIS APP CAN STILL DO, stated plainly so nobody thinks it is more than it
+// is: it can read the CURRENT code for the logged-in user's accounts, which is
+// what the user is looking at on screen anyway. It cannot obtain a seed, cannot
+// ask for a code at another time, and stops working entirely when the session
+// locks and the kernel wipes the key. See kernel/proc/secretuse.h.
+//
+// TIME: this app no longer has a clock. sys_time() returns SECONDS SINCE BOOT,
+// which is useless for TOTP, and the RTC-to-epoch conversion that used to live
+// here is deleted. SECRET_OP_CODES returns the code AND the seconds remaining,
+// both computed against the KERNEL's clock, because a caller-chosen time is the
+// whole difference between a proxy and an oracle (docs/OPEN_BACKLOG.md A4).
 
 #include "syscall.h"
 #include "gui.h"
 #include "stdio.h"
 #include "stdlib.h"
 #include "string.h"
-#include "totp.h"
+// NO totp.h: this app has no crypto of its own any more, and no userconf.h:
+// it does not know or care where the store lives, because it cannot read it.
 
 // Render all text as TTF to match Settings.
 #undef win_draw_text
@@ -24,8 +52,15 @@
 
 #define WIN_W 560
 #define WIN_H 460
-#define MAX_ACCOUNTS 32
-#define DB_PATH "/CONFIG/MFA.DB"
+#define MAX_ACCOUNTS SECRET_MAX_ACCOUNTS
+
+// THERE IS NO db_path() ANY MORE, and its absence is deliberate. This app does
+// not know where the store is, cannot name it, and would be refused if it tried:
+// the container lives under a root-owned 0700 directory and is encrypted under a
+// key this process has never seen. The previous version of this comment spent
+// twenty lines reasoning about which directory the seeds should sit in and what
+// the file mode should be, which was the right argument to have while Ring 3 owned
+// the file. The answer turned out to be that Ring 3 should not own the file.
 
 // ---------------------------------------------------------------------------
 // Theme palette (mirrors Settings color choices, picked from kernel get_theme)
@@ -76,139 +111,105 @@ static void apply_theme(int kt) {
 // ---------------------------------------------------------------------------
 // Account model
 // ---------------------------------------------------------------------------
+// NOTE WHAT IS NOT IN THIS STRUCT. There is no `secret` and no `secret_len`. A
+// field that does not exist cannot be filled in by a later change that forgets
+// why, which is a stronger guarantee than a comment asking nobody to add one.
+// These are the kernel's secret_totp_info_t fields, and the kernel's struct has
+// no secret field either.
 typedef struct {
-    char issuer[48];
-    char label[48];
-    uint8_t secret[64];   // decoded key bytes
-    int secret_len;
+    char issuer[SECRET_NAME_MAX];
+    char label[SECRET_NAME_MAX];
     int digits;           // 6 or 8
-    int period;           // seconds (default 30)
-    totp_alg_t alg;       // SHA1 / SHA256
+    int period;           // seconds
+    int alg;              // 1 = SHA1, 256 = SHA256
 } account_t;
 
 static account_t g_accts[MAX_ACCOUNTS];
+// The CURRENT code and countdown for each account, as the kernel computed them.
+// Refreshed once a second by one syscall; never derived here.
+static secret_totp_code_t g_codes[MAX_ACCOUNTS];
 static int g_count = 0;
+// The kernel refused because there is no session key (the user has not
+// authenticated, or the session was locked and the key was wiped). This is NOT
+// "no accounts", and telling the two apart is one of the reasons the change was
+// worth making: the old app reported every failure as an empty list.
+static int g_locked = 0;
 static int g_selected = -1;     // selected account row (for delete)
 static int g_status_flash = 0;  // ms-ish counter for transient status
 static char g_status[80] = "";
 
-// ---------------------------------------------------------------------------
-// Unix time from RTC (UTC assumed)
-// ---------------------------------------------------------------------------
-static int is_leap(int y) { return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0); }
+// THE RTC-TO-EPOCH CONVERSION THAT USED TO BE HERE IS DELETED. It existed only
+// to build the TOTP counter, and the counter is now the kernel's: it reads
+// realtime_sec_rs() and returns the code plus the seconds remaining. The app
+// keeps a seconds-since-boot tick (sys_time()) purely to decide WHEN to redraw,
+// which needs no notion of the actual date and cannot influence any code.
 
-static uint64_t rtc_unix_time(void) {
-    int hour, min, sec, day, mon, year;
-    get_rtc_time(&hour, &min, &sec);
-    get_rtc_date(&day, &mon, &year);
-    if (year < 1970) return 0;
-    static const int mdays[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
-    uint64_t days = 0;
-    for (int y = 1970; y < year; y++) days += is_leap(y) ? 366 : 365;
-    for (int m = 1; m < mon; m++) {
-        days += mdays[m - 1];
-        if (m == 2 && is_leap(year)) days += 1;
+// ---------------------------------------------------------------------------
+// The store, as seen from Ring 3: ONE syscall, and nothing kept.
+//
+// Everything that used to live in this section is gone: db_save(), db_load(),
+// base32_encode(), the tab-separated line parser and the XOR key. The app cannot
+// open the store, so there is nothing here to parse.
+//
+// refresh_names() is called after a change; refresh_codes() once a second. They
+// are separate because names and geometry do not change every second and a code
+// does, and because SECRET_OP_LIST cannot ever return a secret while
+// SECRET_OP_CODES cannot ever return anything but the CURRENT one.
+// ---------------------------------------------------------------------------
+static int g_last_rc = 0;
+
+static void refresh_names(void) {
+    secret_totp_info_t info[MAX_ACCOUNTS];
+    int n = sys_secret_list(info, MAX_ACCOUNTS);
+    g_last_rc = n;
+    if (n == SECRET_E_LOCKED) { g_locked = 1; g_count = 0; return; }
+    g_locked = 0;
+    if (n < 0) { g_count = 0; return; }
+    if (n > MAX_ACCOUNTS) n = MAX_ACCOUNTS;
+    for (int i = 0; i < n; i++) {
+        strlcpy(g_accts[i].issuer, info[i].issuer, sizeof(g_accts[i].issuer));
+        strlcpy(g_accts[i].label,  info[i].label,  sizeof(g_accts[i].label));
+        g_accts[i].digits = info[i].digits;
+        g_accts[i].period = info[i].period;
+        g_accts[i].alg    = info[i].alg;
     }
-    days += (uint64_t)(day - 1);
-    return days * 86400ULL + (uint64_t)hour * 3600 + (uint64_t)min * 60 + (uint64_t)sec;
+    g_count = n;
+    if (g_selected >= g_count) g_selected = g_count - 1;
 }
 
-// ---------------------------------------------------------------------------
-// Persistence (lightly obfuscated, NOT encrypted)
-// File format (text-ish, line based) after a 1-byte XOR scramble of the whole
-// payload with a fixed key. Plaintext layout:
-//   MFADB1\n
-//   <issuer>\t<label>\t<base32secret>\t<digits>\t<period>\t<alg>\n  (repeated)
-// alg: 1=SHA1, 256=SHA256
-// ---------------------------------------------------------------------------
-#define OBF_KEY 0x5A
-
-// Re-encode raw secret bytes back to base32 for storage.
-static const char B32A[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-static int base32_encode(const uint8_t *in, int len, char *out, int cap) {
-    int n = 0; uint32_t buf = 0; int bits = 0;
-    for (int i = 0; i < len; i++) {
-        buf = (buf << 8) | in[i]; bits += 8;
-        while (bits >= 5) {
-            bits -= 5;
-            if (n >= cap - 1) return -1;
-            out[n++] = B32A[(buf >> bits) & 0x1F];
+static void refresh_codes(void) {
+    if (g_count <= 0) return;
+    int n = sys_secret_codes(g_codes, MAX_ACCOUNTS);
+    if (n == SECRET_E_LOCKED) { g_locked = 1; g_count = 0; return; }
+    if (n < 0) {
+        // Blank every code rather than leaving the last good ones on screen. A
+        // stale code looks exactly like a current one and the user cannot tell,
+        // so showing nothing is the only honest failure.
+        for (int i = 0; i < MAX_ACCOUNTS; i++) {
+            g_codes[i].code[0] = 0;
+            g_codes[i].remaining = 0;
         }
+        g_last_rc = n;
     }
-    if (bits > 0) {
-        if (n >= cap - 1) return -1;
-        out[n++] = B32A[(buf << (5 - bits)) & 0x1F];
-    }
-    out[n] = 0;
-    return n;
 }
 
-static void db_save(void) {
-    char *buf = (char *)malloc(8192);
-    if (!buf) return;
-    int p = 0;
-    p += snprintf(buf + p, 8192 - p, "MFADB1\n");
-    for (int i = 0; i < g_count; i++) {
-        char b32[128];
-        base32_encode(g_accts[i].secret, g_accts[i].secret_len, b32, sizeof(b32));
-        p += snprintf(buf + p, 8192 - p, "%s\t%s\t%s\t%d\t%d\t%d\n",
-                      g_accts[i].issuer, g_accts[i].label, b32,
-                      g_accts[i].digits, g_accts[i].period,
-                      g_accts[i].alg == TOTP_SHA256 ? 256 : 1);
-        if (p > 8000) break;
-    }
-    for (int i = 0; i < p; i++) buf[i] ^= OBF_KEY;
-    sys_unlink(DB_PATH);
-    int fd = sys_open(DB_PATH, O_WRONLY | O_CREAT);
-    if (fd >= 0) { sys_write(fd, buf, (unsigned long)p); sys_close(fd); }
-    free(buf);
-}
+static void refresh_all(void) { refresh_names(); refresh_codes(); }
 
-static char *next_field(char **pp, char sep) {
-    char *s = *pp;
-    char *t = s;
-    while (*t && *t != sep && *t != '\n') t++;
-    if (*t) { *t = 0; *pp = t + 1; } else { *pp = t; }
-    return s;
-}
-
-static void db_load(void) {
-    g_count = 0;
-    int fd = sys_open(DB_PATH, O_RDONLY);
-    if (fd < 0) return;                 // missing -> start empty
-    char *buf = (char *)malloc(8192);
-    if (!buf) { sys_close(fd); return; }
-    long n = sys_read(fd, buf, 8191);
-    sys_close(fd);
-    if (n <= 0) { free(buf); return; }
-    for (long i = 0; i < n; i++) buf[i] ^= OBF_KEY;
-    buf[n] = 0;
-    char *p = buf;
-    // header line
-    if (strncmp(p, "MFADB1", 6) != 0) { free(buf); return; }   // bad/old file -> empty
-    while (*p && *p != '\n') p++;
-    if (*p == '\n') p++;
-    while (*p && g_count < MAX_ACCOUNTS) {
-        char *issuer = next_field(&p, '\t');
-        char *label  = next_field(&p, '\t');
-        char *b32    = next_field(&p, '\t');
-        char *sd     = next_field(&p, '\t');
-        char *sp     = next_field(&p, '\t');
-        char *sa     = next_field(&p, '\t');
-        if (!*b32) break;
-        account_t *a = &g_accts[g_count];
-        memset(a, 0, sizeof(*a));
-        strlcpy(a->issuer, issuer, sizeof(a->issuer));
-        strlcpy(a->label, label, sizeof(a->label));
-        int sl = base32_decode(b32, a->secret, sizeof(a->secret));
-        if (sl <= 0) continue;          // skip corrupt row, never crash
-        a->secret_len = sl;
-        a->digits = atoi(sd); if (a->digits != 6 && a->digits != 8) a->digits = 6;
-        a->period = atoi(sp); if (a->period <= 0) a->period = 30;
-        a->alg = (atoi(sa) == 256) ? TOTP_SHA256 : TOTP_SHA1;
-        g_count++;
+// What went wrong, in words a user can act on. The old app had one failure mode
+// ("no accounts") for every cause, which is how a broken store looked like an
+// empty one.
+static const char *secret_err_text(int rc) {
+    switch (rc) {
+        case SECRET_E_LOCKED:  return "Locked: log in again to unlock your accounts";
+        case SECRET_E_AUTH:    return "Store will not open: wrong key, or it was altered";
+        case SECRET_E_FORMAT:  return "Store is not readable (report this)";
+        case SECRET_E_NOCLOCK: return "No reliable clock: codes would be wrong";
+        case SECRET_E_FULL:    return "Account list full";
+        case SECRET_E_NOSPACE: return "Too many accounts to display";
+        case SECRET_E_NOTIMPL: return "This secret type is not supported yet";
+        case SECRET_E_IO:      return "Could not reach the secret store";
+        default:               return "Refused";
     }
-    free(buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -227,23 +228,33 @@ static void url_decode(char *s) {
     *o = 0;
 }
 
-// Add account from explicit fields. Returns 0 ok, -1 bad secret.
+// Hand the seed to the kernel. THIS IS THE ONLY DIRECTION A SECRET EVER TRAVELS.
+//
+// It has to travel this way once, because the user is typing or pasting it, so
+// Ring 3 necessarily holds it for the duration of this call. The property is that
+// it never comes back: there is no operation that returns it, the local copy is
+// wiped below, and after this function the app has no way to learn it again.
+//
+// Returns 0, or the kernel's negative SECRET_E_*.
 static int add_account(const char *issuer, const char *label, const char *b32secret,
-                       int digits, int period, totp_alg_t alg) {
-    if (g_count >= MAX_ACCOUNTS) return -2;
-    account_t a;
+                       int digits, int period, int alg) {
+    if (g_count >= MAX_ACCOUNTS) return SECRET_E_FULL;
+    secret_totp_add_t a;
     memset(&a, 0, sizeof(a));
-    int sl = base32_decode(b32secret, a.secret, sizeof(a.secret));
-    if (sl <= 0) return -1;
-    a.secret_len = sl;
     strlcpy(a.issuer, (issuer && *issuer) ? issuer : "(none)", sizeof(a.issuer));
     strlcpy(a.label, (label && *label) ? label : "account", sizeof(a.label));
+    strlcpy(a.b32, b32secret ? b32secret : "", sizeof(a.b32));
     a.digits = (digits == 8) ? 8 : 6;
     a.period = (period > 0) ? period : 30;
-    a.alg = alg;
-    g_accts[g_count++] = a;
-    db_save();
-    return 0;
+    a.alg = (alg == 256) ? 256 : 1;
+    int rc = sys_secret_add(&a);
+    // Wipe our copy of the seed as soon as the kernel has it. The base32 text is
+    // also still sitting in the modal field, which clear_secret_fields() handles
+    // on the caller's side; both matter, because either one left behind is the
+    // seed in Ring 3 memory that this whole change exists to remove.
+    memset(&a, 0, sizeof(a));
+    if (rc == 0) refresh_all();
+    return rc;
 }
 
 // Parse an otpauth://totp/Label?secret=...&issuer=...&digits=...&period=...&algorithm=...
@@ -266,7 +277,7 @@ static int add_from_uri(const char *uri) {
     if (colon) { *colon = 0; strlcpy(issuer, labelpart, sizeof(issuer)); strlcpy(label, colon + 1, sizeof(label)); }
     else strlcpy(label, labelpart, sizeof(label));
 
-    char secret[128] = ""; int digits = 6, period = 30; totp_alg_t alg = TOTP_SHA1;
+    char secret[128] = ""; int digits = 6, period = 30; int alg = 1;
     char *tok = rest;
     while (*tok) {
         char *amp = strchr(tok, '&');
@@ -279,21 +290,24 @@ static int add_from_uri(const char *uri) {
             else if (strcasecmp(key, "digits") == 0)   digits = atoi(val);
             else if (strcasecmp(key, "period") == 0)   period = atoi(val);
             else if (strcasecmp(key, "algorithm") == 0)
-                alg = (strcasecmp(val, "SHA256") == 0) ? TOTP_SHA256 : TOTP_SHA1;
+                alg = (strcasecmp(val, "SHA256") == 0) ? 256 : 1;
         }
         if (!amp) break;
         tok = amp + 1;
     }
-    if (!secret[0]) return -1;
-    return add_account(issuer, label, secret, digits, period, alg);
+    if (!secret[0]) return SECRET_E_ARG;
+    int rc = add_account(issuer, label, secret, digits, period, alg);
+    memset(secret, 0, sizeof(secret));   // the parsed seed does not outlive the call
+    return rc;
 }
 
-static void delete_account(int idx) {
-    if (idx < 0 || idx >= g_count) return;
-    for (int i = idx; i < g_count - 1; i++) g_accts[i] = g_accts[i + 1];
-    g_count--;
-    if (g_selected >= g_count) g_selected = g_count - 1;
-    db_save();
+static int delete_account(int idx) {
+    if (idx < 0 || idx >= g_count) return SECRET_E_ARG;
+    // The kernel removes the record, wipes its secret from kernel memory, and
+    // re-seals the store. The app does not edit a list and save it; it asks.
+    int rc = sys_secret_del((unsigned)idx);
+    if (rc == 0) refresh_all();
+    return rc;
 }
 
 // ---------------------------------------------------------------------------
@@ -305,8 +319,15 @@ static int f_field = 0;          // active modal field index
 static char f_issuer[48], f_label[48], f_secret[128], f_uri[400];
 static int f_digits8 = 0, f_alg256 = 0;
 
+// memset, not `[0]=0`. Truncating the string leaves the typed base32 seed in this
+// process's memory for as long as the buffer lives, which is the exact thing this
+// change exists to stop. It costs nothing to clear it properly.
 static void modal_reset(void) {
-    f_issuer[0]=f_label[0]=f_secret[0]=f_uri[0]=0; f_field=0; f_digits8=0; f_alg256=0;
+    memset(f_issuer, 0, sizeof(f_issuer));
+    memset(f_label,  0, sizeof(f_label));
+    memset(f_secret, 0, sizeof(f_secret));
+    memset(f_uri,    0, sizeof(f_uri));
+    f_field=0; f_digits8=0; f_alg256=0;
 }
 
 // ---------------------------------------------------------------------------
@@ -316,19 +337,19 @@ static int window_handle;
 
 static void set_status(const char *s) { strlcpy(g_status, s, sizeof(g_status)); g_status_flash = 24; }
 
-static void itoa6(uint32_t v, int digits, char *out) {
-    // zero-padded code, grouped as "123 456" for 6 digits
-    char tmp[16]; int n = 0;
-    for (int i = 0; i < digits; i++) { tmp[i] = '0' + (v % 10); v /= 10; }
-    // tmp is reversed
+// Insert a readability space in the middle of the kernel's code STRING: "123 456"
+// for 6 digits, "1234 5678" for 8. It used to take a uint32_t and do the decimal
+// conversion itself, which it can no longer do because it is never given a number.
+// Purely cosmetic, and bounded by `cap`.
+static void group_code(const char *code, char *out, int cap) {
+    int n = (int)strlen(code);
+    int mid = (n == 6) ? 3 : (n == 8) ? 4 : -1;
     int o = 0;
-    for (int i = digits - 1; i >= 0; i--) {
-        out[o++] = tmp[i];
-        if (digits == 6 && i == 3) out[o++] = ' ';
-        if (digits == 8 && i == 4) out[o++] = ' ';
+    for (int i = 0; i < n && o < cap - 2; i++) {
+        if (i == mid) out[o++] = ' ';
+        out[o++] = code[i];
     }
     out[o] = 0;
-    n = o; (void)n;
 }
 
 // Fixed-point sin/cos tables (value scaled by 256), 0..360 inclusive.
@@ -374,7 +395,7 @@ static void build_trig(void) {
     }
 }
 
-static void draw_account_row(int y, int idx, uint64_t now) {
+static void draw_account_row(int y, int idx) {
     account_t *a = &g_accts[idx];
     int rowh = 64;
     uint32_t bg = (idx == g_selected) ? COL_BTN_HOVER : COL_CARD;
@@ -389,13 +410,15 @@ static void draw_account_row(int y, int idx, uint64_t now) {
     draw_text_sz(window_handle, 24, y + 8, title, 14, COL_TEXT);
     if (a->label[0]) draw_text_sz(window_handle, 24, y + 30, a->label, 11, COL_TEXT2);
 
-    // current code
-    uint32_t code = totp_at_time(a->secret, a->secret_len, now, a->period, a->digits, a->alg);
-    char cbuf[20]; itoa6(code, a->digits, cbuf);
-    draw_text_sz(window_handle, 250, y + 14, cbuf, 22, COL_ACCENT);
+    // The current code, AS THE KERNEL COMPUTED IT. Nothing here derives it, and
+    // there is no secret in scope with which to try.
+    char cbuf[24];
+    group_code(g_codes[idx].code, cbuf, sizeof(cbuf));
+    draw_text_sz(window_handle, 250, y + 14, cbuf[0] ? cbuf : "------", 22, COL_ACCENT);
 
-    // countdown
-    int rem = a->period - (int)(now % (uint64_t)a->period);
+    // The countdown is also the kernel's: it came back with the code, from the
+    // same clock reading, so the two can never disagree about which window this is.
+    int rem = g_codes[idx].remaining;
     int ringcx = WIN_W - 60, ringcy = y + (rowh - 6) / 2;
     draw_ring(ringcx, ringcy, 18, rem, a->period);
     char rb[8]; snprintf(rb, sizeof(rb), "%d", rem);
@@ -450,7 +473,6 @@ static void draw_modal(void) {
 #define BTN_H 30
 
 static void draw_all(void) {
-    uint64_t now = rtc_unix_time();
     win_draw_rect(window_handle, 0, 0, WIN_W, WIN_H, COL_BG);
 
     // header
@@ -468,13 +490,26 @@ static void draw_all(void) {
 
     win_draw_rect(window_handle, 12, 80, WIN_W - 24, 1, COL_SEP);
 
-    if (g_count == 0) {
+    if (g_locked) {
+        // NOT the same screen as "no accounts", deliberately. The old app could
+        // not tell these apart and showed the empty state for both, so a user
+        // whose store had failed to load was told they had never enrolled.
+        draw_text_sz(window_handle, 24, 120, "Accounts are locked.", 14, COL_TEXT2);
+        draw_text_sz(window_handle, 24, 144,
+                     "Your codes are encrypted with your login password. Log in "
+                     "again to unlock them.", 12, COL_TEXT_DIM);
+    } else if (g_count == 0 && g_last_rc < 0) {
+        draw_text_sz(window_handle, 24, 120, secret_err_text(g_last_rc), 14, COL_TEXT2);
+        draw_text_sz(window_handle, 24, 144,
+                     "Nothing was changed. Your accounts are still in the store.",
+                     12, COL_TEXT_DIM);
+    } else if (g_count == 0) {
         draw_text_sz(window_handle, 24, 120, "No accounts yet.", 14, COL_TEXT2);
         draw_text_sz(window_handle, 24, 144, "Click + Add or Add URI to create one.", 12, COL_TEXT_DIM);
     } else {
         int y = 92;
         for (int i = 0; i < g_count && y < WIN_H - 40; i++) {
-            draw_account_row(y, i, now);
+            draw_account_row(y, i);
             y += 64;
         }
     }
@@ -483,7 +518,16 @@ static void draw_all(void) {
     if (g_status_flash > 0 && g_status[0])
         draw_text_sz(window_handle, 14, WIN_H - 22, g_status, 12, COL_ACCENT);
     else
-        draw_text_sz(window_handle, 14, WIN_H - 22, "Secrets stored obfuscated (not encrypted) in /CONFIG/MFA.DB", 10, COL_TEXT_DIM);
+        {
+            // The old line here read "Secrets stored obfuscated (not encrypted)"
+            // and named the file. Both facts have changed, and the replacement is
+            // written to be true rather than reassuring: it says where the
+            // protection comes from and it does not claim the app is trusted.
+            draw_text_sz(window_handle, 14, WIN_H - 22,
+                         "Seeds are held by the kernel, encrypted with your login "
+                         "password. This app can read codes, not seeds.",
+                         10, COL_TEXT_DIM);
+        }
 
     if (g_modal) draw_modal();
     win_invalidate(window_handle);
@@ -501,18 +545,25 @@ static void modal_char(char c) {
         case 2: target = f_secret; cap = sizeof(f_secret); break;
         default: target = NULL; break;
     }
-    if (c == 27) { g_modal = 0; return; }                 // Esc
+    if (c == 27) { modal_reset(); g_modal = 0; return; }  // Esc: also wipes the seed
     if (c == '\t') { f_field = (f_field + 1) % 5; return; }
     if (c == '\r' || c == '\n') {
         if (g_modal == 2) {
-            if (add_from_uri(f_uri) == 0) { set_status("Account added from URI"); g_modal = 0; }
-            else set_status("Invalid otpauth URI");
+            int r = add_from_uri(f_uri);
+            if (r == 0) { set_status("Account added from URI"); modal_reset(); g_modal = 0; }
+            else if (r == SECRET_E_ARG) set_status("Invalid otpauth URI");
+            else set_status(secret_err_text(r));
         } else {
             int r = add_account(f_issuer, f_label, f_secret, f_digits8 ? 8 : 6, 30,
-                                f_alg256 ? TOTP_SHA256 : TOTP_SHA1);
-            if (r == 0) { set_status("Account added"); g_modal = 0; }
-            else if (r == -1) set_status("Invalid base32 secret");
-            else set_status("Account list full");
+                                f_alg256 ? 256 : 1);
+            // modal_reset() on success is what wipes the typed seed out of this
+            // process. On failure the field is deliberately kept so the user can
+            // fix a typo, which means the seed is still in memory until they
+            // cancel or succeed; that is a real and unavoidable window, and it is
+            // the same one they are looking at on screen.
+            if (r == 0) { set_status("Account added"); modal_reset(); g_modal = 0; }
+            else if (r == SECRET_E_FORMAT) set_status("Invalid base32 secret");
+            else set_status(secret_err_text(r));
         }
         return;
     }
@@ -545,7 +596,9 @@ static void handle_click(int mx, int my) {
         if (mx >= BTN_ADD_X && mx <= BTN_ADD_X + BTN_W) { modal_reset(); g_modal = 1; return; }
         if (mx >= BTN_URI_X && mx <= BTN_URI_X + 120)   { modal_reset(); g_modal = 2; return; }
         if (mx >= BTN_DEL_X && mx <= BTN_DEL_X + BTN_W && g_selected >= 0) {
-            delete_account(g_selected); set_status("Account deleted"); return;
+            int r = delete_account(g_selected);
+            set_status(r == 0 ? "Account deleted" : secret_err_text(r));
+            return;
         }
     }
     // account rows
@@ -565,7 +618,7 @@ int main(int argc, char **argv) {
     window_handle = win_create("Authenticator", 180, 120, WIN_W, WIN_H);
     if (window_handle < 0) return 1;
 
-    db_load();
+    refresh_all();
 
     // If launched with an otpauth:// URI argument, import it.
     if (argc > 1 && argv && argv[1] && strncasecmp(argv[1], "otpauth://", 10) == 0) {
@@ -576,13 +629,20 @@ int main(int argc, char **argv) {
 
     gui_event_t ev;
     int running = 1;
-    uint64_t last_step = 0;
+    // SECONDS SINCE BOOT, and that is all this is for: deciding when a second has
+    // elapsed so the codes are re-fetched and redrawn. It is NOT a wall clock and
+    // is never used to compute anything, because the kernel owns the TOTP counter.
+    unsigned long last_step = 0;
     while (running) {
         int et = win_get_event(window_handle, &ev, 250);
         if (et == 0) {
-            // periodic refresh so codes + countdown update
-            uint64_t now = rtc_unix_time();
-            if (now != last_step) { last_step = now; if (g_status_flash > 0) g_status_flash--; draw_all(); }
+            unsigned long tick = (unsigned long)sys_time();
+            if (tick != last_step) {
+                last_step = tick;
+                if (g_status_flash > 0) g_status_flash--;
+                refresh_codes();
+                draw_all();
+            }
             continue;
         }
         switch (ev.type) {

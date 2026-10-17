@@ -360,6 +360,48 @@ fn win_create_bg(t: &[u8], x: i32, y: i32, w: i32, h: i32) -> i32 {
                       w as i64, h as i64) as i32 }
 }
 fn win_destroy(h: i32) { unsafe { syscall1(SYS_WIN_DESTROY, h as i64); } }
+
+// ===========================================================================
+// #791 [winopacity]: THIS WINDOW'S OWN OPACITY, and the whole reason the
+// syscall exists.
+//
+// OWNER, 2026-10-02, looking at the wizard on a test VM: "the transparency is too
+// high". The first fix raised kernel/gui/themes.c's m_window_opacity default
+// from 215 to 242, and the owner rejected it, correctly: "what do you mean os
+// wide? apps are meant to use the opacity value specified in the settings page
+// not a hardcoded one? i'm looking at only changing the first run wizard". That
+// constant is the DEFAULT BEHIND the Settings "Window Opacity" slider, so
+// moving it changed every window on the system to fix one app, and it inverted
+// the direction the value is meant to flow. Reverted at 1c495364.
+//
+// The owner then settled the design: "apps may override in fact there is an
+// option in the window manager that allows discrete control of this property",
+// and "other apps like full screen DOS apps/games may default to 100% despite
+// the default settings (but still allow control)". SYS_WIN_SET_OPACITY is that
+// override: it touches ONLY this window, it beats the theme/Settings default,
+// and the user's titlebar Opacity stepper still beats IT and keeps beating it
+// across a later theme switch. See kernel/gui/window.h window_t::opacity_src.
+//
+// Number 464, read out of kernel/proc/syscall.h, not guessed, per this file's
+// own header rule; checked by `make syscall-number-lint` rule 5.
+const SYS_WIN_SET_OPACITY: i64 = 464;
+
+// 250/255 = 98%. The wizard is the FIRST thing a user ever sees, over a
+// wallpaper chosen for impact, and its body text and the Date & Time map were
+// genuinely hard to read at the 215 (84%) default. 250 rather than 255 because
+// a trace of the wallpaper behind the card is the material the whole layout is
+// designed as (docs/WIZARD_POWER_CORNER.html); 255 would make it a flat panel.
+//
+// AND IT IS THE ONLY KNOB. GLASS_TINT_A above stays 1000 (fully opaque tint):
+// the card must not double-dip. Two transparency controls multiplying into one
+// visual result is how "the transparency is too high" became hard to localise
+// in the first place; with the card tint at 1.00, this constant alone decides
+// how much wallpaper shows through, and a future adjustment has one place to go.
+const WIN_OPACITY: i32 = 250;
+
+fn win_set_opacity(h: i32, o: i32) -> i32 {
+    unsafe { syscall2(SYS_WIN_SET_OPACITY, h as i64, o as i64) as i32 }
+}
 fn rect(h: i32, x: i32, y: i32, w: i32, ht: i32, c: u32) {
     let (x, y) = body_to_win(x, y);
     unsafe { syscall6(SYS_WIN_DRAW_RECT, h as i64, x as i64, y as i64,
@@ -982,10 +1024,23 @@ fn write_dock_style_live(dock_style: usize) {
 // already accepts elsewhere in this file (KC_LEFT/KC_RIGHT clamp against a
 // literal 4 too). If DOCK_COUNT ever changes, both need revisiting; grep for
 // DOCK_XFCE_IDX.
+#[allow(dead_code)]  // (#glassrevert) no longer the default; kept as the Marble index constant for reference
 const DOCK_XFCE_IDX: usize = 4;
+// (#glassrevert, 2026-10-01) The virgin-machine default dock style again, per
+// the reversal above: DOCK_DEFAULT (classic bottom taskbar) = 0, matching
+// compositor.h's DOCK_DEFAULT and taskbar.c's reverted g_dock_style init.
+const DOCK_DEFAULT_IDX: usize = 0;
 
-// (#wizdock) Owner decision 2026-08-27: Fluent Dark is the default theme,
-// matching the new Marble default dock style (write_dock_style() above).
+// (#glassrevert, 2026-10-01) REVERSES the #wizdock 2026-08-27 decision
+// below, on explicit fresh owner direction (prefers the previous layout,
+// widened to any other app that had this UI change): the default theme
+// is Retro UNIX again, matching the reverted-to-classic default dock style
+// (taskbar.c g_dock_style, also reverted). Fluent Dark/Marble remain fully
+// selectable on the Appearance page for anyone who wants them.
+//
+// (#wizdock) Prior text, kept for history: Owner decision 2026-08-27:
+// Fluent Dark is the default theme, matching the new Marble default dock
+// style (write_dock_style() above).
 // THEMES[] is populated at runtime from /THEMES/*.mtheme (gui_theme_list()),
 // so "the default theme" cannot be a compiled-in array index the way
 // DOCK_XFCE is for dock style - the same theme can load at a different
@@ -994,7 +1049,7 @@ const DOCK_XFCE_IDX: usize = 4;
 // defaulted (initial construction and the back-navigation reset) so the two
 // cannot drift the way a hand-duplicated index would.
 fn default_theme_idx(themes: &[ThemeEntry], nthemes: usize) -> usize {
-    const WANT: &[u8] = b"fluent_dark";
+    const WANT: &[u8] = b"retro_unix";
     let mut i = 0usize;
     while i < nthemes {
         let slug = &themes[i].slug;
@@ -1143,11 +1198,12 @@ struct App {
     dock_style: usize,
     appear_zone: usize,   // 0 theme grid focused, 1 dock-style row focused
     // #745 task #15, PG_APPSW (docs/OOBE_APPS_WIDGETS.html). Bitsets rather
-    // than [bool;N]: 12 and 15 candidates both fit a u16, count_ones() gives
-    // the "n of 12/15" counters for free, and a bitset cannot go out of
-    // bounds the way a hand-sized bool array can.
+    // than [bool;N]: 13 and 15 candidates both fit a u16, count_ones() gives
+    // the "n of <len> chosen/on" counters for free, and a bitset cannot go out
+    // of bounds the way a hand-sized bool array can. (#flowfix: 12 -> 13 dock
+    // candidates when Flow was added; still comfortably inside a u16.)
     apps_sel: u16,          // bit i = APPS_UI[i] checked (dock pin)
-    apps_focus: usize,      // 0..11, row-major (matches dock/grid order)
+    apps_focus: usize,      // 0..APPS_UI.len()-1, row-major (matches dock/grid order)
     widgets_sel: u16,       // bit i = WIDGETS_UI[i] on
     widgets_cursor: usize,  // 0..14, PERSISTS regardless of zone (spec 6.1)
     appsw_zone: usize,      // 0 apps grid, 1 widgets list, 2 Back, 3 Continue
@@ -1491,7 +1547,14 @@ const GQ_H: usize = ((CARD_H + 2 * BLEED) / 4) as usize;   // 172
 // card still reads as a material rather than a flat panel. Do NOT "restore" the
 // mockup's value.
 const GLASS_TINT: u32 = WEL_BG_MID;    // #122420
-const GLASS_TINT_A: i32 = 800;         // 0.80
+// OWNER, 2026-10-02, looking at the wizard on a test VM: "the transparency is too
+// high". Was 800 (0.80), which let 20% of the wallpaper through and, over the
+// default high-contrast abstract wallpaper, made the Date & Time map and the
+// body text genuinely hard to read. 950 keeps the glass legible AS glass (the
+// blur and the edge stroke still read) while putting the content first.
+// ONE constant: glass_at_win() and the blurred GLASS[] prepass both use it, so
+// the blurred path and both unblurred fallbacks cannot disagree.
+const GLASS_TINT_A: i32 = 1000;        // 1.00 - STAYS 1.00, see WIN_OPACITY below
 
 const CARD_EDGE_A: i32 = 340;          // 1 px white @ 0.34 on the rounded path
 const CARD_HL_A: i32   = 440;          // top highlight, white @ 0.44
@@ -4033,18 +4096,45 @@ fn dk_step_dots(win: i32, active_idx: i32, y: i32) {
 // leaves 12px. Checked against every page that shares this footer
 // (Account/Signin/Network/Time/Appear/Wall/Appsw/AI) by screendump before
 // landing - moving the row down only ever ADDS clearance above it.
+// OWNER 2026-10-02: "ensure the back skip and continue buttons are all the same
+// size (width) and properly centre the skip button."
+//
+// ONE source for the footer geometry. Before this, the width 88 appeared in
+// dk_back_button AND in two dk_focus_frame calls, 140 appeared in
+// dk_primary_button AND two more, and footer_bounds() hardcoded Back's right
+// edge as the literal 120 (= 32 + 88). Six places had to agree and nothing made
+// them; widening Back by hand would have left the focus ring and the hit-rect at
+// the old size. Everything below is derived.
+//
+// CENTRING, since "properly" is the requirement: the content box runs 32..608,
+// so its centre is 320. Back 32..172 and Continue 468..608 are symmetric about
+// it (148 either side), and Skip at 250..390 is centred on 320 exactly, leaving
+// an equal 78 px gap on both sides. Skip is therefore centred in the row AND in
+// the gap between the other two, which are the same point here by construction.
+const FOOTER_BTN_W: i32  = 140;   // all three, identical
+const FOOTER_BACK_X: i32 = 32;
+const FOOTER_SKIP_X: i32 = 250;   // 320 - FOOTER_BTN_W/2
+const FOOTER_NEXT_X: i32 = 468;
 const FOOTER_Y: i32 = 440;
 const FOOTER_H: i32 = 28;
 
+// ONE secondary-button painter, shared by Back and Skip. Factored out when the
+// owner asked (2026-10-02) for Skip to become a real button at the same font
+// size as the other two: two copies of a button style is exactly how Back and
+// Skip would drift apart later, and this file already carries that lesson in
+// account_field_geom()'s comment.
+fn dk_secondary_button(win: i32, x: i32, w: i32, label: &[u8]) {
+    frame_inward(win, x, FOOTER_Y, w, FOOTER_H, 1, DK_BACK_BORDER);
+    let tw = unsafe { gui_ttf_width(label.as_ptr(), 12) };
+    dk_solid(win, x + (w - tw) / 2, FOOTER_Y + 8, label, 12, true, DK_BACK_LABEL);
+}
+
 fn dk_back_button(win: i32) {
-    let (x, y, w, h) = (32, FOOTER_Y, 88, FOOTER_H);
-    frame_inward(win, x, y, w, h, 1, DK_BACK_BORDER);
-    let tw = unsafe { gui_ttf_width(b"Back\0".as_ptr(), 12) };
-    dk_solid(win, x + (w - tw) / 2, y + 8, b"Back\0", 12, true, DK_BACK_LABEL);
+    dk_secondary_button(win, FOOTER_BACK_X, FOOTER_BTN_W, b"Back\0");
 }
 
 fn dk_primary_button(win: i32, label: &[u8], disabled: bool) {
-    let (x, y, w, h) = (468, FOOTER_Y, 140, FOOTER_H);
+    let (x, y, w, h) = (FOOTER_NEXT_X, FOOTER_Y, FOOTER_BTN_W, FOOTER_H);
     let bg = wel_composite_at(x + w / 2, y + h / 2);
     let (top, bot) = if disabled { (wel_blend_over(DK_BTN_TOP, bg, 420), wel_blend_over(DK_BTN_BOTTOM, bg, 420)) }
                      else { (DK_BTN_TOP, DK_BTN_BOTTOM) };
@@ -4092,8 +4182,14 @@ fn fmt_pct(buf: &mut [u8; 8], pct: i32) -> usize {
 // can never disagree. Every non-welcome page (PG_TIME included, as of its
 // #745 follow-up dark port) now shares the same dark-spec footer: back
 // 32-120, primary 468-608, both at FOOTER_Y..FOOTER_Y+FOOTER_H (#745 task #38).
+// Derived from the constants above, never re-typed: the literal 120 here was
+// Back's old right edge (32 + 88) and would have silently kept the OLD hit-rect
+// after the button was widened, which is the #188 bug class this file already
+// guards against elsewhere.
 fn footer_bounds(_page: usize) -> (i32, i32, i32, i32, i32, i32) {
-    (32, 120, 468, 608, FOOTER_Y, FOOTER_Y + FOOTER_H)
+    (FOOTER_BACK_X, FOOTER_BACK_X + FOOTER_BTN_W,
+     FOOTER_NEXT_X, FOOTER_NEXT_X + FOOTER_BTN_W,
+     FOOTER_Y, FOOTER_Y + FOOTER_H)
 }
 
 // ===========================================================================
@@ -4903,9 +4999,18 @@ const SKIP_LABEL: &[u8] = b"Skip\0";
 // same FOOTER_Y..FOOTER_Y+FOOTER_H row as both. Measured, not guessed, so the
 // hit-rect is exactly the drawn text: a link whose clickable area is wider
 // than its glyphs is the same class of lie as the button this replaces.
+// OWNER, 2026-10-02: "the Skip option should be a button with the same size font
+// as back and continue". It was a bare 11px text link dimmed to 0.80, which #745
+// chose deliberately to keep it quiet; that choice is now overruled, so this
+// returns a real BUTTON rect, the same 88x28 as Back, still centred in the gap
+// between Back (32..120) and Continue (468..608) at x=294.
+//
+// This one function is still the ONLY source of the rectangle, for the draw and
+// the hit-test both, which is what keeps the #188 "drawn at one rect, clicked at
+// another" bug structurally impossible. The hit-rect is now the button face
+// rather than the glyphs, which is correct for a button and is the point.
 fn skip_link_bounds() -> (i32, i32, i32, i32) {
-    let w = unsafe { gui_ttf_width(SKIP_LABEL.as_ptr(), 11) };
-    (294 - w / 2, FOOTER_Y, w, FOOTER_H)
+    (FOOTER_SKIP_X, FOOTER_Y, FOOTER_BTN_W, FOOTER_H)
 }
 // ===========================================================================
 // #136: bottom-right corner control "Skip to Desktop" (CORNER_LABEL_SKIP /
@@ -5359,14 +5464,20 @@ fn pwr_pump() {
 // "<tray bind>=<0|1>" line per widget - see main.c widgets_cfg_poll()).
 // ===========================================================================
 
-// The twelve dock candidates (spec section 5.1). Every exec path below was
+// The dock candidates (spec section 5.1). Every exec path below was
 // grepped out of the real build/assets/startmenu/system.d/*.MENU fragments,
 // not copied from the spec doc unverified, because startmenu_get_favorites()
 // silently drops any favourite whose path does not string-match a rendered
 // menu item - a typo here would compile, run, and pin nothing.
+//
+// #flowfix: Flow (/APPS/FLOW) was never in this list, so the first-run wizard
+// could never pin it to the dock no matter what the owner chose - the app
+// simply was not a candidate. Confirmed /APPS/FLOW string-matches the real
+// fragment before adding it: build/assets/startmenu/system.d/02-accessories.MENU
+// has "item: Maytera Flow | /APPS/FLOW | icon=converter".
 #[derive(Clone, Copy)]
 struct AppUi { label: &'static [u8], path: &'static [u8] }
-const APPS_UI: [AppUi; 12] = [
+const APPS_UI: [AppUi; 13] = [
     AppUi { label: b"Browser\0",      path: b"/APPS/BROWSER\0" },
     AppUi { label: b"Files\0",        path: b"/APPS/FILES\0" },
     AppUi { label: b"Terminal\0",     path: b"/APPS/TERMINAL\0" },
@@ -5381,15 +5492,16 @@ const APPS_UI: [AppUi; 12] = [
     // Not uppercase - copied verbatim from 04-system.MENU, where the
     // fragment itself names it this way.
     AppUi { label: b"Task Manager\0", path: b"/APPS/taskmgr\0" },
+    AppUi { label: b"Flow\0",         path: b"/APPS/FLOW\0" },
 ];
-// Owner decision (2026-08-18): all twelve dock candidates default checked.
-// Previously only Browser, Files, Terminal, Settings, App Store (indices
-// 0,1,2,4,5, the compiled-in desktop icon set minus Recycle Bin) were on;
-// the person now sees every candidate pre-pinned and can uncheck what they
-// do not want, rather than opt in to the other seven.
+// Owner decision (2026-08-18): all dock candidates default checked. Previously
+// only Browser, Files, Terminal, Settings, App Store (indices 0,1,2,4,5, the
+// compiled-in desktop icon set minus Recycle Bin) were on; the person now sees
+// every candidate pre-pinned and can uncheck what they do not want, rather
+// than opt in. Flow (index 12) follows the same default.
 const APPS_DEFAULT_MASK: u16 =
     (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) |
-    (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
+    (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12);
 
 // The fifteen widgets (spec section 5.2/9.1), column-major display order
 // (col = i/5, row = i%5): column 3 is entirely "needs something first", which
@@ -5484,10 +5596,19 @@ const _: () = assert!(bytes_eq(WIDGETS_UI[WIDX_AICHAT].profkey, b"show_aichat\0"
 
 const APP_X0: i32 = 32;
 const APP_Y0: i32 = 96;
-const APP_PITCH_X: i32 = 98;
+// #flowfix: 7 columns (was 6) so the 13th candidate (Flow) still fits in the
+// existing TWO rows - the page has no vertical slack below this grid (the
+// "Every app stays..." text sits at y=214, 10px under row 1's bottom edge at
+// 204), so adding a 3rd row would need a much larger, unverified page
+// cascade. 576px content band / 7 = 82px pitch; card width trimmed from 86 to
+// 72 to keep the same ~10px gutter. appsw_draw_app_label() now shrinks any
+// label that does not fit (see dk_fit_label call below), so the narrower
+// card cannot clip a longer name like "Task Manager".
+const APP_PITCH_X: i32 = 82;
 const APP_PITCH_Y: i32 = 60;
-const APP_W: i32 = 86;
+const APP_W: i32 = 72;
 const APP_H: i32 = 48;
+const APP_COLS: i32 = 7;
 
 const WID_X0: i32 = 32;
 const WID_Y0: i32 = 260;
@@ -5582,6 +5703,14 @@ fn appsw_key_eq(nul_term: &[u8], key: &[u8]) -> bool {
 // a bold run by 1px per glyph, and this page draws no label near its budget
 // closely enough to need the correction anyway - see section 10.3's measured
 // 22-28px of headroom on every app label).
+// #flowfix: was its own measure-and-center-at-size-12 logic with no overflow
+// handling, safe only because every label used to comfortably fit APP_W=86.
+// Narrowing the card to 72px (7-column grid, see APP_PITCH_X) made that
+// assumption worth not making again, so this now reuses dk_fit_label() - the
+// SAME shrink-then-truncate helper the dock-style cards already use - rather
+// than hand-rolling a second one. A single-word label (e.g. "Flow") gets one
+// fitted line; a two-word label keeps its existing two-line layout, with each
+// word independently fitted.
 fn appsw_draw_app_label(win: i32, cx: i32, cy: i32, name: &[u8], colour: u32) {
     let mut sp: i32 = -1;
     let mut i = 0usize;
@@ -5590,8 +5719,7 @@ fn appsw_draw_app_label(win: i32, cx: i32, cy: i32, name: &[u8], colour: u32) {
         i += 1;
     }
     if sp < 0 {
-        let w = unsafe { gui_ttf_width(name.as_ptr(), 12) };
-        dk_solid(win, cx + (APP_W - w) / 2, cy + 19, name, 12, false, colour);
+        dk_fit_label(win, cx, cy + 19, APP_W, name, colour, false);
         return;
     }
     let sp = sp as usize;
@@ -5604,10 +5732,8 @@ fn appsw_draw_app_label(win: i32, cx: i32, cy: i32, name: &[u8], colour: u32) {
     let mut m = 0usize;
     while j < name.len() && name[j] != 0 && m < 23 { b[m] = name[j]; m += 1; j += 1; }
     b[m] = 0;
-    let wa = unsafe { gui_ttf_width(a.as_ptr(), 12) };
-    let wb = unsafe { gui_ttf_width(b.as_ptr(), 12) };
-    dk_solid(win, cx + (APP_W - wa) / 2, cy + 13, &a, 12, false, colour);
-    dk_solid(win, cx + (APP_W - wb) / 2, cy + 29, &b, 12, false, colour);
+    dk_fit_label(win, cx, cy + 13, APP_W, &a, colour, false);
+    dk_fit_label(win, cx, cy + 29, APP_W, &b, colour, false);
 }
 
 // 7x7 hollow ring: the ring-then-hole construction dk_radio() already uses,
@@ -5637,14 +5763,13 @@ impl App {
         dk_alpha(win, 32, 50, subtitle, 12, false, DK_BODY, 880);
         dk_back_button(win);
         dk_primary_button(win, b"Continue\0", false);
-        // #745: quieter than both buttons by size (11px vs 12px) and by alpha,
-        // and drawn ONLY where page_skippable() says it belongs, so the drawn
+        // Drawn ONLY where page_skippable() says it belongs, so the drawn
         // control and the hit-test in on_click() come from one predicate.
+        // (2026-10-02) Now the same secondary button as Back, 12px, undimmed,
+        // per the owner. #745's quieter 11px-at-0.80 link is gone.
         if page_skippable(self.page) {
-            let (lx, _, _, _) = skip_link_bounds();
-            let ly = FOOTER_Y + 8;
-            let col = wel_blend_over(DK_BODY, wel_composite_at(lx, ly), 800);
-            dk_solid(win, lx, ly, SKIP_LABEL, 11, false, col);
+            let (lx, _, lw, _) = skip_link_bounds();
+            dk_secondary_button(win, lx, lw, SKIP_LABEL);
         }
     }
 
@@ -5836,8 +5961,8 @@ impl App {
                  10, false, DK_FINE_PRINT);
 
         // Footer focus, drawn after dk_page_chrome laid the buttons down.
-        if self.signin_focus == 2 { dk_focus_frame(win, 32, FOOTER_Y, 88, FOOTER_H); }
-        if self.signin_focus == 3 { dk_focus_frame(win, 468, FOOTER_Y, 140, FOOTER_H); }
+        if self.signin_focus == 2 { dk_focus_frame(win, FOOTER_BACK_X, FOOTER_Y, FOOTER_BTN_W, FOOTER_H); }
+        if self.signin_focus == 3 { dk_focus_frame(win, FOOTER_NEXT_X, FOOTER_Y, FOOTER_BTN_W, FOOTER_H); }
     }
 
     // (#wizflash) Same reasoning as account_field_geom() above: ONE table for
@@ -6280,7 +6405,9 @@ impl App {
             let mut cbuf: [u8; 24] = [0; 24];
             let mut cn = 0usize;
             cn += put_u32(&mut cbuf, cn, n);
-            cn += put(&mut cbuf, cn, b" of 12 chosen");
+            cn += put(&mut cbuf, cn, b" of ");
+            cn += put_u32(&mut cbuf, cn, APPS_UI.len() as u32);
+            cn += put(&mut cbuf, cn, b" chosen");
             cbuf[cn] = 0;
             let cw = unsafe { gui_ttf_width(cbuf.as_ptr(), 12) };
             dk_solid(win, 608 - cw, 78, &cbuf, 12, false, DK_BODY);
@@ -6288,8 +6415,8 @@ impl App {
 
         let mut i = 0usize;
         while i < APPS_UI.len() {
-            let col = (i % 6) as i32;
-            let row = (i / 6) as i32;
+            let col = (i as i32) % APP_COLS;
+            let row = (i as i32) / APP_COLS;
             let cx = APP_X0 + col * APP_PITCH_X;
             let cy = APP_Y0 + row * APP_PITCH_Y;
             let on = self.apps_sel & (1u16 << i) != 0;
@@ -6351,8 +6478,8 @@ impl App {
         let detail: &[u8] = if !net_ok && cur.detail_off.len() > 1 { cur.detail_off } else { cur.detail_on };
         dk_solid(win, 32, 386, detail, 12, false, DK_BODY);
 
-        if self.appsw_zone == 2 { dk_focus_frame(win, 32, FOOTER_Y, 88, FOOTER_H); }
-        if self.appsw_zone == 3 { dk_focus_frame(win, 468, FOOTER_Y, 140, FOOTER_H); }
+        if self.appsw_zone == 2 { dk_focus_frame(win, FOOTER_BACK_X, FOOTER_Y, FOOTER_BTN_W, FOOTER_H); }
+        if self.appsw_zone == 3 { dk_focus_frame(win, FOOTER_NEXT_X, FOOTER_Y, FOOTER_BTN_W, FOOTER_H); }
     }
 
     // #745 follow-up: the AI provider page. Skip is deliberately NOT
@@ -8016,7 +8143,7 @@ impl App {
             // choice lives, so "back past PG_APPEAR" means "before the
             // Appearance page was ever reached this pass".
             self.theme = default_theme_idx(unsafe { &*core::ptr::addr_of!(THEMES) }, self.nthemes);
-            self.dock_style = DOCK_XFCE_IDX;
+            self.dock_style = DOCK_DEFAULT_IDX;
         }
         if from <= PG_WALL { self.wall = 0; }
         // #745 task #15: apps/widgets. "I did not choose" means the system
@@ -8285,14 +8412,25 @@ impl App {
             PG_APPSW => {
                 match self.appsw_zone {
                     0 => {
-                        let mut col = (self.apps_focus % 6) as i32;
-                        let mut row = (self.apps_focus / 6) as i32;
+                        // #flowfix: APP_COLS candidates wide (was a hardcoded
+                        // 6), clamped (never wrapped, matching this zone's own
+                        // established rule above) against APPS_UI.len() so a
+                        // short last row (13 candidates over 7 columns leaves
+                        // row 1 with only 6) cannot focus a cell that is not
+                        // actually drawn.
+                        let mut col = (self.apps_focus as i32) % APP_COLS;
+                        let mut row = (self.apps_focus as i32) / APP_COLS;
+                        let n = APPS_UI.len() as i32;
                         if ev.keycode == KC_LEFT { if col > 0 { col -= 1; } }
-                        else if ev.keycode == KC_RIGHT { if col < 5 { col += 1; } }
+                        else if ev.keycode == KC_RIGHT {
+                            if col < APP_COLS - 1 && row * APP_COLS + col + 1 < n { col += 1; }
+                        }
                         else if ev.keycode == KC_UP { if row > 0 { row -= 1; } }
-                        else if ev.keycode == KC_DOWN { if row < 1 { row += 1; } }
+                        else if ev.keycode == KC_DOWN {
+                            if (row + 1) * APP_COLS + col < n { row += 1; }
+                        }
                         else if c == b' ' { self.apps_sel ^= 1u16 << self.apps_focus; }
-                        self.apps_focus = (row * 6 + col) as usize;
+                        self.apps_focus = (row * APP_COLS + col) as usize;
                     }
                     1 => {
                         let mut col = (self.widgets_cursor / 5) as i32;
@@ -8508,13 +8646,13 @@ impl App {
             // resolves to the nearer cell rather than doing nothing).
             PG_APPSW => {
                 let apps_bot = APP_Y0 + 2 * APP_PITCH_Y;
-                let apps_right = APP_X0 + 6 * APP_PITCH_X;
+                let apps_right = APP_X0 + APP_COLS * APP_PITCH_X;
                 let wid_bot = WID_Y0 + 5 * WID_PITCH_Y;
                 let wid_right = WID_X0 + 3 * WID_PITCH_X;
                 if my >= APP_Y0 && my < apps_bot && mx >= APP_X0 && mx < apps_right {
                     let col = (mx - APP_X0) / APP_PITCH_X;
                     let row = (my - APP_Y0) / APP_PITCH_Y;
-                    let idx = (row * 6 + col) as usize;
+                    let idx = (row * APP_COLS + col) as usize;
                     if idx < APPS_UI.len() {
                         self.apps_focus = idx;
                         self.apps_sel ^= 1u16 << idx;
@@ -8885,6 +9023,13 @@ pub extern "C" fn main() -> i32 {
     }
     let win = win_create(b"Setup Assistant\0", wx, wy, ww, wh);
     if win < 0 { return 1; }
+    // #791: declare our own opacity (tier 1) BEFORE the first draw, so the
+    // wizard never flashes at the global default on frame 1. Called once, not
+    // per frame: it is idempotent but it invalidates the screen on a change,
+    // and re-asserting it every frame would also fight the user if they move
+    // the titlebar stepper (the kernel would ignore us, but we would be asking
+    // 60 times a second for something we are not entitled to).
+    win_set_opacity(win, WIN_OPACITY);
     // Set NOCHROME immediately, before the first draw: it is a ONE-WAY flag
     // (kernel/proc/syscall.c sys_win_set_nochrome() only ever does
     // `win->flags |= WINDOW_FLAG_NOCHROME` - there is no path anywhere in
@@ -8950,7 +9095,7 @@ pub extern "C" fn main() -> i32 {
         time_focus: 0, ntp_on: true, ntp_server: Field::new(false), ntp_preset: 0,
         ntp_touched: false,
         dt_year: 2026, dt_month: 1, dt_day: 1, dt_hour: 0, dt_min: 0, dt_sec: 0,
-        dock_style: DOCK_XFCE_IDX, appear_zone: 0,
+        dock_style: DOCK_DEFAULT_IDX, appear_zone: 0,
         // #745 task #15: apps_sel seeded to the compiled-in default here
         // (spec 6.1: "the defaults... unless the person has already visited
         // the page and gone Back", which just means never resetting it again

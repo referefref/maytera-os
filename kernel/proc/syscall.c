@@ -68,9 +68,11 @@ extern int64_t dos_fm_host_call(uint32_t op, uint64_t a1, uint64_t a2,
 #include "../fs/fat.h"
 #include "../fs/ext2.h"
 #include "../fs/perms.h"
+#include "../fs/recycle_fs.h"   // [renamevol] recycle_victim_stat: the ONE volume-aware "is there a file here"
 #include "../fs/guestfs.h"   // #708: DOS/Win16 guest fs gate
 #include "../fs/bootlog.h"
 #include "users.h"
+#include "secretuse.h"   // #secretuse: SYS_SECRET_USE + the session key lifecycle
 #include "elevate.h"   // #745 elevation syscall bodies
 #include "caps.h"      // Stage 1 capability API syscall bodies + chokepoint gate
 #include "../fs/escrow_guard.h"  // #246/#305 AI escrow kernel enforcement chokepoint
@@ -230,12 +232,18 @@ static int64_t sys_wm_fullscreen_status(void);
 // VFS file backings used for shell redirection (open a path as a struct file_t
 // so it can be installed directly into a child's stdin/stdout fd).
 extern file_t *fat_vfs_open(const char *path, int flags);
+// [provetwo] #246: the same opener with the filesystem as a parameter, so a
+// struct file_t can be opened on a hot-plugged removable volume. fat_vfs_open()
+// is one line over it. See fs/fat_vfs.c.
+extern file_t *fat_vfs_open_on(fat_fs_t *fs, const char *rel,
+                               const char *abspath, int flags);
 extern file_t *ext2_vfs_open(const char *path, int flags);
 // ext2 root-cutover path helpers (defined alongside sys_open below).
 // #317 pass 2: SMB network mount control syscalls (defined below).
 int64_t sys_net_mount(const char *server, const char *share,
                       const char *user, const char *pass);
 int64_t sys_net_list_shares(const char *server, char *ubuf, uint32_t maxlen);
+int64_t sys_net_cred_tag(const char *u_pass, char *u_out, uint32_t outcap);
 int64_t sys_net_unmount(const char *server, const char *share);
 int64_t sys_net_list_exports(const char *server, char *ubuf, uint32_t maxlen);
 int64_t sys_nfs_mount(const char *server, const char *export_path, char *mp_out, uint32_t mp_outsz);
@@ -328,6 +336,7 @@ int64_t sys_win_draw_text_ttf_ex(int handle, int x, int y, const char *text, uin
 int64_t sys_win_get_pos(int handle, int *x, int *y);
 int64_t sys_win_move(int handle, int x, int y);
 int64_t sys_win_move_by(int handle, int dx, int dy);
+int64_t sys_win_set_opacity(int handle, int opacity);   // #791 [winopacity]
 
 // Network TX from a user-process syscall context runs on the process CR3, which
 // only copies the kernel's UPPER-half PML4 entries (256-511). The NIC's MMIO
@@ -835,6 +844,15 @@ int64_t sys_session_lock(int reason) {
         return -1;
     }
 
+    // #secretuse: WIPE THE SECRET-STORE KEYS. The key is derived from the login
+    // password at users_authenticate() and lives only in kernel memory; locking
+    // the session destroys it, and unlocking runs users_authenticate() again
+    // (SYS_SESSION_UNLOCK), which re-derives it. So the window in which the
+    // decrypted secrets exist anywhere is exactly the window in which the user is
+    // logged in and present. This is wiped BEFORE the screen is marked locked, so
+    // there is no instant at which the screen says locked while the keys are live.
+    seckey_wipe_all();
+
     desktop_set_locked(1);
     // #158: the kernel is the authority on both facts (session lock and
     // native fullscreen), so this is where the two can never disagree.
@@ -855,6 +873,89 @@ int64_t sys_session_lock(int reason) {
 
 int64_t sys_session_is_locked(void) {
     return desktop_is_locked() ? 1 : 0;
+}
+
+// ============================================================================
+// #harendezvous: WHERE THE ACTIVE SESSION'S PER-USER STATE LIVES, ASKED BY A
+// PROCESS THAT IS NOT THAT USER.
+// ============================================================================
+// A boot-time service runs as uid 0 and has no session of its own, so libc's
+// userhome_root() (which resolves getpwuid(getuid())) answers "/" for it,
+// permanently. That is the right answer for the service's OWN files and useless
+// for the one thing it needs: READING a request the session user's desktop left
+// for it. The Home Assistant pair is the live instance (apps/compositor's HA
+// widget and apps/haservice): both ends used to meet at root-owned literals
+// (/HAENT.TXT, /HALIST.REQ), which uid 0 can write and the uid-1000 compositor
+// cannot, so the entity picker and the custom label were silently dead for
+// every non-root session. That is the #peruserpath bug exactly.
+//
+// THE ALTERNATIVES, AND WHY NOT THEM, because a rendezvous attracts bad ones:
+//   * A WORLD-WRITABLE SHARED DIRECTORY. /SHARED and /TMP are 01777 and the
+//     STICKY BIT makes delete owner-only (fs/perms.c perms_may_remove), so a
+//     server cannot consume a client's request there. Widening the mode further
+//     to work around that hands every app a channel into the one the desktop
+//     uses, to fix a permission error. The sticky bit is a symptom of the wrong
+//     mechanism, not an obstacle to route around.
+//   * A SECOND KERNEL QUEUE in the shape of gui/shotq.c. shotq is the right
+//     mechanism for a CAPABILITY-GATED ACTION with a strong consumer identity
+//     (fb_owner_is()). What is exchanged here is a FILE A USER OWNS, there is
+//     no capability noun, and ipc/msg.c already exists, so a new queue would be
+//     the THIRD mechanism for one question, which is the duplication this tree
+//     keeps paying for. ipc/msg.c itself is not a candidate either: its own
+//     header records that connections are matched by owner_pid so a RECYCLED
+//     PID inherits a dead process's connections, and sys_msg_recv() still spins
+//     on proc_yield(), both pending #515.
+//   * "THE ONE NON-ROOT ACCOUNT". A rule that breaks on the second account.
+//
+// So the kernel answers only the part it alone knows, and that it ALREADY holds
+// a single definition of: session_user() (#745, "the kernel owns this fact;
+// nothing in Ring 3 gets to name it"). THE PATH CONVENTION DELIBERATELY STAYS
+// IN USERLAND'S ONE JOINER (libc/userconf.c userhome_path_as), so this cannot
+// become a second naming scheme that drifts from the first, which is precisely
+// the split brain fs/userconf.c's header warns about for the notification spool.
+//
+// PRE-LOGIN, AND A SESSION WITH NO ACCOUNT, RETURN "/". That is the legacy path
+// every one of these files already used, so a service that re-resolves on each
+// pass degrades to exactly today's behaviour instead of failing. A freshly built
+// golden ships no /CONFIG/PASSWD on purpose (#226/#202), so "/" is the ANSWER ON
+// A STOCK IMAGE, not an error, and the caller must not treat it as one.
+int64_t sys_session_home(char *u_out, int cap) {
+    process_t *p = proc_current();
+    if (!p || p->euid != 0) return -1;      // privileged services only
+    if (!u_out || cap <= 1) return -1;
+
+    user_entry_t *su = session_user();
+    // [noaccount] WAS: `(su && su->home[0] == '/') ? su->home : "/"`, with a
+    // comment above saying a no-account session returns "/" and that this
+    // "degrades to exactly today's behaviour". It degraded to today's BROKEN
+    // behaviour: the requester writes its file through libc's uc_state_root(),
+    // which on a machine with no account resolves to /TMP, and a service
+    // handed "/" here would look for it in root-owned space and find nothing.
+    // Both ends of a rendezvous must answer the same question, so this answers
+    // the STATE ROOT, from the same rustkern/userconf.rs decision the Ring-3
+    // side uses. A session that HAS an account, including root, is unchanged.
+    char rootbuf[HOME_PATH_MAX];
+    extern int userconf_state_root_rs(int has_entry, const char *home,
+                                      char *out, uint32_t cap);
+    if (userconf_state_root_rs(su ? 1 : 0,
+                               (su && su->home[0]) ? su->home : "",
+                               rootbuf, (uint32_t)sizeof(rootbuf)) < 0)
+        return -1;
+    const char *home = rootbuf;
+
+    int n = 0;
+    while (home[n]) n++;
+    // Strip trailing separators but never the root itself: "" is not a path and
+    // would silently make every join relative.
+    while (n > 1 && home[n - 1] == '/') n--;
+
+    char buf[HOME_PATH_MAX];
+    if (n + 1 > (int)sizeof(buf)) return -1;    // refuse rather than truncate
+    if (n + 1 > cap) return -1;
+    for (int i = 0; i < n; i++) buf[i] = home[i];
+    buf[n] = '\0';
+    if (copy_to_user(u_out, buf, (unsigned long)(n + 1)) != 0) return -14;
+    return n;
 }
 
 int64_t sys_session_unlock(const char *uuser, const char *upass) {
@@ -1507,8 +1608,36 @@ static int pkg_write_permit(const char kp[SC_PATH_MAX]) {
         return -1;
     }
 
-    extern fat_fs_t g_fat_fs;
-    if (!fat_exists(&g_fat_fs, kp)) {
+    // [volaudit] #246: ASKED OF THE RIGHT FILESYSTEM, and this one had a
+    // SECURITY consequence, not just a correctness one.
+    //
+    // This was fat_exists(&g_fat_fs, kp). g_fat_fs cannot see a hot-plugged
+    // removable volume, so for a file that plainly EXISTS on a mounted USB
+    // stick it answered ABSENT, and this gate took the CREATE branch: it
+    // authorized against write+search on the PARENT DIRECTORY instead of
+    // against write on the FILE. A caller with write rights in a directory on
+    // a stick could therefore overwrite a file inside it that it had no right
+    // to write at all. That is the same hole, in the same shape, as the
+    // destination-existence check in sys_rename that [renamevol] measured a
+    // file being destroyed through.
+    //
+    // recycle_victim_stat() is the ONE volume-aware existence oracle (it is
+    // what the Recycle-Bin capture and sys_rename's gate both use), so this
+    // check and the capture cannot disagree about whether a file is there.
+    // -1 means a mounted medium that cannot serve files: fail CLOSED rather
+    // than ask the root filesystem instead, because the root may hold a
+    // DIFFERENT file at the same spelling and this call is about to write it.
+#ifdef VOLAUD_REVERT_TEST
+    // [provetwo] #246 NEGATIVE CONTROL. `make VOLAUDREVERT=1` restores the
+    // PRE-84c9a92c oracle in BOTH gates, so the hole can be WATCHED being
+    // exploited instead of only read about. See the block comment in
+    // kernel/Makefile. MUST NEVER be set for a golden.
+    int kex = fat_exists(&g_fat_fs, kp);
+#else
+    int kex = recycle_victim_stat(kp, 0, 0);
+#endif
+    if (kex < 0) return -1;
+    if (kex != 1) {
         char parent[SC_PATH_MAX];
         sc_parent_of(kp, parent, sizeof(parent));
         if (perms_check(parent, p->euid, p->egid, W_OK | X_OK) != 0) return -1;
@@ -1568,6 +1697,20 @@ static void pkg_write_stamp(const char kp[SC_PATH_MAX], int is_elf) {
 static int64_t sys_pkg_write_stream(const char kp[SC_PATH_MAX], const void *udata, uint32_t len) {
     extern int g_root_ext2;
     if (!kp || !g_root_ext2 || kp[0] != '/') return -1;
+    // [provetwo] #246: A REMOVABLE VOLUME IS NOT THE EXT2 ROOT, and this
+    // function had no way of telling. Its only medium test was g_root_ext2
+    // plus the /boot and /EFI exclusions, so a SYS_PKG_WRITE larger than
+    // EXT2_WSPILL_BYTES naming "/USB0/..." was STREAMED TO THE EXT2 ROOT at
+    // that spelling and reported success. That is worse than the buffered
+    // path's failure: the caller is told the write landed, the authorization
+    // was decided about the file on the stick, and the bytes are on a
+    // different medium under a path that will be shadowed by the mount point
+    // the moment anybody reads it back.
+    //
+    // Refusing here is the right shape rather than routing here, because this
+    // function's -1 means "not an ext2 target, use the other path" and the
+    // caller's other path is now volume-aware. One writer, one resolver.
+    if (hotplug_resolve_path(kp, 0) >= 0) return -1;
     // /boot and /EFI live on the FAT ESP, never on ext2.
     if (kp[1]=='b'&&kp[2]=='o'&&kp[3]=='o'&&kp[4]=='t'&&(kp[5]=='/'||kp[5]==0)) return -1;
     if (kp[1]=='E'&&kp[2]=='F'&&kp[3]=='I'&&(kp[4]=='/'||kp[4]==0)) return -1;
@@ -2772,8 +2915,34 @@ static int64_t syscall_dispatch_inner(uint64_t num, uint64_t arg1, uint64_t arg2
             char pw_kp[SC_PATH_MAX];
             if (sc_path_from_user(pw_path, pw_kp, sizeof(pw_kp)) != 0) return -14;  // #58
 
+            // #246 pkgwrite: THE ESCROW CHOKEPOINT, which this case did not
+            // reach at all until 2026-10-03. A full-file replacement is a
+            // DELETE of every byte that was at the path, and it is not a
+            // delete, a rename or an open, so none of the other three hooks
+            // saw it: a marked AI actor could overwrite any file the invoking
+            // user may write and keep no pre-image.
+            //
+            // THE ORDER IS THE CONTRACT (fs/escrow_guard.h): the guard runs
+            // FIRST (it is the scope/grant decision, and for a scoped contract
+            // an out-of-scope package write is now refused), the syscall's OWN
+            // permission check runs SECOND, and the pre-image capture runs
+            // THIRD, so a marked actor can never relocate a file it had no
+            // right to replace. sys_rename() is wired in exactly this order.
+            //
+            // A NON-ACTOR pays one process_t byte in each of the two calls and
+            // nothing else, so the App Store, updated and otaupd paths are
+            // byte-for-byte what they were.
+            if (escrow_fs_guard(ESCROW_OP_WRITE, pw_kp, 0) != ESCROW_ALLOW)
+                return -1;
+
             // #700 B1: ONE authorization decision, before EITHER writer.
             if (pkg_write_permit(pw_kp) != 0) return -1;
+
+            // The pre-image. A COPY, so a package write that fails after this
+            // point still leaves the original where it was; see
+            // escrow_replace_victim's contract for why that differs from the
+            // O_TRUNC|O_CREAT route, which moves.
+            if (escrow_replace_victim(pw_kp) != 0) return -1;
 
             // #689: is the payload an executable? Decided from the first four
             // bytes of the CALLER'S data (copied in, never dereferenced in
@@ -2801,7 +2970,31 @@ static int64_t syscall_dispatch_inner(uint64_t num, uint64_t arg1, uint64_t arg2
             // memcpy from the user pointer, so a racing unmap of the package data
             // faults to EFAULT rather than a Ring-0 read of a freed frame.
             if (pw_len && copy_from_user(pw_kb, pw_data, pw_len) != 0) { kfree(pw_kb); return -14; }
-            int pw_rc = fat_write_file(&g_fat_fs, pw_kp, pw_kb, pw_len);
+            // [provetwo] #246: WHICH FILESYSTEM, the half [volaudit] did not
+            // reach. pkg_write_permit() above was made volume-aware; this, the
+            // call that actually moves the bytes, was still the root handle.
+            // So on a mounted stick SYS_PKG_WRITE authorized against the file
+            // on the VOLUME and then wrote through g_fat_fs, where
+            // fat_path_on_ext2() is true for "/USB0/..." and the write was
+            // redirected to the EXT2 ROOT at that spelling.
+            //
+            // MEASURED on golden 2575's kernel with the PKGRDR prover: an
+            // unprivileged replacement of its OWN file on the stick returned
+            // -1 with the file byte-unchanged, and a CREATE of a new file in a
+            // directory it may write returned -1 as well. SYS_PKG_WRITE did
+            // not work on a removable volume at all, which made the deny arm
+            // next to it worthless as evidence. fs/volblind.c named the cause
+            // in the same boot: "[VOLBLIND] #246 BLIND ASK:
+            // fat_write_file(&g_fat_fs, \"/USB0/PK/PMINE.TXT\")".
+            //
+            // hotplug_fs_or_root() is the one resolver. A NULL return is a
+            // mounted medium that cannot serve files and is a hard failure,
+            // never retried against the root: the root may hold a different
+            // file at this spelling and writing THAT is worse than failing.
+            const char *pw_rel = pw_kp;
+            fat_fs_t *pw_fs = hotplug_fs_or_root(pw_kp, &pw_rel);
+            if (!pw_fs) { kfree(pw_kb); return -1; }
+            int pw_rc = fat_write_file(pw_fs, pw_rel, pw_kb, pw_len);
             kfree(pw_kb);
             if (pw_rc >= 0) pkg_write_stamp(pw_kp, pw_is_elf);
             return pw_rc;
@@ -2809,6 +3002,15 @@ static int64_t syscall_dispatch_inner(uint64_t num, uint64_t arg1, uint64_t arg2
         case SYS_NET_MOUNT:
             return sys_net_mount((const char *)arg1, (const char *)arg2,
                                  (const char *)arg3, (const char *)arg4);
+        case SYS_NET_CRED_TAG:
+            return sys_net_cred_tag((const char *)arg1, (char *)arg2, (uint32_t)arg3);
+        // #secretuse: the secret-use proxy. Six arguments so no argument is
+        // POLYMORPHIC: rustkern/argtab.rs can describe arg3 as a write buffer
+        // sized by arg4 and arg5 as a read buffer sized by arg6, which a single
+        // "sometimes an index, sometimes a pointer" argument could not be.
+        case SYS_SECRET_USE:
+            return sys_secret_use((int)arg1, (uint32_t)arg2, (void *)arg3,
+                                  (uint32_t)arg4, (const void *)arg5, (uint32_t)arg6);
         case SYS_NET_LIST_SHARES:
             return sys_net_list_shares((const char *)arg1, (char *)arg2, (uint32_t)arg3);
         case SYS_NET_UNMOUNT:
@@ -3109,6 +3311,12 @@ static int64_t syscall_dispatch_inner(uint64_t num, uint64_t arg1, uint64_t arg2
             extern int wm_get_default_opacity(void);
             return (int64_t)wm_get_default_opacity();
         }
+        // #791 [winopacity]: PER-WINDOW, app-declared (tier 1). Deliberately
+        // NOT folded into SYS_SET_WIN_OPACITY above, which is the OS-wide
+        // default behind the Settings slider - see syscall.h for why that
+        // distinction is the whole point of this ticket.
+        case SYS_WIN_SET_OPACITY:
+            return (int64_t)sys_win_set_opacity((int)arg1, (int)arg2);
         case SYS_SET_CURSOR:   // (#116) arg1=style, arg2=size%
             g_cursor_style = (int)arg1;
             g_cursor_size  = (int)arg2;
@@ -3410,6 +3618,8 @@ static int64_t syscall_dispatch_inner(uint64_t num, uint64_t arg1, uint64_t arg2
             return sys_session_lock((int)arg1);
         case SYS_SESSION_UNLOCK:
             return sys_session_unlock((const char *)arg1, (const char *)arg2);
+        case SYS_SESSION_HOME:
+            return sys_session_home((char *)arg1, (int)arg2);
         case SYS_SESSION_IS_LOCKED:
             return sys_session_is_locked();
         case SYS_SET_AUTOLOGIN:
@@ -4119,7 +4329,23 @@ static file_t *open_redir_file(const char *path, int flags) {
     {
         process_t *rp = proc_current();
         if (rp && rp->privilege == PRIV_USER) {
-            if (!fat_exists(&g_fat_fs, path)) {
+            // [volaudit] #246: the IDENTICAL defect and fix as
+            // pkg_write_permit() above, in the OTHER create point. On a
+            // mounted removable volume this answered ABSENT for a file that is
+            // there, so `cmd > /USB0/SOMEONE_ELSES_FILE` was authorized
+            // against the parent DIRECTORY rather than against the file it was
+            // about to truncate, and a redirect onto an existing file on a
+            // stick also required O_CREAT it had no reason to need. Asked
+            // through the same oracle; -1 fails closed.
+#ifdef VOLAUD_REVERT_TEST
+            // [provetwo] #246 NEGATIVE CONTROL, the other half. See
+            // pkg_write_permit() above and the block in kernel/Makefile.
+            int rex = fat_exists(&g_fat_fs, path);
+#else
+            int rex = recycle_victim_stat(path, 0, 0);
+#endif
+            if (rex < 0) return NULL;
+            if (rex != 1) {
                 if (!(flags & O_CREAT)) return NULL;
                 char parent[SC_PATH_MAX];
                 sc_parent_of(path, parent, sizeof(parent));
@@ -4130,6 +4356,41 @@ static file_t *open_redir_file(const char *path, int flags) {
             // #679: and the file it creates must belong to its creator, or the
             // creator cannot write to it a second time.
             if (flags & O_CREAT) perms_on_create(path, rp->euid, rp->egid, 0);
+        }
+    }
+
+    // [provetwo] #246: THE VOLUME, AND IT MUST COME FIRST.
+    //
+    // The permission decision above was made volume-aware by [volaudit], and
+    // the ACTION below was not, so on a mounted stick this function asked the
+    // right question and then acted on the wrong medium. path_root_ext2() is
+    // TRUE for "/USB0/..." (ext2 is the root and the path is neither /boot nor
+    // /EFI), so the create fell through to ext2_vfs_open() on the EXT2 ROOT at
+    // that spelling. In practice the parent directory does not exist there, so
+    // it returned NULL and the redirect simply failed; the dangerous shape is
+    // the one where it does exist, because then the bytes land on a DIFFERENT
+    // file from the one that was authorized.
+    //
+    // MEASURED on golden 2575's kernel with the PKGRDR prover: an unprivileged
+    // redirect onto its OWN file on the stick got spawn-rc=-1 with the file
+    // byte-unchanged, while the same call on the root filesystem got a pid and
+    // landed its bytes. Both the deny arm and the allow arm refused, so the
+    // permission fix one layer up was UNPROVABLE rather than wrong.
+    //
+    // Ordering is the same argument proc/fdlayer.c states for sys_open_k's
+    // volume branch: with ext2 as root every "/" path is a candidate for ext2
+    // resolution, and /USB0 is not an ext2 path. hotplug_volume_for_path() is
+    // the one resolver; vmatched with a NULL fs means a mounted medium that
+    // cannot serve files (exFAT), and that FAILS CLOSED here rather than
+    // falling through to the root, which may hold a different file at the same
+    // spelling and this call is about to truncate it.
+    {
+        const char *vrel = 0;
+        int vmatched = 0;
+        fat_fs_t *vfs = hotplug_volume_for_path(path, &vrel, &vmatched);
+        if (vmatched) {
+            if (!vfs) return NULL;
+            return fat_vfs_open_on(vfs, vrel, path, flags);
         }
     }
 
@@ -4212,10 +4473,22 @@ static int64_t spawn_impl(const char *path, char **argv, int argc,
             return -1;
     }
 
-    // Read the ELF file from disk
+    // Read the ELF file from disk.
+    //
+    // [volaudit] #246: WHICH FILESYSTEM. This was
+    // fat_read_file(&g_fat_fs, path), so NO EXECUTABLE ON A MOUNTED USB STICK
+    // COULD BE LAUNCHED: the read returned NULL and spawn failed with -1, for
+    // a file the same kernel can open() and read() through a descriptor
+    // without difficulty. hotplug_fs_or_root() is the one resolver; a NULL
+    // return is a hard failure and is never retried against the root, which
+    // may hold a different binary at the same spelling (and executing THAT
+    // would be considerably worse than failing).
     uint32_t size = 0;
+    const char *xrel = 0;
+    fat_fs_t *xfs = hotplug_fs_or_root(path, &xrel);
+    if (!xfs) return -1;
     scp_span_t __ssl = scp_begin();   // #121
-    void *data = fat_read_file(&g_fat_fs, path, &size);
+    void *data = fat_read_file(xfs, xrel, &size);
     scp_end(SCP_SPAWNLOAD, __ssl);
     if (!data || size == 0) return -1;
 
@@ -4831,6 +5104,15 @@ static int64_t sc_stat_fill(const char *path, k_stat_t *out) {
     #define KSTAT_DEV_EXT2  2u   // the ext2 root volume
     #define KSTAT_DEV_SMB   3u   // any SMB share (see limit above)
     #define KSTAT_DEV_NFS   4u   // any NFS export (see limit above)
+    // [volaudit] #246: a hot-plugged removable volume. It must NOT report
+    // KSTAT_DEV_FAT: with st_ino now filled (#115), a file on a stick and a
+    // file on the FAT ESP that happen to share a synthetic inode would compare
+    // EQUAL on the (st_dev, st_ino) pair, which is exactly the identity
+    // grep-gnu's directory-loop detector uses to decide it has already seen a
+    // directory. Same stated limit as SMB and NFS above: ONE id for the whole
+    // class, not one per volume, so two sticks are not yet distinguishable.
+    // That costs nothing today and is written down rather than discovered.
+    #define KSTAT_DEV_REMOV 5u
 
     // =======================================================================
     // #120: DEVICE NODES, through the SAME classifier fstat() uses.
@@ -4999,9 +5281,25 @@ static int64_t sc_stat_fill(const char *path, k_stat_t *out) {
         }
     }
 
+    // [volaudit] #246: WHICH FILESYSTEM, same defect as sc_path_is_dir()
+    // below. This was fat_open(&g_fat_fs, path), so stat() of ANY path on a
+    // mounted removable volume returned -1. That is not a silent nothing:
+    // userland/libc stat() has a legacy -1 fallback that does open()+SEEK_END
+    // and then FABRICATES st_mode = S_IFREG | 0644, and open() DOES route the
+    // volume. So every DIRECTORY on a USB stick was reported to every Ring-3
+    // caller as a regular file. That is character-for-character the #359
+    // failure (CPython's _path_isdir, hence no filesystem import) and the #120
+    // fabrication, re-created on one class of medium.
+    //
+    // `is_vol_root` is derived from the VOLUME-RELATIVE path, so "/USB0" is
+    // correctly recognised as a volume root (which has no directory entry of
+    // its own) rather than as a file named USB0 in the root directory.
+    const char *frel = 0;
+    fat_fs_t *ffs = hotplug_fs_or_root(path, &frel);
+    if (!ffs) return -1;
     fat_file_t f;
-    if (fat_open(&g_fat_fs, path, &f) != 0) return -1;
-    int is_vol_root = (path[0] == '/' && path[1] == '\0');
+    if (fat_open(ffs, frel, &f) != 0) return -1;
+    int is_vol_root = (frel[0] == '/' && frel[1] == '\0');
     sc_stat_fill_fat(&f, is_vol_root, out);
     if (f.open) fat_close(&f);
     return 0;
@@ -5034,12 +5332,17 @@ static void sc_stat_fill_fat(const fat_file_t *fp, int is_vol_root, k_stat_t *ou
     // FAT's access field is a DATE with no time-of-day, so this lands at
     // midnight UTC of that day. Stated, not smoothed over.
     int64_t f_atime = ktime_dos_to_unix_rs(f.atime_date, 0);
-    uint32_t clus_bytes = g_fat_fs.bytes_per_sector * g_fat_fs.sectors_per_cluster;
+    // [volaudit] #246: the HANDLE's filesystem, not the root's. With a
+    // removable volume now routed into this fill, g_fat_fs is a DIFFERENT
+    // medium with a different cluster size, so st_blksize would have described
+    // the wrong disk. fat_open() stamps file->fs on every handle.
+    const fat_fs_t *hfs = f.fs ? f.fs : &g_fat_fs;
+    uint32_t clus_bytes = hfs->bytes_per_sector * hfs->sectors_per_cluster;
     int read_only = (f.attr & 0x01) != 0;   // FAT_ATTR_READ_ONLY
 
     k_stat_t st;
     memset(&st, 0, sizeof(st));
-    st.st_dev     = KSTAT_DEV_FAT;
+    st.st_dev     = (hfs == &g_fat_fs) ? KSTAT_DEV_FAT : KSTAT_DEV_REMOV;
     st.st_ino     = syn_ino;
     st.st_mode    = (is_dir ? 0040000u : 0100000u)
                     | (is_dir ? 0755u : (read_only ? 0444u : 0644u));
@@ -5292,7 +5595,19 @@ int64_t sys_utime(const char *u_path, int64_t atime, int64_t mtime) {
             // Not on ext2: may still be ESP-only. Fall through.
         }
     }
-    return (fat_set_times(&g_fat_fs, path, atime, mtime) == 0) ? 0 : -5;   // EIO
+    // [volaudit] #246: WHICH FILESYSTEM. This was
+    // fat_set_times(&g_fat_fs, path), so utime()/touch on any file on a
+    // mounted removable volume returned EIO and changed nothing. The comment
+    // above promises that utime and stat "cannot disagree about which volume a
+    // path lives on"; that promise only held for the root family until stat
+    // learned about removable volumes in this same change, so both ends move
+    // together, through the one resolver.
+    {
+        const char *trel = 0;
+        fat_fs_t *tfs = hotplug_fs_or_root(path, &trel);
+        if (!tfs) return -5;   // EIO: mounted medium that cannot serve files
+        return (fat_set_times(tfs, trel, atime, mtime) == 0) ? 0 : -5;
+    }
 }
 
 // ===== #317 pass 2: SMB network mount control syscalls =====================
@@ -5300,10 +5615,64 @@ int64_t sys_utime(const char *u_path, int64_t atime, int64_t mtime) {
 // share so subsequent "/SMB/<server>/<share>/..." file access reuses it. The
 // Files app calls this before navigating into a saved network location so that
 // per-mount credentials (not just the guest default) are used.
-int64_t sys_net_mount(const char *server, const char *share,
-                      const char *user, const char *pass) {
-    if (!server || !share) return -1;
-    return smb_vfs_mount_creds(server, share, user, pass) == 0 ? 0 : -1;
+//
+// #smbdisk: THE FOUR ARGUMENTS ARE NOW BOUNCED. This function used to hand the
+// raw Ring-3 pointers straight to smb_vfs_mount_creds(), which dereferences all
+// four in kernel mode (resolve_hostname, snprintf, the NT-hash derivation). Its
+// two immediate siblings, sys_net_list_shares and sys_net_unmount, both bounce
+// with sc_bounce_str; this one was missed. Same #567 class.
+int64_t sys_net_mount(const char *u_server, const char *u_share,
+                      const char *u_user, const char *u_secret) {
+    if (!u_server || !u_share) return -1;
+    char server[256], share[256], user[128], secret[160];
+    if (sc_bounce_str(u_server, server, sizeof(server)) != 0) return -14;
+    if (sc_bounce_str(u_share,  share,  sizeof(share))  != 0) return -14;
+    user[0] = 0; secret[0] = 0;
+    if (u_user   && sc_bounce_str(u_user,   user,   sizeof(user))   != 0) return -14;
+    if (u_secret && sc_bounce_str(u_secret, secret, sizeof(secret)) != 0) return -14;
+    int rc = smb_vfs_mount_creds(server, share, user, secret) == 0 ? 0 : -1;
+    // The secret may be a cleartext password (a fresh dialog entry) rather than
+    // an nt$ hash, so it does not outlive this frame. secure_zero, not memset:
+    // a memset of a dead local is what the compiler may delete.
+    { extern void secure_zero(void *ptr, size_t size); secure_zero(secret, sizeof(secret)); }
+    return rc;
+}
+
+// #smbdisk: sys_net_cred_tag - derive the PERSISTABLE form of an SMB password,
+// "nt$" + 32 lowercase hex of nt_hash = MD4(UTF-16LE(password)).
+//
+// WHY A SYSCALL AND NOT A LIBC FUNCTION. There is no MD4 in userland and there
+// must not become one: a second copy of a crypto primitive is the anti-pattern
+// this tree has a family of bugs from (userland/libc/sha256.c is already a
+// forked twin of crypto/sha256.c, which is the mistake not to repeat). Copying
+// md4.c would also fork the DERIVATION, not merely the block function, because
+// the UTF-16LE widening lives in net/smb.c's ntlm_hash() and that is the step
+// crypto/ntlm_nthash_kat.sh actually pins to the published MS-NLMP vectors. One
+// derivation, one oracle, three callers (auth, migration, this) is the whole
+// point. It also matches the existing precedent that password derivation
+// happens kernel-side in this OS (SYS_USER_CREATE_PW does the PBKDF2).
+//
+// SECURITY POSTURE, stated rather than assumed: this is a pure function of its
+// argument. It discloses no kernel state, and it grants nothing, because the
+// caller already holds the password it is hashing. So it is [NOCAP] in
+// syscall-cap.manifest by decision, not by omission. It is NOT audited for the
+// same reason: it changes no state.
+int64_t sys_net_cred_tag(const char *u_pass, char *u_out, uint32_t outcap) {
+    extern void smb_nt_hash(const char *password, uint8_t *out16);
+    extern int  nt_secret_format(const uint8_t *h, char *out, unsigned long cap);
+    extern void secure_zero(void *ptr, size_t size);
+    // 36 = "nt$" + 32 hex + NUL. Refuse rather than truncate a credential.
+    if (!u_pass || !u_out || outcap < 36) return -1;
+    char pass[129];          // ntlm_hash widens at most 128 chars
+    if (sc_bounce_str(u_pass, pass, sizeof(pass)) != 0) return -14;
+    uint8_t nt[16];
+    char tag[40];
+    smb_nt_hash(pass, nt);
+    secure_zero(pass, sizeof(pass));
+    int ok = nt_secret_format(nt, tag, sizeof(tag));
+    secure_zero(nt, sizeof(nt));
+    if (!ok) return -1;
+    return (copy_to_user(u_out, tag, 36) != 0) ? -14 : 0;
 }
 
 // sys_net_list_shares: enumerate the shares a server exports (srvsvc/IPC$).
@@ -5803,7 +6172,37 @@ int64_t sys_http_fetch_poll(int id, int *ustatus, uint32_t *ulen) {
 int64_t sys_http_fetch_read(int id, char *ubuf, uint32_t max) {
     if (async_job_auth(FETCHOWN_TAB_FETCH, id, ASYNC_FETCH_MAX, "read") != 0) return FETCHOWN_EREFUSED;
     async_fetch_t *j = &g_async_fetch[id];
-    if (j->state == 0) return -2;   // still running
+    if (j->state == 0) {
+        // (#glassrevert, 2026-10-01) max==0 on a still-running job is the
+        // READ-as-abandon idiom: FOUR call sites in userland/apps/browser/
+        // main.c (page-fetch error path, image-fetch teardown x3, one of
+        // them hit on every window resize while an image is still loading)
+        // call http_fetch_read(id, buf, 0) meaning "I do not want this any
+        // more", not "give me the body". Before this fix that silently did
+        // nothing but return -2: the slot was never released, since release
+        // only happened in the state != 0 branch below. The ASYNC_FETCH_MAX
+        // (6) slots in g_async_fetch[] are a GLOBAL, system-wide pool
+        // (fetchown_claim_rs() scans the same table for every process), so
+        // leaking all 6 from inside ONE browser window (trivial: drag-resize
+        // a window while its page is still loading images) permanently
+        // starved sys_http_fetch_start() for every process on the machine -
+        // this is the actual mechanism behind the owner's "browser crashed
+        // during resizing and never went away": the window was not crashed,
+        // it was a live process whose poll_images() retried a now-doomed
+        // http_fetch_start() every single main-loop tick forever (no
+        // backoff on that path, unlike the sibling NET_ERR_FAULTY retry a
+        // few lines above it in the same file), burning CPU permanently.
+        // Treat max==0 on a running job exactly like CANCEL (orphan it to
+        // the worker, which frees it the moment it finishes) instead of
+        // leaving every caller correct only if it happens to spell the call
+        // "cancel" - this is the one place that fixes it for every past and
+        // future caller of the idiom, not just the four sites that hit it.
+        // A real poll-then-read caller never reaches this branch with
+        // max==0 (it reads with a real buffer size once POLL says done), so
+        // normal behaviour is unchanged.
+        if (max == 0) fetchown_orphan_rs(FETCHOWN_TAB_FETCH, (uint32_t)id);
+        return -2;   // still running
+    }
     uint32_t n = 0;
     int rc = 0;
     if (j->state == 1 && j->body && ubuf) {
@@ -8884,6 +9283,19 @@ void win16_host_route_close_to_dos(int slot) {
         kprintf("[dos] host window slot=%d owner_pid=%u name='%s' "
                 "(app_id will resolve; #dosowner)\n",
                 slot, (unsigned)cur->pid, cur->name);
+        // #791 [winopacity]: a full-screen DOS guest is opaque by declaration
+        // (tier 1). The identity table in window_create() cannot reach this
+        // route: a Ring-0 creator is deliberately given owner_pid 0 (#pid0desk,
+        // and that ring test must NOT be weakened - see the comment above), so
+        // the DOS identity does not exist until the line above stamps it. This
+        // is therefore the earliest point on the LEGACY route where the
+        // declaration can be made, and it is the same one function the Ring-3
+        // route reaches, not a second copy of the rule. Inert on a shipping
+        // image, where DOSROUTE.CFG defaults to ring3, which is exactly why
+        // leaving it out would have been an untested asymmetry rather than a
+        // visible bug.
+        extern int wm_set_window_opacity_app(window_t *win, int opacity);
+        wm_set_window_opacity_app(user_windows[slot].window, 255);
     }
 }
 
@@ -10039,6 +10451,22 @@ int64_t sys_win_move_by(int handle, int dx, int dy) {
     return sys_win_move(handle, (int)win->bounds.x + dx, (int)win->bounds.y + dy);
 }
 
+// #791 [winopacity]: the owning app declares ITS OWN window's opacity (tier 1).
+// The slot check is character-for-character sys_win_move()'s above, and it is
+// the whole access-control story: `handle` indexes the user-window table the
+// caller uses for every draw call, so this can only ever be aimed at a window
+// the caller holds a handle to.
+//
+// All the precedence logic lives in wm_set_window_opacity_app() (gui/window.c),
+// beside the other two writers of window_t::opacity, so the tier rules are read
+// in one place rather than reconstructed from three.
+int64_t sys_win_set_opacity(int handle, int opacity) {
+    if (handle < 0 || handle >= MAX_USER_WINDOWS || !user_windows[handle].window)
+        return -1;
+    extern int wm_set_window_opacity_app(window_t *win, int opacity);
+    return (int64_t)wm_set_window_opacity_app(user_windows[handle].window, opacity);
+}
+
 // #221 terminal notifications: report the CALLER'S OWN window's state.
 //
 // The slot check is character-for-character the one sys_win_get_size() below
@@ -10727,8 +11155,21 @@ int64_t sys_mkdir(const char *upath, int mode) {
         }
     }
 
-    int ret = fat_mkdir(&g_fat_fs, path);
+    // [renamevol] #246: WHICH FILESYSTEM. This was fat_mkdir(&g_fat_fs, path)
+    // with the FULL path, and g_fat_fs does not route a hot-plugged removable
+    // volume, so mkdir on a mounted USB stick simply FAILED for every caller.
+    // MEASURED 2026-10-04 on golden 2571 with an unmarked Ring-3 prover:
+    // "A4 mkdir on the removable volume rc=-1 present=no". Three sibling
+    // syscalls had the same defect; see the long comment in sys_rename.
+    // hotplug_fs_or_root() is the ONE root-or-volume resolver (hotplug.h).
+    const char *mrel = path;
+    fat_fs_t *mfs = hotplug_fs_or_root(path, &mrel);
+    if (!mfs) return -1;        // unreachable medium: never retry on the root
+    int ret = fat_mkdir(mfs, mrel);
     if (ret == 0 && p) {
+        // The ABSOLUTE path, not mrel: /CONFIG/PERMS.DB is keyed by the path
+        // userland names, and a row filed under "/SH" would describe a
+        // directory in the root of the boot volume.
         perms_set_default(path, p->euid, p->egid, 1);
     }
     // #246 Stage 5C: record a CONFIRMED new directory for the escrow rollback
@@ -10744,10 +11185,13 @@ int64_t sys_rmdir(const char *upath) {
     { int prc = sc_path_from_user(upath, kpath, sizeof(kpath)); if (prc != 0) return prc; }  // #58
     const char *path = kpath;
 
-    // #246 escrow: rmdir is a DELETE. An escrow actor is refused every delete
-    // by construction (no delete-scope grant is ever issued). A non-actor is
-    // unaffected.
-    if (escrow_fs_guard(ESCROW_OP_DELETE, path, 0) != 0) return -1;
+    // #246 escrow: rmdir is its OWN op class, and a marked actor is refused.
+    // THE NAMED EXCEPTION: the Recycle Bin is a flat store of files with one
+    // index row each, so a directory tree has no recoverable form to redirect
+    // into, and refusing is the honest answer rather than destroying. ext2's
+    // rmdir already refuses a non-empty directory, so this refuses only empty
+    // ones. A non-actor is unaffected (one process_t byte, then allow).
+    if (escrow_fs_guard(ESCROW_OP_RMDIR, path, 0) != ESCROW_ALLOW) return -1;
 
     // #317: SMB network share.
     if (path_is_smb(path)) {
@@ -10760,13 +11204,21 @@ int64_t sys_rmdir(const char *upath) {
     if (p && p->privilege == PRIV_USER) {
         char parent[256];
         sc_parent_of(path, parent, sizeof(parent));   // #676: one shared helper
-        if (perms_check(parent, p->euid, p->egid, W_OK) != 0) {
+        // #prewrite: sticky applies to a DIRECTORY name in an all-users
+        // directory exactly as it does to a file name. Removing somebody
+        // else's subdirectory is removing their work.
+        if (perms_may_remove(parent, path, p->euid, p->egid) != 0) {
             return -1;  // EACCES
         }
     }
 
-    int ret = fat_delete(&g_fat_fs, path);
-    if (ret == 0) perms_remove(path);
+    // [renamevol] #246: same volume-blindness as sys_mkdir above. MEASURED:
+    // "A6 rmdir on the removable volume rc=-1".
+    const char *drel = path;
+    fat_fs_t *dfs = hotplug_fs_or_root(path, &drel);
+    if (!dfs) return -1;
+    int ret = fat_delete(dfs, drel);
+    if (ret == 0) perms_remove(path);   // absolute: PERMS.DB is keyed that way
     return ret;
 }
 
@@ -10777,13 +11229,28 @@ int64_t sys_unlink(const char *upath) {
     { int prc = sc_path_from_user(upath, kpath, sizeof(kpath)); if (prc != 0) return prc; }  // #58
     const char *path = kpath;
 
-    // #246 escrow: unlink is a DELETE. An escrow actor is refused every delete
-    // by construction (no delete-scope grant is ever issued), even as uid 0 and
-    // even issuing this raw syscall directly. A non-actor is unaffected.
-    if (escrow_fs_guard(ESCROW_OP_DELETE, path, 0) != 0) return -1;
+    // #246 escrow: unlink is a DELETE, and for a MARKED actor it is REDIRECTED
+    // rather than refused or performed. The owner's requirement (2026-10-03) is
+    // that an AI can delete, that the user is told, and that the file can be
+    // put back; so the kernel moves it into the user's Recycle Bin and reports
+    // success. A marked actor cannot reach a hard unlink from here even as
+    // uid 0 and even issuing this raw syscall directly, which is the whole
+    // point: the AI tool layer in Ring 3 can be bypassed, this cannot.
+    //
+    // THE REDIRECT IS DEFERRED UNTIL AFTER THE PERMISSION CHECK BELOW. Doing it
+    // here would let a marked actor relocate a file it has no right to remove.
+    // A non-actor is unaffected (one process_t byte, then allow).
+    int esc_disp = escrow_fs_guard(ESCROW_OP_DELETE, path, 0);
+    if (esc_disp < 0) return -1;
 
     // #317: SMB network share.
+    // #246: a marked actor is REFUSED on a share rather than hard-deleting.
+    // The Recycle Bin is local, and capturing a remote file into a local bin
+    // is a design decision nobody has taken; the one thing that must not
+    // happen is this path quietly staying a destructive delete because the
+    // redirect was wired further down.
     if (path_is_smb(path)) {
+        if (esc_disp == ESCROW_REDIRECT) return -1;
         if (smb_vfs_ensure_mount(path) != 0) return -1;
         return smb_delete(path) == 0 ? 0 : -1;
     }
@@ -10798,9 +11265,23 @@ int64_t sys_unlink(const char *upath) {
     if (p && p->privilege == PRIV_USER) {
         char parent[256];
         sc_parent_of(path, parent, sizeof(parent));   // #676: one shared helper
-        if (perms_check(parent, p->euid, p->egid, W_OK) != 0) {
+        // #prewrite: perms_may_remove() APPLIES this same write-on-the-parent
+        // check itself and then, ONLY if the parent carries the sticky bit,
+        // asks whether THIS principal may remove THIS name. On a directory
+        // without the bit it returns exactly what the bare perms_check()
+        // returned, so this can never allow what was previously refused.
+        if (perms_may_remove(parent, path, p->euid, p->egid) != 0) {
             return -1;  // EACCES
         }
+    }
+
+    // #246: the marked actor's delete happens HERE, as a capture into the
+    // Recycle Bin, and the backends below are never reached for it. The
+    // permission check above has already run, so an actor cannot relocate a
+    // file it had no right to remove.
+    if (esc_disp == ESCROW_REDIRECT) {
+        extern int escrow_delete_redirect(const char *path);
+        return escrow_delete_redirect(path) == 0 ? 0 : -1;
     }
 
     // ext2 volume (#99): delete on the mounted ext2 filesystem.
@@ -10814,8 +11295,17 @@ int64_t sys_unlink(const char *upath) {
         return r == 0 ? 0 : -1;
     }
 
-    int ret = fat_delete(&g_fat_fs, path);
-    if (ret == 0) perms_remove(path);
+    // [renamevol] #246: same volume-blindness again, and this one had the most
+    // confusing symptom of the four. A MARKED AI actor's delete on a USB stick
+    // WORKED, because escrow_delete_redirect() above was made volume-aware on
+    // 2026-10-03; an ORDINARY user's delete of their own file on the same stick
+    // did not, because it reached this line. MEASURED: "A5 unlink on the
+    // removable volume planted=yes rc=-1 gone=no".
+    const char *urel = path;
+    fat_fs_t *ufs = hotplug_fs_or_root(path, &urel);
+    if (!ufs) return -1;
+    int ret = fat_delete(ufs, urel);
+    if (ret == 0) perms_remove(path);   // absolute: PERMS.DB is keyed that way
     return ret;
 }
 
@@ -10838,30 +11328,160 @@ int64_t sys_rename(const char *u_oldpath, const char *u_newpath) {
     // #317: SMB network share (both paths must be on the same share).
     if (path_is_smb(oldpath) || path_is_smb(newpath)) {
         if (!path_is_smb(oldpath) || !path_is_smb(newpath)) return -1;
+        // #246: a MARKED process is refused on a share, for the same reason
+        // sys_unlink refuses one: the Recycle Bin is local, so a displaced
+        // remote file could not be captured, and a rename over it would be an
+        // unrecoverable delete. Refuse rather than let this path quietly stay
+        // destructive.
+        { process_t *mp = proc_current();
+          if (mp && mp->escrow_active) return -1; }
         if (smb_vfs_ensure_mount(oldpath) != 0) return -1;
         return smb_rename(oldpath, newpath) == 0 ? 0 : -1;
+    }
+
+    // [renamevol] #246: AN IDENTICAL SOURCE AND DESTINATION IS A NO-OP, AND
+    // SAYING SO HERE IS NOT PEDANTRY. fat_rename_inner() detects it further
+    // down ("already the same file") and returns 0, but escrow_rename_victim()
+    // runs BEFORE it and would by then have MOVED the file into the Recycle
+    // Bin as the displaced victim. rename(x, x) would make x disappear and
+    // report success. Exact string equality only: on FAT, rename("A.TXT",
+    // "a.txt") is a real case change and must still be performed.
+    if (!strcmp(oldpath, newpath)) return 0;
+
+    // [renamevol] #246: WHICH FILESYSTEM SERVES EACH END, DECIDED FIRST.
+    //
+    // THE DEFECT. Every rename was performed as fat_rename(&g_fat_fs, old,
+    // new). g_fat_fs routes the ext2 root, the FAT ESP, /SMB, /NFS and a
+    // mounted disk image; it does NOT route a hot-plugged removable volume. So
+    // a user renaming a file on their own USB stick asked the ROOT filesystem
+    // about a path the root has never heard of, and the rename failed.
+    // MEASURED 2026-10-04 on golden 2571 with an unmarked Ring-3 prover
+    // (/APPS/USBRNT): "rename to a NEW name rc=-1 src-gone=no", "rename OVER
+    // an existing file rc=-1 dst-still-old-bytes=yes", while the IDENTICAL two
+    // renames on the root filesystem returned 0 in the same boot.
+    //
+    // AND A SECOND, SILENT DEFECT IN THE SAME CALL. The destination-existence
+    // test below used the same blind g_fat_fs call, so for a removable path it
+    // read ABSENT and the gate took the WEAKER branch: "may I write the target
+    // directory" instead of "may I remove THAT name". The same boot measured
+    // the blindness directly on a live 64-byte file:
+    // "oracle-compare path=/USB0/SH/VIC.TXT fat_exists(g_fat_fs)=0
+    // recycle_victim_stat=1 len=64". It had NO consequence while the rename
+    // failed anyway. It has one the moment the rename works, which is why both
+    // halves are in ONE change: wiring the rename without the oracle hands an
+    // unprivileged caller a rename-over of another user's file in a sticky
+    // directory, and that was verified to happen on a kernel with only the
+    // first half.
+    //
+    // hotplug_volume_for_path() is the ONE resolver (drivers/hotplug.c, over
+    // hotplug_path_split_rs); the PAIR decision is rename_route_rs()
+    // (rustkern/renamevol.rs), which carries an exhaustive boot self-test over
+    // its whole input space. Neither is re-implemented here. The fat_fs_t
+    // POINTERS stay on this side, which is why "same volume" is a C pointer
+    // comparison and only its answer crosses the FFI.
+    const char *oldrel = oldpath, *newrel = newpath;
+    fat_fs_t *rfs = &g_fat_fs;
+    {
+        int om = 0, nm = 0;
+        const char *orel = 0, *nrel = 0;
+        fat_fs_t *ofs = hotplug_volume_for_path(oldpath, &orel, &om);
+        fat_fs_t *nfs = hotplug_volume_for_path(newpath, &nrel, &nm);
+        extern int rename_route_rs(int, int, int, int, int);
+        int route = rename_route_rs(om, nm, ofs ? 1 : 0, nfs ? 1 : 0,
+                                    (ofs && ofs == nfs) ? 1 : 0);
+        // REFUSE covers a cross-device pair (one end on a volume, one on the
+        // root), two DIFFERENT volumes, and a mounted volume whose filesystem
+        // cannot serve files. All three failed before this change too, because
+        // the root could not find the volume-side path; the difference is that
+        // they now fail on purpose and cannot be half-performed on whichever
+        // filesystem was asked.
+        if (route == RNV_REFUSE) return -1;
+        if (route == RNV_SAMEVOL) { rfs = nfs; oldrel = orel; newrel = nrel; }
     }
 
     // Permission check: need W_OK on both parent directories
     process_t *p = proc_current();
     if (p && p->privilege == PRIV_USER) {
-        char parent[256];
-        strncpy(parent, oldpath, sizeof(parent) - 1);
-        parent[255] = '\0';
-        char *last_slash = strrchr(parent, '/');
-        if (last_slash && last_slash != parent) *last_slash = '\0';
-        else { parent[0] = '/'; parent[1] = '\0'; }
-        if (perms_check(parent, p->euid, p->egid, W_OK) != 0) return -1;
+        // #prewrite: sc_parent_of() rather than a third and fourth hand-rolled
+        // copy of the same chop. It was already open-coded TWICE here, with a
+        // 256-byte buffer instead of SC_PATH_MAX, which is how the two ends of
+        // one syscall came to differ from the rest of the file.
+        char parent[SC_PATH_MAX];
+        sc_parent_of(oldpath, parent, sizeof(parent));
+        // SOURCE end: a rename REMOVES a name from the source directory, so it
+        // is a removal and is decided by the removal rule.
+        if (perms_may_remove(parent, oldpath, p->euid, p->egid) != 0) return -1;
 
-        strncpy(parent, newpath, sizeof(parent) - 1);
-        parent[255] = '\0';
-        last_slash = strrchr(parent, '/');
-        if (last_slash && last_slash != parent) *last_slash = '\0';
-        else { parent[0] = '/'; parent[1] = '\0'; }
-        if (perms_check(parent, p->euid, p->egid, W_OK) != 0) return -1;
+        sc_parent_of(newpath, parent, sizeof(parent));
+        // DESTINATION end, and this was the weakest gate in the filesystem.
+        // Both fat_rename() and ext2_rename() REPLACE an existing destination,
+        // and nothing here looked at the victim at all: "may I write the target
+        // directory" was the entire check for destroying another user's file by
+        // renaming over it. If the destination exists this is a removal of THAT
+        // name and is decided as one; if it does not, it is an ordinary create
+        // and only the directory write is required, exactly as before.
+        //
+        // [renamevol] #246: ASKED OF THE RIGHT FILESYSTEM. This was
+        // fat_exists(&g_fat_fs, newpath), which cannot see a hot-plugged
+        // volume, so on a stick it answered ABSENT for a file that is there and
+        // the gate silently used the weaker branch. recycle_victim_stat() is
+        // the volume-aware oracle the Recycle-Bin capture ALREADY uses for
+        // exactly this question, so the gate and the capture now cannot
+        // disagree about whether there is a file at this path - and them
+        // disagreeing is the precise shape of the bug being fixed here.
+        //
+        // -1 means a mounted medium that cannot serve files. Fail CLOSED
+        // rather than ask the root filesystem instead: the root may have a
+        // different file at the same spelling.
+        int dst = recycle_victim_stat(newpath, 0, 0);
+        if (dst < 0) return -1;
+        if (dst == 1) {
+            if (perms_may_remove(parent, newpath, p->euid, p->egid) != 0) return -1;
+        } else {
+            if (perms_check(parent, p->euid, p->egid, W_OK) != 0) return -1;
+        }
     }
 
-    int ret = fat_rename(&g_fat_fs, oldpath, newpath);
+    // [renamevol] #246: THE SOURCE MUST EXIST BEFORE ANYTHING CAPTURES THE
+    // DESTINATION. This is an ORDERING fix and it has already bitten once.
+    //
+    // escrow_rename_victim() below MOVES the displaced destination into the
+    // Recycle Bin, because a rename over it is about to destroy it. If the
+    // rename then FAILS, the destination has left the user's drive for an
+    // operation that never happened. blame.md records exactly that outcome,
+    // measured, on the boot that was meant to confirm the first attempt at
+    // this fix: "rename over a file on the bound device rc=-1
+    // victim-intact=no". The bytes were recoverable from the bin, so it was
+    // not data loss; a file vanished from the user's drive for nothing, which
+    // is its own kind of harm.
+    //
+    // The same hazard was live on the ROOT filesystem for every rename with a
+    // missing source, and nobody had looked: capture the victim, then fail.
+    // One existence test, asked through the SAME oracle as the gate above,
+    // removes it for every medium at once.
+    //
+    // Asked AFTER the permission checks on purpose, so a caller with no right
+    // to either end cannot use the return code to learn whether the source
+    // exists.
+    { int src = recycle_victim_stat(oldpath, 0, 0);
+      if (src != 1) return -1; }
+
+    // #246: A RENAME OVER AN EXISTING FILE IS A DELETE OF THAT FILE, and both
+    // fat_rename() and ext2_rename() REPLACE the destination. For a marked
+    // process the displaced file is captured into the Recycle Bin FIRST, so a
+    // rename cannot be used as a delete that skips the delete chokepoint. A
+    // non-marked process is unaffected (one process_t byte, then 0). This runs
+    // AFTER the permission checks above, including the destination-removal
+    // check that decides whether this caller may displace the victim at all.
+    {
+        extern int escrow_rename_victim(const char *newpath);
+        if (escrow_rename_victim(newpath) != 0) return -1;
+    }
+
+    // [renamevol] rfs/oldrel/newrel: the root family with the absolute paths
+    // exactly as before, or the one removable volume that serves BOTH ends,
+    // with the volume-relative paths fat_rename() needs for it.
+    int ret = fat_rename(rfs, oldrel, newrel);
     if (ret == 0) {
         uint32_t uid, gid;
         uint16_t mode;
@@ -11215,8 +11835,25 @@ static int sc_path_is_dir(const char *kpath) {
             // Not on ext2: fall through to FAT (may be ESP-only).
         }
     }
+    // [volaudit] #246: WHICH FILESYSTEM. This was fat_open(&g_fat_fs, kpath),
+    // and g_fat_fs routes the ext2 root, the FAT ESP, /SMB, /NFS and a mounted
+    // disk image but NOT a hot-plugged removable volume. So every directory on
+    // a mounted USB stick answered "not a directory" here, and sys_chdir()
+    // refused it on fault 2's directory test: `cd /USB0` was impossible for
+    // every caller, Ring 0 or Ring 3, on a stick whose files open() can read
+    // perfectly well. MEASURED on golden 2572; see the CHANGELOG entry.
+    //
+    // hotplug_fs_or_root() is the ONE root-or-volume resolver
+    // (drivers/hotplug.h), created by [renamevol] precisely so callers stop
+    // reinventing it. A NULL return means nothing here can reach the path (a
+    // mounted medium whose filesystem cannot serve files) and must NEVER be
+    // retried against the root, which may hold a different file at the same
+    // spelling.
+    const char *frel = 0;
+    fat_fs_t *ffs = hotplug_fs_or_root(kpath, &frel);
+    if (!ffs) return 0;
     fat_file_t f;
-    if (fat_open(&g_fat_fs, kpath, &f) != 0) return 0;
+    if (fat_open(ffs, frel, &f) != 0) return 0;
     int is_dir = f.is_dir || (f.attr & FAT_ATTR_DIRECTORY);
     if (f.open) fat_close(&f);
     return is_dir ? 1 : 0;
@@ -11619,6 +12256,31 @@ int64_t sys_passwd_change(const char *u_username, const char *u_old, const char 
                       pw_policy_message(PW_RC_CODE(r)), PW_RC_CODE(r));
         return r;
     }
+    // #secretuse: THE SECRET STORE IS KEYED BY THIS PASSWORD, so a change that
+    // does not re-key it destroys the user's enrolled second factors silently.
+    // Re-key AFTER the set succeeded and only on the path that proved the old
+    // password; see the block comment on seckey_rekey() for why this order and
+    // why an admin reset cannot do it.
+    if (r == 0) {
+        if (have_old) {
+            int kr = seckey_rekey(username, old_pass, new_pass);
+            if (kr < 0)
+                bootlog_write("[SECRET] passwd: uid=%u changed '%s' but the secret "
+                              "store could NOT be re-keyed; its accounts are "
+                              "unreachable until the old password is restored",
+                              (unsigned)p->euid, username);
+        } else {
+            // Root reset with no old password. There is no old key, so any sealed
+            // store for that user is now unopenable. That is CORRECT: a secret
+            // protected by a password must not be recoverable by someone who does
+            // not know it. It is logged so it is discovered here and not by the
+            // user wondering where their accounts went.
+            bootlog_write("[SECRET] passwd: '%s' was reset WITHOUT the old password, "
+                          "so any secret store it had cannot be re-keyed and its "
+                          "contents are unrecoverable (by design)", username);
+        }
+    }
+
     bootlog_write("[AUTH] passwd %s: uid=%u changed '%s' (#745)",
                   (r == 0) ? "OK" : "FAILED", (unsigned)p->euid, username);
     return r;
@@ -11900,6 +12562,21 @@ int64_t sys_user_create_pw(const char *u_username, const char *u_password,
             kprintf("[USERS] sync failed after user create\n");
         bootlog_write("[USERS] created '%s' uid=%u gid=%u home='%s' WITH a password (#745)",
                       username, (unsigned)uid, (unsigned)gid, home);
+        // [binmigrate] The SECOND account-commit site. Same reasoning as the
+        // users_create_first_admin site: after the commit, never inside
+        // user_create(), because the rollback above this line is real.
+        //
+        // AND IT CANNOT FIRE TODAY, which is worth saying rather than leaving
+        // to be rediscovered. The claim only passes for a session that was
+        // established with NO user-table entry, and login_run() produces such a
+        // session ONLY when users_count_active() == 0; this path is reached
+        // from sys_firstboot_admin() only when root ALREADY EXISTS, i.e. when
+        // that count is NOT 0. The two are mutually exclusive on every image
+        // that can exist today. It is kept because it costs one atomic load and
+        // it is the correct place for the migration if the bootstrap window
+        // ever widens; it is NOT evidence that this path has been exercised.
+        { extern int binmig_on_account_committed(uint32_t uid);   // fs/binmigrate.h
+          (void)binmig_on_account_committed(uid); }
         rc = (int64_t)uid;
     }
 

@@ -1,0 +1,33 @@
+{
+  "id": "angband",
+  "name": "Angband",
+  "version": "4.2.6-1",
+  "category": "games",
+  "tagline": "Classic roguelike dungeon crawl to the depths of Angband",
+  "summary": "Classic roguelike dungeon crawl to the depths of Angband",
+  "description": "Angband 4.2.6 is a deep, turn based roguelike: roll a character from sixteen races and ten classes, descend a hundred levels of randomly generated dungeon, and kill Morgoth. This is the MayteraOS port (task #745 Tier 3 item 15), built as the GCU/ncurses frontend against the ported ncurses library and run inside the MayteraOS Terminal, which is a real VT220/xterm class emulator with antialiased TrueType glyphs and DEC special graphics mapped to Unicode. Includes the full lib data tree the game needs: gamedata, customize, help and screens. Saves, scores and panic files go to /GAMES/ANGBAND, a single shared location rather than a per-user one, for the reason recorded in the port recipe: the upstream per-user default resolves through getpwuid() and fails outright on an image where the first boot setup wizard has not run.",
+  "whatsnew": "First release. Angband used to be baked into the golden image because its lib data lived at /ANGBAND, a top level directory the App Store installer refuses as a destination. The data now lives at /GAMES/ANGBAND/lib, so the game is served from here instead.",
+  "author": "Angband Development Team (GPL-2.0-only)",
+  "license": "GPL-2.0-only",
+  "license_note": "Angband 4.2.6 is offered by upstream under either GPLv2 or the non-standard \"Angband licence\". MayteraOS redistributes under GPL-2.0-only, the clear and OSI-approved option. Option (b) was deliberately NOT chosen because it restricts use to educational, research and not-for-profit purposes, which GPL-2.0 does not. The port links userland/libc (MIT) and userland/ports/ncurses (X11-style permissive), neither copyleft.",
+  "license_refs": [
+    "ATTRIBUTION.md"
+  ],
+  "redistribution": "permitted",
+  "featured": false,
+  "screenshots": [],
+  "preview_images": [],
+  "size": 0,
+  "installed_size": 0,
+  "dependencies": [],
+  "path": "packages/angband-4.2.6-1.mpkg",
+  "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "type": "app",
+  "tags": [
+    "game",
+    "roguelike",
+    "rpg",
+    "terminal",
+    "opensource"
+  ]
+}

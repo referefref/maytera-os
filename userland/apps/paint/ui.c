@@ -11,6 +11,8 @@
 #include "../../libc/dirent.h"
 #include "../../libc/gui_scroll.h"   // assistant transcript viewport (shared scroll widget)
 #include "../../libc/syscall.h"      // uptime_ms() for the assistant's thinking indicator
+#include "../../libc/userconf.h"   // [filesui] named-places accessors
+#include "../../libc/places.h"     // [filesui] places_have_home()
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -2719,7 +2721,13 @@ static void modal_confirm(void){
 #define FB_SBW 10                           // list scrollbar width (px)
 static int   fb_open=0;
 static int   fb_purpose=0;                  // MP_OPEN / MP_SAVEAS / MP_EXPORT / MP_EXPORTBMP / MP_EXPORTJPG
-static char  fb_dir[128]="/HOME";
+// [filesui] WAS "/HOME", which is the PARENT of every home and contains no
+// file any user ever made: on a machine with one account it is a directory
+// holding exactly one directory. Resolved on first use instead, through the
+// shared named-locations model, so Paint opens where the user's pictures are.
+// Lazy rather than in main() because this browser is reached from four
+// different actions and none of them is a startup path.
+static char  fb_dir[128]="";
 static int   fb_n=0, fb_selrow=-1, fb_scroll=0;
 static int   fb_sb_drag=0;                  // 1 while dragging the list scrollbar thumb
 static char  fb_name[FB_MAX][48];
@@ -2730,6 +2738,14 @@ static uint32_t *fb_thumb=0;                // FBT*FBT preview buffer
 static int   fb_thumb_ok=0;
 
 static void sset(char*d,int cap,const char*s){ int i=0; if(s) while(s[i]&&i<cap-1){d[i]=s[i];i++;} d[i]=0; }
+
+static void fb_dir_default(void){
+    if(fb_dir[0]) return;
+    char b[128];
+    if(userhome_pictures_dir(b,sizeof b)==0 && places_have_home()) sset(fb_dir,sizeof fb_dir,b);
+    else if(userscratch_dir(b,sizeof b)==0) sset(fb_dir,sizeof fb_dir,b);
+    else sset(fb_dir,sizeof fb_dir,"/");
+}
 
 // ---- JPEG export options strip (Studio plan P5) ----------------------------
 // Lives inside the file browser and appears whenever the FILE NAME ends in
@@ -2819,6 +2835,7 @@ static void fb_load_thumb(void){
     fb_thumb_ok=(io_thumb(full,fb_thumb,FBT,FBT)==0);
 }
 static void fb_start(int purpose){
+    fb_dir_default();   // [filesui] first use resolves the start directory
     fb_purpose=purpose; fb_open=1;
     if(purpose==MP_EXPORT) sset(fb_fname,sizeof fb_fname,"IMAGE.PNG");
     else if(purpose==MP_EXPORTBMP) sset(fb_fname,sizeof fb_fname,"IMAGE.BMP");

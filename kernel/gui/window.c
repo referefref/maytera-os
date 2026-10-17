@@ -494,6 +494,94 @@ bool wm_is_exclusive_mode(void) {
     return g_exclusive_mode;
 }
 
+// ===========================================================================
+// #791 [winopacity]: WHICH APPS ARE OPAQUE BY DECLARATION (tier 1).
+//
+// OWNER, 2026-10-02: "other apps like full screen DOS apps/games may default to
+// 100% despite the default settings (but still allow control)". Both halves are
+// implemented here: these windows are born at WIN_OPACITY_SRC_APP/255, which
+// beats the theme + Settings default and survives every theme switch, and the
+// user's titlebar Opacity stepper still overrides them and keeps the override
+// (wm_set_window_opacity_app() refuses to downgrade tier 2).
+//
+// WHY HERE AND NOT IN N APPS. window_create() is the single birth chokepoint
+// for every window in the system, and BOTH DOS routes reach it: the shipping
+// Ring-3 host (/APPS/DOSUSER, DOSROUTE.CFG default=ring3) by an ordinary
+// SYS_WIN_CREATE from Ring 3, and the legacy in-kernel route via
+// win16_host_create() in proc/syscall.c. One table here replaces a
+// win_set_opacity() call in a dozen separate app main()s, each of which could
+// be forgotten by the next game that lands. The file's own #titlebar-chrome
+// comment below already states the rule for this kind of extension: key on
+// owner->name, the launched binary's basename, never on title text.
+//
+// WHY THESE NAMES AND NOT A SIZE TEST. A "window covers the screen" rule would
+// also catch any MAXIMIZED ordinary app, and a user who maximises their editor
+// has not asked for it to stop being glass. Identity is what the owner actually
+// described.
+//
+// THE NAMES ARE THE EXEC BASENAMES FROM build/assets/startmenu/system.d/
+// 03-games.MENU, read out of that file, not guessed, with case exactly as
+// shipped (owner->name preserves the launching path's case, so these are NOT
+// case-folded) - the same sourcing rule s_win_titlebar_icons[] states. Those
+// targets are additionally gated by build/invariant-gate.sh check 18, which
+// requires every launch target in that fragment to resolve on the image with
+// exact case, so a typo here cannot hide behind a menu entry that never ran.
+// ASSAULTCUBE and OPENARENA are not in the fragment (both ship as signed App
+// Store packages, #gamedata2) but their sources are in userland/apps/, so they
+// are listed for when they are installed.
+//
+// THE CRITERION, and it is not only cosmetic: in these windows every pixel is
+// the game's own render, so there is nothing meaningful behind them to show
+// through. Transparency is therefore pure cost, and MEASURABLE cost: the
+// content blit in proc/syscall.c takes the fast verbatim fb_blit() path only
+// when opacity >= 255, and otherwise runs a per-pixel fb_get_pixel() +
+// fb_put_pixel() blend loop over the whole window, every frame. For a game
+// redrawing a screen-sized surface at frame rate that is the expensive path
+// for a visual effect nobody wants.
+//
+// DELIBERATELY NOT LISTED: GLCUBE, GLMATRIX, LAVALAMP, AQUARIUM. They are
+// ambient GL visuals rather than games, and an ambient visual is a reasonable
+// thing to WANT translucent. If that turns out wrong it is one more line here.
+//
+// MEASURED, so the "full screen" in the owner's sentence is not overclaimed:
+// SQUADRON (main.c:3118) and ARENA (main.c:690, when its config asks for
+// fullscreen) genuinely create windows at 0,0 x screen size. DOOM, SOLITAIRE,
+// pong, lemmings and CHESS create ordinary fixed-size windows; they are listed
+// on the "every pixel is the game's own render" criterion above, not because
+// they are literally full screen.
+static bool win_owner_name_is_dos(const char *name) {
+    if (!name) return false;
+    // "dos"/"dosrun" name the legacy in-kernel Ring-0 route, "DOSUSER" the
+    // Ring-3 host that actually ships. ONE definition: window_is_dos_host()
+    // below now calls this instead of keeping its own copy of the three
+    // strcmps, which is what its own comment warned against.
+    return strcmp(name, "dos") == 0 ||
+           strcmp(name, "dosrun") == 0 ||
+           strcmp(name, "DOSUSER") == 0;
+}
+
+static const char *const s_opaque_owner_names[] = {
+    "ARENA",        // /APPS/ARENA      - creates 0,0 x screen when configured fullscreen
+    "SQUADRON",     // /APPS/SQUADRON   - creates 0,0 x screen
+    "CLASSICUBE",   // /APPS/CLASSICUBE - 3D, sized up to the display
+    "DOOM.ELF",     // /GAMES/DOOM/DOOM.ELF
+    "SOLITAIRE",    // /APPS/SOLITAIRE
+    "CHESS",        // /APPS/CHESS
+    "lemmings",     // /APPS/lemmings   (lower case as shipped)
+    "pong",         // /APPS/pong       (lower case as shipped)
+    "ASSAULTCUBE",  // App Store package (#gamedata2), source in userland/apps/
+    "OPENARENA",    // App Store package (#gamedata2), source in userland/apps/
+    0
+};
+
+static bool win_owner_name_wants_opaque(const char *name) {
+    if (!name) return false;
+    if (win_owner_name_is_dos(name)) return true;
+    for (int i = 0; s_opaque_owner_names[i]; i++)
+        if (strcmp(name, s_opaque_owner_names[i]) == 0) return true;
+    return false;
+}
+
 // Create a new window
 window_t *window_create(const char *title, int32_t x, int32_t y, int32_t width, int32_t height) {
     window_t *win = (window_t *)kzalloc(sizeof(window_t));
@@ -531,7 +619,9 @@ window_t *window_create(const char *title, int32_t x, int32_t y, int32_t width, 
 
     win->resize_edge = 0;
     win->opacity = g_default_window_opacity;
-    win->opacity_override = 0;   // #osglass: fresh windows inherit the OS-wide default
+    // #791: tier 0. A fresh window has had nobody choose for it, so the
+    // OS-wide default owns it until the app declares or the user picks.
+    win->opacity_src = WIN_OPACITY_SRC_DEFAULT;
     win->locked = 0;
     win->theme_override = 0;     // follow system theme by default
     win->chrome_style = WIN_CHROME_DEFAULT;
@@ -576,6 +666,16 @@ window_t *window_create(const char *title, int32_t x, int32_t y, int32_t width, 
             (strcmp(creator->name, "gbemu") == 0 ||
              strcmp(creator->name, "GBEMU") == 0)) {
             win->chrome_style = WIN_CHROME_LIGHT_UTILITY;
+        }
+        // #791 [winopacity]: and resolve the APP-DECLARED opacity (tier 1)
+        // from that same identity, at that same call site. Goes through
+        // wm_set_window_opacity_app() rather than assigning the two fields
+        // here, so the tier rules have exactly one implementation shared with
+        // the SYS_WIN_SET_OPACITY path. See win_owner_name_wants_opaque()
+        // above for the list and why it is identity and not geometry.
+        if (win->owner_pid != 0 && creator &&
+            win_owner_name_wants_opaque(creator->name)) {
+            wm_set_window_opacity_app(win, 255);
         }
     }
 
@@ -833,9 +933,10 @@ static bool window_is_dos_host(window_t *win) {
     if (!win || win->owner_pid == 0) return false;
     process_t *owner = proc_get(win->owner_pid);
     if (!owner) return false;
-    return strcmp(owner->name, "dos") == 0 ||
-           strcmp(owner->name, "dosrun") == 0 ||
-           strcmp(owner->name, "DOSUSER") == 0;
+    // #791: the three names now live in win_owner_name_is_dos() (above
+    // window_create(), which also needs them), so this is no longer a second
+    // copy that can drift from the icon table's.
+    return win_owner_name_is_dos(owner->name);
 }
 
 // Maximize a window
@@ -1557,7 +1658,7 @@ uint8_t g_default_window_opacity = 255;
 // UIPROFIL winopacity, both arriving via SYS_SET_WIN_OPACITY -> the user entry
 // point below). While set, a theme apply no longer stomps the user's choice;
 // the theme's window_opacity is only the DEFAULT for a user who has not chosen
-// their own. Per-window opacity_override is a separate, finer layer and is
+// their own. Per-window opacity_src (#791) is a separate, finer layer and is
 // unaffected by this flag.
 static int g_user_opacity_pinned = 0;
 
@@ -1582,23 +1683,37 @@ static bool is_on_fullscreen_button(window_t *win, int32_t x, int32_t y) {
 }
 
 // Shared apply: clamp, set the OS-wide default, and push it onto every window
-// that has not taken a per-window opacity_override. (Unchanged behaviour; only
+// that is still at tier 0 / WIN_OPACITY_SRC_DEFAULT (#791). (Only
 // factored out so the user path and the theme path can share it.)
-static void wm_apply_default_opacity(int opacity) {
+// #791 [winopacity]: THE one opacity clamp. Was copy-pasted in
+// wm_apply_default_opacity() and winmenu_handle_click()'s Opacity stepper, and
+// the app-declaration path added at #791 would have been a third copy. A
+// window may never become fully invisible, because an invisible window is
+// unrecoverable: it still takes focus and clicks, and the control that would
+// un-hide it is drawn in the window you can no longer see.
+static int wm_clamp_opacity(int opacity) {
     if (opacity < 40) opacity = 40;        // never fully invisible
     if (opacity > 255) opacity = 255;
+    return opacity;
+}
+
+static void wm_apply_default_opacity(int opacity) {
+    opacity = wm_clamp_opacity(opacity);
     g_default_window_opacity = (uint8_t)opacity;
-    // #osglass (2026-09-16): skip any window with an explicit PER-WINDOW
-    // override (opacity_override, set via the titlebar decorator popup's
-    // Opacity stepper below). Before this guard, ANY caller of this function
-    // - the theme switch hook in themes.c theme_set(), the Settings/tray
-    // "Window Opacity" slider, a per-app control like MusicPlayer's cycle_
-    // opacity() - unconditionally stomped every window's opacity, silently
-    // erasing a user's deliberate per-window choice. This is what makes the
-    // OS-wide default and the per-window override coexist instead of the
-    // second one always losing to whichever call happens next.
+    // #osglass (2026-09-16) / #791 (2026-10-02): this is the TIER 0 writer, so
+    // it may only touch windows that are still at tier 0. Before the #osglass
+    // guard, ANY caller of this function - the theme switch hook in themes.c
+    // theme_set(), the Settings/tray "Window Opacity" slider, a per-app
+    // control like MusicPlayer's cycle_opacity() - unconditionally stomped
+    // every window's opacity, silently erasing a user's deliberate per-window
+    // choice. #791 widens that guard from "skip the user's windows" to "skip
+    // ANY window somebody above me has chosen for", which is now tier 1 (an
+    // app declaration, e.g. the first-run wizard or a full-screen DOS guest)
+    // as well as tier 2 (the user's titlebar stepper). The owner's rule is
+    // that apps may override the Settings default and the user still wins, so
+    // the global default is the one thing that may never win an argument.
     for (window_t *w = wm_state.window_list; w; w = w->next)
-        if (!w->opacity_override) w->opacity = (uint8_t)opacity;
+        if (w->opacity_src == WIN_OPACITY_SRC_DEFAULT) w->opacity = (uint8_t)opacity;
     wm_invalidate_all();
 }
 
@@ -1609,6 +1724,38 @@ static void wm_apply_default_opacity(int opacity) {
 void wm_set_default_opacity(int opacity) {
     g_user_opacity_pinned = 1;
     wm_apply_default_opacity(opacity);
+}
+
+// ===========================================================================
+// #791 [winopacity]: TIER 1 - the owning APP declares its own window opacity.
+//
+// The owner's rule (2026-10-02): "apps may override [the Settings default], in
+// fact there is an option in the window manager that allows discrete control
+// of this property", and "other apps like full screen DOS apps/games may
+// default to 100% despite the default settings (but still allow control)". So
+// an app's declaration beats the global default and loses to the user.
+//
+// IF THE USER HAS ALREADY CHOSEN (tier 2) THE REQUEST IS IGNORED, NOT RECORDED.
+// Recording it would mean storing a second value that is applied only if the
+// user's choice were ever withdrawn, and there is no withdraw path: the
+// titlebar stepper only ever moves to another explicit value, it has no reset.
+// A stored value that nothing can ever apply is state no test can reach, so it
+// would be unverifiable by construction. Ignoring loses nothing reachable and
+// is one comparison.
+//
+// Returns the EFFECTIVE opacity after the call, so a caller that lost can see
+// it lost (and see what to) without a second syscall.
+int wm_set_window_opacity_app(window_t *win, int opacity) {
+    if (!win) return -1;
+    if (win->opacity_src >= WIN_OPACITY_SRC_USER)
+        return (int)win->opacity;          // the user owns this window; ignored
+    uint8_t o = (uint8_t)wm_clamp_opacity(opacity);
+    if (win->opacity != o || win->opacity_src != WIN_OPACITY_SRC_APP) {
+        win->opacity = o;
+        win->opacity_src = WIN_OPACITY_SRC_APP;
+        wm_invalidate_all();
+    }
+    return (int)win->opacity;
 }
 
 // THEME path (themes.c theme_set): the theme's window_opacity becomes the
@@ -2777,14 +2924,15 @@ static int winmenu_handle_click(int32_t x, int32_t y) {
             } else if (row == 3) {
                 int o = w->opacity;
                 if (right) o += plus ? 25 : -25; else o += 25;
-                if (o < 40) o = 40;
-                if (o > 255) o = 255;
-                w->opacity = (uint8_t)o;
-                // #osglass: this is the PER-WINDOW override winning over the
-                // OS-wide/theme default from now on - wm_set_default_opacity()
-                // (a theme switch or the Settings/tray slider) must not stomp
-                // it back. See window_t::opacity_override in window.h.
-                w->opacity_override = 1;
+                w->opacity = (uint8_t)wm_clamp_opacity(o);
+                // #osglass / #791: TIER 2. The user has now chosen for THIS
+                // window, and from here on nothing else may change it: not a
+                // theme switch or the Settings/tray slider (tier 0,
+                // wm_apply_default_opacity() skips any non-tier-0 window), and
+                // not the owning app (tier 1,
+                // wm_set_window_opacity_app() refuses to downgrade tier 2).
+                // See window_t::opacity_src in window.h.
+                w->opacity_src = WIN_OPACITY_SRC_USER;
             }
         }
         wm_invalidate_all();

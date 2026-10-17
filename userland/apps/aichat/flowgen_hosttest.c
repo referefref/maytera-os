@@ -40,6 +40,20 @@ int flow_plat_app_invoke(const char *app, int argc, char **argv, char *out, int 
 }
 // #469 AI-VISION: perceive / decide / act seams. This binary never executes a
 // flow, so these exist to satisfy the link and refuse, with no message needed.
+// aichat compiles flow.c only to VALIDATE generated workflow YAML with the
+// runner's own parser; it never executes a graph. Refuse, like the other
+// non-executing consumers do.
+int flow_plat_launch(const char *app, const char *rom, const char *arg,
+                     const char *wait_target, int timeout_ms,
+                     char *out_title, int tcap, int *out_already,
+                     char *err, int errcap) {
+    (void)app; (void)rom; (void)arg; (void)wait_target; (void)timeout_ms;
+    if (tcap > 0) out_title[0] = 0;
+    if (out_already) *out_already = 0;
+    if (errcap > 0) snprintf(err, errcap, "aichat does not execute workflows");
+    return -1;
+}
+
 int flow_plat_capture(const char *target, int rx, int ry, int rw, int rh,
                       int max_w, int max_h, int quality, const char *path,
                       int *out_w, int *out_h, char *err, int errcap) {

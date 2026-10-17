@@ -27,11 +27,39 @@ compiled in). If you do build it in, it is a minimal, unhardened implementation:
 configure your own accounts and put it behind a firewall before exposing the VM
 to any untrusted network. Do not rely on it for anything that matters.
 
+## What we found and fixed
+
+This project publishes its own security defects, including the ones nobody reported
+and the ones that were our own fault. Two places carry that record:
+
+- **`kernel/SECURITY_ADVISORIES.md`** in this repo: the issuing ledger. One entry per
+  advisory, in discovery order, with the affected component, the CWE class, the
+  reachability (remote versus local), what the fix actually changes, and the build
+  range. It also keeps **withdrawn** ids rather than reusing them, so an id always
+  means one thing.
+- **<https://maytera.net/security>**: the same set presented for reading, grouped by
+  class, with the patched build for each.
+
+Three classes are held to different evidence standards, deliberately, because they
+are not the same kind of claim:
+
+| class | what it means | what counts as evidence |
+| --- | --- | --- |
+| memory safety | a crafted input makes the code over-read or over-write | usually AddressSanitizer, and the entry says where that is insufficient |
+| access control | a missing authorization check, nothing corrupted | the caller could ask for something it should never have been able to ask for |
+| availability | a crafted input causes grossly disproportionate work | a **measured** before-and-after on the running system, not a reasoned argument |
+
+Two habits in that ledger are worth stating, because they are the point of keeping it:
+an advisory is only filed if the defect is **reachable**, so defence-in-depth
+hardening of already-correct code does not inflate the count; and where an entry was
+later found to be wrong, it is **corrected in place and the correction is visible**
+rather than quietly rewritten.
+
 ## Known insecurities
 
 This is a non-exhaustive list of things a security reviewer would flag. Some have TODO comments in the code; others don't yet.
 
-- **No seccomp/capabilities enforcement at the syscall layer.** The `kernel/security/` directory has scaffolding (`capability.c`, `validate.c`) but the dispatcher does not consistently check caller capabilities.
+- **Capability enforcement exists but is NOT comprehensive.** This bullet used to say the dispatcher does not check caller capabilities at all. That is no longer true: `syscall_cap_check()` is a chokepoint in the syscall dispatcher (`kernel/proc/syscall.c`) and gates a named set of capabilities, currently `screen.capture`, `screen.stream`, `serial.port`, `input.inject`, `input.observe`, `net.connect`, `net.listen` and `device.eject`, each obtainable only through a compositor-drawn consent prompt and recorded as a journalled grant. **Most syscalls are still ungated**, and a capability a program already holds is time-bounded but broad, so treat this as a working mechanism covering specific high-risk surfaces rather than a sandbox. The advisories for the gaps this closed are in the ledger linked above.
 - **User-copy helpers are rudimentary.** `copy_from_user` / `copy_to_user` validate page presence but do not exhaustively defend against TOCTOU races between the check and the access.
 - **No W^X in all regions.** User stacks and heaps are RW, but some legacy allocations in the kernel are still RWX.
 - **ASLR is implemented but the entropy source is weak** when RDRAND is not available.

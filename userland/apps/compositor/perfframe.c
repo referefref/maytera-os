@@ -10,14 +10,27 @@
 #include "../../libc/fcntl.h"
 #include "../../libc/string.h"
 #include "../../libc/stdio.h"
+#include "../../libc/userconf.h"   // #peruserrows: userscratch_path()
 
 // ----------------------------------------------------------------------------
 // Config
 // ----------------------------------------------------------------------------
 
 #define PF_GATE_PATH    "/CONFIG/PERF62.CFG"   // existence-only gate, ext2 root
-#define PF_OUT_PATH     "/PERF62.TXT"          // verdict log, ext2 root, sibling
-                                                // of /BOOTLOG.TXT and /HEARTBEAT.TXT
+
+// #peruserrows: the verdict log was /PERF62.TXT at the root-owned ext2 root. The
+// compositor runs as uid 1000, so that open returned -13 and the instrument's
+// whole output was missing on a stock image while the gate still reported
+// "armed". tools/smp-payoff/smppay-run.sh has been copying an absent file.
+// userscratch_path() resolves to <home>/PERF62.TXT with an account and
+// /TMP/PERF62.TXT without one (root included, whose home is "/"); the armed
+// bootlog line below now names the path THIS session resolved, never a literal
+// that is only correct for one uid.
+static const char *pf_out_path(void) {
+    static char p[192];
+    if (!p[0] && userscratch_path("PERF62.TXT", p, sizeof(p)) != 0) p[0] = '\0';
+    return p;
+}
 #define PF_GATE_POLL_MS   2000   // matches dock_style_poll()'s throttle class
 #define PF_DUMP_PERIOD_MS 10000  // one verdict block roughly every 10s while armed
 #define PF_RING_CAP       256    // samples per path, ring (overwrite oldest)
@@ -162,7 +175,9 @@ static void pf_write(int fd, const char *s) {
 }
 
 static void pf_dump_verdict(void) {
-    int fd = sys_open(PF_OUT_PATH, O_WRONLY | O_CREAT | O_APPEND);
+    const char *outp = pf_out_path();
+    if (!outp[0]) return;
+    int fd = sys_open(outp, O_WRONLY | O_CREAT | O_APPEND);
     if (fd < 0) return;   // best-effort: never let logging wedge the compositor
 
     char line[256];
@@ -250,8 +265,12 @@ void perfframe_poll(void) {
             }
             s_last_quiescent_us = 0;   // #62: no stale floor from a prior session
             s_next_dump_ms = now + PF_DUMP_PERIOD_MS;
-            sys_bootlog("[PERF62] gate ON (" PF_GATE_PATH " present): frame-interval "
-                        "instrument armed, logging to " PF_OUT_PATH);
+            {   char armed[224];
+                snprintf(armed, sizeof(armed),
+                         "[PERF62] gate ON (" PF_GATE_PATH " present): frame-interval "
+                         "instrument armed, logging to %s", pf_out_path());
+                sys_bootlog(armed);
+            }
         } else if (!s_gate_on && was_on) {
             sys_bootlog("[PERF62] gate OFF: instrument disarmed");
         }

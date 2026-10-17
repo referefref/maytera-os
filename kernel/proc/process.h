@@ -823,6 +823,10 @@ void proc_mm_unlock(void);
 
 // #404/#349 Task Manager: number of threads in `pid`'s thread group (>=1).
 uint32_t proc_thread_count(uint32_t pid);
+// #fdreclaim: members of thread group `tgid` that can still run (zombies
+// excluded, no floor of 1). 0 means nothing of this group can be inside a
+// syscall any more, which is what makes tearing down its leaked fd slots safe.
+uint32_t proc_group_live_count(uint32_t tgid);
 
 // #487: pid of the running process, or 0 if there is none. A narrow accessor so
 // callers that only need the pid (net/tcp.c stamping socket ownership) do not

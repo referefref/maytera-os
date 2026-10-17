@@ -17,7 +17,8 @@
 // index walk over a fixed array, not a wait loop (concurrency-lint is unmoved).
 
 #include "escrow_undo.h"
-#include "fat.h"                  // fat_rename / fat_delete / fat_exists (route to ext2)
+#include "fat.h"
+#include "../drivers/hotplug.h"   // [renamevol] hotplug_fs_or_root: the revert may be on a stick                  // fat_rename / fat_delete / fat_exists (route to ext2)
 #include "../sync/spinlock.h"
 #include "../string.h"
 #include "../serial.h"
@@ -138,21 +139,47 @@ void escrow_undo_record(uint32_t task_node, uint32_t op,
 // Revert one entry, NON-DESTRUCTIVELY. Returns 1 if reverted, 0 if skipped.
 // Runs with NO lock held (may-block fat_* calls).
 // ---------------------------------------------------------------------------
+// [renamevol] #246: THIS ENGINE WAS BLIND TO REMOVABLE VOLUMES, and blame.md
+// recorded it on 2026-10-04 as found-and-not-fixed, because "the rename half of
+// it cannot work on a stick until sys_rename reaches one". It does now, so this
+// is the other half of that change.
+//
+// It failed SAFE rather than open: fat_exists(&g_fat_fs, ...) read "not
+// present" for a path on a stick, so the entry was counted as SKIPPED and the
+// count is printed. It was still an escrow guarantee that did not hold on the
+// owner's thumbdrive: "undo this agent's work" could not undo work done there.
+//
+// hotplug_fs_or_root() is the ONE root-or-volume resolver (drivers/hotplug.h).
+// A NULL from it means the medium cannot be reached at all, which is a SKIP and
+// never a retry against the root filesystem: the root may hold a different file
+// at the same spelling, and STEP 2 of the rename branch would then clobber it.
 static int escu_revert_entry(const escu_entry_t *ent) {
     uint32_t inv = escu_inverse_rs(ent->op);
     if (inv == ESCU_INV_RENAME_BACK) {
         // Forward moved a -> b. Inverse: move b back to a, but ONLY if a is free,
         // so we never clobber whatever now occupies the original slot.
-        if (!fat_exists(&g_fat_fs, ent->b)) return 0;   // forward not present / already reverted
-        if (fat_exists(&g_fat_fs, ent->a)) return 0;    // original slot occupied: refuse to clobber
-        return fat_rename(&g_fat_fs, ent->b, ent->a) == 0 ? 1 : 0;
+        const char *brel = 0, *arel = 0;
+        fat_fs_t *bfs = hotplug_fs_or_root(ent->b, &brel);
+        fat_fs_t *afs = hotplug_fs_or_root(ent->a, &arel);
+        if (!bfs || !afs) return 0;      // unreachable medium: skip, never guess
+        // A recorded forward rename is always same-volume (sys_rename refuses
+        // any other pair), so a disagreement here means the volume set changed
+        // under us - a stick was pulled or swapped. Skip rather than perform
+        // half of a cross-device move.
+        if (bfs != afs) return 0;
+        if (!fat_exists(bfs, brel)) return 0;   // forward not present / already reverted
+        if (fat_exists(afs, arel)) return 0;    // original slot occupied: refuse to clobber
+        return fat_rename(bfs, brel, arel) == 0 ? 1 : 0;
     }
     if (inv == ESCU_INV_RMDIR_EMPTY) {
         // Forward created dir a. Inverse: remove it, but ONLY if empty. fat_delete
         // routes to ext2_rmdir, which returns -3 (not 0) for a non-empty dir, so a
         // non-empty directory is left intact and counted as skipped.
-        if (!fat_exists(&g_fat_fs, ent->a)) return 0;   // already gone
-        return fat_delete(&g_fat_fs, ent->a) == 0 ? 1 : 0;
+        const char *arel = 0;
+        fat_fs_t *afs = hotplug_fs_or_root(ent->a, &arel);
+        if (!afs) return 0;
+        if (!fat_exists(afs, arel)) return 0;   // already gone
+        return fat_delete(afs, arel) == 0 ? 1 : 0;
     }
     return 0;   // ESCU_INV_NONE: nothing to do
 }

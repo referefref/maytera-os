@@ -1,32 +1,28 @@
 // browser - Web Browser for MayteraOS (userland version)
 // Fetches and renders web pages via SYS_HTTP_FETCH syscall.
 //
-// [no-ticket] (browser-glass): chrome restyled into the shared dark-teal glass
-// language already shipped in the first-run wizard, App Repo and Task Manager
-// (docs/UI_GLASS_DESIGN_SYSTEM.md, section 10's "regardless of the active
-// theme" pattern, same as App Repo's #glassrepo override). Existing nav/
-// address/Go geometry is unchanged; a tab strip and a bookmarks bar are added
-// above and below the toolbar, and a Settings (overflow) button is added next
-// to Go. Page parsing and fetch behavior are unchanged.
-//
-// (browserglass) Second pass: the flat dark-teal bands above became the REAL
-// glass the seven glassed apps share (Task Manager, Calculator, Image Viewer,
-// Media Player, Editor, Terminal, Files): a frosted-wallpaper backdrop in a
-// PAD 10 margin (userland/libc gui_glass_backdrop_sync/_blit/_at, the shared
-// recipe, not a private copy), tab pills ON the backdrop, and ONE rounded
-// glass panel (PANEL_R 12, inset PANEL_IN 12) that holds the toolbar row, the
-// bookmarks row, the progress line, the page viewport and the status row.
-// The PAGE VIEWPORT is untouched: an opaque page_bg() sheet the engine paints
-// into exactly as before (draw_content() is not edited), so live content
-// never sits on a blurred backdrop. Designed first as an HTML/CSS spec
-// (the build host:/root/browserglass-proof/browserglass-spec.html), then ported.
+// [no-ticket] (glassrevert): chrome reverted from the dark-teal glass restyle
+// (frosted backdrop, rounded AA panel, pill-shaped controls fixed to one
+// palette regardless of the active theme) back to the classic CDE/Motif
+// chrome: flat beveled bands, square-cornered controls, colors read live from
+// the active theme via theme_color(), matching Settings/Files (docs/
+// UI_STYLE_GUIDE.md). The owner's directive (2026-10-01): "this new 'glass'
+// design for the browser is awful, i prefer the previous layout", extended to
+// every app that had the same restyle. Tabs, the bookmarks bar and the
+// Settings (overflow) menu are KEPT (real features added after the original
+// chrome), just redrawn with the shared gui_button()/gui_card() style-engine
+// primitives instead of the glass backdrop/pill helpers, so the tab strip
+// reads like the OS taskbar's window buttons and the Settings menu reads like
+// any other dropdown (THEME_COLOR_MENU_*). The render/layout/JS engine below
+// (NetSurf parse, CSS cascade, flex/paint, draw_content()) is NOT touched by
+// this pass; only the toolbar/tabs/bookmarks/status/menu chrome is.
 
 #include "../../libc/maytera.h"
 #include "../../libc/gui.h"
 #include "../../libc/syscall.h"
 #include "../../libc/theme.h"
 #include "../../libc/gui_scroll.h"   // shared scrollbar contrast rule (#745 item 77)
-#include "../../libc/gui_style.h"    // gui_fill_rounded_aa / gui_soft_shadow / gui_glass_backdrop_* (browserglass)
+#include "../../libc/gui_style.h"    // gui_button/gui_card/gui_fill_rounded/gui_active_style (glassrevert: classic chrome via the shared style engine)
 
 // NetSurf-backed render pipeline (hubbub->libdom parse, libcss style, our
 // MIT block+inline layout). See <workspace>
@@ -39,6 +35,7 @@
 #include "rrect.h"
 #include "duk_dom.h"  // Duktape JS + DOM binding (Phase 2)
 #include "../../libc/keys.h"   // #243: GUI_KEY_* nav codes
+#include "../../libc/contract.h"
 
 // Route in-window text through the antialiased TrueType path (matches Settings).
 #define br_text(h, x, y, s, c)       win_draw_text_ttf((h), (x), (y), (s), 14, (c))
@@ -50,48 +47,40 @@
 
 // #89: live window size, updated on EVENT_RESIZE so the whole UI (toolbar,
 // content viewport, status bar) and the page layout width reflow on resize.
-// [no-ticket] (browser-glass): height raised 600->664 (+64, the tab strip
-// (34) plus bookmarks bar (28) plus progress line (2) added below) so the
-// content viewport keeps the same size it had before this restyle rather
-// than shrinking by the height of the new chrome.
+// (glassrevert) Kept at the glass-era 664 rather than the original 600: the
+// tab strip and bookmarks bar are real, kept features (not glass-only), and
+// this leaves the content viewport the same size readers are used to instead
+// of shrinking it again.
 static int g_win_w = 800, g_win_h = 664;
 #define WIN_WIDTH       g_win_w
 #define WIN_HEIGHT      g_win_h
 
-// (browserglass) Geometry. One definition each; draw and hit-test both read
-// the rect functions / macros below (glass doc section 8). PAD / TAB_H /
-// TAB_GAP / PANEL_R / PANEL_IN and the panel top (PAD + TAB_H + 10) are the
-// Task Manager's, the Calculator's and the Image Viewer's, so the glassed
-// windows share one geometry. Top to bottom: tab pills on the backdrop, then
-// ONE glass panel holding the toolbar row, the bookmarks row, the progress
-// line, the page viewport and the status row, each inset PANEL_IN from the
-// panel edge (PANEL_IN >= PANEL_R, so no band ever touches a rounded corner).
-#define PAD             10                    // window margin: the backdrop shows here
-#define TAB_H           26                    // tab pill height (radius TAB_H/2)
-#define TAB_GAP         6                     // gap between pills
-#define PANEL_Y         (PAD + TAB_H + 10)    // panel top (46)
-#define PANEL_R         12                    // panel corner radius
-#define PANEL_IN        12                    // inset from the panel edge to its content
-#define ROW_H           28                    // toolbar row: pills, address field, Go
-#define INNER_X         (PAD + PANEL_IN)      // left edge of everything inside the panel (22)
-#define INNER_W         (WIN_WIDTH - 2 * INNER_X)
+// (glassrevert) Classic flush-chrome geometry: no window margin, no rounded
+// backdrop panel. Bands run edge to edge top to bottom - tab strip, toolbar,
+// bookmarks bar, progress line, page viewport, status row - each a flat
+// themed band with a 1px separator, the same stacking the pre-glass browser
+// and every other classic MayteraOS app window use. One definition each;
+// draw and hit-test both read the rect functions / macros below, so a
+// control's drawn rect and its click target can never drift apart.
+#define TABSTRIP_H      24     // tab strip band height
+#define TOOLBAR_H       36     // toolbar band: nav buttons, address field, Go
+#define BOOKMARKS_H     20     // bookmarks bar band height
+#define PROGRESS_H      2      // load-progress sliver
+#define STATUS_H        18     // status row height
 
-// The tab strip BAND for hit-testing: everything above the panel.
-#define TABSTRIP_H      (PANEL_Y)
-#define TOOLBAR_Y       (PANEL_Y + PANEL_IN)  // 58
-#define TOOLBAR_H       ROW_H
-#define BOOKMARKS_H     20
-#define PROGRESS_H      2
-#define STATUS_H        18
+#define TOOLBAR_Y       (TABSTRIP_H)
+#define BOOKMARKS_Y     (TOOLBAR_Y + TOOLBAR_H)
+#define PROGRESS_Y      (BOOKMARKS_Y + BOOKMARKS_H)
+#define STATUS_Y        (WIN_HEIGHT - STATUS_H)
 
-// Navigation pills live on the left of the toolbar row.
-#define NAV_BTN_W       36
-#define NAV_BTN_H       ROW_H
-#define NAV_BTN_Y       (TOOLBAR_Y)
-#define NAV_GAP         6
-#define TOOLBAR_PAD     INNER_X
+// Navigation buttons live on the left of the toolbar row.
+#define NAV_BTN_W       34
+#define NAV_BTN_H       28
+#define NAV_BTN_Y       (TOOLBAR_Y + (TOOLBAR_H - NAV_BTN_H) / 2)
+#define NAV_GAP         4
+#define TOOLBAR_PAD     8
 
-// Four nav pills: Back, Forward, Reload, Home.
+// Four nav buttons: Back, Forward, Reload, Home.
 #define NAV_BACK_X      (TOOLBAR_PAD)
 #define NAV_FWD_X       (NAV_BACK_X + NAV_BTN_W + NAV_GAP)
 #define NAV_RELOAD_X    (NAV_FWD_X  + NAV_BTN_W + NAV_GAP)
@@ -99,41 +88,33 @@ static int g_win_w = 800, g_win_h = 664;
 
 // Go button on the right of the toolbar row.
 #define GO_BTN_W        50
-#define GO_BTN_H        ROW_H
-#define GO_BTN_Y        (TOOLBAR_Y)
-#define GO_BTN_X        (WIN_WIDTH - INNER_X - GO_BTN_W)
+#define GO_BTN_H        NAV_BTN_H
+#define GO_BTN_Y        (NAV_BTN_Y)
+#define GO_BTN_X        (WIN_WIDTH - TOOLBAR_PAD - GO_BTN_W)
 
-// Settings (overflow) pill: the three-dot control, just left of Go. Opens a
-// small glass menu (Home, Reconnect, About).
-#define SETTINGS_BTN_W  30
-#define SETTINGS_BTN_H  ROW_H
-#define SETTINGS_BTN_Y  (TOOLBAR_Y)
-#define SETTINGS_BTN_X  (GO_BTN_X - 8 - SETTINGS_BTN_W)
+// Settings (overflow) button: the three-dot control, just left of Go. Opens
+// a themed dropdown (Home, Reconnect, About) drawn with the THEME_COLOR_MENU_*
+// tokens, same as every other menu in the OS.
+#define SETTINGS_BTN_W  28
+#define SETTINGS_BTN_H  NAV_BTN_H
+#define SETTINGS_BTN_Y  (NAV_BTN_Y)
+#define SETTINGS_BTN_X  (GO_BTN_X - 6 - SETTINGS_BTN_W)
 
-// Address field fills the gap between the nav pills and the Settings pill.
-#define URL_BAR_X       (NAV_HOME_X + NAV_BTN_W + 10)
-#define URL_BAR_Y       (TOOLBAR_Y)
-#define URL_BAR_W       (SETTINGS_BTN_X - 8 - URL_BAR_X)
-#define URL_BAR_H       ROW_H
+// Address field fills the gap between the nav buttons and the Settings button.
+#define URL_BAR_X       (NAV_HOME_X + NAV_BTN_W + 8)
+#define URL_BAR_Y       (NAV_BTN_Y)
+#define URL_BAR_W       (SETTINGS_BTN_X - 6 - URL_BAR_X)
+#define URL_BAR_H       NAV_BTN_H
 // Bookmark star hit-box, inset from the address field's right edge.
-#define URL_STAR_W      22
+#define URL_STAR_W      20
 
-// Bookmarks row: a row of glass chips under the toolbar row.
-#define BOOKMARKS_Y     (TOOLBAR_Y + TOOLBAR_H + 8)
-// The accent progress line sits between the bookmarks row and the viewport.
-#define PROGRESS_Y      (BOOKMARKS_Y + BOOKMARKS_H + 8)
-// The status row sits inside the panel, PANEL_IN above its bottom edge.
-#define STATUS_Y        (WIN_HEIGHT - PAD - PANEL_IN - STATUS_H)
-
-// Content viewport: the page sheet, inside the panel. Its right edge is the
-// panel's inner edge (INNER_X from the window edge), and the scrollbar sits
-// flush against THAT edge (gui_scroll_bar_x()'s "right-aligned inside the
-// viewport"); the old "viewport right edge IS the window right edge" rule
-// predates the panel and no longer applies.
-#define CONTENT_X       INNER_X
-#define CONTENT_Y       (PROGRESS_Y + PROGRESS_H + 4)
-#define CONTENT_W       INNER_W
-#define CONTENT_H       (STATUS_Y - 6 - CONTENT_Y)
+// Content viewport: the page sheet, flush with the window's left/right edges
+// (the pre-glass convention: "the viewport's right edge IS the window's
+// right edge", gui_scroll_bar_x()'s "right-aligned inside the viewport").
+#define CONTENT_X       8
+#define CONTENT_Y       (PROGRESS_Y + PROGRESS_H + 2)
+#define CONTENT_W       (WIN_WIDTH - CONTENT_X)
+#define CONTENT_H       (STATUS_Y - CONTENT_Y)
 #define SB_W            12   // vertical scrollbar width (#245)
 
 #define HOME_URL        "https://maytera.net"
@@ -154,71 +135,64 @@ static int g_win_w = 800, g_win_h = 664;
 // Theme palette (mirrors the Settings app approach)
 // ============================================================================
 
-// (browserglass) Glass tokens: docs/UI_GLASS_DESIGN_SYSTEM.md section 1, the
-// exact values the Task Manager, Calculator and Image Viewer use (their
-// C_PANEL / C_CARD / C_EDGE / C_INK / C_INK_DIM / C_ACCENT / C_ACCENT_INK).
-// The COL_ names predate this pass and are kept because dozens of call
-// sites read them; the section-1 name is beside each value. Fixed dark glass
-// regardless of the active theme: the window carries its own backdrop, so
-// there is no light-theme surface for these to sit on.
-static uint32_t COL_WINDOW_BG;     // DK_CARD_FILL: pal.surface for the shared widgets
-static uint32_t COL_CARD_BG;       // DK_CARD_FILL: the overflow menu's card
-static uint32_t COL_SEPARATOR;     // DK_STROKE_UNSEL: panel / pill / viewport 1px border
-static uint32_t COL_TEXT;          // DK_HEADLINE
-static uint32_t COL_TEXT_DIM;      // DK_BODY
-static uint32_t COL_ACCENT;        // DK_ACCENT
-static uint32_t COL_FIELD_BG;      // DK_INPUT_FILL
-static uint32_t COL_FIELD_BORDER;  // DK_INPUT_BORDER
+// (glassrevert) Theme-driven tokens, read live from the active theme via
+// theme_color() (see docs/UI_STYLE_GUIDE.md), the same approach Settings'
+// own apply_theme() uses: this app owns no literal per-theme palette table,
+// so it inherits every shipped theme (and any future one) automatically.
+// The COL_ names predate the glass pass and are kept because dozens of call
+// sites already read them; only what feeds them changes.
+static uint32_t COL_WINDOW_BG;     // window background, behind the page sheet
+static uint32_t COL_CARD_BG;       // Settings (overflow) menu card
+static uint32_t COL_SEPARATOR;     // band separators / control borders
+static uint32_t COL_TEXT;          // primary text
+static uint32_t COL_TEXT_DIM;      // secondary/dim text
+static uint32_t COL_ACCENT;        // accent: active tab, focus ring, Go button, progress fill
+static uint32_t COL_FIELD_BG;      // address field fill
+static uint32_t COL_FIELD_BORDER;  // address field border (resting; focus uses the accent)
 static uint32_t COL_ERROR;
-static uint32_t COL_PANEL;         // WEL_BG_MID: the glass panel, pill fills, the backdrop tint
-static uint32_t COL_RAISED;        // hovered row inside the overflow menu
-static uint32_t COL_FAINT;         // least emphasis text (inactive tab labels)
-static uint32_t COL_ACCENT_INK;    // text on the accent (the active tab pill)
-static uint32_t COL_TRACK;         // DK_PROGRESS_TRACK: the progress line's track
-static uint32_t COL_EDGE_GLASS;    // DK_EDGE_GLASS: a stroke that floats over the page (overflow menu)
-#define WEL_BG_TOP     0x000A1614  // backdrop gradient fallback, top stop
-#define WEL_BG_BOTTOM  0x00050A09  // backdrop gradient fallback, bottom stop
+static uint32_t COL_PANEL;         // tab strip / toolbar / bookmarks / status band background
+static uint32_t COL_RAISED;        // hovered row inside the Settings menu
+static uint32_t COL_FAINT;         // least-emphasis text (inactive tab label/close-x)
+static uint32_t COL_ACCENT_INK;    // text drawn on the accent fill (the active tab)
+static uint32_t COL_TRACK;         // progress line track (idle/behind)
+static uint32_t COL_MENU_BORDER;   // Settings menu card border
 
-// Build the palette and push it into the style engine so all gui_*
-// primitives render consistently.
-//
-// [no-ticket] (browser-glass): this used to branch on the live kernel theme
-// (Light/Classic/Ocean/Modern Dark/Dark) and pick one of five palettes. The
-// owner-approved glass redesign asks for the SAME dark-teal glass chrome the
-// first-run wizard, App Repo and Task Manager already ship REGARDLESS of the
-// active desktop theme - the exact override App Repo's setup_palette()
-// applies (userland/apps/appstore/main.c, "#glassrepo": "the owner wants
-// this store to read like the first-run wizard's glass regardless of the
-// active theme"). So the browser now does the same thing: one fixed palette,
-// not five theme-derived ones. `kernel_theme` is kept as a parameter (still
-// passed get_theme() at the call site) only so a future per-theme carve-out
-// does not require touching every caller.
+// Build the palette from the LIVE theme and push it into the style engine so
+// every gui_* primitive (gui_button, gui_card, gui_fill_rounded/border) both
+// colors AND renders (beveled/square for a classic theme, rounded for a
+// modern one) consistently. `kernel_theme` is unused directly - theme_color()
+// already reads the live kernel theme - but kept as a parameter so the
+// get_theme() call site below does not need touching.
 static void apply_theme(int kernel_theme) {
     (void) kernel_theme;
 
-    COL_WINDOW_BG    = 0x000E1D1B;   // DK_CARD_FILL
-    COL_PANEL        = 0x00122420;   // WEL_BG_MID (browserglass: was the flat band's 0x16302A)
-    COL_CARD_BG      = 0x000E1D1B;   // DK_CARD_FILL
-    COL_RAISED       = 0x001B3A33;   // hovered menu row
-    COL_SEPARATOR    = 0x002C4A44;   // DK_STROKE_UNSEL
-    COL_TEXT         = 0x00F3FBF9;   // DK_HEADLINE
-    COL_TEXT_DIM     = 0x00A9D9CC;   // DK_BODY
-    COL_FAINT        = 0x006E9E92;   // faint
-    COL_ACCENT       = 0x006AE2CF;   // DK_ACCENT
-    COL_FIELD_BG     = 0x00213B34;   // DK_INPUT_FILL (address field; browserglass, was the card token)
-    COL_FIELD_BORDER = 0x004E7168;   // DK_INPUT_BORDER (resting; focus is the accent)
-    COL_ACCENT_INK   = 0x0004231A;
-    COL_TRACK        = 0x0016241F;   // DK_PROGRESS_TRACK
-    COL_EDGE_GLASS   = 0x006FA99E;   // DK_EDGE_GLASS
+    COL_WINDOW_BG    = theme_color(THEME_COLOR_WINDOW_BG);
+    COL_PANEL        = theme_color(THEME_COLOR_SURFACE_RAISED);
+    COL_CARD_BG      = theme_color(THEME_COLOR_MENU_BG);
+    COL_RAISED       = theme_color(THEME_COLOR_MENU_ITEM_HOVER);
+    COL_SEPARATOR    = theme_color(THEME_COLOR_BORDER_SUBTLE);
+    COL_TEXT         = theme_color(THEME_COLOR_ON_SURFACE);
+    COL_TEXT_DIM     = theme_color(THEME_COLOR_MUTED);
+    COL_FAINT        = theme_color(THEME_COLOR_MUTED);
+    COL_ACCENT       = theme_color(THEME_COLOR_ACCENT);
+    COL_FIELD_BG     = theme_color(THEME_COLOR_TEXTBOX_BG);
+    COL_FIELD_BORDER = theme_color(THEME_COLOR_TEXTBOX_BORDER);
+    COL_ACCENT_INK   = theme_color(THEME_COLOR_ON_ACCENT);
+    COL_TRACK        = theme_color(THEME_COLOR_PROGRESS_BG);
+    COL_MENU_BORDER  = theme_color(THEME_COLOR_MENU_BORDER);
     // Semantic: kept as its own danger tone, never recolored to fit the
     // palette (an insecure/error state must stay legible as "different").
-    COL_ERROR        = 0x00E2795A;
+    COL_ERROR        = theme_color(THEME_COLOR_ERROR);
 
-    gui_set_style(GUI_STYLE_MODERN);
+    // (#711) Reads decor.style from the ACTIVE theme FILE, so a classic/
+    // retro-style theme gets the beveled, square CDE/Motif renderer and
+    // every other theme gets the rounded modern one - no hardcoded family
+    // and no fixed palette regardless of theme, unlike the glass restyle.
+    gui_style_sync_from_theme();
 
     gui_palette_t pal;
     pal.surface        = COL_WINDOW_BG;
-    pal.surface_raised = COL_CARD_BG;
+    pal.surface_raised = COL_PANEL;
     pal.ink            = COL_TEXT;
     pal.ink_dim        = COL_TEXT_DIM;
     pal.accent         = COL_ACCENT;
@@ -349,6 +323,25 @@ static void cssvar_report(const char *line)
     g_cv_cases++;
     if (g_cv_detail) printf("[CSSVAR] %s\n", line);
 }
+// #245 engstack: the same free-canary treatment for the PAINT-ORDER rules.
+// paintorder.c is pure integer logic over a stacking-context tree, so it can be
+// asserted exhaustively; this runs it IN THE OS on every launch, so the ordering
+// rules are proven on the shipping image and not only on a developer's host.
+// The tag is [STACK], deliberately not [BRDUMP], so the layout-dump extraction
+// the engine harness greps for is untouched.
+static int  g_st_cases = 0;
+static void stack_report(const char *line)
+{
+    g_st_cases++;
+    if (g_cv_detail) printf("[STACK] %s\n", line);
+}
+
+/* #245 layoutsweep: per-case detail for dsmath_selftest(), same shape as
+ * cssvar_report/stack_report so all three canaries read alike on serial. */
+static void dsmath_report(const char *line) { printf("%s\n", line); }
+/* #245 deepdom: per-case detail for mdb_depth_selftest(), gated on
+ * /BRDUMP.TXT like the other three canaries. */
+static void deepdom_report(const char *line) { printf("%s\n", line); }
 static int  g_content_len = 0;   // #89: length of the page in content_buffer (for re-layout on resize)
 static int  last_layout_w = 0;   // #89: window width the page was last laid out at
 // #resizereflow: the current page's PARSED DOM and BUILT CSSOM, kept alive so a
@@ -421,7 +414,7 @@ static int  btn_press = -1;
 static int  g_mx_last = -1, g_my_last = -1;
 
 // ============================================================================
-// Tabs [no-ticket] (browser-glass)
+// Tabs
 //
 // SCOPE, STATED HONESTLY: the render pipeline (content_buffer, the NetSurf
 // DOM/CSS parse trees g_doc_parser/g_css_ctx, the layout item list g_layout,
@@ -472,7 +465,7 @@ static const uint32_t TAB_CHIP_COLORS[] = {
 #define TAB_CHIP_N ((int)(sizeof(TAB_CHIP_COLORS) / sizeof(TAB_CHIP_COLORS[0])))
 
 // ============================================================================
-// Bookmarks bar [no-ticket] (browser-glass)
+// Bookmarks bar
 // ============================================================================
 #define MAX_BOOKMARKS 12
 typedef struct { char label[24]; char url[MAX_URL_LEN]; uint32_t chip_col; } bookmark_t;
@@ -497,32 +490,6 @@ static int g_settings_open = 0;
 
 static int  window_handle = -1;
 static int  running = 1;
-
-// ---------------------------------------------------------------------------
-// (browserglass) The frosted-wallpaper backdrop: the shared libc recipe
-// (userland/libc/gui_style.h gui_glass_backdrop_*, blame.md glasslib). This
-// app owns only the two persistent pieces the API asks for; the scratch
-// (raw thumbnail bytes, blur plane) lives in gui.c.
-// ---------------------------------------------------------------------------
-static uint32_t g_bd[GUI_GLASS_BD_W * GUI_GLASS_BD_H];
-static int g_bd_wi = GUI_GLASS_BD_NEVER;   // wallpaper index the backdrop was built for
-static int g_chrome_dirty = 1;             // the ONLY thing that can make redraw() blit the backdrop
-static int g_last_tab_count = -1;          // tab pills uncover margin when their count changes
-
-// The backdrop colour under content pixel (x, y): what the kernel's nearest-
-// neighbour scale put there, to within the blur. Every AA edge and shadow
-// drawn onto the backdrop takes its outer colour from here; a flat guess is
-// what produces a square halo around a round corner (glass doc section 2).
-static uint32_t bd_at(int x, int y) {
-    return gui_glass_backdrop_at(g_bd, g_win_w, g_win_h, x, y);
-}
-
-// Rebuild the backdrop if the wallpaper changed. SYS_GET_WALLPAPER is the
-// same poll the compositor makes; a changed index marks the chrome dirty.
-static void sync_backdrop(void) {
-    if (gui_glass_backdrop_sync(g_bd, &g_bd_wi, COL_PANEL, 158, WEL_BG_TOP, WEL_BG_BOTTOM))
-        g_chrome_dirty = 1;
-}
 
 // ============================================================================
 // String helpers (freestanding)
@@ -1014,8 +981,13 @@ extern int printf(const char *fmt, ...);
 #define ENGWALK_MAIN_STAMP "unstamped"
 #endif
 static void br_buildstamp(void) {
-    printf("[BUILDSTAMP] browser layout.c=%s main.c=%s\n",
-           layout_src_stamp(), ENGWALK_MAIN_STAMP);
+    // #245 enggrad2: cssvar= covers cssvar.c + cssvar.h + css_select_bind.c as
+    // one md5. The gradient carrier spans all three, and a stamp gate that
+    // could only see layout.c and main.c would be blind to precisely the edit
+    // an A/B run of this feature is measuring.
+    printf("[BUILDSTAMP] browser layout.c=%s main.c=%s cssvar=%s stack=%s\n",
+           layout_src_stamp(), ENGWALK_MAIN_STAMP, cssvar_src_stamp(),
+           layout_stack_stamp());
 }
 
 /*
@@ -1043,6 +1015,13 @@ static void br_layout_dump(const char *tag) {
         if (it->ol_w)
             printf("[BRDUMP]   outline[%d] w=%d style=%d col=%06x\n",
                    i, it->ol_w, it->ol_style, (unsigned)it->ol_col);
+        // #245 engstack: which stacking context this box paints in. Printed
+        // only when it is not the root, so a page with no positioned box dumps
+        // byte-identically to before. It is the only way the STRUCTURE behind
+        // the order is visible: the array order already IS the paint order,
+        // but it cannot say WHY two boxes came out in the order they did.
+        if (it->pg)
+            printf("[BRDUMP]   pg[%d]=%d\n", i, it->pg);
     }
     for (int i = 0; i < g_layout.n_scrolls; i++) {
         scroll_box *sb = &g_layout.scrolls[i];
@@ -1050,10 +1029,41 @@ static void br_layout_dump(const char *tag) {
                i, sb->content_x, sb->content_y, sb->content_w, sb->content_h,
                sb->extent_h, sb->offset, sb->extent_w, sb->offset_x);
     }
+    // #245 engstack: the stacking-context TREE.
+    //
+    // A box dump is blind to COLOUR, which is why tools/browser-pixelprobe
+    // exists. It is NOT blind to ORDER: the painter walks g_layout.items by
+    // index, and the loop above prints that same array in that same order, so
+    // the SEQUENCE of box[] lines is a direct readout of paint order. What the
+    // sequence cannot show is WHY two boxes came out in the order they did,
+    // which is what these lines add.
+    //
+    // own_pre= is a PRE-SORT item index, not an index into the box[] lines
+    // above, because that is what the ordering was computed from.
+    {
+        int ng = layout_stack_groups();
+        if (ng > 1) {
+            printf("[BRDUMP] stack groups=%d overflow=%d\n",
+                   ng, layout_stack_overflowed());
+            for (int g = 1; g < ng; g++) {
+                int par = 0, z = 0, ctx = 0, own = -1;
+                if (layout_stack_group(g, &par, &z, &ctx, &own) == 0)
+                    printf("[BRDUMP]  sc[%d] parent=%d z=%d ctx=%d own_pre=%d\n",
+                           g, par, z, ctx, own);
+            }
+        }
+    }
 }
 
 static void render_page(const char *html, int html_len) {
-    unsigned long t_a = uptime_ms();
+    /* #245 jsdom: mono_us(), not uptime_ms(). The phase numbers below are the
+     * instrument this task's whole shape argument rests on, and uptime_ms() is
+     * tick-derived: KVM replays a starved vCPU's lost timer IRQs in BURSTS
+     * (blame.md, timer-ticks-is-not-a-wall-clock), so a tick-derived interval
+     * can misreport exactly the stall it is there to measure. SYS_MONO_US is
+     * TSC-backed microseconds. The unit printed below is MICROSECONDS, which is
+     * also what makes a sub-millisecond phase readable instead of "0". */
+    unsigned long long t_a = mono_us();
     g_content_len = html_len;   // #89: remember for re-layout on resize
     // engscroll (#245): a new page starts with every overflow container at the
     // top. Reset before layout so scroll offsets never leak across navigations.
@@ -1077,12 +1087,49 @@ static void render_page(const char *html, int html_len) {
     g_doc_parser = p;   // #resizereflow: keep for layout-only reflow on resize
     mdb_parse_chunk(p, (const unsigned char *) html, (unsigned long) html_len);
     mdb_parse_complete(p);
-    unsigned long t_parse = uptime_ms();
+    unsigned long long t_parse = mono_us();
 
     // Run inline <script> elements under Duktape with the DOM bound.
     // DOM mutations are visible to the layout pass below.
+    /* #275 jsdom: console.log had NOWHERE TO GO. js_run_document was called with
+     * a NULL log buffer, so every console.log() and every uncaught script error
+     * was silently discarded, and the only way to see what a script did was to
+     * have the script write its result into the DOM and then photograph the
+     * screen (kernel/mm/tests/vma_scale_browser.html says so in as many words).
+     * Under PERF=1 the log is captured and emitted to serial as [BRJS], which is
+     * what makes a scripted measurement readable without a screendump.
+     *
+     * It is NOT on in the shipping build, and that is deliberate rather than
+     * laziness: every printf character here is a SYS_PUTCHAR syscall plus a
+     * syslog ring entry, so an unconditional console.log sink hands a hostile
+     * page a cheap way to make the browser do kernel work per character. A
+     * visible console pane, which is where this output belongs, is its own
+     * change. */
+#ifdef BROWSER_PERF
+    static char js_log[8192];
+    int js_ran = js_run_document(mdb_document(p), js_log, (int) sizeof js_log);
+#else
     js_run_document(mdb_document(p), 0, 0);
-    unsigned long t_js = uptime_ms();
+#endif
+    unsigned long long t_js = mono_us();
+#ifdef BROWSER_PERF
+    /* #245 jsdom: the two deterministic allocator counters, printed next to the
+     * script phase's wall clock. A timing spike that is the allocator moves
+     * walk_steps; one that is the kernel's page/mmap path does not. Both are
+     * declared in userland/libc (heap high-water in stdlib.h; the walk-step
+     * counter deliberately not, see its comment, so it is declared here). */
+    extern uint64_t __malloc_walk_steps(void);
+    printf("[BRHEAP] after_js highwater_KB=%lu walk_steps=%lu\n",
+           (unsigned long) (malloc_heap_highwater() >> 10),
+           (unsigned long) __malloc_walk_steps());
+    printf("[BRJS] scripts=%d\n", js_ran);
+    for (const char *q = js_log; *q; ) {
+        const char *e = q;
+        while (*e && *e != '\n') e++;
+        printf("[BRJS] %.*s\n", (int)(e - q), q);
+        q = (*e == '\n') ? e + 1 : e;
+    }
+#endif
 
     mcs_ctx *css = mcs_create();
     if (!css) { mdb_destroy(p); return; }
@@ -1099,12 +1146,12 @@ static void render_page(const char *html, int html_len) {
     int css_len = extract_styles(html, html_len, author_css, sizeof(author_css));
     if (css_len > 0)
         mcs_add_author_css(css, author_css, (unsigned long) css_len);
-    unsigned long t_css = uptime_ms();
+    unsigned long long t_css = mono_us();
 
     // External stylesheets (#245): fetch + apply <link rel=stylesheet> sheets.
     // Synchronous; bounded by the fetch timeout per sheet and a total CSS budget.
     apply_external_css(css, html, html_len);
-    unsigned long t_ext = uptime_ms();
+    unsigned long long t_ext = mono_us();
 
     unsigned long m0 = g_layout_measure_calls;
     unsigned long w0 = g_layout_measure_words;
@@ -1116,10 +1163,10 @@ static void render_page(const char *html, int html_len) {
     }
     br_layout_dump("render");
     br_report_depth();   // engwalkstack (#245)
-    unsigned long t_lay = uptime_ms();
+    unsigned long long t_lay = mono_us();
 #ifdef BROWSER_PERF
-    printf("[BRPERF] bytes=%d parse=%lu js=%lu css=%lu extcss=%lu layout=%lu "
-           "total=%lu ms items=%d words=%lu measures=%lu\n",
+    printf("[BRPERF] bytes=%d parse=%llu js=%llu css=%llu extcss=%llu layout=%llu "
+           "total=%llu us items=%d words=%lu measures=%lu\n",
            html_len, t_parse - t_a, t_js - t_parse, t_css - t_js,
            t_ext - t_css, t_lay - t_ext, t_lay - t_a,
            g_layout.n_items, g_layout_measure_words - w0,
@@ -1248,7 +1295,26 @@ static void relayout_page(void) {
     // Drop any in-flight image fetch (its target item index is now stale) and
     // rescan; poll_images() skips items already in the cache, so only images not
     // yet loaded are fetched. An all-images-cached page fetches nothing on resize.
-    if (g_img_job >= 0) { http_fetch_read(g_img_job, (char *) g_imgfetch, 0); g_img_job = -1; }
+    //
+    // (#glassrevert, 2026-10-01) THIS WAS THE RESIZE WEDGE. This used to call
+    // http_fetch_read(g_img_job, buf, 0) "to free the job" - but
+    // sys_http_fetch_read() only releases the kernel-side slot once the job
+    // has FINISHED; called on a job that is still downloading (the only case
+    // this line exists to handle), it silently did nothing and the slot leaked
+    // forever, because g_img_job is forgotten on the very next line. The six
+    // ASYNC_FETCH_MAX slots are a GLOBAL pool shared by every process on the
+    // machine, so a single resize-drag over a page that is still loading
+    // images could leak all of them, after which http_fetch_start() fails
+    // system-wide and poll_images()'s "fetch table full: retry next tick"
+    // path (no backoff) retried forever - alive, scheduled, burning CPU, a
+    // wedged window on a running process ("crashed... and never went away").
+    // http_fetch_cancel() is the real primitive for "abandon this job" (it
+    // already handles both the running and the finished case - see its own
+    // kernel comment) and this file already calls it correctly three screens
+    // down, from the Stop button. The kernel was also hardened separately
+    // (kernel/proc/syscall.c sys_http_fetch_read()) so this class of mistake
+    // cannot leak a slot even if a caller gets it wrong again.
+    if (g_img_job >= 0) { http_fetch_cancel(g_img_job); g_img_job = -1; }
     g_img_item = -1;
     g_img_scan = 0;
 }
@@ -1426,16 +1492,18 @@ static void trunc_fit(const char *s, int size, int max_w, char *out, int cap) {
 }
 
 // ---- Tab strip geometry (shared by draw_tabstrip() and hit-testing) ----
-// (browserglass) Tabs are pills ON the backdrop, y = PAD, height TAB_H,
-// exactly the Task Manager's tab row. The "+" is a round pill at the right.
-#define TAB_Y          PAD
+// (glassrevert) Square tabs flush with the top-left of the window, the same
+// stacking the OS taskbar's window-button strip uses. The "+" sits at the
+// right, also square.
+#define TAB_Y          0
 #define TAB_MIN_W      90
 #define TAB_MAX_W      170
-#define NEWTAB_W       TAB_H
+#define TAB_GAP        2
+#define NEWTAB_W       TABSTRIP_H
 
 static void tabstrip_geom(int *tab_w_out, int *area_x_out) {
-    int area_x = PAD;
-    int area_w = WIN_WIDTH - PAD - NEWTAB_W - TAB_GAP - PAD;
+    int area_x = 0;
+    int area_w = WIN_WIDTH - NEWTAB_W - TAB_GAP;
     int n = g_tab_count > 0 ? g_tab_count : 1;
     int w = (area_w - (n - 1) * TAB_GAP) / n;
     if (w > TAB_MAX_W) w = TAB_MAX_W;
@@ -1450,7 +1518,7 @@ static int tab_rect(int i, int *x, int *y, int *w, int *h) {
     *x = ax + i * (tw + TAB_GAP);
     *y = TAB_Y;
     *w = tw;
-    *h = TAB_H;
+    *h = TABSTRIP_H;
     return 1;
 }
 // The close (x) hit-box: the right end of the tab, same rect draw_tabstrip()
@@ -1458,42 +1526,25 @@ static int tab_rect(int i, int *x, int *y, int *w, int *h) {
 static void tab_close_rect(int i, int *x, int *y, int *w, int *h) {
     int tx = 0, ty = 0, tw = 0, th = 0;
     tab_rect(i, &tx, &ty, &tw, &th);
-    *w = 18; *h = th;
-    *x = tx + tw - *w - 6;
+    *w = 16; *h = th;
+    *x = tx + tw - *w - 4;
     *y = ty;
 }
 static int newtab_rect(int *x, int *y, int *w, int *h) {
-    *x = WIN_WIDTH - PAD - NEWTAB_W;
+    *x = WIN_WIDTH - NEWTAB_W;
     *y = TAB_Y;
     *w = NEWTAB_W;
-    *h = TAB_H;
+    *h = TABSTRIP_H;
     return 1;
 }
 
-// (browserglass) One pill on the frosted backdrop: the Task Manager /
-// Calculator / Image Viewer tab pill. Selected = accent fill; otherwise
-// panel-coloured glass with the panel border, hover lightens. The AA edge
-// takes the backdrop colour at the pill's own centre. Returns the fill so
-// the caller can blend what it draws inside toward it.
-static uint32_t draw_bd_pill(int x, int y, int w, int h, int sel, int hov) {
-    uint32_t outer = bd_at(x + w / 2, y + h / 2);
-    uint32_t fill = sel ? COL_ACCENT : (hov ? gui_lighten(COL_PANEL, 18) : COL_PANEL);
-    gui_fill_rounded_aa(window_handle, x, y, w, h, h / 2, fill, outer);
-    if (!sel) gui_rounded_border(window_handle, x, y, w, h, h / 2, COL_SEPARATOR);
-    return fill;
-}
-
-// Draw the tab strip: one pill per tab on the backdrop (accent for the
-// active one), a chip dot and a truncated label inside each, a stroked close
-// x on each when there is more than one, and a round "+" pill.
-//
-// Anti-flash note (glass doc section 11): every pixel this paints lies
-// inside a pill that is REFILLED here, so a hover repaint is idempotent and
-// a changed label never smears. The only thing that can leave stale pill
-// pixels on the backdrop is a change in the NUMBER of tabs (the pills get
-// wider or narrower), which redraw() catches by comparing g_tab_count with
-// the previous frame's and re-blitting the backdrop (edglass trap 3: track
-// every "uncovers margin" transition at ONE place).
+// Draw the tab strip: one square button per tab (the shared gui_button()
+// primitive, same widget the nav/Go buttons use, so it bevels/squares off
+// exactly like the rest of the OS's classic chrome), the active tab in the
+// accent variant, a small flat chip square + truncated label drawn over it,
+// and a stroked close x when there is more than one tab. Plain rects, no
+// backdrop, no AA pill: every pixel here is refilled each draw, so a hover
+// or label change is idempotent.
 static void draw_tabstrip(void) {
     for (int i = 0; i < g_tab_count; i++) {
         int tx, ty, tw, th;
@@ -1502,19 +1553,22 @@ static void draw_tabstrip(void) {
         const char *url = active ? url_buffer : g_tabs[i].url;
         uint32_t chip = (i < TAB_CHIP_N) ? TAB_CHIP_COLORS[i] : g_tabs[i].chip_col;
 
-        uint32_t fill = draw_bd_pill(tx, ty, tw, th, active, i == g_tab_hover);
-        uint32_t ink  = active ? COL_ACCENT_INK : (i == g_tab_hover ? COL_TEXT_DIM : COL_FAINT);
+        gui_state_t st = active ? GUI_ST_PRESSED : (i == g_tab_hover ? GUI_ST_HOVER : GUI_ST_NORMAL);
+        gui_button(window_handle, tx, ty, tw, th, "",
+                  active ? GUI_BTN_PRIMARY : GUI_BTN_SECONDARY, st);
+        uint32_t ink = active ? COL_ACCENT_INK : (i == g_tab_hover ? COL_TEXT : COL_FAINT);
 
-        // Chip dot: on the accent pill the chip reads as the accent ink (a
-        // teal chip on a teal pill would vanish); elsewhere its own colour.
+        // Chip: a small flat square (no AA circle - square corners, the
+        // CDE/Motif house style). On the active (accent-filled) tab it reads
+        // as the accent ink so it never vanishes against its own color.
         int chip_d = 8;
-        int ccx = tx + 10, ccy = ty + (th - chip_d) / 2;
-        gui_fill_circle_aa(window_handle, ccx, ccy, chip_d, active ? COL_ACCENT_INK : chip, fill);
+        int ccx = tx + 8, ccy = ty + (th - chip_d) / 2;
+        gui_fill_rect(window_handle, ccx, ccy, chip_d, chip_d, active ? COL_ACCENT_INK : chip);
 
         char lbl[40];
         tab_label(url, lbl, sizeof(lbl));
-        int lx = ccx + chip_d + 8;
-        int lw = tx + tw - (g_tab_count > 1 ? 26 : 12) - lx;
+        int lx = ccx + chip_d + 6;
+        int lw = tx + tw - (g_tab_count > 1 ? 22 : 10) - lx;
         char fit[40];
         trunc_fit(lbl, 12, lw > 0 ? lw : 1, fit, sizeof(fit));
         win_draw_text_ttf(window_handle, lx, ty + (th - 12) / 2 - 1, fit, 12, ink);
@@ -1530,52 +1584,51 @@ static void draw_tabstrip(void) {
         }
     }
 
-    // New tab: a round pill with a STROKED plus (glass doc section 6: never a
-    // typed glyph for a mark that must look like a mark).
+    // New tab: a square button with a stroked plus (never a typed glyph for
+    // a mark that must look like a mark).
     int nx, ny, nw, nh;
     newtab_rect(&nx, &ny, &nw, &nh);
-    draw_bd_pill(nx, ny, nw, nh, 0, 0);
+    gui_button(window_handle, nx, ny, nw, nh, "", GUI_BTN_SECONDARY, GUI_ST_NORMAL);
     int pcx = nx + nw / 2, pcy = ny + nh / 2;
     gui_thick_line(window_handle, pcx - 5, pcy, pcx + 5, pcy, 2, COL_TEXT_DIM);
     gui_thick_line(window_handle, pcx, pcy - 5, pcx, pcy + 5, 2, COL_TEXT_DIM);
 }
 
 // ---- Bookmarks row geometry (shared by draw_bookmarks_bar() and hit-testing) ----
-// (browserglass) Chips are 20px pills inside the panel: an 8px dot, an 11px
-// label. Width is measured, never guessed.
-#define BMK_GAP    6
+// (glassrevert) Each bookmark is a square button sized to its label: an 8px
+// chip square, an 11px label. Width is measured, never guessed.
+#define BMK_GAP    4
 #define BMK_CHIP   8
 #define BMK_TTF    11
 
 static int bookmark_rect(int i, int *x, int *y, int *w, int *h) {
     if (i < 0 || i >= g_bookmark_count) return 0;
-    int bx = INNER_X;
+    int bx = 8;
     for (int j = 0; j < i; j++) {
-        int jw = gui_ttf_width(g_bookmarks[j].label, BMK_TTF) + BMK_CHIP + 22;
+        int jw = gui_ttf_width(g_bookmarks[j].label, BMK_TTF) + BMK_CHIP + 18;
         bx += jw + BMK_GAP;
     }
-    *w = gui_ttf_width(g_bookmarks[i].label, BMK_TTF) + BMK_CHIP + 22;
+    *w = gui_ttf_width(g_bookmarks[i].label, BMK_TTF) + BMK_CHIP + 18;
     *x = bx;
     *y = BOOKMARKS_Y;
     *h = BOOKMARKS_H;
     return 1;
 }
 
-// The bookmarks row: its band of the panel is refilled first (flat C_PANEL,
-// idempotent), then each chip. A hovered chip gets the lightened pill fill;
-// the dot and the label are drawn over whichever fill is under them.
+// The bookmarks row: the band is refilled flat first (idempotent), then each
+// bookmark is a square gui_button() with a chip square + label drawn over it.
 static void draw_bookmarks_bar(void) {
-    gui_fill_rect(window_handle, INNER_X, BOOKMARKS_Y, INNER_W, BOOKMARKS_H, COL_PANEL);
+    gui_fill_rect(window_handle, 0, BOOKMARKS_Y, WIN_WIDTH, BOOKMARKS_H, COL_PANEL);
     for (int i = 0; i < g_bookmark_count; i++) {
         int bx, by, bw, bh;
         if (!bookmark_rect(i, &bx, &by, &bw, &bh)) break;
-        if (bx + bw > INNER_X + INNER_W) break;   // out of room: drop silently, no scroll (v1)
+        if (bx + bw > WIN_WIDTH - 8) break;   // out of room: drop silently, no scroll (v1)
         int hov = (bx <= g_mx_last && g_mx_last < bx + bw && by <= g_my_last && g_my_last < by + bh);
-        uint32_t fill = hov ? gui_lighten(COL_PANEL, 18) : COL_PANEL;
-        if (hov) gui_fill_rounded_aa(window_handle, bx, by, bw, bh, bh / 2, fill, COL_PANEL);
+        gui_button(window_handle, bx, by, bw, bh, "", GUI_BTN_SECONDARY,
+                  hov ? GUI_ST_HOVER : GUI_ST_NORMAL);
         int ccy = by + (bh - BMK_CHIP) / 2;
-        gui_fill_circle_aa(window_handle, bx + 8, ccy, BMK_CHIP, g_bookmarks[i].chip_col, fill);
-        win_draw_text_ttf(window_handle, bx + 8 + BMK_CHIP + 6, by + (bh - BMK_TTF) / 2 - 1,
+        gui_fill_rect(window_handle, bx + 6, ccy, BMK_CHIP, BMK_CHIP, g_bookmarks[i].chip_col);
+        win_draw_text_ttf(window_handle, bx + 6 + BMK_CHIP + 6, by + (bh - BMK_TTF) / 2 - 1,
                           g_bookmarks[i].label, BMK_TTF, hov ? COL_TEXT : COL_TEXT_DIM);
     }
 }
@@ -1598,16 +1651,18 @@ static void settings_item_rect(int idx, int *x, int *y, int *w, int *h) {
 }
 static const char *SETTINGS_ITEM_LABELS[SETTINGS_ITEM_N] = { "Home", "Reconnect", "About" };
 
+// (glassrevert) A plain dropdown card, the same THEME_COLOR_MENU_* tokens
+// every other menu in the OS (gui_menu's own popups) reads, instead of the
+// glass card/edge tokens. Radius comes from the active theme's style
+// (gui_active_style().radius), so it is square under Classic and rounded
+// under Modern, like every other themed card.
 static void draw_settings_menu(void) {
     if (!g_settings_open) return;
     int mx, my, mw, mh;
     settings_menu_rect(&mx, &my, &mw, &mh);
-    // (browserglass) The popout floats over the bookmarks row / the page
-    // sheet, whose colour is the document's: a non-AA fill (no outer colour
-    // to blend toward) with the DK_EDGE_GLASS stroke that is rated for an
-    // unknown surface (glass doc section 1), not the panel's own border.
-    gui_fill_rounded(window_handle, mx, my, mw, mh, 8, COL_CARD_BG);
-    gui_rounded_border(window_handle, mx, my, mw, mh, 8, COL_EDGE_GLASS);
+    int r = gui_active_style().radius;
+    gui_fill_rounded(window_handle, mx, my, mw, mh, r, COL_CARD_BG);
+    gui_rounded_border(window_handle, mx, my, mw, mh, r, COL_MENU_BORDER);
     for (int i = 0; i < SETTINGS_ITEM_N; i++) {
         int ix, iy, iw, ih;
         settings_item_rect(i, &ix, &iy, &iw, &ih);
@@ -1616,7 +1671,7 @@ static void draw_settings_menu(void) {
         int hov = (g_mx_last >= ix && g_mx_last < ix + iw && g_my_last >= iy && g_my_last < iy + ih);
         // Refill the row every draw (flat card colour) so a hover that moved
         // off it never leaves the highlight behind.
-        gui_fill_rounded(window_handle, ix, iy, iw, ih, 5, hov ? COL_RAISED : COL_CARD_BG);
+        gui_fill_rect(window_handle, ix, iy, iw, ih, hov ? COL_RAISED : COL_CARD_BG);
         win_draw_text_ttf(window_handle, ix + 10, iy + (ih - 12) / 2 - 1,
                           SETTINGS_ITEM_LABELS[i], 12, COL_TEXT);
     }
@@ -1631,21 +1686,8 @@ static void url_star_rect(int *x, int *y, int *w, int *h) {
     *y = URL_BAR_Y + (URL_BAR_H - *h) / 2;
 }
 
-// (browserglass) A toolbar pill ON the panel: same shape as the tab pills
-// but the outer colour is the flat panel fill, so a repaint over itself is
-// exact. Hover lightens, press lightens more, disabled keeps the resting
-// fill (its glyph goes faint instead: a control that still does something
-// is never greyed as a whole, glass doc section 8).
-static void draw_panel_pill(int x, int y, int w, int h, gui_state_t st) {
-    uint32_t fill = COL_PANEL;
-    if (st == GUI_ST_HOVER)   fill = gui_lighten(COL_PANEL, 18);
-    if (st == GUI_ST_PRESSED) fill = gui_lighten(COL_PANEL, 30);
-    gui_fill_rounded_aa(window_handle, x, y, w, h, h / 2, fill, COL_PANEL);
-    gui_rounded_border(window_handle, x, y, w, h, h / 2, COL_SEPARATOR);
-}
-
 // Back / Forward arrows: STROKED with the shared gui_thick_line (a typed "<"
-// is a thin chevron at 1:1; glass doc section 6, "the arrow is stroked").
+// is a thin chevron at 1:1).
 static void draw_arrow_icon(int bx, int by, int bw, int bh, int forward, uint32_t col) {
     int cx = bx + bw / 2, cy = by + bh / 2;
     int tip = forward ? cx + 5 : cx - 5, tail = forward ? cx - 5 : cx + 5;
@@ -1655,18 +1697,23 @@ static void draw_arrow_icon(int bx, int by, int bw, int bh, int forward, uint32_
     gui_thick_line(window_handle, tip, cy, back, cy + 4, 2, col);
 }
 
-// Draw the toolbar row: nav pills, address field, overflow pill and Go.
+// Draw the toolbar row: nav buttons, address field, overflow button and Go.
+// (glassrevert) nav/settings buttons are the shared gui_button() primitive
+// directly (GUI_BTN_SECONDARY, blank label + icon overlay), the same call
+// the pre-glass toolbar made - no more hand-rolled "panel pill".
 static void draw_toolbar(void) {
-    // The row's band of the panel, refilled flat (idempotent) so a control
-    // that shrank (the caret, a shorter URL) leaves nothing behind.
-    gui_fill_rect(window_handle, INNER_X, TOOLBAR_Y, INNER_W, TOOLBAR_H, COL_PANEL);
+    // The row's band, refilled flat (idempotent) so a control that shrank
+    // (the caret, a shorter URL) leaves nothing behind, plus a 1px separator
+    // at the bottom edge.
+    gui_fill_rect(window_handle, 0, TOOLBAR_Y, WIN_WIDTH, TOOLBAR_H, COL_PANEL);
+    gui_fill_rect(window_handle, 0, TOOLBAR_Y + TOOLBAR_H - 1, WIN_WIDTH, 1, COL_SEPARATOR);
 
-    // Navigation pills with stroked faces.
+    // Navigation buttons.
     int en[4] = { can_go_back(), can_go_forward(), 1, 1 };
     for (int i = 0; i < 4; i++) {
         int bx, by, bw, bh;
         nav_btn_rect(i, &bx, &by, &bw, &bh);
-        draw_panel_pill(bx, by, bw, bh, btn_state(i, en[i]));
+        gui_button(window_handle, bx, by, bw, bh, "", GUI_BTN_SECONDARY, btn_state(i, en[i]));
         uint32_t ic = en[i] ? COL_TEXT : COL_FAINT;
         if (i == 0)      draw_arrow_icon(bx, by, bw, bh, 0, ic);
         else if (i == 1) draw_arrow_icon(bx, by, bw, bh, 1, ic);
@@ -1676,10 +1723,11 @@ static void draw_toolbar(void) {
         } else draw_home_icon(bx, by, bw, bh, ic);
     }
 
-    // Address field: a pill-shaped input (DK_INPUT_FILL / DK_INPUT_BORDER),
-    // an accent focus ring, a TLS lock, TTF text + caret, and a bookmark star.
-    int fr = URL_BAR_H / 2;
-    gui_fill_rounded_aa(window_handle, URL_BAR_X, URL_BAR_Y, URL_BAR_W, URL_BAR_H, fr, COL_FIELD_BG, COL_PANEL);
+    // Address field: a themed input (field_bg/field_border), an accent focus
+    // ring, a TLS lock, TTF text + caret, and a bookmark star. Radius comes
+    // from the active style, so it is square under Classic.
+    int fr = gui_active_style().radius;
+    gui_fill_rounded(window_handle, URL_BAR_X, URL_BAR_Y, URL_BAR_W, URL_BAR_H, fr, COL_FIELD_BG);
     if (url_focused) {
         // (#745) was COL_ACCENT, the theme accent, which is 1.76:1 on the
         // Dark theme's surface. gui_pal()->focus is the keyboard-position
@@ -1734,16 +1782,17 @@ static void draw_toolbar(void) {
     gui_fill_star_aa(window_handle, sx, sy, sw,
                      star_bookmarked ? 100 : 0, COL_ACCENT, COL_FAINT, COL_FIELD_BG);
 
-    // Settings (overflow): three-dot pill.
+    // Settings (overflow): three-dot button.
     {
         int bx, by, bw, bh;
         nav_btn_rect(5, &bx, &by, &bw, &bh);
-        draw_panel_pill(bx, by, bw, bh, g_settings_open ? GUI_ST_PRESSED : btn_state(5, 1));
+        gui_button(window_handle, bx, by, bw, bh, "", GUI_BTN_SECONDARY,
+                  g_settings_open ? GUI_ST_PRESSED : btn_state(5, 1));
         draw_dots_icon(bx, by, bw, bh, COL_TEXT);
     }
 
     // Go button: the shared primary button (palette accent), the only solid
-    // accent element on the panel.
+    // accent element on the toolbar.
     gui_button(window_handle, GO_BTN_X, GO_BTN_Y, GO_BTN_W, GO_BTN_H, "Go",
                GUI_BTN_PRIMARY, btn_state(4, 1));
 }
@@ -2291,29 +2340,28 @@ static void draw_content(void) {
 // SYS_HTTP_FETCH_PROGRESS, and a shared-style gui_progress() bar whenever the
 // server sent a Content-Length. No Content-Length means no bar - a guessed
 // percentage would be worse than none, so it is withheld, not faked.
-// (browserglass) The status ROW lives inside the panel now (STATUS_Y, under
-// the viewport); its band is refilled flat every draw so a changed string
-// never smears (the Image Viewer's status row does the same).
+// (glassrevert) Flush with the window edges, a flat themed band with a 1px
+// separator on top, refilled every draw so a changed string never smears.
 static void draw_status_bar(void) {
     int sy = STATUS_Y;
-    gui_fill_rect(window_handle, INNER_X, sy, INNER_W, STATUS_H, COL_PANEL);
+    gui_fill_rect(window_handle, 0, sy, WIN_WIDTH, STATUS_H, COL_PANEL);
+    gui_fill_rect(window_handle, 0, sy, WIN_WIDTH, 1, COL_SEPARATOR);
 
     uint32_t ink = last_was_error ? COL_ERROR : COL_TEXT_DIM;
     if (is_loading) ink = COL_ACCENT;
 
-    // Small dot as a loading/status indicator.
-    gui_fill_circle_aa(window_handle, INNER_X, sy + (STATUS_H - 8) / 2, 8,
-                       is_loading ? COL_ACCENT : (last_was_error ? COL_ERROR : COL_TEXT_DIM),
-                       COL_PANEL);
+    // Small square dot as a loading/status indicator.
+    gui_fill_rect(window_handle, 8, sy + (STATUS_H - 8) / 2, 8, 8,
+                 is_loading ? COL_ACCENT : (last_was_error ? COL_ERROR : COL_TEXT_DIM));
 
-    int text_x = INNER_X + 16;
-    int text_y = sy + (STATUS_H - 11) / 2 - 1;
+    int text_x = 24;
+    int text_y = sy + (STATUS_H - 11) / 2;
     if (is_loading) {
         char line[160];
         int pct = fetch_progress_text(line, sizeof(line));
         if (pct >= 0) {
             int bar_w = 120;
-            int bar_x = INNER_X + INNER_W - bar_w;
+            int bar_x = WIN_WIDTH - TOOLBAR_PAD - bar_w;
             int bar_y = sy + (STATUS_H - 8) / 2;
             gui_progress(window_handle, bar_x, bar_y, bar_w, 8, pct);
         }
@@ -2325,56 +2373,18 @@ static void draw_status_bar(void) {
     br_text_sz(window_handle, text_x, text_y, msg, 11, ink);
 }
 
-// (browserglass) The glass panel: soft shadow, AA rounded fill, 1px border,
-// 1px top highlight; the same layering the Task Manager's, the Calculator's
-// and the Image Viewer's draw_panel() use. Every outer colour is sampled from
-// the backdrop under that edge, so the fringe and corners match what the
-// blit put there. Drawn EVERY frame on purpose: the same inputs give the
-// same pixels, so the repaint is idempotent (section 11: only the backdrop
-// blit is a commit on the chrome side).
-static void draw_panel(int x, int y, int w, int h) {
-    uint32_t below = bd_at(x + w / 2, y + h + 3);
-    // Mean of the four corner samples: gui_fill_rounded_aa takes ONE outer
-    // colour, and the blur keeps the four within a few levels of each other.
-    uint32_t c0 = bd_at(x + 4, y + 4),     c1 = bd_at(x + w - 4, y + 4),
-             c2 = bd_at(x + 4, y + h - 4), c3 = bd_at(x + w - 4, y + h - 4);
-    uint32_t outer = 0;
-    for (int sh = 0; sh <= 16; sh += 8) {
-        uint32_t m = (((c0 >> sh) & 0xFF) + ((c1 >> sh) & 0xFF) + ((c2 >> sh) & 0xFF) + ((c3 >> sh) & 0xFF)) / 4;
-        outer |= m << sh;
-    }
-    gui_soft_shadow(window_handle, x, y + 2, w, h, PANEL_R, below);
-    gui_fill_rounded_aa(window_handle, x, y, w, h, PANEL_R, COL_PANEL, outer);
-    gui_rounded_border(window_handle, x, y, w, h, PANEL_R, COL_SEPARATOR);
-    win_draw_rect(window_handle, x + PANEL_R, y + 1, w - 2 * PANEL_R, 1, gui_lighten(COL_PANEL, 16));
-}
-
 // Redraw the whole window.
 //
-// (browserglass) THE ANTI-FLASH CONTRACT (docs/UI_GLASS_DESIGN_SYSTEM.md
-// section 11). The backdrop blit self-commits, so it runs ONLY when the
-// chrome is dirty: start, EVENT_RESIZE, EVENT_REDRAW, a wallpaper change, or
-// a change in the number of tab pills (they get wider or narrower and would
-// leave stale pill pixels on the backdrop). Everything else is a plain draw
-// onto the panel, refilled every frame. The page viewport is drawn LAST
-// among the chrome-adjacent bands (draw_content() is the engine's paint and
-// is not edited here; its inline-image win_draw_image calls self-commit, as
-// they always did, but by then every band above and beside the page is
-// already in the content buffer). The window is never cleared with a flat
-// fill: the panel and pills cover every pixel that changes, and the margins
-// are the backdrop.
+// (glassrevert) No backdrop, no commit-on-dirty dance: every band is a flat,
+// idempotent draw straight onto the window, top to bottom - tab strip,
+// toolbar, bookmarks bar, progress line, status row, then the page viewport
+// (draw_content() is the engine's paint and is not edited here). The window
+// background fill at the start covers any area none of those bands reach
+// (there should be none at a correct WIN_HEIGHT, but a resize race is cheap
+// insurance, not a correctness requirement).
 static void redraw(void) {
     unsigned long t_r0 = uptime_ms();
-    sync_backdrop();
-    if (g_tab_count != g_last_tab_count) {
-        g_last_tab_count = g_tab_count;
-        g_chrome_dirty = 1;
-    }
-    if (g_chrome_dirty) {
-        gui_glass_backdrop_blit(window_handle, g_bd);
-        g_chrome_dirty = 0;
-    }
-    draw_panel(PAD, PANEL_Y, WIN_WIDTH - 2 * PAD, WIN_HEIGHT - PAD - PANEL_Y);
+    gui_fill_rect(window_handle, 0, 0, WIN_WIDTH, WIN_HEIGHT, COL_WINDOW_BG);
     draw_tabstrip();
     draw_toolbar();
     draw_bookmarks_bar();
@@ -2522,20 +2532,20 @@ static int fetch_progress_text(char *out, int cap) {
 // worse than none); otherwise a small fixed sliver as an honest "something
 // is happening" indicator, never a fabricated percentage.
 static void draw_progress_line(void) {
-    // (browserglass) Inside the panel, spanning the viewport width: the panel
-    // colour when idle (invisible), the DK_PROGRESS_TRACK plus the accent
-    // fraction while loading.
-    gui_fill_rect(window_handle, INNER_X, PROGRESS_Y, INNER_W, PROGRESS_H, COL_PANEL);
+    // (glassrevert) Flush with the window edges: the track colour when idle
+    // (invisible against the band above/below it), plus the accent fraction
+    // while loading.
+    gui_fill_rect(window_handle, 0, PROGRESS_Y, WIN_WIDTH, PROGRESS_H, COL_PANEL);
     if (!is_loading) return;
-    gui_fill_rect(window_handle, INNER_X, PROGRESS_Y, INNER_W, PROGRESS_H, COL_TRACK);
+    gui_fill_rect(window_handle, 0, PROGRESS_Y, WIN_WIDTH, PROGRESS_H, COL_TRACK);
     int pct = 8;
     if (g_fetch_phase == HTTP_PHASE_RECEIVING && g_fetch_content_len > 0) {
         pct = (int) (((unsigned long long) g_fetch_bytes * 100) / g_fetch_content_len);
         if (pct > 100) pct = 100;
         if (pct < 8) pct = 8;
     }
-    int w = (INNER_W * pct) / 100;
-    gui_fill_rect(window_handle, INNER_X, PROGRESS_Y, w, PROGRESS_H, COL_ACCENT);
+    int w = (WIN_WIDTH * pct) / 100;
+    gui_fill_rect(window_handle, 0, PROGRESS_Y, w, PROGRESS_H, COL_ACCENT);
 }
 
 static void poll_fetch(void) {
@@ -2641,7 +2651,7 @@ static void poll_fetch(void) {
         url_fresh = 1;
         redraw();
     } else {                                   // error -> one retry, then report
-        http_fetch_read(g_fetch_id, content_buffer, 0);   // free the job
+        http_fetch_cancel(g_fetch_id);   // (#glassrevert) was http_fetch_read(..,0): see relayout_page()
         g_fetch_id = -1;
         if (g_fetch_retry < 1) {
             g_fetch_retry++;
@@ -2865,7 +2875,8 @@ static void free_images(void) {
 // cancel any in-flight job, and arm the scan. poll_images() does the work.
 static void images_begin(void) {
     free_images();
-    if (g_img_job >= 0) { http_fetch_read(g_img_job, (char *) g_imgfetch, 0); g_img_job = -1; }
+    // (#glassrevert) was http_fetch_read(..,0): see relayout_page()'s comment.
+    if (g_img_job >= 0) { http_fetch_cancel(g_img_job); g_img_job = -1; }
     g_img_scan = 0;
     g_img_item = -1;
 }
@@ -2901,7 +2912,7 @@ static void poll_images(void) {
                 }
             }
         } else {
-            http_fetch_read(g_img_job, (char *) g_imgfetch, 0);   // free the job
+            http_fetch_cancel(g_img_job);   // (#glassrevert) was http_fetch_read(..,0)
             g_img_job = -1;
         }
         g_img_item = -1;
@@ -2964,7 +2975,7 @@ static void stop_load(void) {
 }
 
 // ============================================================================
-// Tabs [no-ticket] (browser-glass) - see the scope comment by g_tabs above.
+// Tabs - see the scope comment by g_tabs above.
 // ============================================================================
 
 // Short label for a tab: strip the scheme, keep host (+ a hint of path), cut
@@ -3052,7 +3063,7 @@ static void tab_close(int idx) {
 }
 
 // ============================================================================
-// Bookmarks bar [no-ticket] (browser-glass)
+// Bookmarks bar
 // ============================================================================
 
 static int bookmark_find(const char *url) {
@@ -3087,7 +3098,7 @@ static void bookmark_navigate(int idx) {
 }
 
 // ============================================================================
-// Settings (overflow) menu [no-ticket] (browser-glass)
+// Settings (overflow) menu
 // ============================================================================
 
 // "Reconnect": clear any #549 breaker wait state and retry the current page
@@ -3508,9 +3519,469 @@ static void handle_mouse_up(gui_event_t *event) {
 // Main
 // ============================================================================
 
+// ===========================================================================
+// THE CONTRACT (docs/CONTRACT_COVERAGE_PLAN.md task 3 phase 2, no-ticket).
+// SCOPE: the browser CHROME - navigation, tabs, bookmarks, the settings
+// (overflow) menu and the address bar. The render/layout/JS engine
+// (#245, userland/apps/browser/port/) is deliberately out of scope here, the
+// same split the repo's agent roster already draws (browser-ui vs
+// browser-engine); it is a separate, much larger surface and belongs to its
+// own tranche.
+//
+// STATIC, not projected - the toolbar buttons are hit-tested by a plain index
+// (btn_at()/a switch on idx in handle_mouse_up()), the settings menu by
+// settings_menu_action()'s switch on item index, and tabs/bookmarks by array
+// index - none of these is a CONST TABLE carrying a function pointer, so none
+// is a structural control table in contract-lint check 5's sense. Every row
+// below calls the EXACT function the matching switch case calls
+// (run_go_back wraps the same go_back() button 0 runs), so it cannot drift
+// even though completeness is human-checked rather than structural.
+//
+// contract_is_invocation() is checked as THE FIRST STATEMENT OF main(),
+// before win_create(). Unlike Writer/Sheets/Slides (which hide their window
+// creation inside office_app's oapp_create(), invisible to contract-lint
+// check 8's literal win_create() match), Browser calls win_create() directly
+// in main(), so this ordering is NOT optional here: check 8 would fail the
+// build on it. On that spawn path window_handle is still its static-
+// initializer -1, so EVERY action below is CT_TF_LIVE_ONLY and additionally
+// self-guards with "if (window_handle < 0) refuse" - belt and braces, because
+// drawing through an uncreated window handle is not a path worth probing for
+// safety on a GUI library this contract did not audit. Only the plain state
+// reads (nav.url, tabs.count, ...) answer anything on a bare spawn, which is
+// honestly all a spawn-only probe of a single-window app with no persisted
+// config can ever show.
+//
+// address.set_and_go is the one NEW primitive: a non-interactive caller has
+// no address-bar text field to type into, so it sets url_buffer (bounds-
+// checked against MAX_URL_LEN, which str_cpy() itself does not check) and
+// calls the SAME navigate() Enter/Go call.
+//
+// NOT COVERED: scrollbar drag, in-page link/form-control clicks (those are
+// the render engine's own hit-testing, out of this tranche's scope), and
+// text selection - gestures into the page content rather than chrome
+// controls.
+// ===========================================================================
+
+#define BR_NEED_WINDOW(outp, ocapv) do { \
+    if (window_handle < 0) { snprintf((outp), (size_t)(ocapv), "no-window"); return -1; } \
+} while (0)
+
+static const ct_terms_t k_t_nav = {
+    CT_TIME_SLOW, CT_TF_LIVE_ONLY | CT_TF_ASYNC, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE | CT_FAIL_IO | CT_FAIL_TIMEOUT, "nav.url", 0
+};
+static const ct_terms_t k_t_tabs = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE | CT_FAIL_RANGE, "tabs.active", 0
+};
+static const ct_terms_t k_t_bookmarks = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE | CT_FAIL_RANGE, "bookmarks.count", 0
+};
+static const ct_terms_t k_t_settings = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE, "settings.menu_open", 0
+};
+static const ct_terms_t k_t_settings_action = {
+    CT_TIME_SLOW, CT_TF_LIVE_ONLY | CT_TF_ASYNC, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_NEEDSLIVE | CT_FAIL_RANGE, "nav.url", 0
+};
+
+// ---- the handler wrappers: each calls the EXACT function the toolbar/menu
+// switch calls. -------------------------------------------------------------
+static int run_go_back(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    BR_NEED_WINDOW(out, ocap);
+    go_back();
+    snprintf(out, (size_t)ocap, "url=%s can_go_back=%d", url_buffer, can_go_back());
+    return 0;
+}
+static int run_go_forward(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    BR_NEED_WINDOW(out, ocap);
+    go_forward();
+    snprintf(out, (size_t)ocap, "url=%s can_go_forward=%d", url_buffer, can_go_forward());
+    return 0;
+}
+static int run_reload(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    BR_NEED_WINDOW(out, ocap);
+    if (is_loading) stop_load(); else load_current_url();   // same toggle button 2 runs
+    snprintf(out, (size_t)ocap, "url=%s is_loading=%d", url_buffer, is_loading);
+    return 0;
+}
+static int run_home(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    BR_NEED_WINDOW(out, ocap);
+    go_home();
+    snprintf(out, (size_t)ocap, "url=%s", url_buffer);
+    return 0;
+}
+static int run_address_go(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    BR_NEED_WINDOW(out, ocap);
+    load_current_url();   // same function the "Go" button runs, on the CURRENT address text
+    snprintf(out, (size_t)ocap, "url=%s", url_buffer);
+    return 0;
+}
+static int run_address_set_and_go(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    BR_NEED_WINDOW(out, ocap);
+    if (argc < 1 || !argv[0] || !argv[0][0]) { snprintf(out, (size_t)ocap, "need-url"); return -1; }
+    if (str_len(argv[0]) >= MAX_URL_LEN) { snprintf(out, (size_t)ocap, "url-too-long (max %d)", MAX_URL_LEN - 1); return -1; }
+    str_cpy(url_buffer, argv[0]);
+    url_cursor = str_len(url_buffer);
+    navigate(1);
+    snprintf(out, (size_t)ocap, "url=%s", url_buffer);
+    return 0;
+}
+static int run_tabs_new(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    BR_NEED_WINDOW(out, ocap);
+    tab_new();
+    snprintf(out, (size_t)ocap, "tabs_count=%d tabs_active=%d", g_tab_count, g_tab_active);
+    return 0;
+}
+static int run_tabs_close(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    BR_NEED_WINDOW(out, ocap);
+    int idx = (argc >= 1 && argv[0]) ? atoi(argv[0]) : g_tab_active;
+    if (idx < 0 || idx >= g_tab_count) { snprintf(out, (size_t)ocap, "out-of-range 0..%d", g_tab_count - 1); return -1; }
+    tab_close(idx);
+    snprintf(out, (size_t)ocap, "tabs_count=%d tabs_active=%d", g_tab_count, g_tab_active);
+    return 0;
+}
+static int run_tabs_switch(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    BR_NEED_WINDOW(out, ocap);
+    if (argc < 1 || !argv[0]) { snprintf(out, (size_t)ocap, "need-index"); return -1; }
+    int idx = atoi(argv[0]);
+    if (idx < 0 || idx >= g_tab_count) { snprintf(out, (size_t)ocap, "out-of-range 0..%d", g_tab_count - 1); return -1; }
+    tab_switch(idx);
+    snprintf(out, (size_t)ocap, "tabs_active=%d url=%s", g_tab_active, url_buffer);
+    return 0;
+}
+static int run_bookmarks_toggle(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    BR_NEED_WINDOW(out, ocap);
+    bookmark_toggle_current();
+    snprintf(out, (size_t)ocap, "bookmarks_count=%d starred=%d", g_bookmark_count, bookmark_find(url_buffer) >= 0);
+    return 0;
+}
+static int run_bookmarks_navigate(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    BR_NEED_WINDOW(out, ocap);
+    if (argc < 1 || !argv[0]) { snprintf(out, (size_t)ocap, "need-index"); return -1; }
+    int idx = atoi(argv[0]);
+    if (idx < 0 || idx >= g_bookmark_count) { snprintf(out, (size_t)ocap, "out-of-range 0..%d", g_bookmark_count - 1); return -1; }
+    bookmark_navigate(idx);
+    snprintf(out, (size_t)ocap, "url=%s", url_buffer);
+    return 0;
+}
+static int run_settings_open(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    BR_NEED_WINDOW(out, ocap);
+    g_settings_open = 1;
+    redraw();
+    snprintf(out, (size_t)ocap, "menu_open=%d", g_settings_open);
+    return 0;
+}
+static int run_settings_action(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    BR_NEED_WINDOW(out, ocap);
+    if (argc < 1 || !argv[0]) { snprintf(out, (size_t)ocap, "need-index"); return -1; }
+    int idx = atoi(argv[0]);
+    if (idx < 0 || idx >= SETTINGS_ITEM_N) { snprintf(out, (size_t)ocap, "out-of-range 0..%d", SETTINGS_ITEM_N - 1); return -1; }
+    settings_menu_action(idx);
+    snprintf(out, (size_t)ocap, "url=%s menu_open=%d", url_buffer, g_settings_open);
+    return 0;
+}
+
+// CT_CHECK_ACTFN: a leading-`it`-parameter mismatch is a warning, not an
+// error (contract.h); these turn it into a build-stopping one.
+CT_CHECK_ACTFN(run_go_back);
+CT_CHECK_ACTFN(run_go_forward);
+CT_CHECK_ACTFN(run_reload);
+CT_CHECK_ACTFN(run_home);
+CT_CHECK_ACTFN(run_address_go);
+CT_CHECK_ACTFN(run_address_set_and_go);
+CT_CHECK_ACTFN(run_tabs_new);
+CT_CHECK_ACTFN(run_tabs_close);
+CT_CHECK_ACTFN(run_tabs_switch);
+CT_CHECK_ACTFN(run_bookmarks_toggle);
+CT_CHECK_ACTFN(run_bookmarks_navigate);
+CT_CHECK_ACTFN(run_settings_open);
+CT_CHECK_ACTFN(run_settings_action);
+
+// ---- the readable state a caller checks a control against ------------------
+static int ct_str_url(char *o, int n)    { snprintf(o, (size_t)n, "%s", url_buffer); return 0; }
+static int ct_str_status(char *o, int n) { snprintf(o, (size_t)n, "%s", status_msg[0] ? status_msg : "(none)"); return 0; }
+static int ct_get_can_back(void)    { return can_go_back(); }
+static int ct_get_can_forward(void) { return can_go_forward(); }
+static int ct_get_is_loading(void)  { return is_loading; }
+static int ct_get_last_error(void)  { return last_was_error; }
+static int ct_get_tabs_count(void)  { return g_tab_count; }
+static int ct_get_tabs_active(void) { return g_tab_active; }
+static int ct_get_bm_count(void)    { return g_bookmark_count; }
+static int ct_get_bm_starred(void)  { return bookmark_find(url_buffer) >= 0; }
+static int ct_get_settings_open(void) { return g_settings_open; }
+
+static const ct_item_t BROWSER_ITEMS[] = {
+    // ---- value rows -----------------------------------------------------
+    {
+      .name = "nav.url",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_str_url,
+      .desc = "URL currently shown in the address bar",
+    },
+    {
+      .name = "nav.can_go_back",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_can_back,
+      .desc = "Whether the active tab has back history",
+    },
+    {
+      .name = "nav.can_go_forward",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_can_forward,
+      .desc = "Whether the active tab has forward history",
+    },
+    {
+      .name = "nav.is_loading",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_is_loading,
+      .desc = "Whether a fetch is currently in flight",
+    },
+    {
+      .name = "nav.last_was_error",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_last_error,
+      .desc = "Whether the most recent navigation ended in an error page",
+    },
+    {
+      .name = "nav.status",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_str_status,
+      .desc = "Status bar text (Loading.../HTTP nnn/Done .../an error message)",
+    },
+    {
+      .name = "tabs.count",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .lo = 1,
+      .hi = MAX_TABS,
+      .getfn = ct_get_tabs_count,
+      .desc = "Number of open tabs",
+    },
+    {
+      .name = "tabs.active",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = MAX_TABS - 1,
+      .getfn = ct_get_tabs_active,
+      .desc = "Index of the active tab",
+    },
+    {
+      .name = "bookmarks.count",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = MAX_BOOKMARKS,
+      .getfn = ct_get_bm_count,
+      .desc = "Number of bookmarks on the bookmarks bar",
+    },
+    {
+      .name = "bookmarks.current_starred",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_bm_starred,
+      .desc = "Whether the current URL is already bookmarked",
+    },
+    {
+      .name = "settings.menu_open",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_settings_open,
+      .desc = "Whether the settings (gear) overflow menu is open",
+    },
+
+    // ---- action rows: each calls the exact function the toolbar/menu
+    // switch calls, and each is LIVE_ONLY (see the block comment above) ----
+    {
+      .name = "nav.back",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_go_back,
+      .desc = "Go to the previous page in this tab's history",
+      .terms = &k_t_nav,
+    },
+    {
+      .name = "nav.forward",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_go_forward,
+      .desc = "Go to the next page in this tab's history after a Back",
+      .terms = &k_t_nav,
+    },
+    {
+      .name = "nav.reload",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_reload,
+      .desc = "Reload the current page, or cancel the in-flight fetch if one is loading (the Reload/Stop button)",
+      .terms = &k_t_nav,
+    },
+    {
+      .name = "nav.home",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_home,
+      .desc = "Navigate to the home page",
+      .terms = &k_t_nav,
+    },
+    {
+      .name = "address.go",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_address_go,
+      .desc = "Submit the address bar's current text (the Go button)",
+      .terms = &k_t_nav,
+    },
+    {
+      .name = "address.set_and_go",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_address_set_and_go,
+      .desc = "Set the address bar to argv[0] and navigate, with no text field to type into",
+      .terms = &k_t_nav,
+    },
+    {
+      .name = "tabs.new",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_tabs_new,
+      .desc = "Open another tab on the home page (the + control)",
+      .terms = &k_t_tabs,
+    },
+    {
+      .name = "tabs.close",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_tabs_close,
+      .desc = "Close the tab at argv[0] (an index, default the active tab); closing the last tab goes home instead",
+      .terms = &k_t_tabs,
+    },
+    {
+      .name = "tabs.switch",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_tabs_switch,
+      .desc = "Make the tab at argv[0] (an index) active",
+      .terms = &k_t_tabs,
+    },
+    {
+      .name = "bookmarks.toggle_current",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_bookmarks_toggle,
+      .desc = "Add the current page to the bookmarks bar, or remove it if already starred (the star in the address bar)",
+      .terms = &k_t_bookmarks,
+    },
+    {
+      .name = "bookmarks.navigate",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_bookmarks_navigate,
+      .desc = "Navigate to the bookmark at argv[0] (an index) on the bookmarks bar",
+      .terms = &k_t_nav,
+    },
+    {
+      .name = "settings.open_menu",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_settings_open,
+      .desc = "Open the settings (gear) overflow menu",
+      .terms = &k_t_settings,
+    },
+    {
+      .name = "settings.action",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_settings_action,
+      .desc = "Run overflow menu item argv[0] (an index): 0=Home, 1=Reconnect, 2=About",
+      .terms = &k_t_settings_action,
+    },
+};
+#define BROWSER_N_ITEMS ((int)(sizeof(BROWSER_ITEMS) / sizeof(BROWSER_ITEMS[0])))
+
+static const ct_contract_t BROWSER_CONTRACT = {
+    "browser", "Browser",
+    "Scope is the CHROME only (navigation, tabs, bookmarks, the settings "
+    "menu, the address bar), not the render/layout/JS engine - a separate, "
+    "much larger surface with its own agent (browser-engine) and its own "
+    "future tranche. STATIC: none of the toolbar/tabs/bookmarks/settings-menu "
+    "hit-tests is a const table carrying a function pointer, so none is a "
+    "structural control table; every row below calls the exact function the "
+    "matching switch case calls. Every action is CT_TF_LIVE_ONLY and "
+    "self-guards against window_handle < 0, because contract_is_invocation() "
+    "runs before win_create() here (check 8 matches Browser's literal "
+    "win_create() call, unlike the office_app apps), so a spawn-only probe "
+    "can read state but cannot act. address.set_and_go is the one NEW "
+    "primitive: no address-bar text field exists for a non-interactive "
+    "caller to type into. NOT covered: scrollbar drag, in-page link/form "
+    "clicks (the render engine's own hit-testing) and text selection.",
+    BROWSER_ITEMS, BROWSER_N_ITEMS,
+    0,   // no projection (see the note above)
+    0,   // no persisted config to load
+    0    // no persisted config to commit
+};
+
+
 int main(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
+    // ---- THE CONTRACT, ANSWERED BEFORE win_create() -------------------------
+    // Unlike Writer/Sheets/Slides, Browser calls win_create() literally in
+    // this function, so contract-lint check 8 requires this check to come
+    // first (and would fail the build if it did not). window_handle is still
+    // its static-initializer -1 here; every BROWSER_CONTRACT action is
+    // CT_TF_LIVE_ONLY and self-refuses on window_handle < 0, so a spawn-only
+    // probe can read state (nav.url, tabs.count, ...) but cannot act.
+    if (contract_is_invocation(argc, argv))
+        return contract_cli(argc, argv, &BROWSER_CONTRACT);
 
     // Adopt the running kernel theme so the browser matches Settings/Files.
     apply_theme(get_theme());
@@ -3536,7 +4007,12 @@ int main(int argc, char **argv) {
     // Dev: if a local /TEST.HTML fixture exists, open it instead of the
     // home page (lets the render+JS pipeline be exercised offline).
     // Dev/headless: /STARTURL.TXT (first line) overrides the startup URL.
-    { int sfd = open("/STARTURL.TXT", 0); if (sfd >= 0) { char ub[512]; long rn = read(sfd, ub, 511);
+    // #peruserrows: the per-user copy FIRST (libc/aiclient.c's web.open tool now
+    // writes <home>/STARTURL.TXT, since the ext2 root is not writable by uid
+    // 1000), then the legacy literal, which is what an offline-baked headless
+    // override still uses. Root's home is "/", so for root the two are the same
+    // file and nothing about a root session changes.
+    { int sfd = userhome_open_read(0, "STARTURL.TXT", "/STARTURL.TXT"); if (sfd >= 0) { char ub[512]; long rn = read(sfd, ub, 511);
         close(sfd); if (rn > 0) { int k = 0; while (k < rn && ub[k] != '\n' && ub[k] != '\r') k++;
             ub[k] = 0; if (k > 0) { str_cpy(url_buffer, ub); url_cursor = k; } } } }
     { FILE *tf = fopen("/TEST.HTML", "r"); if (tf) { fclose(tf); str_cpy(url_buffer, "test"); url_cursor = 4; } }
@@ -3554,6 +4030,30 @@ int main(int argc, char **argv) {
     { int cvf = cssvar_selftest(cssvar_report);
       printf("[CSSVAR] selftest: %d cases, %d failing, %s\n",
              g_cv_cases, cvf, cvf ? "FAIL" : "PASS"); }
+    { int stf = layout_stack_selftest(stack_report);
+      printf("[STACK] selftest: %d cases, %d failing, %s\n",
+             g_st_cases, stf, stf ? "FAIL" : "PASS"); }
+    /*
+     * #245 layoutsweep: the Duktape libm shim's non-finite inputs. Math.log of
+     * +Infinity used to spin in Ring 3 forever, reachable from any page in
+     * eleven characters of script, so this runs on every launch next to the
+     * other two canaries. Detail lines are gated on /BRDUMP.TXT like the cssvar
+     * ones; the summary is unconditional, and a case that HANGS is identified by
+     * the last [DSMATH] line on serial even though no summary can follow it.
+     */
+    { int dsf = dsmath_selftest(g_brdump ? dsmath_report : 0);
+      printf("[DSMATH] selftest: %d cases, %d failing, %s\n",
+             dsmath_selftest_count(), dsf, dsf ? "FAIL" : "PASS"); }
+    /*
+     * #245 deepdom: the deep-DOM depth cap, checked in the OS on every launch.
+     * A page of nested elements used to peg this process at 100% CPU with no
+     * script on it, because four separate per-insertion walks were O(tree
+     * depth). Those are O(1) now and the parsed depth is bounded; this asserts
+     * the bound is really in the shipped binary and that it costs no content.
+     */
+    { int ddf = mdb_depth_selftest(g_brdump ? deepdom_report : 0);
+      printf("[DEEPDOM] selftest: %d cases, %d failing, %s\n",
+             mdb_depth_selftest_cases(), ddf, ddf ? "FAIL" : "PASS"); }
 
     // [no-ticket] (browser-glass): seed tab 0 with whatever url_buffer ended
     // up as above (home page, or a STARTURL.TXT/TEST.HTML override).
@@ -3589,7 +4089,6 @@ int main(int argc, char **argv) {
                 break;
 
             case EVENT_REDRAW:
-                g_chrome_dirty = 1;   // (browserglass) a compositor-requested full frame re-blits the backdrop
                 redraw();
                 break;
 
@@ -3643,7 +4142,6 @@ int main(int argc, char **argv) {
                 // redraw + scroll clamp), so vertical drags don't re-parse.
                 if (event.mouse_x > 0 && event.mouse_y > 0) {
                     int new_w = event.mouse_x, new_h = event.mouse_y;
-                    if (new_w != g_win_w || new_h != g_win_h) g_chrome_dirty = 1;   // (browserglass) the backdrop is scaled to the content rect
                     g_win_w = new_w;
                     g_win_h = new_h;
                     if (g_have_layout && g_content_len > 0 && new_w != last_layout_w)

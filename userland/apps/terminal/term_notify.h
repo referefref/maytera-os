@@ -69,6 +69,36 @@
 #define TERM_MON_BELL       3
 #define TERM_MON_COUNT      4
 
+// --- The nine TERMNOTI.CFG keys, as indices -------------------------------
+// The ORDER IS THE FILE'S ORDER and is locked to TN_CFG[] in term_notify.c by a
+// _Static_assert on the count. Indices rather than nine getter/setter pairs
+// because the contract's value rows need exactly one of each per key and nine
+// duplicated pairs is nine places for a key to be wired to the wrong variable.
+#define TERM_NCFG_ENABLE                 0
+#define TERM_NCFG_FINISH_MS              1
+#define TERM_NCFG_FINISH_UNATTENDED_ONLY 2
+#define TERM_NCFG_BELL_NOTIFY            3
+#define TERM_NCFG_VISUAL_BELL            4
+#define TERM_NCFG_VISUAL_BELL_MS         5
+#define TERM_NCFG_ACTIVITY               6
+#define TERM_NCFG_SILENCE                7
+#define TERM_NCFG_SILENCE_MS             8
+#define TERM_NCFG_COUNT                  9
+
+// Read / write one key. The setter REFUSES a value outside the key's declared
+// range (it does not clamp: a contract set that silently stored something else
+// would report success for a value the caller did not ask for) and re-applies
+// the file-level defaults to every open tab, which is the documented semantics.
+int  term_notify_cfg_get(int key);
+int  term_notify_cfg_set(int key, int v);
+// Persist all nine. Returns 0, or -1 if the write failed (#743).
+int  term_notify_cfg_save(void);
+// Read TERMNOTI.CFG into the live variables WITHOUT touching the window, so a
+// windowless `terminal --contract get notify.*` answers from the user's file
+// rather than from the compiled defaults. term_notify_init() cannot be used for
+// that: it primes a window-state cache off window_handle.
+void term_notify_cfg_load(void);
+
 // Call once, after win_create() has assigned window_handle.
 void term_notify_init(void);
 

@@ -1055,7 +1055,15 @@ void gui_button(int handle, int x, int y, int w, int h, const char *label,
     // black button, so a red fallback is applied on exactly that condition -
     // this is a "0 means unset" test on a colour that no theme would ever
     // legitimately author as pure black for an error state.
-    else if (variant == GUI_BTN_DANGER)  { base = theme_color(THEME_COLOR_ERROR); if (!base) base = 0x00CC0000;
+    // [filesui] THEME-SENTINEL-OK: a FILL, not a glyph, and the author's reason
+    // above stands for a fill. Two corrections to that reason, since it is now
+    // measured: the "theme with the key missing" case CANNOT occur (themes.c
+    // seeds every parse from g_fallback_theme since 2026-08-07, and
+    // theme_get_color_by_id() returns a struct field in every arm including
+    // `default:`), so the only surviving reading is the one the comment gives
+    // second, that no theme would author pure black for an error state. Left in
+    // place rather than removed inside an unrelated change; see libc/theme.h.
+    else if (variant == GUI_BTN_DANGER)  { base = theme_color(THEME_COLOR_ERROR); if (!base) base = 0x00CC0000; /* THEME-SENTINEL-OK: a fill; no theme authors pure black for an error state */
                                            ink = gui_ink_on(base); bord = gui_ensure_contrast(gui_darken(base, 40), p->surface, GUI_FLOOR_NONTEXT); }
     else                                 { base = gui_mix(p->surface_raised, p->ink, 8); ink = p->ink; bord = p->edge_strong; }
     if (!disabled) {

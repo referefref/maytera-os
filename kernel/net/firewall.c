@@ -4,6 +4,9 @@
 #include "firewall.h"
 #include "../fs/fat.h"
 #include "../fs/bootlog.h"
+#include "../security/seclog.h"  // #kfirewall: audit the policy change
+#include "../proc/process.h"      // #kfirewall: proc_current() for the actor pid
+#include "../string.h"            // #kfirewall: the SHARED snprintf, not a private one
 #include "../fs/perms.h"
 #include "../mm/heap.h"
 #include "../serial.h"
@@ -30,6 +33,36 @@ void fw_report(const char *why) {
             c.pol_in  == FW_ACT_DENY ? "DENY" : "ALLOW",
             c.pol_out == FW_ACT_DENY ? "DENY" : "ALLOW",
             (unsigned)c.rule_count, c.rule_count == 1 ? "" : "s");
+
+    // #kfirewall: the same change, into the audit trail.
+    //
+    // WHY HERE AND NOWHERE ELSE. fw_report() is already the ONE place every
+    // policy change is summarised: the SYS_NET_FW SET handler calls it, the
+    // RELOAD op calls it, and fw_boot_load() calls it for both the loaded-from-
+    // disk and compiled-in-fail-safe cases. Auditing at each of those call sites
+    // instead would be three producers of one event, which is how one of them
+    // later gets forgotten. There is one chokepoint for the decision
+    // (rule_action) and now one for the record.
+    //
+    // THE DETAIL STRING CARRIES THE RESULTING POSTURE, not just "something
+    // changed", because the question asked of an audit trail months later is
+    // "when did inbound stop being DENY", and a line that does not say what the
+    // policy BECAME cannot answer it.
+    //
+    // Non-blocking: security_audit() is a static-ring write plus a guarded
+    // wait-queue wake, safe before seclog_init() has run (seclog_kick() returns
+    // early until g_seclog_ready), which matters because fw_boot_load() reaches
+    // this from net_init().
+    {
+        process_t *p = proc_current();
+        char d[128];
+        snprintf(d, sizeof(d), "policy now %s in=%s out=%s rules=%u (%s)",
+                 c.enabled ? "ENABLED" : "DISABLED",
+                 c.pol_in  == FW_ACT_DENY ? "DENY" : "ALLOW",
+                 c.pol_out == FW_ACT_DENY ? "DENY" : "ALLOW",
+                 (unsigned)c.rule_count, why ? why : "?");
+        seclog_report_firewall(p ? (unsigned int)p->pid : 0u, d);
+    }
     for (unsigned i = 0; i < c.rule_count && i < FW_MAX_RULES; i++) {
         kprintf("[FW]   %s %s %s %u\n",
                 c.rules[i].dir == FW_DIR_IN ? "in " : "out",
@@ -45,8 +78,23 @@ void fw_report(const char *why) {
 //
 //   file absent        -> keep the compiled-in policy (fwfilter.rs
 //                         DEFAULT_CFG). This is the virgin-image case and it
-//                         is NOT "no filtering": it is inbound DENY with
-//                         sshd permitted, outbound ALLOW.
+//                         is NOT "no filtering": it is inbound DENY, outbound
+//                         ALLOW, with three outbound allowances (tcp 80, tcp
+//                         443, udp 53) and NO inbound allowance at all on a
+//                         default build.
+//
+//                         CORRECTED 2026-10-01 (#kfirewall). This line read
+//                         "inbound DENY with sshd permitted". That was true
+//                         when written and stopped being true on 2026-08-23,
+//                         when the `allow in tcp 22` rule was removed from
+//                         DEFAULT_CFG because no shipped golden contains the
+//                         server it was holding a port open for. The removal
+//                         was deliberate and is written up in fwfilter.rs; this
+//                         sentence was simply not updated with it, and it is
+//                         the one a reader asking "do I need a firewall rule to
+//                         re-enable sshd?" would land on and be told no. The
+//                         answer is yes, and it is now derived from
+//                         MAYTERA_SSHD rather than remembered.
 //   file unreadable    -> same.
 //   file unusable      -> same, and say so loudly. "Unusable" means the parser
 //   (parse < 0)           found no valid directive at all, so honouring it

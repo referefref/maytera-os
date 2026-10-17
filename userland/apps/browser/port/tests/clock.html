@@ -1,0 +1,44 @@
+<html><head><title>245 clock resolution</title></head>
+<body id="b" style="font-family:sans-serif;background:#d6d3ce;color:#1a1a1a">
+<h1>#275 JS clock resolution</h1>
+<div id="out">running...</div>
+<script>
+// RESOLUTION IS THE SMALLEST NON-ZERO STEP THE CLOCK EVER TAKES, which is the
+// only definition that distinguishes a 1-second clock from a 1-millisecond one
+// without depending on how long the loop happened to run. A 1 s clock steps by
+// 1000 ms; a 1 ms clock steps by 1; a microsecond clock steps by about 0.001.
+var fails = 0, checks = 0, lines = [];
+function ok(name, cond, extra) {
+  checks++; if (!cond) fails++;
+  var s = (cond ? 'PASS ' : 'FAIL ') + name + (extra === undefined ? '' : ' (' + extra + ')');
+  lines.push(s); console.log('[JSCLOCK] ' + s);
+}
+function tryv(f, d) { try { return f(); } catch (e) { return d; } }
+function minStep(read) {
+  var prev = read(), best = -1;
+  for (var i = 0; i < 200000; i++) {
+    var v = read();
+    var d = v - prev;
+    if (d > 0 && (best < 0 || d < best)) best = d;
+    prev = v;
+  }
+  return best;
+}
+ok('performance_is_object', tryv(function () { return typeof performance; }, 'undefined') === 'object');
+ok('performance_now_is_function', tryv(function () { return typeof performance.now; }, 'undefined') === 'function');
+var a = tryv(function () { return performance.now(); }, -1);
+var b2 = tryv(function () { return performance.now(); }, -1);
+ok('perf_nonnegative', a >= 0, 'first=' + a);
+ok('perf_monotonic', b2 >= a);
+var ps = tryv(function () { return minStep(function () { return performance.now(); }); }, -1);
+ok('perf_step_under_1ms', ps > 0 && ps < 1, 'min step ' + ps + ' ms');
+var d1 = Date.now();
+ok('date_epoch_plausible', d1 > 1600000000000 && d1 < 4000000000000, d1);
+var ds = minStep(function () { return Date.now(); });
+ok('date_step_at_most_1ms', ds > 0 && ds <= 1, 'min step ' + ds + ' ms');
+ok('date_is_integral', Date.now() % 1 === 0);
+console.log('[JSCLOCK] CHECKS=' + checks + ' FAILS=' + fails);
+document.getElementById('out').textContent =
+  'CHECKS=' + checks + ' FAILS=' + fails + ' | ' + lines.join(' | ');
+</script>
+</body></html>

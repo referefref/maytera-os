@@ -34,6 +34,9 @@
 #include "../../libc/fcntl.h"
 #include "../../libc/userconf.h"  // #148 (local 164): userhome_path() - THE home join
 #include "../../libc/tz.h"        // #148 (local 164): tz_local_stamp() - THE local-clock stamp
+#include "../../libc/capreq.h"   // #peruserrows: THE shared capture request + consent
+#include "../../libc/contract.h"
+#include "../../libc/ctpromise.h"   // #<config-ref>: the escrow backend for file.save's promise
 
 // ---------------------------------------------------------------------------
 // Layout tokens
@@ -73,8 +76,25 @@
 // FB_MAX_W x FB_MAX_H 24bpp BMP with headroom for other formats.
 #define FBUF_CAP     (4 * 1024 * 1024)
 
-#define REQ_PATH     "/SCREENSHOT.REQ"
-#define CAP_PATH     "/SNAPWORK.BMP"
+// #peruserrows: REQ_PATH IS GONE, AND SO WAS THIS APP'S WHOLE PURPOSE. Snap
+// dropped a /SCREENSHOT.REQ trigger file naming /SNAPWORK.BMP as the output.
+// Stage 1 of the capability API DELETED that trigger (MAYTERA-SEC-2026-0035); the
+// compositor has dequeued from the kernel queue (SYS_SCREENSHOT_POLL) ever since,
+// so the file was written and never read and no capture happened for any uid, root
+// included. The request now goes through cap_capture_to() (libc/capreq.c).
+//
+// AND THE OUTPUT PATH HAD TO MOVE TOO, for a reason the syscall makes explicit:
+// kernel/gui/shotq.c re-applies perms_check() to the REQUESTER, and the file is
+// then created by the COMPOSITOR running as the session user. /SNAPWORK.BMP at the
+// root-owned ext2 root fails BOTH tests (-13 then -14), and -14 used to surface
+// only as a timeout. userscratch_path() is a location the session can write:
+// <home>/SNAPWORK.BMP with an account, /TMP/SNAPWORK.BMP without one.
+static const char *cap_work_path(void) {
+    static char p[160];
+    if (!p[0] && userscratch_path("SNAPWORK.BMP", p, sizeof p) != 0) p[0] = 0;
+    return p;
+}
+#define CAP_PATH     cap_work_path()
 
 // ---------------------------------------------------------------------------
 // State
@@ -850,13 +870,24 @@ static void capture_tick(void) {
 
     if (g_cap == CAP_SETTLE) {
         if (now - g_cap_t0 < 300) return;   // one recomposed frame is enough
-        int fd = sys_open(REQ_PATH, O_WRONLY | O_CREAT | O_TRUNC);
-        if (fd < 0) {
-            capture_finish(0, "Capture failed: cannot write request");
+        const char *dst = CAP_PATH;
+        if (!dst[0]) {
+            capture_finish(0, "Capture failed: nowhere writable to put the image");
             return;
         }
-        write_all(fd, CAP_PATH, (long)strlen(CAP_PATH));
-        sys_close(fd);
+        char why[160]; why[0] = 0;
+        long rc = cap_capture_to(dst, why, sizeof why);
+        if (rc != 0) {
+            // Say WHY, in the status bar. A refused capture and a slow one used
+            // to look identical: a countdown that finished and nothing else.
+            char msg[200]; int m = 0;
+            const char *t = "Capture refused: ";
+            for (int k = 0; t[k] && m < (int)sizeof msg - 1; k++) msg[m++] = t[k];
+            for (int k = 0; why[k] && m < (int)sizeof msg - 1; k++) msg[m++] = why[k];
+            msg[m] = 0;
+            capture_finish(0, msg);
+            return;
+        }
         g_cap = CAP_WAIT;
         g_cap_t0 = now;
         return;
@@ -969,7 +1000,109 @@ typedef struct {
     void      (*fn)(void);
     const char *cap;       // 0 = safe
     const char *desc;
+    // #<config-ref> THE CONTRACT TERMS live in THIS table, not beside it.
+    // snapshot_project() copies this pointer straight onto the projected row, so
+    // a button's timing / success / promise is declared in the same braces as
+    // its token, its handler and its capability. A parallel terms table indexed
+    // the same way would be a second thing to keep in step, which is the whole
+    // fault this ticket removes: the reason projection beats a hand-written list
+    // is that there is only ever ONE place to edit.
+    const ct_terms_t *terms;
 } tb_act_t;
+
+
+// ---- the terms for each toolbar action (#<config-ref>) ---------------------
+// Declared per action because an ACTION's timing, success and depth are not
+// derivable from its row the way a value row's are (contract_terms_of).
+
+// The three capture buttons ARM a state machine the event-loop tick drives, so
+// they are CT_TF_ASYNC and CT_SUCC_ARMED: the call returns once the capture is
+// armed, and image.width is where the result shows up later. Claiming
+// CT_SUCC_ITEM on image.width would be a claim that the image is there when the
+// call returns, which it is not, and a caller that believed it would read 0 and
+// conclude the capture failed.
+static const ct_terms_t k_t_capture_now = {
+    CT_TIME_FAST, CT_TF_ASYNC | CT_TF_LIVE_ONLY, CT_TIME_MS_FAST,
+    CT_SUCC_ARMED, CT_DEPTH_VIEW, CT_FAIL_DENIED | CT_FAIL_NEEDSLIVE,
+    "image.width", 0
+};
+// A 3 s / 10 s countdown: the BUDGET is the countdown plus the capture, and this
+// is exactly the distinction the timing term exists for. A caller allowing
+// 250 ms for capture.delay_10s would abort work that was progressing.
+static const ct_terms_t k_t_capture_d3 = {
+    CT_TIME_SLOW, CT_TF_ASYNC | CT_TF_LIVE_ONLY, 3500,
+    CT_SUCC_ARMED, CT_DEPTH_VIEW, CT_FAIL_DENIED | CT_FAIL_NEEDSLIVE,
+    "image.width", 0
+};
+static const ct_terms_t k_t_capture_d10 = {
+    CT_TIME_LONG, CT_TF_ASYNC | CT_TF_LIVE_ONLY, 10500,
+    CT_SUCC_ARMED, CT_DEPTH_VIEW, CT_FAIL_DENIED | CT_FAIL_NEEDSLIVE,
+    "image.width", 0
+};
+// Selecting a tool sets one variable the contract also exposes directly, so the
+// caller can read annotate.tool back. Instant, and nothing outlives the window
+// until commit() persists the preference.
+static const ct_terms_t k_t_tool_select = {
+    CT_TIME_INSTANT, 0, CT_TIME_MS_INSTANT,
+    CT_SUCC_ITEM, CT_DEPTH_PREF, 0, "annotate.tool", 0
+};
+static const ct_terms_t k_t_size_cycle = {
+    CT_TIME_INSTANT, 0, CT_TIME_MS_INSTANT,
+    CT_SUCC_ITEM, CT_DEPTH_PREF, 0, "annotate.size", 0
+};
+static const ct_terms_t k_t_undo = {
+    CT_TIME_FAST, CT_TF_LIVE_ONLY, CT_TIME_MS_FAST,
+    CT_SUCC_ITEM, CT_DEPTH_VIEW, CT_FAIL_NEEDSLIVE, "edit.undo_available", 0
+};
+
+// ---- file.save: THE PROMISE (#<config-ref>) --------------------------------
+//
+// This is the row the whole task-2 promise term exists for, and it is a real
+// one, not a demonstration: save_next() writes a BMP into <home>/SCREENSHOTS and
+// records where it landed in g_saved, which this contract already exposes as the
+// CT_STR item file.last_saved.
+//
+// So the postcondition is checkable by somebody other than the action: the file
+// the action SAYS it wrote must actually exist. That is the difference the
+// success/promise terms are for. Returning 0 is save_next()'s opinion of itself;
+// "paths=2/2 deletes=0" is the escrow oracle's finding.
+//
+// The path is NOT known at call time (the name carries a timestamp and a
+// collision suffix), so the post names it as "item:file.last_saved" and
+// ctpromise.c resolves it at SETTLE time, after the action has chosen it. The
+// scope is the output folder, which is what the KERNEL grant is scoped to: while
+// this action runs, this process may write inside <home>/SCREENSHOTS and nowhere
+// else, and may delete nothing at all, because the escrow never mints a delete
+// grant. That is enforcement at Ring 0, not a userland promise (see escrow.h).
+//
+// CONSEQUENCE, stated because it is a real behaviour change and not a detail:
+// save_next()'s bare-<home>/SNAP-<stamp>.BMP fallback is OUT of that scope, so
+// under this promise the kernel refuses it and the save fails honestly instead
+// of silently landing somewhere the promise did not name. A promise that quietly
+// widened its own scope on the failure path would not be a promise.
+static const ct_post_t k_posts_save[] = {
+    { CT_POST_PATH, "item:file.last_saved", 0, 0 },
+    { CT_POST_END,  0, 0, 0 }
+};
+static const ct_promise_t k_promise_save = {
+    "snapshot file.save: the capture is written into <home>/SCREENSHOTS and the "
+    "path it reports through file.last_saved exists afterwards; nothing is deleted",
+    "home:SCREENSHOTS",   // the escrow scope: the ONE prefix this may write in
+    60,                   // a save is seconds of work, not the 1-hour default
+    k_posts_save
+};
+static const ct_terms_t k_t_file_save = {
+    CT_TIME_SLOW, CT_TF_LIVE_ONLY, CT_TIME_MS_SLOW,
+    CT_SUCC_PATH, CT_DEPTH_FS,
+    CT_FAIL_NEEDSLIVE | CT_FAIL_IO | CT_FAIL_NOSPACE | CT_FAIL_DENIED,
+    "item:file.last_saved",
+    &k_promise_save
+};
+static const ct_terms_t k_t_gallery = {
+    CT_TIME_FAST, CT_TF_ASYNC, CT_TIME_MS_FAST,
+    CT_SUCC_RC, CT_DEPTH_SYSTEM, CT_FAIL_DENIED | CT_FAIL_NOTFOUND,
+    0, 0
+};
 
 static const tb_act_t TB_ACTS[] = {
     // Capture is a DISCLOSURE of whatever is on screen, so it is guarded on the
@@ -979,34 +1112,38 @@ static const tb_act_t TB_ACTS[] = {
     // event-loop tick, so it completes in a RUNNING app and not in a headless
     // one-shot invocation.
     { BTN_SNAP,    "capture.now",     act_snap,    "snapshot.capture",
-      "Arm an immediate screen capture (driven to completion by the running app's tick)" },
+      "Arm an immediate screen capture (driven to completion by the running app's tick)",
+      &k_t_capture_now },
     { BTN_D3,      "capture.delay_3s", act_d3,     "snapshot.capture",
-      "Arm a screen capture after a 3 second countdown" },
+      "Arm a screen capture after a 3 second countdown", &k_t_capture_d3 },
     { BTN_D10,     "capture.delay_10s", act_d10,   "snapshot.capture",
-      "Arm a screen capture after a 10 second countdown" },
+      "Arm a screen capture after a 10 second countdown", &k_t_capture_d10 },
     { BTN_PEN,     "tool.pen",        act_pen,     0,
-      "Select the freehand pen annotation tool" },
+      "Select the freehand pen annotation tool", &k_t_tool_select },
     { BTN_LINE,    "tool.line",       act_line,    0,
-      "Select the straight line annotation tool" },
+      "Select the straight line annotation tool", &k_t_tool_select },
     { BTN_BOX,     "tool.box",        act_box,     0,
-      "Select the rectangle outline annotation tool" },
+      "Select the rectangle outline annotation tool", &k_t_tool_select },
     { BTN_ARROW,   "tool.arrow",      act_arrow,   0,
-      "Select the arrow annotation tool" },
+      "Select the arrow annotation tool", &k_t_tool_select },
     { BTN_MARK,    "tool.marker",     act_mark,    0,
-      "Select the translucent highlighter annotation tool" },
+      "Select the translucent highlighter annotation tool", &k_t_tool_select },
     { BTN_CROP,    "tool.crop",       act_crop,    0,
-      "Select the crop tool, which trims the image to the dragged rectangle" },
+      "Select the crop tool, which trims the image to the dragged rectangle",
+      &k_t_tool_select },
     { BTN_SIZE,    "size.cycle",      act_size,    0,
-      "Cycle the annotation stroke size through Small, Medium and Large" },
+      "Cycle the annotation stroke size through Small, Medium and Large",
+      &k_t_size_cycle },
     { BTN_UNDO,    "edit.undo",       act_undo,    0,
-      "Undo the last annotation or crop (one level)" },
+      "Undo the last annotation or crop (one level)", &k_t_undo },
     // Writing a BMP into the user's home is not cosmetic and not reversible by
     // this app, so it takes the capability the AI tool table already carries
     // for a file write rather than inventing a second name for the same thing.
     { BTN_SAVE,    "file.save",       act_save,    "files.write",
-      "Save the current capture as a 24-bit BMP under <home>/SCREENSHOTS" },
+      "Save the current capture as a 24-bit BMP under <home>/SCREENSHOTS",
+      &k_t_file_save },
     { BTN_GALLERY, "file.open_gallery", act_gallery, "app.launch",
-      "Open the Gallery app on the <home>/SCREENSHOTS folder" },
+      "Open the Gallery app on the <home>/SCREENSHOTS folder", &k_t_gallery },
 };
 #define TB_NACTS ((int)(sizeof(TB_ACTS) / sizeof(TB_ACTS[0])))
 
@@ -1127,7 +1264,9 @@ static void stroke_end(void) {
 // capture state and writes no image. They are declared because the surface
 // exists, with the limit in their own descriptions.
 // ---------------------------------------------------------------------------
-#include "../../libc/contract.h"
+// #<config-ref>: contract.h moved up here from just above the contract section:
+// TB_ACTS[] now carries its rows' ct_terms_t, so the types must be visible at
+// the table, not 260 lines after it.
 
 static int ct_press(const ct_item_t *it, int argc, char **argv,
                     char *out, int ocap) {
@@ -1141,6 +1280,7 @@ static int ct_press(const ct_item_t *it, int argc, char **argv,
              g_tool, g_color, g_size, g_iw, g_ih, g_status);
     return 0;
 }
+CT_CHECK_ACTFN(ct_press);
 
 static int snapshot_project(int idx, ct_item_t *out) {
     if (idx < 0 || idx >= TB_NACTS) return 0;
@@ -1155,6 +1295,7 @@ static int snapshot_project(int idx, ct_item_t *out) {
     it.actfn  = ct_press;
     it.ctx    = a;
     it.desc   = a->desc;
+    it.terms  = a->terms;   // #<config-ref>: declared in the SAME table row
     *out = it;
     return 1;
 }
@@ -1166,36 +1307,92 @@ static const ct_item_t SNAPSHOT_ITEMS[] = {
     // The three annotation preferences. Each is the variable the toolbar itself
     // assigns, and each is persisted, because "which pen and which colour" is a
     // preference and forgetting it every launch is the bug this closes.
-    { "annotate.tool", CT_ENUM, CT_RW, CT_SAFE, 'p', 0, TOOL_COUNT - 1,
-      "Pen|Line|Box|Arrow|Marker|Crop",
-      &g_tool, 0, 0, 0, 0, 0, 0,
-      "Selected annotation tool; the same variable the six tool buttons set" },
-    { "annotate.color", CT_ENUM, CT_RW, CT_SAFE, 'k', 0, SWATCH_N - 1,
-      "Red|Yellow|Green|Blue|White|Black",
-      &g_color, 0, 0, 0, 0, 0, 0,
-      "Selected annotation colour; the same variable a swatch click sets" },
-    { "annotate.size", CT_ENUM, CT_RW, CT_SAFE, 'z', 0, 2, "Small|Medium|Large",
-      &g_size, 0, 0, 0, 0, 0, 0,
-      "Annotation stroke size; the same variable the S/M/L button cycles" },
+    {
+      .name = "annotate.tool",
+      .type = CT_ENUM,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .cfgkey = 'p',
+      .hi = TOOL_COUNT - 1,
+      .options = "Pen|Line|Box|Arrow|Marker|Crop",
+      .var = &g_tool,
+      .desc = "Selected annotation tool; the same variable the six tool buttons set",
+    },
+    {
+      .name = "annotate.color",
+      .type = CT_ENUM,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .cfgkey = 'k',
+      .hi = SWATCH_N - 1,
+      .options = "Red|Yellow|Green|Blue|White|Black",
+      .var = &g_color,
+      .desc = "Selected annotation colour; the same variable a swatch click sets",
+    },
+    {
+      .name = "annotate.size",
+      .type = CT_ENUM,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .cfgkey = 'z',
+      .hi = 2,
+      .options = "Small|Medium|Large",
+      .var = &g_size,
+      .desc = "Annotation stroke size; the same variable the S/M/L button cycles",
+    },
 
-    { "image.width", CT_INT, CT_READ, CT_SAFE, 0, 0, IMG_MAX_W, 0,
-      &g_iw, 0, 0, 0, 0, 0, 0,
-      "Width in pixels of the capture currently loaded, 0 if none" },
-    { "image.height", CT_INT, CT_READ, CT_SAFE, 0, 0, IMG_MAX_H, 0,
-      &g_ih, 0, 0, 0, 0, 0, 0,
-      "Height in pixels of the capture currently loaded, 0 if none" },
-    { "image.zoom", CT_INT, CT_READ, CT_SAFE, 0, 0, 1000, 0,
-      &g_zoom, 0, 0, 0, 0, 0, 0,
-      "Zoom percent the view is fitted at, as the status bar shows it" },
-    { "edit.undo_available", CT_BOOL, CT_READ, CT_SAFE, 0, 0, 1, 0,
-      &g_undo_valid, 0, 0, 0, 0, 0, 0,
-      "Whether one level of undo is currently available" },
-    { "status", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
-      0, 0, 0, 0, ct_status_get, 0, 0,
-      "The status-bar line the window draws" },
-    { "file.last_saved", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
-      0, 0, 0, 0, ct_saved_get, 0, 0,
-      "Path of the most recent save, or (unsaved)" },
+    {
+      .name = "image.width",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = IMG_MAX_W,
+      .var = &g_iw,
+      .desc = "Width in pixels of the capture currently loaded, 0 if none",
+    },
+    {
+      .name = "image.height",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = IMG_MAX_H,
+      .var = &g_ih,
+      .desc = "Height in pixels of the capture currently loaded, 0 if none",
+    },
+    {
+      .name = "image.zoom",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1000,
+      .var = &g_zoom,
+      .desc = "Zoom percent the view is fitted at, as the status bar shows it",
+    },
+    {
+      .name = "edit.undo_available",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .var = &g_undo_valid,
+      .desc = "Whether one level of undo is currently available",
+    },
+    {
+      .name = "status",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_status_get,
+      .desc = "The status-bar line the window draws",
+    },
+    {
+      .name = "file.last_saved",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_saved_get,
+      .desc = "Path of the most recent save, or (unsaved)",
+    },
 };
 
 static const ct_contract_t *snapshot_contract(void);
@@ -1250,8 +1447,14 @@ int main(int argc, char **argv) {
     // before win_create(), is what makes the API usable from a headless test
     // harness and from the AI tool loop without a compositor. `win` stays -1,
     // which is what the four drawing guards read.
-    if (contract_is_invocation(argc, argv))
+    if (contract_is_invocation(argc, argv)) {
+        // #<config-ref>: file.save declares a PROMISE, so the escrow backend must
+        // be registered or contract.c refuses the action rather than running it
+        // with its postconditions unchecked. contract-lint enforces that this
+        // call exists in any app that declares a promise.
+        contract_use_escrow_promises();
         return contract_cli(argc, argv, &SNAPSHOT_CONTRACT);
+    }
 
     snapshot_load();
 

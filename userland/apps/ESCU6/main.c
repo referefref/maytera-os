@@ -10,7 +10,8 @@
 //        (which now enters the KERNEL escrow contract) creates the date folder,
 //        moves the images bytes-intact, deletes nothing, and verifies FULFILLED.
 //   (A2) THE KERNEL IS THE AUTHORITY: after escrow_request() (the thin client)
-//        enters the kernel contract, RAW out-of-scope write and RAW delete are
+//        enters the kernel contract, a RAW out-of-scope write is refused and a
+//        RAW delete is redirected into the Recycle Bin, and
 //        refused BY THE KERNEL - the userland aicap grant/deny no longer exists,
 //        so this is the kernel enforcing, not any userland check. The bypass is
 //        inherent: these are raw syscalls issued as uid 0.
@@ -112,8 +113,16 @@ int main(void) {
     long w_in    = r_open_w(SC2 "/ok.txt");               // in-scope write
     if (w_in >= 0) syscall1(SYS_CLOSE, w_in);
     int a2_in    = (w_in >= 0);                           // kernel must allow
-    int a2_del   = (r_unlink(SC2 "/todel.txt") < 0);      // kernel no-delete invariant
-    int a2_intact= exists(SC2 "/todel.txt") && !exists(OUTF);
+    // 2026-10-03: the kernel REDIRECTS a marked actor's delete into the user's
+    // Recycle Bin instead of refusing it. The file leaves its path and the
+    // bytes survive; /APPS/ESCRVT proves the recoverability half.
+    int a2_del   = (r_unlink(SC2 "/todel.txt") == 0) && !exists(SC2 "/todel.txt");
+    // todel.txt is deliberately NOT checked here: a2_del above requires it to
+    // be GONE (the delete is redirected into the bin, not refused, since
+    // 2026-10-03), and this line still required it to be PRESENT. The two
+    // contradicted each other, so this assertion could never pass again. What
+    // is left is the one op on this path that IS still a refusal.
+    int a2_intact= !exists(OUTF);
     int cl = c ? escrow_close(c) : ESCROW_ERROR;          // PARTIAL -> kernel abort
     // After close the marker is cleared: the same out-of-scope write now works.
     long w_after = r_open_w(OUTF);
@@ -124,8 +133,8 @@ int main(void) {
     line("A2.escrow_request entered the kernel contract", a2_enter);
     line("A2.KERNEL refused a RAW out-of-scope write (aicap bypassed)", a2_out);
     line("A2.KERNEL allowed a RAW in-scope write", a2_in);
-    line("A2.KERNEL refused a RAW delete (no-delete invariant)", a2_del);
-    line("A2.refused ops had no effect", a2_intact);
+    line("A2.KERNEL redirected a RAW delete into the recycle bin", a2_del);
+    line("A2.the still-refused out-of-scope write left nothing behind", a2_intact);
     line("A2.after close, ordinary proc again (out-of-scope write ok)", a2_after);
     line("A2.THE KERNEL IS THE AUTHORITY (enforcement not in userland)", a2);
     overall = overall && a2;

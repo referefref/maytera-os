@@ -73,7 +73,9 @@ int  term_prefs_poll_reload(void);
 // the pty.
 int  term_prefs_dialog(void);
 
-// The terminal.* tool contract (#241/#233), for `terminal --contract ...`.
-extern const ct_contract_t TERMINAL_CONTRACT;
+// The terminal.* tool contract (#241/#233) is declared in term_contract.h, not
+// here. It stopped being a tail on this file's preferences when it grew to cover
+// the shell builtins, the menu bar, three runtime lists, the profile store's
+// edit operations and the nine notification keys.
 
 #endif // TERM_PREFS_H

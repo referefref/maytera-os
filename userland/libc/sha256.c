@@ -6,6 +6,29 @@
 // Ported verbatim in behaviour from kernel crypto/sha256.c (FIPS 180-4).
 // See sha256.h for why this port exists rather than a syscall.
 
+// ---------------------------------------------------------------------------
+// THIS FILE IS A DELIBERATE TWIN OF kernel/crypto/sha256.c (backlog D1).
+//
+// D1 asked for the two to be de-duplicated. Measured 2026-10-01 and the answer
+// was NO, with the evidence in kernel/crypto/sha256_twin_kat.sh's header. Short
+// version: the kernel build container only receives `git archive <commit>
+// kernel`, so a shared file here is absent from the kernel build; and two
+// existing oracles (pbkdf2_shadow_kat.sh, secretuse_kat.sh) stage the kernel
+// sha256.c by sed-ing its includes, so an #ifdef-split shared file would leave
+// the userland branch covered by NOTHING while the tree looked de-duplicated.
+//
+// So the fork stays and is GATED instead: kernel/crypto/sha256_twin_kat.sh
+// compiles BOTH real files on the host and fails if they ever disagree on any
+// digest, across the padding boundaries and the streaming paths. It runs on
+// every land via crypto/run-all-kats.sh. If you change the algorithm in either
+// file, that oracle is what tells you the other one did not follow.
+//
+// DO NOT "fix" this by copying the kernel file over the top. The remaining
+// differences are intentional: the kernel carries HMAC-SHA256, the
+// -DRUST_SHA256 strangler dispatcher and dlprof instrumentation, none of which
+// belong in libc.
+// ---------------------------------------------------------------------------
+
 #include "sha256.h"
 #include "string.h"
 
@@ -126,7 +149,12 @@ void sha256_final(sha256_ctx_t *ctx, uint8_t digest[32]) {
         digest[i * 4 + 3] = (uint8_t)(ctx->state[i]);
     }
 
-    memset(ctx, 0, sizeof(*ctx));
+    // Not memset: in sha256() the ctx is a stack local that is dead after
+    // this call, which is the exact shape gcc -O2 deletes as a dead store
+    // (see string.h on secure_zero). The buffer still holds up to 63 bytes
+    // of the last partial block. The kernel twin uses crypto_zero here for
+    // the same reason; secure_zero is libc's one shared equivalent.
+    secure_zero(ctx, sizeof(*ctx));
 }
 
 void sha256(const void *data, size_t length, uint8_t digest[32]) {

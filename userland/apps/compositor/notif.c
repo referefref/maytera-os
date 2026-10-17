@@ -156,7 +156,9 @@ static int kv_int(const char *buf,const char *key,int def){
     return def;
 }
 static void load_prefs(void){
-    int fd=sys_open(ALERTS_CFG,0); if(fd<0) return;
+    // #peruser2: the user's own alert preferences first, then the system default.
+    // Settings writes <home>/CONFIG/ALERTS.CFG in the same commit.
+    int fd=userconf_open_read("ALERTS.CFG", ALERTS_CFG); if(fd<0) return;
     char buf[512]; long n=sys_read(fd,buf,sizeof(buf)-1); sys_close(fd);
     if(n<=0) return; buf[n]=0;
     p_enabled  = kv_int(buf,"enabled",1);
@@ -197,11 +199,14 @@ static void push_notification(int sev,const char*title,const char*body){
 static long g_off = 0;
 void notif_init(void) {
     { char _sp[256];       // fresh spool each session; old records already shown
-      if (userconf_path(SPOOL_NAME, _sp, sizeof(_sp)) == 0) sys_unlink(_sp); }
+      // [foundbugs] userconf_path_scratch(), matching libc/notify.c's writer:
+      // see userconf.h for why the no-account case cannot use the plain
+      // CONFIG-relative path.
+      if (userconf_path_scratch(SPOOL_NAME, _sp, sizeof(_sp)) == 0) sys_unlink(_sp); }
     g_off = 0;
 }
 static void poll_spool(void) {
-    int fd = userconf_open_read(SPOOL_NAME, 0);   // #683: no legacy fallback, see notify.c
+    int fd = userconf_open_read_scratch(SPOOL_NAME);   // #683/#foundbugs: no legacy fallback; scratch fallback when there is no account, see notify.c
     if (fd < 0) return;
     static char buf[8200];
     long n = sys_read(fd, buf, sizeof(buf) - 1);

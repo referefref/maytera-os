@@ -24,8 +24,14 @@ int  fdown_release_rs(uint32_t slot);
 int  fdown_check_rs(uint32_t slot, uint32_t owner);
 uint32_t fdown_owner_rs(uint32_t slot);
 int  fdown_mark_dead_if_owner_rs(uint32_t slot, uint32_t owner);
+// #fdreclaim: claim the teardown of a slot `owner` leaked. 1 = this call owns
+// it and must free its buffers then fdown_release_rs() it; 0 = not ours.
+int  fdown_take_for_reap_rs(uint32_t slot, uint32_t owner);
+// 0 free, 1 live, 2 dead (leaked), 3 being reclaimed. Diagnostics/audit only.
+int  fdown_state_rs(uint32_t slot);
 uint32_t fdown_refusals_rs(void);
 uint32_t fdown_exit_marks_rs(void);
+uint32_t fdown_reaped_rs(void);
 int  fdown_selftest_rs(void);
 
 // Release every legacy fd slot the exiting process group owned, by poisoning
@@ -33,6 +39,25 @@ int  fdown_selftest_rs(void);
 // Defined in proc/fdlayer.c (it owns the tables), called from proc_exit().
 // Runs under cli() on the dying process's own stack.
 void fdown_proc_exit(uint32_t owner);
+
+// #fdreclaim: RECLAIM every legacy fd slot the now-gone thread group leaked,
+// freeing the read/write windows they hold, and return them to the pool.
+// Poisoning (above) only made them unreachable; this is what makes them
+// reusable. Called from proc_exit() on EVERY exit, leader or worker thread: it
+// only acts once the group has no live member left, which is the condition that
+// makes freeing the buffers safe. Defined in proc/fdlayer.c (it owns the
+// tables). Runs under cli(); frees but never blocks. See the block comment
+// there for the full safety argument and for what it deliberately does not do.
+void fdown_proc_reclaim(uint32_t owner);
+
+// #fdreclaim: how many of the LEGACY_MAX_FDS-3 usable slots are free now. The
+// instrument the gated oracle samples; a ceiling that falls and never recovers
+// is the signature of a slot leak.
+int  legacy_fd_free_slots(void);
+
+// #fdreclaim: DEV-ONLY. Disable the reclaim for this boot (/CONFIG/FDRECLAIM.OFF),
+// restoring the pre-fix leak so one build can be measured both ways.
+void fdreclaim_set_disabled(int off);
 
 // Boot-time: run the self-test and prove the Rust slot count agrees with
 // LEGACY_MAX_FDS. Defined in proc/fdlayer.c, called from main.c.

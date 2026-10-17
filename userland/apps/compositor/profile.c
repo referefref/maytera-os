@@ -80,17 +80,28 @@ extern void set_wallpaper_anim_palette(int p);
 // NOTE: the FAT driver is 8.3-only (no long/leading-dot names), so the profile
 // is stored as <home>/UIPROFIL.YML rather than the literal ~/.ui-profile.yaml.
 // (LFN support to use the exact name is tracked separately.)
+// [noaccount] THIS WAS A SECOND IMPLEMENTATION OF "WHERE IS HOME", and it is
+// how the desktop profile stayed broken after every other per-account file was
+// fixed. It did its own getpwuid(), its own trailing-slash strip and its own
+// join, so when the shared accessor learned about the no-account session this
+// one did not: MEASURED on golden 2565, the only two remaining refusals on an
+// otherwise clean boot were both this file, `userconf_write_all REFUSED
+// path=/UIPROFIL.YML rc=-13`, while THEME.CFG and all four dock settings
+// beside it saved correctly.
+//
+// libc/userconf.h says in as many words that it exists to stop exactly this
+// ("two implementations of 'where is home' is exactly how a sandbox root and
+// the paths inside it come to disagree"). One joiner, and this is now a caller
+// of it. For a session WITH an account, including root, userhome_path(NULL,
+// ...) produces the identical string this did, so nothing about the supported
+// case changes; for a session with none it produces a path that can actually
+// be written.
+//
+// The out buffer is char[120] at both call sites. On failure the path is left
+// EMPTY rather than half-built, so the callers' existing fallback to the
+// literal "/UIPROFIL.YML" still fires and nothing is written to a partial path.
 static void prof_path(char *out) {
-    struct passwd *pw = getpwuid(getuid());
-    const char *d = (pw && pw->pw_dir && pw->pw_dir[0]) ? pw->pw_dir : "/";
-    int i = 0;
-    if (!(d[0] == '/' && d[1] == '\0')) {        // home is not just "/"
-        while (d[i] && i < 70) { out[i] = d[i]; i++; }
-        if (i > 0 && out[i-1] == '/') i--;        // strip trailing slash
-    }
-    const char *f = "/UIPROFIL.YML"; int j = 0;
-    while (f[j] && i < 110) out[i++] = f[j++];
-    out[i] = '\0';
+    if (userhome_path(0, "UIPROFIL.YML", out, 120) != 0) out[0] = '\0';
 }
 
 // Current logged-in session username, e.g. for keying the Start menu's
@@ -357,8 +368,11 @@ static void prof_apply(const char *k, int v) {
 }
 
 void profile_load(void) {
+    // [noaccount] the per-account copy first, then the legacy one at the
+    // filesystem root: the same asymmetric READ rule libc/userconf.h states,
+    // so an upgraded machine that has only the old file keeps its profile.
     char path[120]; prof_path(path);
-    int fd = sys_open(path, 0);
+    int fd = path[0] ? sys_open(path, 0) : -1;
     if (fd < 0) fd = sys_open("/UIPROFIL.YML", 0);
     if (fd < 0) return;
     // (#745) 5120, matching profile_save()'s buffer: the icon list is now
@@ -680,7 +694,7 @@ void profile_save(void) {
     // only sys_write(), as this function used to, is blind to exactly the
     // failure that matters.
     char path[120]; prof_path(path);
-    int rc = userconf_write_all(path, buf, (unsigned long)len);
+    int rc = path[0] ? userconf_write_all(path, buf, (unsigned long)len) : -1;
     if (rc != 0 && path[0] == '/') {
         rc = userconf_write_all("/UIPROFIL.YML", buf, (unsigned long)len);
     }

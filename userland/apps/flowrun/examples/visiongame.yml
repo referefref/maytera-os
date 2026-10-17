@@ -1,41 +1,53 @@
-# visiongame.yml - AI-VISION: watch an app's screen and drive it (#469).
+# visiongame.yml - AI-VISION: launch an app, watch its screen and drive it (#469).
 #
-# WHAT IT DOES. A perceive -> decide -> act loop: photograph the Game Boy
-# emulator's window, show the picture to the model, press the key it names, and
-# repeat until the model says the objective is met or the budget runs out.
-# AT MOST 8 vision calls: `max_iters: 8` on the agent bounds the passes and
-# `max_calls: 8` on the decide node is the independent backstop, so neither a
-# rewiring nor a loop bug can turn this into an unbounded spend.
+# WHAT IT DOES. A launch -> perceive -> decide -> act loop: start the Game Boy
+# emulator, photograph its window, show the picture to the model, press the key
+# it names, and repeat until the model says the objective is met or the budget
+# runs out. AT MOST 8 vision calls: `max_iters: 8` on the agent bounds the
+# passes and `max_calls: 8` on the decide node is the independent backstop, so
+# neither a rewiring nor a loop bug can turn this into an unbounded spend.
 #
 # THE NODE VOCABULARY IS GENERIC. Nothing in the runner knows what a Game Boy
-# is: `capture` photographs a window, `llm` reads a picture, `input` presses a
-# key. Point the same three nodes at any app. Everything Game-Boy-specific in
-# this file is TEXT: the target title, the crop rect and the prompt.
+# is: `launch` starts an app from the system's own app manifest, `capture`
+# photographs a window, `llm` reads a picture, `input` presses a key. Point the
+# same four nodes at any app. Everything Game-Boy-specific in this file is TEXT:
+# the launch id, the target title, the crop rect and the prompt.
 #
-# WHAT IT ASKS OF YOU, ONCE. Both halves are privileged and both go through a
-# human. On the first capture and again on the first keypress, flowrun opens a
-# small "Maytera Flow" window and prints to the serial console:
+# IT STARTS FROM A COLD DESKTOP. This file used to open with "/APPS/GBEMU must be
+# running with a ROM loaded", a precondition the flow could not satisfy itself,
+# so on a machine where the emulator was not already open it failed on its first
+# node with "no visible window matches target 'app:GBEMU'". The `launch` node is
+# that missing first step. It is IDEMPOTENT: if a Game Boy window is already
+# open it launches nothing and uses the one that is there, so re-running the
+# flow never piles up a second emulator.
+#
+# WHAT IT ASKS OF YOU, ONCE. Both halves of driving another app are privileged
+# and both go through a human. On the first capture and again on the first
+# keypress, flowrun opens a small "Maytera Flow" window and prints to the serial
+# console:
 #     flowrun: CONSENT NEEDED for screen.capture (scope ...)
 # Press a key IN THAT WINDOW (the kernel will not raise a consent prompt without
 # real hardware input to a window this process owns), then approve the prompt
 # the compositor draws. A synthetic keypress can never do either of these: the
 # kernel marks it INPUT_SRC_SYNTHETIC and it never stamps the input credit.
 # Both grants then last up to 15 minutes, so you are asked twice per run, not
-# twice per iteration.
+# twice per iteration. Launching is NOT one of them: it is classified
+# process.launch / low risk, exactly as the AI assistant's app.launch is, and is
+# audited rather than gated.
 #
 # BEFORE YOU RUN IT
-#   1. /APPS/GBEMU must be running with a ROM loaded, its window visible and not
-#      minimized. This flow never launches it: it drives what is already there.
-#   2. An AI key must be configured for the running user (Settings > AI).
-#   3. Check `target` below matches the emulator window's title. GBEMU titles
-#      its window after the loaded ROM and falls back to "Game Boy", so
-#      "app:GBEMU" is the more stable match and is what is used here.
+#   1. An AI key must be configured for the running user (Settings > AI).
+#   2. Nothing else. With cartridges under /ROMS the emulator opens its ROM
+#      navigator, which is a menu the model drives with UP/DOWN and x like any
+#      other. With no cartridges it says NO ROMS FOUND, the flow still runs, and
+#      it honestly reports max_iters rather than claiming an objective it could
+#      not reach. To open one cartridge directly, add `rom: <part of its name>`
+#      to the launch node and the OS resolves it against /ROMS.
 #
 # ON FAILURE it prints FLOWRUN-FAIL <reason> and exits non-zero. No key, no
-# consent, no network, an unmatched target or an oversized capture are all
-# reported as themselves. There is no path here that reports success for a loop
-# that did not run.
-
+# consent, no network, an unknown app id, a launch that produced no window, an
+# unmatched target or an oversized capture are all reported as themselves. There
+# is no path here that reports success for a loop that did not run.
 #
 # WHY THE RECT IS SET, AND WHY SMALL (measured on golden 2474). The whole 344x400
 # window at quality 65 encodes to about 15.6 KB, and that request FAILED with
@@ -46,13 +58,30 @@
 # large-body failure is an OPEN DEFECT in the TLS/send path, not a cap. This crop
 # is a working default, NOT a fix for that. Re-measure the rect against a real
 # capture if the window size changes.
+#
+# EVERY TEXT VALUE HERE FITS IN 512 BYTES, which is FLOW_VAL_MAX, the per-param
+# ceiling in the shared graph model. The prompt was 599 bytes and was being
+# TRUNCATED at 511 on parse, silently, losing the end of the key guidance. The
+# parser now says so on stderr when it happens; keep new values under the limit.
 
 name: visiongame
+description: "Launch the Game Boy emulator, look at its screen and drive it with the model"
 
 nodes:
   - id: t1
     type: trigger
     params: { kind: manual }
+
+  # START. Idempotent: an already-open Game Boy window is used as-is. `app` is a
+  # launch id from the system app manifest (/CONFIG/STARTMENU/SYSTEM.D), the same
+  # list the Start menu shows, matched case-insensitively against the display
+  # name slug ("gameboy") or the binary basename ("gbemu").
+  - id: gb
+    type: launch
+    params:
+      app: gbemu
+      wait_for: "app:GBEMU"
+      timeout_ms: 20000
 
   # The promise: run the body until the model says the objective is met, or 8
   # passes have happened. `objective` is the human-readable promise; the
@@ -67,12 +96,9 @@ nodes:
   #
   # `rect` is "x,y,w,h" IN THE TARGET'S OWN COORDINATES (relative to the
   # window's top-left, so it survives the window being moved), and an empty rect
-  # means the whole window. It is EMPTY here on purpose: the default GBEMU
-  # window is 344x400, which already fits inside max_width/max_height, so the
-  # whole device including the LCD is captured at full resolution with no
-  # scaling, and nothing depends on a hardcoded screen size.
+  # means the whole window.
   #
-  # TO CROP TO JUST THE LCD, set rect from the skin's own geometry
+  # The rect below crops to the LCD, derived from the skin's own geometry
   # (userland/apps/gbemu/main.rs): the skin is 738x827 and the LCD occupies
   # x 26..702, y 5..459 of it, i.e. 3.5%..95.1% across and 0.6%..55.5% down. For
   # a W x H CONTENT area that is roughly "0.035W, 0.006H, 0.916W, 0.549H", plus
@@ -93,7 +119,10 @@ nodes:
 
   # DECIDE. An `llm` node with an `image` input port is a vision call. The reply
   # format is pinned so the act step can be parsed out of it reliably, and so
-  # `goal_met` (which the runner parses out of the reply) is always present.
+  # `goal_met` (which the runner parses out of the reply) is always present. The
+  # key names live in `system` rather than `prompt` because they are a property
+  # of the device, not of this objective, and because both strings have to stay
+  # under FLOW_VAL_MAX.
   - id: see
     type: llm
     params:
@@ -101,20 +130,20 @@ nodes:
       max_calls: 8
       system: >-
         You are operating a Game Boy emulator by looking at screenshots of it.
-        Answer in EXACTLY this three-line format and write nothing else:
+        Key names you may use: ENTER is Start, x is the A button (confirm), z is
+        the B button (cancel), RSHIFT is Select, and UP DOWN LEFT RIGHT are the
+        D-pad. Answer in EXACTLY this three-line format and write nothing else:
         state: <one short sentence describing what is on screen>
         goal_met: true or false
         keys: <one or two key names from the list, or the word none>
       prompt: >-
         Objective: a new game has started. That means the title screen and any
         intro are over and the game is running: the player is choosing NEW GAME,
-        or dialogue or the overworld is on screen. Look at the screenshot.
-        If the objective is already met, answer goal_met: true and keys: none.
-        Otherwise pick the key that makes progress toward it.
-        Key names you may use: ENTER is Start, x is the A button (confirm),
-        z is the B button (cancel), RSHIFT is Select, and UP DOWN LEFT RIGHT are
-        the D-pad. On a title screen press ENTER. On a menu, move with UP or DOWN
-        and confirm with x. To advance dialogue press x.
+        or dialogue or the overworld is on screen. Look at the screenshot. If the
+        objective is already met, answer goal_met: true and keys: none. Otherwise
+        pick the key that makes progress toward it. On a title screen press
+        ENTER. On a menu or a list, move with UP or DOWN and confirm with x. To
+        advance dialogue press x.
 
   # ACT. `after: 'keys:'` is what makes a model reply safe to act on: only the
   # text following that marker, to the end of that line, is read as keys. Without
@@ -145,6 +174,8 @@ nodes:
 
 edges:
   - from: [t1, out]
+    to:   [gb, in]
+  - from: [gb, out]
     to:   [ag, in]
   - from: [shot, image]
     to:   [see, image]

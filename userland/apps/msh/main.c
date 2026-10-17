@@ -4,6 +4,7 @@
 #include "../../libc/unistd.h"
 #include "../../libc/pwd.h"
 #include "../../libc/userconf.h"   // #745: <home>/APPS on PATH
+#include "../../libc/capreq.h"     // #peruserrows: THE shared capture request + consent
 #include "../../libc/termios.h"
 #include "../../libc/aiclient.h"
 #include "../../libc/pipeline.h"   // #745 local 108: the ONE pipeline runner
@@ -466,25 +467,42 @@ static int builtin_exit(command_t *cmd) {
     return code;
 }
 
-// screenshot [path]: request a remote screen capture. msh cannot map the
-// composited framebuffer itself (only the compositor owns it), so this simply
-// drops a /SCREENSHOT.REQ trigger that the compositor services once per frame.
-// With no arg the compositor writes /SCREENSHOT.BMP; an absolute path arg
-// (e.g. `screenshot /MYSHOT.BMP`) is passed through as the output target.
+// screenshot [path]: request a screen capture. msh cannot map the composited
+// framebuffer itself (only the compositor owns it), so it asks the kernel.
+//
+// #peruserrows: THIS BUILTIN WROTE A FILE NOTHING READS, FOR EVERY UID INCLUDING
+// ROOT. It dropped /SCREENSHOT.REQ, and that trigger was DELETED by Stage 1 of
+// the capability API (MAYTERA-SEC-2026-0035: the file drop let any Ring-3 app
+// capture the whole desktop, every window on screen, to a path of its choosing,
+// with no uid check, no capability, no consent and no audit). The compositor's
+// screenshot_poll() has dequeued from the KERNEL-MEDIATED queue
+// (SYS_SCREENSHOT_POLL) ever since. So this was never a per-user-path bug: it was
+// a dead writer, and the honest fix is the syscall, not a different filename. It
+// now goes through cap_capture_to() (libc/capreq.c), which requests, raises the
+// trusted compositor consent prompt only if no grant already covers the path, and
+// names the refusal when there is one.
+//
+// CONSENT IS NOW REQUIRED, AND THAT IS THE POINT. A capture driven from an SSH
+// exec channel, which is what the old file drop was built for, cannot be
+// consented to by anybody, so it is refused WITH A REASON instead of silently
+// producing nothing. The default output is the session's own writable location,
+// because both the requester AND the compositor (which creates the file) must be
+// able to write it: the ext2 root is root-owned 0755 and yields -14.
 static int builtin_screenshot(command_t *cmd) {
-    const char *body = "1\n";
-    if (cmd->argc > 1 && cmd->args[1][0] == '/') body = cmd->args[1];
-    int fd = sys_open("/SCREENSHOT.REQ", 0x41 | 0x200 /*O_WRONLY|O_CREAT|O_TRUNC*/);
-    if (fd < 0) {
-        printf("screenshot: could not create /SCREENSHOT.REQ\n");
+    char out[192];
+    if (cmd->argc > 1 && cmd->args[1][0] == '/') {
+        strncpy(out, cmd->args[1], sizeof(out) - 1); out[sizeof(out) - 1] = 0;
+    } else if (userscratch_path("SCREENSHOT.BMP", out, sizeof(out)) != 0) {
+        printf("screenshot: cannot work out where to write it (no home, no /TMP)\n");
         return 1;
     }
-    unsigned long len = 0;
-    while (body[len]) len++;
-    sys_write(fd, body, len);
-    sys_close(fd);
-    printf("screenshot: requested -> %s\n",
-           (cmd->argc > 1 && cmd->args[1][0] == '/') ? cmd->args[1] : "/SCREENSHOT.BMP");
+    char why[160]; why[0] = 0;
+    long rc = cap_capture_to(out, why, sizeof(why));
+    if (rc != 0) {
+        printf("screenshot: refused (%ld): %s\n", rc, why[0] ? why : "unknown reason");
+        return 1;
+    }
+    printf("screenshot: queued -> %s (the compositor writes it on a later frame)\n", out);
     return 0;
 }
 

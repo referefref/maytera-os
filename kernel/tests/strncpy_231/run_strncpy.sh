@@ -28,15 +28,18 @@ build_and_run() {   # $1 = string.c source, $2 = output tag
         echo "  compile of harness FAILED:"; sed -n 1,20p "$d/cc2.log"; rm -rf "$d"; return 2; }
     gcc -m64 -fsanitize=address "$d/t.o" "$d/string.o" -o "$d/t" 2>"$d/ld.log" || {
         echo "  link FAILED:"; sed -n 1,20p "$d/ld.log"; rm -rf "$d"; return 2; }
-    local rc=0 try
-    for try in 1 2 3; do
-        ASAN_OPTIONS=detect_leaks=0:abort_on_error=0 "$d/t" >"$d/$tag.out" 2>&1
-        rc=$?
-        if grep -q "#231 KERNEL strncpy" "$d/$tag.out"; then break; fi
-        if ! grep -q "DEADLYSIGNAL" "$d/$tag.out"; then break; fi
-        rc=3
-        sleep 2
-    done
+    # #deadtests: ONE shared ASan runner (tools/asan/asan-run). It disables
+    # ADDR_NO_RANDOMIZE, which is the ACTUAL cause of the DEADLYSIGNAL
+    # startups this loop used to retry: the host kernel has
+    # vm.mmap_rnd_bits=32 and gcc ASan assumes ~28, so some layouts collide
+    # with the shadow mapping. It is not host LOAD, as the old comment here
+    # said. --expect keeps a crash that happened AFTER startup a result.
+    local rc=0
+    bash ../../../tools/asan/asan-run \
+        --opts detect_leaks=0:abort_on_error=0 \
+        --expect "#231 KERNEL strncpy" \
+        -- "$d/t" >"$d/$tag.out" 2>&1
+    rc=$?
     cp "$d/$tag.out" "./$tag.out"
     rm -rf "$d"
     return $rc

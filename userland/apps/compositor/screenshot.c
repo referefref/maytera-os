@@ -3,15 +3,20 @@
 // The machine is real hardware driven over SSH (no host-side QMP capture), so
 // we grab the compositor's own composited backbuffer (g_fb, the exact buffer
 // fb_flip presents) and write it to a small, valid image file that SSH can
-// `cat` back. Two triggers, both file-driven so they work over an SSH exec
-// channel whose stdout is not captured:
+// `cat` back.
 //
-//   1. The msh `screenshot [path]` builtin writes /SCREENSHOT.REQ.
-//   2. Anything that creates /SCREENSHOT.REQ (e.g. `echo 1 > /SCREENSHOT.REQ`).
+// CORRECTED #peruserrows (2026-10-01). This said there were "two triggers, both
+// file-driven": the msh `screenshot` builtin writing /SCREENSHOT.REQ, and
+// `echo 1 > /SCREENSHOT.REQ`. BOTH WERE REMOVED BY STAGE 1 OF THE CAPABILITY API
+// (MAYTERA-SEC-2026-0035), as screenshot_poll()'s own comment further down has
+// said since: the file drop is DELETED, not merely checked, and the only Ring-3
+// route in is SYS_SCREENSHOT_REQUEST gated on a screen.capture grant. msh's
+// builtin and Maytera Snap went on writing that file for months, which is what a
+// stale header does for you. msh now calls the syscall (libc/capreq.c).
 //
 // screenshot_poll() is called once per compositor frame from the main loop
-// (NOT a busy/spin loop, see CLAUDE.md #426): it checks for the request file at
-// the normal idle/frame cadence, captures, then deletes the request.
+// (NOT a busy/spin loop, see CLAUDE.md #426): it dequeues from the kernel-
+// mediated queue at the normal idle/frame cadence and captures.
 //
 // OUTPUT SIZE CONSTRAINT: the on-device file READ over SSH is reliable only for
 // files under ~500KB (a full 1280x800x32 fb ~4MB reads back as 0 bytes). So the

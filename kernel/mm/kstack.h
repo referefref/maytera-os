@@ -103,6 +103,26 @@ void kstack_selftest(void);
 // does not return. NEVER for a golden.
 void kstack_overflow_selftest(void);
 
+// #heapinvptr: the same census as kstack_report(), as numbers a self-test can
+// compare before and after its own work. free_foreign counts kstack_free() calls
+// whose pointer was not in the live-block registry; each of those went to
+// kfree(), which is how a kernel stack came to be reported as a bad HEAP
+// pointer.
+uint64_t kstack_free_foreign_count(void);
+// #heapinvptr: kstack_free() calls whose pointer WAS a guarded kernel stack but
+// had no registry row, i.e. it had already been freed. Non-zero means a process
+// lifecycle path released the same kernel stack twice. These are REFUSED, not
+// freed, so each one leaks exactly one granule and corrupts nothing.
+uint64_t kstack_free_orphan_count(void);
+// Commits that found the same pointer ALREADY registered in another row, or
+// that landed on a row nothing had reserved. Non-zero means a registration
+// went astray despite g_ks_lock, i.e. the arbitration in
+// rustkern/kstackreg.rs has a hole; it is a number rather than only a serial
+// line because the owner's two machines have no serial port (mmlog.h).
+uint64_t kstack_reg_anomaly_count(void);
+uint64_t kstack_guarded_count(void);
+uint64_t kstack_freed_count(void);
+
 // The census: how many stacks are guarded, how many fell back and why.
 void kstack_report(void);
 

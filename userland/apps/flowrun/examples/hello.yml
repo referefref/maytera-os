@@ -7,6 +7,10 @@
 # to /HOME/FLOWOUT.TXT. Expected result: /HOME/FLOWOUT.TXT contains exactly
 # "Maytera Flow M1 OK" and the runner prints  FLOWRUN-OK 18.
 name: hello
+# The Library catalog in /APPS/FLOW shows this line. It is part of the
+# additive optional schema: flow.c skips unknown top-level keys, so the
+# runner ignores it.
+description: "Manual trigger, constant, file write (the M1 hello example)"
 nodes:
   - id: t1
     type: trigger

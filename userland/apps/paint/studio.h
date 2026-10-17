@@ -444,6 +444,14 @@ void               studio_register(const studio_op_t *op);  // op must be static
 int                studio_op_count(void);
 const studio_op_t *studio_op_get(int i);
 void               studio_register_all(void);   // registry.c: calls every *_register_all()
+// The ONE non-interactive apply path (#<config-ref>, registry.c). Applies op i
+// with `nvals` supplied parameters (the rest take their declared defaults, and
+// every one is clamped to the op's own declared range), performing the SAME
+// undo_push + apply + mark-dirty run_op()/pd_commit() perform. Used by the
+// contract projection so a headless `--contract call fx....` and a dialog OK
+// reach the identical apply. Returns the op's own rc, -1 if there is no such
+// op, -2 if there is no drawable (a spawned copy with no document).
+int                studio_op_apply_params(int i, const int *vals, int nvals);
 
 // SP_CURVE bridge: the interactive tone-curve editor lives in ui.c and owns the
 // control-point state (like colorpick owns the SP_COLOR modal). An op with an

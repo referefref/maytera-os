@@ -41,6 +41,7 @@ void    *mh_malloc(unsigned long);
 void     mh_free(void *);
 void    *mh_realloc(void *, unsigned long);
 unsigned mh___malloc_walk_report_count(void);
+unsigned mh___malloc_diag_report_count(void);
 
 // --- host-side backing for everything the allocator calls -----------------
 long mh_syscall0(long n) { (void)n; return 0; }
@@ -67,6 +68,14 @@ int    mh_strncmp(const char *a, const char *b, size_t n) { return strncmp(a, b,
 int   *mh___errno_location(void) { static int e; return &e; }
 int    mh_pthread_mutex_lock(void *m) { (void)m; return 0; }
 int    mh_pthread_mutex_unlock(void *m) { (void)m; return 0; }
+// #245 domscript: stdlib.c's exit() calls fflush() and its mkstemp() calls
+// time(). Neither is on any path this test drives, but the WHOLE translation
+// unit is linked, so without these two stubs the link fails, and this test has
+// been reporting "RESULT: BROKEN - negative arm did not build" (exit 1) ever
+// since #745 added them. A gate that cannot build is not a gate; keep this list
+// in step with the external calls stdlib.c makes.
+int    mh_fflush(void *f) { (void)f; return 0; }
+long   mh_time(void *t) { (void)t; return 0; }
 
 // --- mirror of the allocator's block layout, for injecting corruption -----
 // MUST track stdlib.c's block_header_t and BLK_HDR. If they ever diverge this
@@ -77,6 +86,7 @@ typedef struct block_header {
     size_t size;
     int free;
     struct block_header *next;
+    struct block_header *prev;      // #245 domscript
 } block_header_t;
 _Static_assert(sizeof(block_header_t) <= BLK_HDR,
                "#631 test: block_header_t no longer fits BLK_HDR; sync with stdlib.c");
@@ -85,33 +95,62 @@ static block_header_t *hdr(void *p) {
     return (block_header_t *)((uint8_t *)p - BLK_HDR);
 }
 
+// #245 domscript: the free-list links live in the FREE block's payload, so a
+// bin-list cycle is injected through the returned pointer itself. Mirror of
+// stdlib.c's free_link_t / FLINK().
+typedef struct free_link {
+    block_header_t *fnext;
+    block_header_t *fprev;
+} free_link_t;
+static free_link_t *flink(void *p) { return (free_link_t *)p; }
+
+// Big enough to land in the catch-all bin (stdlib.c: HEAP_BIN_MAX_EXACT 1024),
+// which is the only bin find_free_block() has to SEARCH and therefore the only
+// one with a walk to corrupt.
+#define BIG_DATA 4096
+
+// The pass condition is "it came back AND it said so". #245 domscript: either
+// report channel counts. Some corruption shapes are now caught by a value guard
+// rather than by a walk running past its budget (scenario 1 is one: absorbing a
+// self-referential successor doubles the block's size, so block_size_sane()
+// stops the merge before any budget is reached). Requiring the walk-overrun
+// counter specifically would have scored that as a silent continue when it is
+// in fact two loud lines on stderr.
 static int done(const char *what) {
-    unsigned r = mh___malloc_walk_report_count();
-    printf("RETURNED from %s; walk-overrun reports=%u\n", what, r);
-    if (r == 0) {
+    unsigned w = mh___malloc_walk_report_count();
+    unsigned d = mh___malloc_diag_report_count();
+    printf("RETURNED from %s; walk-overrun reports=%u guard reports=%u\n", what, w, d);
+    if (w == 0 && d == 0) {
         printf("FAIL: the walk returned but reported nothing (silent continue)\n");
         return 1;
     }
     return 0;
 }
 
-// 1. free() -> coalesce_all(): the walk every app pays on every free().
+// 1. free() -> the forward merge: the walk every app pays on every free().
+//    (Before #245 domscript this reached coalesce_all(), which no longer
+//    exists; the self-referential `next` is driven over the merge loop that
+//    replaced it, which carries the same step budget.)
 static int sc_coalesce(void) {
     void *a = mh_malloc(64), *b = mh_malloc(64), *c = mh_malloc(64);
     (void)c;
     mh_free(b);
     hdr(a)->next = hdr(a);              // one aligned word: a->next = a
     mh_free(a);
-    return done("free()/coalesce_all");
+    return done("free()/forward merge");
 }
 
-// 2. malloc() -> find_free_block(): a FREE block pointing at itself.
+// 2. malloc() -> find_free_block(): a FREE block whose BIN link points at
+//    itself. #245 domscript moved this walk off the all-blocks list and onto
+//    the per-size free bins, so the corruption has to go where the walk now
+//    looks: the free block's own payload. A block in the catch-all bin that is
+//    too small for the request is the only case that steps at all.
 static int sc_findfree(void) {
-    void *p1 = mh_malloc(48), *p2 = mh_malloc(48), *p3 = mh_malloc(48);
+    void *p1 = mh_malloc(48), *p2 = mh_malloc(BIG_DATA), *p3 = mh_malloc(48);
     (void)p1; (void)p3;
     mh_free(p2);
-    hdr(p2)->next = hdr(p2);
-    void *q = mh_malloc(4096);
+    flink(p2)->fnext = hdr(p2);         // bin link points back at its own block
+    void *q = mh_malloc(BIG_DATA * 8);  // too big for p2: the scan must step
     int bad = done("malloc()/find_free_block");
     // Detecting the cycle must not turn into an allocation failure: NULL from
     // find_free_block() means "nothing reusable", and request_space() still
@@ -135,14 +174,22 @@ static int sc_tailwalk(void) {
 
 // 4. A multi-node backward loop, not merely a self-reference: proves the
 //    budget catches a CYCLE, not just the degenerate b->next == b case that a
-//    single equality check would also catch.
+//    single equality check would also catch. #245 domscript: in the free BINS,
+//    for the same reason as scenario 2. Four large free blocks are chained into
+//    the catch-all bin by the allocator itself, then the last one's link is
+//    pointed back at the first, and a request too large for any of them forces
+//    the scan all the way round.
 static int sc_multiloop(void) {
     void *v[8];
-    for (int i = 0; i < 8; i++) v[i] = mh_malloc(64);
-    for (int i = 0; i < 8; i += 2) mh_free(v[i]);
-    hdr(v[7])->next = hdr(v[1]);
-    mh_free(v[3]);
-    return done("multi-node backward loop");
+    for (int i = 0; i < 8; i++) v[i] = mh_malloc(BIG_DATA);
+    for (int i = 0; i < 8; i += 2) mh_free(v[i]);      // v0,v2,v4,v6 -> bin
+    // The bin is a LIFO push list, so v6 is the head and v0 the tail; close the
+    // loop from the tail back to the head.
+    flink(v[0])->fnext = hdr(v[6]);
+    void *q = mh_malloc(BIG_DATA * 16);
+    int bad = done("multi-node bin loop");
+    if (!q) { printf("FAIL: malloc() returned NULL instead of growing the heap\n"); bad = 1; }
+    return bad;
 }
 
 // 5. After a corruption has been reported the allocator must keep WORKING:

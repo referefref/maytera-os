@@ -7,8 +7,15 @@
 #include "../../libc/dirent.h"
 #include "../../libc/sys/stat.h"
 #include "../../libc/unistd.h"   // #742: fsync - a copy is not a copy until it is durable
+#include "../../libc/userconf.h"   // #peruser2: the bin is per-user
+#include "../../libc/rbindex.h"    // #aidelete: THE shared bin location + row format
+#include "../../libc/time.h"       // #aidelete: render the deleted-at timestamp
 
-static int g_win_w = 500, g_win_h = 400;  // #89: live window size (EVENT_RESIZE)
+// #aidelete: five columns now (Name, Original Location, Deleted, By, Size), so
+// the default is wider. 500px could not fit them without truncating the
+// original location to uselessness, and the point of the two new columns is
+// that a file an AI deleted is VISIBLY different from one the user deleted.
+static int g_win_w = 680, g_win_h = 400;  // #89: live window size (EVENT_RESIZE)
 #define WIN_W g_win_w
 #define WIN_H g_win_h
 #define TOOLBAR_H 40
@@ -23,7 +30,13 @@ typedef struct {
     char name[64];
     char original_path[128];
     int size_kb;
-    int deleted_time;  // Unix timestamp (demo)
+    // #aidelete: a REAL timestamp, read from field 3 of the index row. This
+    // used to be set to 0 unconditionally, with the comment "(demo)", because
+    // there was nowhere to read a time from: the row was two fields. 0 still
+    // means AGE UNKNOWN (a V1 row from an existing bin) and is rendered as
+    // "unknown", never as 1970.
+    unsigned long deleted_time;
+    char actor[RB_ACTOR_MAX];   // "user" or "ai:xxxxxxxx"
     int selected;
 } deleted_item_t;
 
@@ -39,20 +52,28 @@ static int total_size_kb = 0;
 static void init_items(void) {  /* replaced: real /RECYCLE trash backend */
 }
 
-#define TRASH_DIR    "/CONFIG/RECYCLE"
-#define TRASH_INDEX  "/CONFIG/RBINDEX.TXT"
+// #peruser2: THE SAME RESOLVER AS apps/files/main.c, and it has to be, because
+// these two apps read and write ONE store: Files moves a file into the bin and
+// appends the index row, this app lists and restores from it. If they disagreed
+// about the path, "Delete" would appear to work and the Recycle Bin would
+// appear empty. Root's home is "/", so a root session still uses exactly
+// /CONFIG/RECYCLE and /CONFIG/RBINDEX.TXT.
+//
+// #aidelete: "the same resolver SHAPE" is now literally the same resolver.
+// There were two copies of these two functions, two copies of rb_join(), and
+// two copies of the index parser/writer, in this file and in apps/files; a
+// third was about to be written for the recycler daemon. They all live in
+// libc/rbindex.c now and nothing here re-derives them. Deleting the copies IS
+// the fix: two implementations of "where is the bin" is how the two apps come
+// to disagree, which the old comment could only ask the reader not to do.
+#define TRASH_DIR    rbindex_dir()
+#define TRASH_INDEX  rbindex_path()
 
 static int rb_streq(const char *a, const char *b) {
     while (*a && *b) { if (*a != *b) return 0; a++; b++; }
     return *a == *b;
 }
-static void rb_join(char *out, int outsz, const char *dir, const char *name) {
-    int j = 0;
-    for (int i = 0; dir[i] && j < outsz - 1; i++) out[j++] = dir[i];
-    if (j > 0 && out[j-1] != '/' && j < outsz - 1) out[j++] = '/';
-    for (int i = 0; name[i] && j < outsz - 1; i++) out[j++] = name[i];
-    out[j] = 0;
-}
+#define rb_join(o, c, d, n) rbindex_join((o), (c), (d), (n))
 // #742 failure reporting. The disk is what failed, so the report lives in RAM
 // and is drawn in the window; printf/notify_post are extras.
 static char g_err[192];
@@ -64,81 +85,23 @@ static void rb_error(const char *what) {
     printf("[recyclebin] %s\n", g_err);
 }
 
-// (#239) ext2 rename() is unreliable, so restore falls back to copy+unlink.
-// #742: returns 0 ONLY if every byte is on the medium. The caller unlinks the
-// SOURCE on a 0, so an unchecked close() here is a delete of the only copy: on
-// a full volume ext2_write_file truncates the destination before it discovers
-// there is no room and leaves a valid ZERO-BYTE file behind.
-static int rb_copy_file(const char *src, const char *dst) {
-    int in = open(src, 0); if (in < 0) return -1;
-    int out = open(dst, 0x41); if (out < 0) { close(in); return -1; }
-    char b[4096]; int n, rc = 0;
-    while ((n = read(in, b, sizeof(b))) > 0) {
-        int w = 0; while (w < n) { int k = write(out, b + w, n - w); if (k <= 0) { rc = -1; break; } w += k; }
-        if (rc) break;
-    }
-    if (n < 0) rc = -1;
-    if (rc == 0 && fsync(out) != 0) rc = -1;
-    if (close(out) != 0) rc = -1;
-    close(in); return rc;
-}
+// (#239) ext2 rename() is unreliable, so restore falls back to copy+unlink, and
+// (#742) returns 0 only if every byte is on the medium because the caller
+// unlinks the SOURCE on a 0. #aidelete: that sequence now lives ONCE, inside
+// rbindex_restore(), with the same checks and the same comment. This app's copy
+// is deleted rather than kept beside it.
 
-static char idx_buf[8192];
-static int  idx_len;
-
-static void idx_load(void) {
-    idx_len = 0; idx_buf[0] = 0;
-    int fd = open(TRASH_INDEX, 0);
-    if (fd < 0) return;
-    char tmp[512]; int n;
-    while ((n = read(fd, tmp, sizeof(tmp))) > 0)
-        for (int i = 0; i < n && idx_len < (int)sizeof(idx_buf) - 1; i++) idx_buf[idx_len++] = tmp[i];
-    idx_buf[idx_len] = 0;
-    close(fd);
-}
-
-static int idx_lookup(const char *name, char *out, int outsz) {
-    int i = 0;
-    while (i < idx_len) {
-        int ls = i; while (i < idx_len && idx_buf[i] != '\n') i++;
-        int le = i; if (i < idx_len) i++;
-        int bar = ls; while (bar < le && idx_buf[bar] != '|') bar++;
-        if (bar < le) {
-            int k = ls, t = 0, m = 1;
-            while (k < bar) { if (idx_buf[k] != name[t]) { m = 0; break; } k++; t++; }
-            if (m && name[t] == 0) { int o = 0, p = bar + 1; while (p < le && o < outsz - 1) out[o++] = idx_buf[p++]; out[o] = 0; return 1; }
-        }
-    }
-    return 0;
-}
-
-// #742: returns 0 only if the rewritten index is on the medium. It used to
-// unlink(TRASH_INDEX) first and then hope the create worked; if it did not, the
-// restore information for EVERY item in the bin was gone and nothing said so.
-static int idx_remove(const char *name) {
-    char nb[8192]; int nl = 0; int i = 0;
-    while (i < idx_len) {
-        int ls = i; while (i < idx_len && idx_buf[i] != '\n') i++;
-        int le = i; if (i < idx_len) i++;
-        int bar = ls; while (bar < le && idx_buf[bar] != '|') bar++;
-        int match = 0;
-        if (bar < le) { int k = ls, t = 0, m = 1; while (k < bar) { if (idx_buf[k] != name[t]) { m = 0; break; } k++; t++; } if (m && name[t] == 0) match = 1; }
-        if (!match) { for (int j = ls; j < le && nl < (int)sizeof(nb) - 1; j++) nb[nl++] = idx_buf[j]; if (nl < (int)sizeof(nb) - 1) nb[nl++] = '\n'; }
-    }
-    int fd = open(TRASH_INDEX, 0x241);   // O_WRONLY|O_CREAT|O_TRUNC, no gap
-    if (fd < 0) return -1;
-    int rc = 0;
-    if (nl && write(fd, nb, nl) != nl) rc = -1;
-    if (rc == 0 && fsync(fd) != 0) rc = -1;
-    if (close(fd) != 0) rc = -1;
-    if (rc != 0) return rc;
-    for (int j = 0; j < nl; j++) idx_buf[j] = nb[j];
-    idx_len = nl; idx_buf[nl] = 0;
-    return 0;
-}
+// #aidelete: idx_load/idx_lookup/idx_remove are GONE from this file. They are
+// rbindex_load()/rbindex_lookup()/rbindex_remove() in libc/rbindex.c, which
+// carries the #742 durability discipline verbatim (O_TRUNC never
+// unlink-then-create, fsync before the in-RAM copy is updated, a non-zero
+// return on any failed step) and the V1/V2 row parser.
+#define idx_load()        rbindex_load()
+#define idx_remove(n)     rbindex_remove(n)
 
 static void load_trash(void) {
     item_count = 0; total_size_kb = 0;
+    userconf_ensure_parent_dir(TRASH_DIR);   // #peruser2: <home>/CONFIG
     mkdir(TRASH_DIR, 0755);
     idx_load();
     DIR *d = opendir(TRASH_DIR);
@@ -150,16 +113,76 @@ static void load_trash(void) {
         if (e->d_type == DT_DIR) continue;
         deleted_item_t *it = &items[item_count];
         int j = 0; while (e->d_name[j] && j < 63) { it->name[j] = e->d_name[j]; j++; } it->name[j] = 0;
-        if (!idx_lookup(e->d_name, it->original_path, sizeof(it->original_path))) {
-            const char *u = "(unknown)"; int k = 0; while (u[k] && k < 127) { it->original_path[k] = u[k]; k++; } it->original_path[k] = 0;
+        rb_row_t row;
+        if (rbindex_lookup(e->d_name, &row)) {
+            int k = 0;
+            while (row.original_path[k] && k < (int)sizeof(it->original_path) - 1) {
+                it->original_path[k] = row.original_path[k]; k++;
+            }
+            it->original_path[k] = 0;
+            it->deleted_time = row.deleted_unix;
+            for (k = 0; k < RB_ACTOR_MAX; k++) it->actor[k] = row.actor[k];
+        } else {
+            // No row at all: this file was put in the bin by something that
+            // did not record where it came from, so it cannot be restored and
+            // its age is unknown. Both facts are shown, neither is guessed.
+            const char *u = "(unknown)"; int k = 0;
+            while (u[k] && k < (int)sizeof(it->original_path) - 1) { it->original_path[k] = u[k]; k++; }
+            it->original_path[k] = 0;
+            it->deleted_time = 0;
+            it->actor[0] = 0;
         }
         char fp[200]; rb_join(fp, sizeof(fp), TRASH_DIR, e->d_name);
         struct stat st; it->size_kb = (stat(fp, &st) == 0) ? (int)((st.st_size + 1023) / 1024) : 0;
-        it->deleted_time = 0; it->selected = 0;
+        it->selected = 0;
         total_size_kb += it->size_kb;
         item_count++;
     }
     closedir(d);
+}
+
+// #aidelete: "Deleted" and "By".
+//
+// A 0 timestamp is a V1 row, i.e. a file that was in the bin before the index
+// carried a time. It renders as "unknown", NEVER as a 1970 date: a made-up date
+// next to a retention setting would read as "this will be purged shortly", and
+// the recycler's rule is the opposite (an unknown age is never purged).
+static void format_deleted(unsigned long t, char *buf, int cap) {
+    if (cap < 17) { if (cap > 0) buf[0] = 0; return; }
+    if (t == 0) {
+        const char *u = "unknown"; int i = 0;
+        while (u[i]) { buf[i] = u[i]; i++; }
+        buf[i] = 0;
+        return;
+    }
+    time_t tv = (time_t)t;
+    struct tm tmv;
+    if (!localtime_r(&tv, &tmv)) { buf[0] = '?'; buf[1] = 0; return; }
+    int y = tmv.tm_year + 1900, mo = tmv.tm_mon + 1, d = tmv.tm_mday;
+    int hh = tmv.tm_hour, mi = tmv.tm_min;
+    buf[0]  = (char)('0' + (y / 1000) % 10);
+    buf[1]  = (char)('0' + (y / 100) % 10);
+    buf[2]  = (char)('0' + (y / 10) % 10);
+    buf[3]  = (char)('0' + y % 10);
+    buf[4]  = '-';
+    buf[5]  = (char)('0' + mo / 10); buf[6] = (char)('0' + mo % 10);
+    buf[7]  = '-';
+    buf[8]  = (char)('0' + d / 10);  buf[9] = (char)('0' + d % 10);
+    buf[10] = ' ';
+    buf[11] = (char)('0' + hh / 10); buf[12] = (char)('0' + hh % 10);
+    buf[13] = ':';
+    buf[14] = (char)('0' + mi / 10); buf[15] = (char)('0' + mi % 10);
+    buf[16] = 0;
+}
+
+// "You" or "AI". The distinction is the whole requirement: a file an AI deleted
+// must be visibly distinguishable from one the user deleted. The actor token
+// also carries WHICH AI task (ai:XXXXXXXX), which the status bar shows for the
+// selected row rather than squeezing eight hex digits into a list column.
+static const char *actor_label(const deleted_item_t *it) {
+    if (rbindex_actor_is_ai(it->actor)) return "AI";
+    if (it->actor[0] == 0) return "-";
+    return "You";
 }
 
 // Format size
@@ -225,14 +248,28 @@ static void draw_toolbar(void) {
     }
 }
 
+// #aidelete: FIVE columns, and their x positions are derived ONCE here so the
+// header, the rows and the truncation all read the same numbers. The three
+// right-hand columns are pinned to the right edge (the window is resizable),
+// and the two left-hand columns take what is left.
+#define COL_NAME_X   28
+static int col_size_x(void)    { return WIN_W - 84; }   // right-most
+static int col_by_x(void)      { return WIN_W - 128; }
+static int col_deleted_x(void) { return WIN_W - 268; }
+static int col_path_x(void)    { return 188; }
+static int col_name_w(void)    { return col_path_x() - COL_NAME_X - 8; }
+static int col_path_w(void)    { return col_deleted_x() - col_path_x() - 8; }
+
 // Draw column headers
 static void draw_headers(void) {
     int y = TOOLBAR_H;
     win_draw_rect(win, 0, y, WIN_W, HEADER_H, THEME_BG_TERTIARY);
-    
-    win_draw_text(win, 28, y + 6, "Name", THEME_TEXT_PRIMARY);
-    win_draw_text(win, 200, y + 6, "Original Location", THEME_TEXT_PRIMARY);
-    win_draw_text(win, 400, y + 6, "Size", THEME_TEXT_PRIMARY);
+
+    win_draw_text(win, COL_NAME_X, y + 6, "Name", THEME_TEXT_PRIMARY);
+    win_draw_text(win, col_path_x(), y + 6, "Original Location", THEME_TEXT_PRIMARY);
+    win_draw_text(win, col_deleted_x(), y + 6, "Deleted", THEME_TEXT_PRIMARY);
+    win_draw_text(win, col_by_x(), y + 6, "By", THEME_TEXT_PRIMARY);
+    win_draw_text(win, col_size_x(), y + 6, "Size", THEME_TEXT_PRIMARY);
 }
 
 // Draw item list
@@ -271,39 +308,50 @@ static void draw_items(void) {
             win_draw_rect(win, 13, y + 7, 2, 10, THEME_ACCENT);
         }
         
-        // Name (truncated)
-        char name_disp[24];
+        // Name (truncated to the column, which is now derived rather than a
+        // hardcoded 20 characters: the window is resizable)
+        char name_disp[72];
+        int maxc = col_name_w() / 8;
+        if (maxc > (int)sizeof(name_disp) - 4) maxc = (int)sizeof(name_disp) - 4;
+        if (maxc < 4) maxc = 4;
         int j = 0;
-        while (items[idx].name[j] && j < 20) {
-            name_disp[j] = items[idx].name[j];
-            j++;
-        }
-        if (items[idx].name[j]) {
-            name_disp[j++] = '.';
-            name_disp[j++] = '.';
-            name_disp[j++] = '.';
-        }
+        while (items[idx].name[j] && j < maxc) { name_disp[j] = items[idx].name[j]; j++; }
+        if (items[idx].name[j]) { name_disp[j++] = '.'; name_disp[j++] = '.'; name_disp[j++] = '.'; }
         name_disp[j] = '\0';
-        win_draw_text(win, 28, y + 4, name_disp, text_color);
-        
-        // Original path (truncated)
-        char path_disp[24];
+        win_draw_text(win, COL_NAME_X, y + 4, name_disp, text_color);
+
+        // Original path (truncated to the column)
+        char path_disp[72];
+        maxc = col_path_w() / 8;
+        if (maxc > (int)sizeof(path_disp) - 4) maxc = (int)sizeof(path_disp) - 4;
+        if (maxc < 4) maxc = 4;
         j = 0;
-        while (items[idx].original_path[j] && j < 22) {
-            path_disp[j] = items[idx].original_path[j];
-            j++;
-        }
-        if (items[idx].original_path[j]) {
-            path_disp[j++] = '.';
-            path_disp[j++] = '.';
-        }
+        while (items[idx].original_path[j] && j < maxc) { path_disp[j] = items[idx].original_path[j]; j++; }
+        if (items[idx].original_path[j]) { path_disp[j++] = '.'; path_disp[j++] = '.'; }
         path_disp[j] = '\0';
-        win_draw_text(win, 200, y + 4, path_disp, THEME_TEXT_SECONDARY);
-        
+        win_draw_text(win, col_path_x(), y + 4, path_disp, THEME_TEXT_SECONDARY);
+
+        // #aidelete: Deleted (when) and By (who).
+        char when[20];
+        format_deleted(items[idx].deleted_time, when, (int)sizeof(when));
+        win_draw_text(win, col_deleted_x(), y + 4, when,
+                      items[idx].selected ? text_color : THEME_TEXT_SECONDARY);
+
+        // An AI delete is drawn in the warning ink so it stands out in a list of
+        // "You" rows, which is the point: the owner's requirement is that an AI
+        // delete is ANNOUNCED, and a bin where the two look identical announces
+        // nothing. The selection fill wins where it would hurt contrast.
+        {
+            int ai = rbindex_actor_is_ai(items[idx].actor);
+            uint32_t bc = items[idx].selected ? text_color
+                        : (ai ? THEME_WARNING : THEME_TEXT_SECONDARY);
+            win_draw_text(win, col_by_x(), y + 4, actor_label(&items[idx]), bc);
+        }
+
         // Size
         char size_str[16];
         format_size(items[idx].size_kb, size_str);
-        win_draw_text(win, 400, y + 4, size_str, text_color);
+        win_draw_text(win, col_size_x(), y + 4, size_str, text_color);
     }
     
     // Scrollbar
@@ -357,9 +405,39 @@ static void draw_status(void) {
     const char *total_text = " total";
     j = 0;
     while (total_text[j]) status[i++] = total_text[j++];
+
+    // #aidelete: the retention policy belongs next to the item list, because
+    // "Deleted" only means something if the user can see how long a deleted
+    // file is kept. Read fresh each draw so a Settings change shows up without
+    // restarting the app.
+    {
+        const char *lab = rbindex_retention_label(rbindex_read_retention());
+        const char *pre = "   Kept: ";
+        j = 0; while (pre[j] && i < (int)sizeof(status) - 20) status[i++] = pre[j++];
+        j = 0; while (lab[j] && i < (int)sizeof(status) - 2) status[i++] = lab[j++];
+    }
     status[i] = '\0';
-    
+
     win_draw_text(win, 8, y + 6, status, THEME_TEXT_SECONDARY);
+
+    // Exactly one AI-deleted row selected: name the AI task that did it. Eight
+    // hex digits is the GraphFS journal's node id for the same delete, so it is
+    // the join key between this window and the tamper-evident trail, which is
+    // why it is shown verbatim rather than summarised.
+    {
+        int sel = -1, n = 0;
+        for (int k = 0; k < item_count; k++) if (items[k].selected) { sel = k; n++; }
+        if (n == 1 && rbindex_actor_is_ai(items[sel].actor)) {
+            char msg[64]; int o = 0;
+            const char *p = "Deleted by AI task ";
+            while (p[o]) { msg[o] = p[o]; o++; }
+            for (int k = 3; items[sel].actor[k] && o < (int)sizeof(msg) - 1; k++)
+                msg[o++] = items[sel].actor[k];
+            msg[o] = 0;
+            int w = 8 * o;
+            win_draw_text(win, WIN_W - w - 10, y + 6, msg, THEME_WARNING);
+        }
+    }
 }
 
 // Full redraw
@@ -381,14 +459,24 @@ static void restore_selected(void) {
     rb_err_clear();
     for (int i = item_count - 1; i >= 0; i--) {
         if (!items[i].selected) continue;
-        char src[200]; rb_join(src, sizeof(src), TRASH_DIR, items[i].name);
-        int ok = 0;
-        if (items[i].original_path[0] && !rb_streq(items[i].original_path, "(unknown)")) {
-            if (rename(src, items[i].original_path) == 0) ok = 1;
-            else if (rb_copy_file(src, items[i].original_path) == 0) ok = (unlink(src) == 0);
-        }
-        if (!ok) { failed++; continue; }
-        if (idx_remove(items[i].name) != 0) failed++; else done++;
+        // #aidelete: rbindex_restore() IS the rename-then-fsynced-copy-then-
+        // unlink sequence this loop used to inline, with the row dropped last
+        // and only on success. Flags 0 keeps today's exact behaviour (an
+        // existing destination is overwritten, as it always has been here); the
+        // AI undelete path passes RB_RESTORE_NOCLOBBER instead. One
+        // implementation, two policies, rather than two implementations.
+        rb_row_t row;
+        int k = 0;
+        while (items[i].name[k] && k < RB_NAME_MAX - 1) { row.name[k] = items[i].name[k]; k++; }
+        row.name[k] = 0;
+        for (k = 0; k < RB_PATH_MAX - 1 && items[i].original_path[k]; k++)
+            row.original_path[k] = items[i].original_path[k];
+        row.original_path[k] = 0;
+        row.deleted_unix = items[i].deleted_time;
+        row.actor[0] = 0;
+        int rc = rbindex_restore(&row, 0);
+        if (rc == 0) { done++; continue; }
+        failed++;
     }
     if (failed)
         rb_error(done ? "Some items could not be restored and are still here"
@@ -425,12 +513,9 @@ static void empty_bin(void) {
         // only record of where they came from.
         rb_error("Could not empty the Recycle Bin; some items remain");
     } else {
-        int fd = open(TRASH_INDEX, 0x241);
-        int rc = (fd < 0) ? -1 : 0;
-        if (rc == 0 && fsync(fd) != 0) rc = -1;
-        if (fd >= 0 && close(fd) != 0) rc = -1;
-        if (rc != 0) rb_error("Emptied, but the index could not be cleared");
-        else { idx_len = 0; idx_buf[0] = 0; }
+        // #aidelete: rbindex_clear() is the same O_TRUNC + fsync + checked
+        // close this did inline, with the in-RAM copy updated only on success.
+        if (rbindex_clear() != 0) rb_error("Emptied, but the index could not be cleared");
     }
     load_trash();
 }

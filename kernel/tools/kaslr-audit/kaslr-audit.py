@@ -58,6 +58,7 @@
 import sys
 import struct
 import os
+import shutil
 import tempfile
 
 # --- measured constraints, each with the source that defines it ---------------
@@ -559,6 +560,15 @@ def self_test():
         check("a non-ELF input is rejected", False)
     except ElfError:
         check("a non-ELF input is rejected", True)
+
+    # #deadtests: CLEAN UP THE mkdtemp. It was never removed, and because the
+    # land-time self-test census runs this arm on EVERY land, the leak is per
+    # land and unbounded: 118 abandoned /tmp/kaslr-audit-selftest-* directories
+    # were sitting in the build container on 2026-10-02. Each is only 8K, which is exactly
+    # why nobody noticed; the problem is the growth, not the size. Done on the
+    # way out of every path including the failing one, which is the same
+    # discipline the losetup/umount rule exists for.
+    shutil.rmtree(tmp, ignore_errors=True)
 
     print("")
     print("SELF-TEST %s" % ("PASS" if ok else "FAIL"))

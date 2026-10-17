@@ -68,13 +68,16 @@ extern "C" {
                   variant: i32, st: i32);
     fn gui_progress(handle: i32, x: i32, y: i32, w: i32, h: i32, pct: i32);
     fn gui_lighten(c: u32, amt: i32) -> u32;
-    // (tmglass) the glass primitives the App Repo pilot draws its panels with
-    // (libc/gui.c: AA rounded fill blending toward a caller-supplied outer
-    // colour, 1px rounded border, 2-layer soft shadow, blend). Shared, not
-    // re-implemented here: docs/UI_GLASS_DESIGN_SYSTEM.md section 9.
-    fn gui_fill_rounded_aa(handle: i32, x: i32, y: i32, w: i32, h: i32, r: i32, color: u32, bg: u32);
-    fn gui_rounded_border(handle: i32, x: i32, y: i32, w: i32, h: i32, r: i32, color: u32);
-    fn gui_soft_shadow(handle: i32, x: i32, y: i32, w: i32, h: i32, r: i32, bg: u32);
+    // (owner revert, 2026-10-01) needed for the classic tab bevel's shadow
+    // side (draw_tabs(), below); gui_lighten() alone cannot darken.
+    fn gui_darken(c: u32, amt: i32) -> u32;
+    // (owner revert, 2026-10-01) gui_fill_rounded_aa()/gui_rounded_border()/
+    // gui_soft_shadow() - the AA rounded-fill/border/shadow primitives the
+    // glasstm panels drew with - are no longer called anywhere in this file:
+    // draw_panel()/draw_tabs() now draw square CDE/Motif chrome through
+    // gui_card() (already declared above) and plain win_draw_rect() bevels.
+    // Declarations removed rather than left to rot unused; still real symbols
+    // in libc.a if a future modern-theme pass wants them again.
     fn gui_mix(a: u32, b: u32, t: i32) -> u32;
     fn gui_ttf_render_width(s: *const u8, size: i32) -> i32;
     // (2026-09-16 owner fix) gui_text_ttf_centered() (libc/gui.c) centers a
@@ -459,63 +462,26 @@ fn text_w(s: &[u8], size: i32) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// (tmglass) Glass tokens and the frosted backdrop.
-//
-// docs/UI_GLASS_DESIGN_SYSTEM.md sections 1 and 10, exactly as the App Repo
-// pilot (userland/apps/appstore/main.c build_backdrop / draw_header) applied
-// them: always dark, teal accent, regardless of the active theme (owner
-// decision, recorded at glasstm). Copy the NAMES as well as the values; a
-// second name for the same hex is how two surfaces drift apart.
+// (owner revert, 2026-10-01) Fixed semantic status colours ONLY. These are NOT
+// theme tokens (every real surface colour now comes out of apply_theme()
+// below, read live from the active theme, same as every other classic app):
+// they are the same kind of pinned literal gui_style.h's own GUI_BTN_SUCCESS
+// uses for "no theme authors a positive-action green", restored to the exact
+// values this app used before the glasstm dark-glass palette replaced them
+// (commit 5e8a277a^, "Running"/"On" status text and the link-down warning).
 // ---------------------------------------------------------------------------
-const C_PANEL: u32 = 0x0012_2420;       // WEL_BG_MID: the glass panel fill (= pal.surface)
-const C_CARD: u32 = 0x000E_1D1B;        // DK_CARD_FILL: nested cards (= pal.surface_raised)
-const C_EDGE: u32 = 0x002C_4A44;        // DK_STROKE_UNSEL: panel border, App Repo C_border
-const C_HAIR: u32 = 0x001E_322E;        // hairline rule inside a panel
-const C_INK: u32 = 0x00F3_FBF9;         // DK_HEADLINE
-const C_INK_DIM: u32 = 0x00A9_D9CC;     // DK_BODY
-const C_ACCENT: u32 = 0x006A_E2CF;      // DK_ACCENT
-const C_ACCENT_INK: u32 = 0x0004_231A;  // App Repo C_accent_ink: text on the accent
-const C_OK: u32 = 0x003F_D6A4;          // App Repo C_ok
-const C_ERR: u32 = 0x00FF_AAA2;         // DK_ERROR
-const WEL_BG_TOP: u32 = 0x000A_1614;
-const WEL_BG_BOTTOM: u32 = 0x0005_0A09;
+const C_OK: u32 = 0x0040_C060;
+const C_ERR: u32 = 0x00E0_5050;
 
-/// (2026-09-16 owner fix) Plain vertical gradient wash for the window's own
-/// margins - a fixed function of window height, not a sample of the desktop
-/// wallpaper. This REPLACES the old gui_glass_backdrop_* recipe (decode the
-/// wallpaper, point-sample it, blur it, tint it toward C_PANEL, blit it into
-/// the window every time the chrome was dirty): that recipe made this window
-/// look translucent unconditionally, regardless of the OS-wide theme opacity,
-/// because the "glass" was faked in the app's own pixels rather than left to
-/// the compositor's real per-window alpha blend. This app now only ever
-/// paints fully opaque pixels; whether the desktop shows through is entirely
-/// the compositor's decision (kernel/gui/window.c win->opacity, theme-driven).
-///
-/// Deliberately cheap (a handful of flat rects, no decode/scale/blur), so
-/// unlike the old backdrop it needs no dirty-flag gate: draw() calls it every
-/// frame.
+/// (owner revert, 2026-10-01) Flat, theme-coloured window background. This
+/// REPLACES the glasstm vertical dark-teal gradient wash (WEL_BG_TOP/BOTTOM,
+/// grad_at()), which was fixed-dark regardless of the active theme - the
+/// exact defect the owner asked to have undone ("the same is true for editor
+/// and any other app that's had this new UI update"). draw_main_panel() now
+/// draws its own beveled/rounded card on top via the shared gui_card()
+/// primitive, so this only needs to paint the margin around it.
 fn draw_bg(a: &App) {
-    const BANDS: i32 = 24;
-    let bh = (a.dh + BANDS - 1) / BANDS;
-    if bh <= 0 { return; }
-    let mut y = 0;
-    while y < a.dh {
-        let h = if bh < a.dh - y { bh } else { a.dh - y };
-        let col = grad_at(a.dh, y);
-        win_draw_rect(a.win, 0, y, a.dw, h, col);
-        y += bh;
-    }
-}
-
-/// The vertical-gradient colour at content-space y, matching what draw_bg()
-/// paints there. AA rounded corners (draw_tabs()/draw_panel()) sample this
-/// instead of the old backdrop buffer, so a corner's antialiasing fringe
-/// blends into the flat colour actually behind it rather than a flat guess
-/// (a flat guess is what produces a visible halo around a round corner).
-fn grad_at(dh: i32, y: i32) -> u32 {
-    if dh <= 0 { return WEL_BG_TOP; }
-    let yc = if y < 0 { 0 } else if y > dh { dh } else { y };
-    mix(WEL_BG_TOP, WEL_BG_BOTTOM, ((yc * 100) / dh) as u32)
+    win_draw_rect(a.win, 0, 0, a.dw, a.dh, a.pal.surface);
 }
 
 // ---------------------------------------------------------------------------
@@ -664,13 +630,13 @@ const ZN: NetStatus = NetStatus { ip: 0, netmask: 0, gateway: 0, dns_active: 0, 
                                   dhcp_ip: 0, link_up: 0, dhcp_state: 0, config_static: 0,
                                   faulty: 0, driver: 0, prefix_len: 0 };
 
-// Theme access. All four constants below were READ OUT of the kernel/libc
+// Theme access. Both constants below were READ OUT of the kernel/libc
 // headers, not assumed: SYS_THEME_COLOR is 290 and takes (theme_id, color_id)
-// with theme_id = -1 meaning "the active theme"; the theme id itself comes from
-// SYS_GET_THEME (134). The colour IDs are the ORDINALS of theme_color_id_t in
-// libc/theme.h (BACKGROUND=0, ACCENT=2, WINDOW_BG=8), which is why they are
-// spelled as numbers here.
-const SYS_GET_THEME: i64 = 134;
+// with theme_id = -1 meaning "the active theme". The colour IDs are the
+// ORDINALS of theme_color_id_t in libc/theme.h (ACCENT=2, WINDOW_BG=8), which
+// is why they are spelled as numbers here. The classic/modern style check
+// itself goes through gui_theme_is_classic() (libc/gui_theme.h), not a numeric
+// theme-id comparison - see its FFI declaration above for why.
 const SYS_THEME_COLOR: i64 = 290;
 const THEME_COLOR_ACCENT: i64 = 2;
 const THEME_COLOR_WINDOW_BG: i64 = 8;
@@ -679,13 +645,21 @@ fn theme_color(id: i64) -> u32 {
     // theme_id = -1 -> the active theme (matches libc theme_color()).
     unsafe { syscall2(SYS_THEME_COLOR, -1i64, id) as u32 }
 }
-fn theme_active() -> i32 {
-    unsafe { syscall1(SYS_GET_THEME, 0) as i32 }
-}
 
-// (tmglass) lum()/ink_on() are gone: the palette is a fixed dark glass, so
-// the ink on the accent is the measured token C_ACCENT_INK, not a luminance
-// pick. Bring them back the day this window follows the theme again.
+/// (owner revert, 2026-10-01) Perceptual luminance, integer weights (Rec.601
+/// x100). Restored: the glasstm palette deleted this because its ink was a
+/// fixed measured token (C_ACCENT_INK) that never had to be derived, which
+/// only worked because the palette itself was fixed-dark regardless of theme.
+/// Reading the theme for real means ink has to be picked for WHATEVER
+/// background comes back, light or dark, which is what keeps light themes
+/// legible here (a repeat offender elsewhere in this codebase).
+fn lum(c: u32) -> u32 {
+    let r = (c >> 16) & 0xFF;
+    let g = (c >> 8) & 0xFF;
+    let b = c & 0xFF;
+    (r * 30 + g * 59 + b * 11) / 100
+}
+fn ink_on(bg: u32) -> u32 { if lum(bg) > 140 { 0x0018_1818 } else { 0x00F0_F0F0 } }
 fn mix(a: u32, b: u32, pct: u32) -> u32 {
     let f = |sh: u32| {
         let x = (a >> sh) & 0xFF;
@@ -696,30 +670,34 @@ fn mix(a: u32, b: u32, pct: u32) -> u32 {
 }
 
 impl App {
+    /// (owner revert, 2026-10-01) Restores theme polling: the glasstm/45012bb5
+    /// passes made this window ALWAYS a fixed dark-teal palette regardless of
+    /// the active theme ("owner decision at glasstm"), which is exactly the
+    /// "awful, prefer the previous layout" the owner is reverting house-wide.
+    /// This is the pre-glasstm mechanism (commit 5e8a277a^), adapted to two
+    /// things this app has gained since and must keep: gui_theme_is_classic()
+    /// for the style family (correct for every theme, not just one numeric
+    /// id) and the 48-byte GuiPalette with the two engine-owned fields left
+    /// at 0 for gui_set_palette() to fill in (#745).
     fn apply_theme(&mut self) {
-        // The widget FAMILY (bevelled vs rounded) still follows the active
-        // theme file, exactly as the App Repo does; the COLOURS do not.
         unsafe { gui_set_style(if gui_theme_is_classic() != 0 { GUI_STYLE_CLASSIC } else { GUI_STYLE_MODERN }); }
-        // (tmglass) The App Repo dark-glass language, docs/UI_GLASS_DESIGN_
-        // SYSTEM.md sections 1 and 10: always dark, teal accent, regardless of
-        // the active theme (owner decision at glasstm). Content sits INSIDE the
-        // glass panels, so pal.surface is the PANEL fill: every shared widget
-        // (gui_button, gui_card) anti-aliases its edges against pal.surface,
-        // and that has to be the colour actually behind it. Nested cards (the
-        // Performance charts) are DK_CARD_FILL, the section 6 "nested card".
-        let _ = (theme_color(THEME_COLOR_WINDOW_BG), theme_color(THEME_COLOR_ACCENT), theme_active());
-        self.dark = true;
+        let wb = theme_color(THEME_COLOR_WINDOW_BG);
+        let accent = theme_color(THEME_COLOR_ACCENT);
+        self.dark = lum(wb) < 128;
+        let surface = mix(if self.dark { 0x0026_2A30 } else { 0x00F5_F6F8 }, accent, 5);
+        let raised = mix(if self.dark { 0x002C_313B } else { 0x00ED_EFF3 }, accent, 6);
+        let ink = ink_on(surface);
         self.pal = GuiPalette {
-            surface: C_PANEL,
-            surface_raised: C_CARD,
-            ink: C_INK,
-            ink_dim: C_INK_DIM,
-            accent: C_ACCENT,
-            accent_hover: unsafe { gui_lighten(C_ACCENT, 18) },
-            border: C_EDGE,
-            field_bg: 0x0021_3B34,
-            field_border: 0x004E_7168,
-            track: 0x0016_241F,
+            surface,
+            surface_raised: raised,
+            ink,
+            ink_dim: mix(ink, surface, 45),
+            accent,
+            accent_hover: unsafe { gui_lighten(accent, 24) },
+            border: if self.dark { 0x003A_424F } else { 0x00CD_D3DB },
+            field_bg: if self.dark { 0x0033_3A45 } else { 0x00FF_FFFF },
+            field_border: if self.dark { 0x003A_424F } else { 0x00CD_D3DB },
+            track: mix(surface, accent, 20),
             focus: 0,        // engine-owned, overwritten by gui_set_palette()
             edge_strong: 0,  // engine-owned, overwritten by gui_set_palette()
         };
@@ -1144,77 +1122,69 @@ fn cron_action_name(a: u8) -> &'static [u8] {
     match a { 0 => b"callback\0", 1 => b"launch\0", 2 => b"event\0", _ => b"?\0" }
 }
 
-/// (2026-09-16 owner fix) The tab strip, ATTACHED to the panel below it. It
-/// used to be floating pills sitting apart from the panel with a gap (PANEL_Y
-/// added 10px of clear space) and no shared edge: the active tab was a
-/// separate accent-filled capsule with nothing tying it visually to the box
-/// its own content lived in. Now the active tab is filled the SAME colour as
-/// the panel (C_PANEL) and sits with NO gap above it (PANEL_Y, logic.rs), so
-/// draw_main_panel() - called right after this, every frame - visually
-/// continues the active tab's fill straight down into the box. A 3px accent
-/// bar along the active tab's top edge is what still marks it as selected,
-/// since the fill itself no longer does. Inactive tabs use the darker
-/// C_CARD ("nested card") fill, which is what reads them as sitting behind
-/// the active one rather than as separate buttons.
+/// (owner revert, 2026-10-01; geometry kept from the 2026-09-16 owner fix)
+/// The tab strip, ATTACHED to the panel below it with NO gap (PANEL_Y,
+/// logic.rs) - that geometry fix is kept exactly, only the shapes and colours
+/// change. Square CDE/Motif notebook tabs, not glass pills: the selected tab
+/// is filled the SAME colour as the panel (pal.surface_raised, what
+/// draw_main_panel()'s gui_card() also fills with) and left open along the
+/// bottom, so draw_main_panel() - called right after this, every frame -
+/// visually continues the selected tab's fill straight down into the box,
+/// with a 1px classic highlight on its top/left/right taking the place of the
+/// old rounded-corner AA fringe. Inactive tabs are a separate, fully
+/// bordered, beveled square sitting on pal.surface, which is what reads them
+/// as buttons behind the active one rather than as the same shape.
 ///
-/// Corners: gui_fill_rounded_aa()/gui_rounded_border() only take ONE radius
-/// for all four corners, and a tab wants rounded top / square bottom (the
-/// bottom has to be square to butt flush against the panel). Both calls are
-/// given a rect extended TAB_R px past the tab's real bottom (PAD + TAB_H);
-/// draw_main_panel(), drawn immediately afterward, paints over that
-/// extension with its own flat top strip, which is what turns the rounded
-/// bottom corners into a square edge with no second primitive needed.
+/// No AA rounding and no outer-colour sampling are needed any more (compare
+/// the old gui_fill_rounded_aa()/grad_at() version this replaces): a square
+/// fill blends against nothing, so there is no "squared-corners-meeting-
+/// flush" trick left to perform - flush is just y = PAD .. PAD + TAB_H
+/// butting directly against the panel's own y = PANEL_Y, which draw_panel()
+/// still gets from panel_rect() unchanged.
 ///
-/// Label placement goes through the shared gui_text_ttf_centered() instead of
-/// a hand-measured x with a guessed y (this is fix #3: the label used to sit
-/// high and off-centre because "PAD + 5" was never actually the vertical
-/// centre of a 26px-tall tab, and the guess did not track font metrics).
+/// Label placement still goes through the shared gui_text_ttf_centered()
+/// instead of a hand-measured x with a guessed y (the 2026-09-16 fix #3,
+/// unaffected by the shape change).
 fn draw_tabs(a: &App) {
     for (i, name) in TAB_NAMES.iter().enumerate() {
         let sel = i == a.tab as usize;
         let r = tab_rect(i);
-        let outer = grad_at(a.dh, PAD);
-        let fill = if sel { C_PANEL } else { C_CARD };
+        let (x, y, w, h) = (r.x, PAD, r.w, TAB_H);
         unsafe {
-            gui_fill_rounded_aa(a.win, r.x, PAD, r.w, TAB_H + TAB_R, TAB_R, fill, outer);
-            gui_rounded_border(a.win, r.x, PAD, r.w, TAB_H + TAB_R, TAB_R,
-                               if sel { C_PANEL } else { C_EDGE });
             if sel {
-                // The selection indicator, now that fill alone can't carry it.
-                win_draw_rect(a.win, r.x + TAB_R, PAD, r.w - 2 * TAB_R, 3, C_ACCENT);
+                win_draw_rect(a.win, x, y, w, h, a.pal.surface_raised);
+                let hi = gui_lighten(a.pal.surface_raised, 60);
+                win_draw_rect(a.win, x, y, w, 1, hi);       // top
+                win_draw_rect(a.win, x, y, 1, h, hi);       // left
+                win_draw_rect(a.win, x + w - 1, y, 1, h, hi); // right
+            } else {
+                win_draw_rect(a.win, x, y, w, h, a.pal.surface);
+                let hi = gui_lighten(a.pal.surface, 60);
+                let sh = gui_darken(a.pal.surface, 40);
+                win_draw_rect(a.win, x, y, w, 1, hi);           // top
+                win_draw_rect(a.win, x, y, 1, h, hi);           // left
+                win_draw_rect(a.win, x, y + h - 1, w, 1, sh);   // bottom
+                win_draw_rect(a.win, x + w - 1, y, 1, h, sh);   // right
             }
+            let ink = if sel { a.pal.ink } else { a.pal.ink_dim };
+            gui_text_ttf_centered(a.win, x, y, w, h, name.as_ptr(), ink, 12);
         }
-        let ink = if sel { C_INK } else { C_INK_DIM };
-        unsafe { gui_text_ttf_centered(a.win, r.x, PAD, r.w, TAB_H, name.as_ptr(), ink, 12); }
     }
 }
 
-/// (2026-09-16 owner fix) One panel: soft shadow, AA rounded fill on the
-/// BOTTOM two corners only, 1px border on the sides and bottom, 1px top
-/// highlight. The top used to be rounded like the other three corners, which
-/// is what made the tab strip above it read as a separate floating shape
-/// instead of the same control: gui_fill_rounded_aa()/gui_rounded_border()
-/// still only take one radius, so the top corners are rounded by the same
-/// calls as the bottom ones and then squared BACK off by a flat cover over
-/// the top PANEL_R rows - the same trick draw_tabs() uses in reverse, and
-/// what that function's own top-corner extension is drawn to be squared by.
-/// No border line is drawn across the top at all: the panel is meant to read
-/// as open there, capped by the tab strip, not divided from it by an edge.
-///
-/// Every outer colour comes from grad_at() - the SAME deterministic gradient
-/// draw_bg() just painted behind everything - instead of a backdrop-buffer
-/// sample, because there is no longer a backdrop buffer (see draw_bg()).
-/// Drawn every frame on purpose: the same inputs give the same pixels, so the
-/// repaint is idempotent.
+/// (owner revert, 2026-10-01) The panel every tab draws its content into is
+/// now the SHARED style-engine card (libc/gui_style.h gui_card(), already
+/// used elsewhere in this file for the Performance charts), not a hand-rolled
+/// AA rounded fill + soft shadow + border dance. gui_card() already does
+/// exactly "beveled square card under classic, rounded card under modern,
+/// driven by the active palette" - the classic arm draws flat
+/// pal.surface_raised with a 1px highlight (top/left) and shadow
+/// (bottom/right) bevel, which is the real CDE/Motif notebook-page look, and
+/// it is what every other shared widget in this app already anti-aliases
+/// against. No outer-colour sampling is needed because nothing here is
+/// rounded under the classic theme.
 fn draw_panel(a: &App, x: i32, y: i32, w: i32, h: i32) {
-    let outer = grad_at(a.dh, y + h + 3);
-    unsafe {
-        gui_soft_shadow(a.win, x, y + 2, w, h, PANEL_R, outer);
-        gui_fill_rounded_aa(a.win, x, y, w, h, PANEL_R, C_PANEL, outer);
-        gui_rounded_border(a.win, x, y, w, h, PANEL_R, C_EDGE);
-        win_draw_rect(a.win, x, y, w, PANEL_R, C_PANEL);
-        win_draw_rect(a.win, x + PANEL_R, y + 1, w - 2 * PANEL_R, 1, gui_lighten(C_PANEL, 16));
-    }
+    unsafe { gui_card(a.win, x, y, w, h); }
 }
 
 /// The main panel every tab draws its content into.
@@ -1225,7 +1195,7 @@ fn draw_main_panel(a: &App) {
 
 /// A hairline rule inside the panel, PANEL_IN from either edge.
 fn draw_rule(a: &App, y: i32) {
-    win_draw_rect(a.win, CX, y, a.dw - 2 * CX, 1, C_HAIR);
+    win_draw_rect(a.win, CX, y, a.dw - 2 * CX, 1, a.pal.border);
 }
 /// A full-width list row band inside the panel.
 fn draw_row_band(a: &App, y: i32, color: u32) {
@@ -1305,10 +1275,10 @@ fn draw_processes(a: &App) {
         if i >= a.nproc { break; }
         let ry = ltop + (r as i32) * ROW_H;
         let sel = a.procs[i].pid == a.sel_pid;
-        if sel { draw_row_band(a, ry, C_ACCENT); }
-        else if r & 1 == 1 { draw_row_band(a, ry, unsafe { gui_lighten(C_PANEL, 4) }); }
-        let ink = if sel { C_ACCENT_INK } else { a.pal.ink };
-        let dim = if sel { C_ACCENT_INK } else { a.pal.ink_dim };
+        if sel { draw_row_band(a, ry, a.pal.accent); }
+        else if r & 1 == 1 { draw_row_band(a, ry, unsafe { gui_lighten(a.pal.surface, 4) }); }
+        let ink = if sel { ink_on(a.pal.accent) } else { a.pal.ink };
+        let dim = if sel { ink_on(a.pal.accent) } else { a.pal.ink_dim };
 
         draw_text(a.win, c_name, ry + 3, &a.procs[i].name, 12, ink);
         b.clear(); b.putu(a.procs[i].pid as u64);
@@ -1449,9 +1419,8 @@ fn draw_net_card(a: &App, x: i32, y: i32, w: i32, h: i32) {
 }
 
 fn draw_performance(a: &App) {
-    // (tmglass) the control row and the charts all live inside the main
-    // glass panel; PERF_CTL_Y / perf_mode_btns() are the same definitions the
-    // click handler tests.
+    // PERF_CTL_Y / perf_mode_btns() are the same definitions the click
+    // handler tests.
     let top = PERF_CTL_Y;
     let pm = perf_mode_btns();
     unsafe {
@@ -1657,10 +1626,10 @@ fn draw_services(a: &App) {
         let ry = ltop + (i as i32) * ROW_H;
         if ry + ROW_H > list_bottom(a.dh) { break; }
         let sel = i == a.svc_sel;
-        if sel { draw_row_band(a, ry, C_ACCENT); }
-        else if i & 1 == 1 { draw_row_band(a, ry, unsafe { gui_lighten(C_PANEL, 4) }); }
-        let ink = if sel { C_ACCENT_INK } else { a.pal.ink };
-        let dim = if sel { C_ACCENT_INK } else { a.pal.ink_dim };
+        if sel { draw_row_band(a, ry, a.pal.accent); }
+        else if i & 1 == 1 { draw_row_band(a, ry, unsafe { gui_lighten(a.pal.surface, 4) }); }
+        let ink = if sel { ink_on(a.pal.accent) } else { a.pal.ink };
+        let dim = if sel { ink_on(a.pal.accent) } else { a.pal.ink_dim };
         let s = &a.svcs[i];
         draw_text(a.win, c_name, ry + 3, &s.name, 12, ink);
         draw_text(a.win, c_state, ry + 3, if s.running != 0 { b"Running\0" } else { b"Stopped\0" },
@@ -1701,10 +1670,10 @@ fn draw_scheduled(a: &App) {
         if ry + ROW_H > list_bottom(a.dh) { break; }
         // #188: row selection, drawn exactly like the Services tab's.
         let sel = i == a.job_sel;
-        if sel { draw_row_band(a, ry, C_ACCENT); }
-        else if i & 1 == 1 { draw_row_band(a, ry, unsafe { gui_lighten(C_PANEL, 4) }); }
-        let ink = if sel { C_ACCENT_INK } else { a.pal.ink };
-        let dim = if sel { C_ACCENT_INK } else { a.pal.ink_dim };
+        if sel { draw_row_band(a, ry, a.pal.accent); }
+        else if i & 1 == 1 { draw_row_band(a, ry, unsafe { gui_lighten(a.pal.surface, 4) }); }
+        let ink = if sel { ink_on(a.pal.accent) } else { a.pal.ink };
+        let dim = if sel { ink_on(a.pal.accent) } else { a.pal.ink_dim };
         let j = &a.jobs[i];
         let nm: &[u8] = if j.label[0] != 0 { &j.label } else { &j.target };
         draw_text(a.win, c_name, ry + 3, nm, 12, ink);
@@ -2033,7 +2002,7 @@ pub extern "C" fn main() -> i32 {
                         if r < app.nproc { app.sel_pid = app.procs[r].pid; app.refresh_detail(); draw(&mut app); }
                     }
                 } else if app.tab == Tab::Performance {
-                    // (tmglass) PERF_CTL_Y / perf_mode_btns(): what draw_performance() paints.
+                    // PERF_CTL_Y / perf_mode_btns(): what draw_performance() paints.
                     if my >= PERF_CTL_Y && my < PERF_CTL_Y + PERF_CTL_H {
                         let pm = perf_mode_btns();
                         if pm[0].hit(mx) { app.perf_cores = false; draw(&mut app); }
@@ -2064,8 +2033,8 @@ pub extern "C" fn main() -> i32 {
                         if r < app.njobs { app.job_sel = r; draw(&mut app); }
                     }
                 } else if app.tab == Tab::Services {
-                    // (tmglass) foot_y()/FOOT_H/svc_btns()/LIST_TOP_Y: the
-                    // same definitions draw_services() paints from.
+                    // foot_y()/FOOT_H/svc_btns()/LIST_TOP_Y: the same
+                    // definitions draw_services() paints from.
                     let fy = foot_y(app.dh);
                     if my >= fy && my < fy + FOOT_H {
                         if app.svc_sel < app.nsvcs {

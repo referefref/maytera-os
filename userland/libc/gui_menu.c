@@ -7,6 +7,7 @@
 #include "gui_menu.h"
 #include "gui.h"       // gui_ttf_width (via gui_style.h), win_draw_rect/win_draw_text_ttf
 #include "theme.h"     // theme_color_of / theme_metric_or - the widget themes ITSELF
+#include "stdio.h"     // snprintf, for otb_ctl_invoke-style "no-handler" text
 
 // The POPUP ROW's left gutter. Unlike the bar's padding (GUI_MENU_BAR_PAD,
 // which is metric.gap) this one is NOT free and is NOT a theme read: the
@@ -468,4 +469,67 @@ int gui_menu_key(gui_menu_bar_t *bar, uint32_t keycode, char key_char) {
     }
 
     return -1;
+}
+
+// ===========================================================================
+// CONTRACT PROJECTION + GENERIC DISPATCH (docs/CONTRACT_COVERAGE_PLAN.md
+// task 3 phase 4). Mirrors otoolbar.c's otb_ctl_* exactly, one struct over:
+// gui_menu_item_t is the SAME table gui_menu_bar_draw()/gui_menu_bar_click()
+// already read, so adding tok/afn/desc/risk/cap/terms means a menu click and
+// a contract call run through the ONE row an app writes, instead of two
+// independently maintained descriptions of what that row does.
+static int menu_ctl_invoke(const struct ct_item *it, int argc, char **argv,
+                           char *out, int ocap) {
+    const gui_menu_item_t *a = (const gui_menu_item_t *)it->ctx;
+    if (!a || !a->afn) {
+        if (out && ocap > 0) snprintf(out, (size_t)ocap, "no-handler");
+        return -1;
+    }
+    return a->afn(it, argc, argv, out, ocap);
+}
+
+int menu_ctl_count(const gui_menu_item_t *items, int n) {
+    int c = 0;
+    for (int i = 0; i < n; i++) if (items[i].tok) c++;
+    return c;
+}
+
+int menu_ctl_project(const gui_menu_item_t *items, int n, int idx, ct_item_t *out) {
+    if (idx < 0) return 0;
+    for (int i = 0; i < n; i++) {
+        if (!items[i].tok) continue;
+        if (idx == 0) {
+            __builtin_memset(out, 0, sizeof(*out));
+            out->name   = items[i].tok;
+            out->type   = CT_ACTION;
+            out->access = CT_WRITE;
+            out->risk   = items[i].risk;
+            out->cap    = items[i].cap;
+            out->actfn  = menu_ctl_invoke;
+            out->ctx    = &items[i];
+            out->desc   = items[i].desc;
+            out->terms  = items[i].terms;
+            return 1;
+        }
+        idx--;
+    }
+    return 0;
+}
+
+// Live dispatch: a menu click carries no value (unlike a toolbar event), so
+// every afn here is called with argc = 0 - the same "no argument" shape a
+// plain button press already uses on the toolbar side (otb_ctl_dispatch with
+// value < 0). Returns 1 if a row in THIS table matched `id` (so a caller
+// chaining several menus - File/Edit/Format/Insert/... - can fall through in
+// order), 0 if none did.
+int menu_ctl_dispatch(const gui_menu_item_t *items, int n, int id,
+                      char *out, int ocap, int *outcode) {
+    for (int i = 0; i < n; i++) {
+        if (items[i].id != id) continue;
+        if (!items[i].afn) return 1;
+        int rc = items[i].afn(0, 0, 0, out, ocap);
+        if (outcode) *outcode = rc;
+        return 1;
+    }
+    return 0;
 }

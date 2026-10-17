@@ -41,6 +41,13 @@ size_t heap_get_total_size(void);
 size_t heap_get_used_size(void);
 size_t heap_get_free_size(void);
 
+// #heapinvptr: the number of pointers kfree()/krealloc() have REFUSED, and the
+// number of double frees caught, since boot. For a self-test that must compare a
+// count before and after its own work; see the declaration in heap.c for why a
+// counter and not only the existing log line.
+uint64_t heap_invalid_free_count(void);
+uint64_t heap_double_free_count(void);
+
 // Debug: print heap statistics
 void heap_print_stats(void);
 

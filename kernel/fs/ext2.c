@@ -16,6 +16,7 @@
 #include "../sync/waitq.h"     // #609: contenders BLOCK on a wait queue, never spin
 #include "../cpu/mono.h"      // #618: real-time clock for the lock-hold profiler
 #include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
+#include "fsenoent.h"   // #aicappersist: why an ext2 ENOENT happened
 #include "../security/selftest_registry.h"  // #EXT2SELFTEST: a probe that
                                             // cannot run must SAY so
 #include "../cpu/wallclock.h"   // #115: the ONE wall clock + calendar converter
@@ -57,10 +58,96 @@ extern int64_t blkmgr_dev_rw_c(uint8_t kind, uint8_t index, uint64_t lba,
 // One place that decides "legacy blk_* vs unified blkmgr" for a given fs, so no
 // call site below has to. `lba` is the ABSOLUTE device LBA (part_start_lba is
 // already folded in by the caller, exactly as for blk_read/blk_write).
-static int e2_dev_read(const ext2_fs_t *fs, uint32_t lba, uint32_t count, void *buf) {
+// ---------------------------------------------------------------------------
+// #e2rdio: the ext2 read path's device-I/O ledger and fault injector.
+//
+// All of the state and all of the policy live in rustkern/e2rdio.rs (new kernel
+// code, so Rust per the 2026-07-16 rule); this file owns only the two seams that
+// consult it: the device read below, and the sparse-block decision inside the
+// two readers. Read that module's header for WHY the ledger exists: nothing in
+// this kernel has ever counted a failed sector read, which is why "did a
+// transient disk fault actually happen" has never been an answerable question.
+// ---------------------------------------------------------------------------
+extern int  e2rdio_dev_take_rs(uint32_t count, int *out_rc);
+extern int  e2rdio_hole_take_rs(uint32_t ino);
+extern void e2rdio_note_retry_rs(void);
+extern void e2rdio_note_recovered_rs(uint32_t attempts);
+extern void e2rdio_note_exhausted_rs(int rc);
+extern void e2rdio_note_hole_rs(void);
+extern int  e2rdio_arm_rs(uint32_t mode, uint32_t shots, uint32_t ino, uint32_t owner);
+extern void e2rdio_disarm_rs(void);
+extern void e2rdio_seal_rs(void);
+extern int  e2rdio_sealed_rs(void);
+extern int  e2rdio_selftest_rs(uint32_t *out_checks);
+extern void e2rdio_stats_rs(void *out);
+
+// Mirrors #[repr(C)] struct E2RdioStats in rustkern/e2rdio.rs. The
+// _Static_assert is this codebase's FFI layout lock (see RUST_PORT_LEDGER.md).
+typedef struct {
+    uint64_t retries;
+    uint64_t recovered;
+    uint64_t exhausted;
+    uint64_t holes;
+    uint64_t launder;
+    uint64_t injected;
+    uint32_t last_produced;
+    uint32_t last_ino;
+    int64_t  last_got;
+} e2rdio_stats_t;
+_Static_assert(sizeof(e2rdio_stats_t) == 64,
+               "e2rdio_stats_t must match rustkern/e2rdio.rs E2RdioStats");
+
+#define E2RD_INJ_DEV_FAIL   1u
+#define E2RD_INJ_DEV_SHORT  2u
+#define E2RD_INJ_HOLE       3u
+
+// How many times a FAILED ext2 device read is re-issued before the failure is
+// reported upwards, and it is deliberately small.
+//
+// WHY IT IS MOUNTED-ONLY, which is not a detail. Every PROBE in this file
+// (ext2_mount's superblock read at LBA 2, ext2_find_partition, the aux-volume
+// scans) deliberately reads a device that may not be there and EXPECTS the read
+// to fail: on a shipping golden the whole-disk mount attempt fails on every
+// boot, by design. Retrying those would multiply the cost of every
+// absent-device probe by three, and a device probe that got slower is exactly
+// the #426 shape that has produced boot hangs on this OS before. A probe
+// therefore keeps its single attempt, byte for byte as before; only I/O against
+// a volume already proved present retries.
+//
+// WHY RETRY AT ALL. A re-read of the same LBAs is idempotent, so on the healthy
+// path this costs nothing (the loop exits on the first attempt) and on the
+// unhealthy path it is the difference between an app dying and an app working.
+// It is also the ONLY way the `recovered` counter can ever be non-zero, and that
+// counter is the measurement that turns "a transient disk fault, probably" into
+// a fact. NOT a wait loop and NOT a poll (#426): each iteration RE-ISSUES the
+// transfer, which is the operation itself making progress; no condition is
+// polled, nothing sleeps, and nothing blocks here that did not block before.
+#define E2_DEV_READ_TRIES 3u
+
+static int e2_dev_read_once(const ext2_fs_t *fs, uint32_t lba, uint32_t count, void *buf) {
     if (fs->via_blkmgr)
         return (int)blkmgr_dev_rw_c(fs->dev_kind, fs->dev_index, lba, count, buf, 0);
     return blk_read(fs->channel, fs->drive, lba, count, buf);
+}
+
+static int e2_dev_read(const ext2_fs_t *fs, uint32_t lba, uint32_t count, void *buf) {
+    uint32_t tries = fs->mounted ? E2_DEV_READ_TRIES : 1u;
+    int r = -1;
+    for (uint32_t attempt = 0; attempt < tries; attempt++) {
+        int inj = 0;
+        if (e2rdio_dev_take_rs(count, &inj)) {
+            r = inj;                      // pretend the device answered this
+        } else {
+            r = e2_dev_read_once(fs, lba, count, buf);
+        }
+        if (r == (int)count) {
+            if (attempt) e2rdio_note_recovered_rs(attempt + 1);
+            return r;
+        }
+        if (attempt + 1 < tries) e2rdio_note_retry_rs();
+    }
+    if (tries > 1) e2rdio_note_exhausted_rs(r);
+    return r;
 }
 static MUST_CHECK int e2_dev_write(const ext2_fs_t *fs, uint32_t lba, uint32_t count,
                                    const void *buf) {
@@ -1335,6 +1422,7 @@ static int64_t ext2_read_file_ino_on(const ext2_fs_t *fs, uint32_t ino,
             // (avoids writing past a non-block-aligned output buffer).
             if (phys == 0) {
                 memset(out + copied, 0, (size_t)remaining);
+                e2rdio_note_hole_rs();                // #e2rdio
             } else {
                 if (ext2_read_block(fs, phys, tmp) != 0) goto done;
                 memcpy(out + copied, tmp, (size_t)remaining);
@@ -1344,6 +1432,7 @@ static int64_t ext2_read_file_ino_on(const ext2_fs_t *fs, uint32_t ino,
         }
         if (phys == 0) {
             memset(out + copied, 0, bs);   // sparse hole (full block)
+            e2rdio_note_hole_rs();         // #e2rdio
             copied += bs; lb++;
             continue;
         }
@@ -1424,6 +1513,11 @@ int64_t ext2_read_file_range_on(const ext2_fs_t *fs, uint32_t ino,
         uint32_t phys = ext2_resolve_cached(fs, &inode, lb, indbuf, &ind_cached,
                                             dindbuf, &dind_cached);
         if (phys == EXT2_BMAP_ERR) { rc = -4; goto rdone; }
+        // #e2rdio: the sparse-hole injection seam. A hole is NOT an error and
+        // must not become one (zeros are the correct data for a hole), so this
+        // exists to PROVE that, not to fault. See rustkern/e2rdio.rs and the
+        // ext2/readfault group in ext2_selftest().
+        if (phys != 0 && e2rdio_hole_take_rs(ino)) phys = 0;
 
         uint64_t remain = len - copied;
         if (boff != 0 || remain < bs) {
@@ -1433,6 +1527,7 @@ int64_t ext2_read_file_range_on(const ext2_fs_t *fs, uint32_t ino,
             if ((uint64_t)chunk > remain) chunk = (uint32_t)remain;
             if (phys == 0) {
                 memset(out + copied, 0, chunk);       // sparse hole
+                e2rdio_note_hole_rs();                // #e2rdio: counted, not complained about
             } else {
                 if (ext2_read_block(fs, phys, tmp) != 0) goto rdone;
                 memcpy(out + copied, tmp + boff, chunk);
@@ -1440,7 +1535,8 @@ int64_t ext2_read_file_range_on(const ext2_fs_t *fs, uint32_t ino,
             copied += chunk;
             continue;
         }
-        if (phys == 0) { memset(out + copied, 0, bs); copied += bs; continue; }
+        if (phys == 0) { memset(out + copied, 0, bs); e2rdio_note_hole_rs();
+                         copied += bs; continue; }
 
         // Aligned full block(s): gather a physically-contiguous run and DMA it
         // straight into the destination in one transfer.
@@ -2071,6 +2167,49 @@ static int e2st_walk_root(uint32_t *entries_out, uint32_t *geom_bad_out,
     return 1;
 }
 
+// ---------------------------------------------------------------------------
+// #e2rdio REPORTING. The recording sites (e2_dev_read, the sparse decision,
+// proc/fdlayer.c's refill failure) must NEVER print: e2_dev_read runs inside the
+// block read path, where bootlog_write()'s flush would re-enter blk_write(),
+// which is the recursion kernel/fs/blockdev.c already documents. So they set a
+// PENDING flag and a caller in a safe context prints. That is the same split
+// rustkern/netfail.rs uses, for the same reason.
+//
+// Called from the boot self-test (covers everything that happened during boot)
+// and, lazily, from proc/fdlayer.c's ext2 read branch when the flag is set
+// (covers everything that happens afterwards). One relaxed atomic swap per
+// pending check.
+// ---------------------------------------------------------------------------
+void e2rdio_report(const char *why) {
+    e2rdio_stats_t s;
+    memset(&s, 0, sizeof(s));
+    e2rdio_stats_rs(&s);
+    // `recovered` is the line that matters most: a NON-ZERO value is the first
+    // direct evidence this OS has ever had that a transient device read fault is
+    // real rather than inferred. `injected` must be 0 outside the self-test.
+    kprintf("[E2RDIO] %s: retry=%lu recovered=%lu exhausted=%lu holes=%lu "
+            "launder=%lu inject=%lu last(ino=%u got=%ld produced=%u)\n",
+            why ? why : "report",
+            (unsigned long)s.retries, (unsigned long)s.recovered,
+            (unsigned long)s.exhausted, (unsigned long)s.holes,
+            (unsigned long)s.launder, (unsigned long)s.injected,
+            (unsigned)s.last_ino, (long)s.last_got, (unsigned)s.last_produced);
+    // Durable, because the two machines whose evidence matters (the ASUS
+    // laptop, the iMac14,4) have no serial port, so kprintf() produces literally
+    // nothing there. Only when something actually happened: a line of zeroes on
+    // every boot is how a log turns into noise.
+    if (s.retries || s.exhausted || s.launder || s.recovered)
+        bootlog_write("[E2RDIO] %s retry=%lu recovered=%lu exhausted=%lu "
+                      "holes=%lu launder=%lu inject=%lu last_ino=%u last_got=%ld "
+                      "last_produced=%u",
+                      why ? why : "report",
+                      (unsigned long)s.retries, (unsigned long)s.recovered,
+                      (unsigned long)s.exhausted, (unsigned long)s.holes,
+                      (unsigned long)s.launder, (unsigned long)s.injected,
+                      (unsigned)s.last_ino, (long)s.last_got,
+                      (unsigned)s.last_produced);
+}
+
 void ext2_selftest(void) {
     g_e2st_checks = 0; g_e2st_fail = 0; g_e2st_logged = 0; g_e2st_first[0] = '\0';
 
@@ -2330,6 +2469,212 @@ void ext2_selftest(void) {
             }
             if (b) kfree(b);
         }
+    }
+
+    // ---- group: read-fault reporting (#e2rdio) ---------------------------
+    // THE ONE THING THIS GROUP PROVES, and it is the whole ticket: a device read
+    // that FAILS must reach the caller as an ERROR, not as end-of-file.
+    //
+    // It is END TO END through the SHIPPING path. sys_open_k() on the real
+    // volume, sys_read() on the real bounded-window refill, ext2_read_file_range
+    // on the real resolver and the real contiguous-run gather. The ONLY synthetic
+    // thing is the device answer itself, injected at this file's device seam by
+    // rustkern/e2rdio.rs. Nothing is stubbed and no code path is bypassed.
+    //
+    // RED AND GREEN IN THE SAME BOOT, WITHOUT SHIPPING A SWITCH THAT RE-ARMS THE
+    // BUG. The pre-fix code returned `produced` at the refill-failure site, and
+    // `produced` is 0 whenever the first refill failed, which userland's
+    // refill() correctly reads as EOF. sys_read() now RECORDS that value through
+    // e2rdio_note_launder_rs() before returning a real error, so both halves are
+    // assertable from one run: last_produced == 0 (what the old code would have
+    // returned, i.e. the bug) AND the actual return is -EIO (the fix). The
+    // alternative, a flag that restores the old behaviour, would have meant
+    // shipping a switch that re-arms a silent-data-loss bug in the read path.
+    //
+    // WHY IT IS NOT COMPILE-GATED. A self-test nobody has watched go red is
+    // indistinguishable from one that is not wired up (#514/#665), and a gated
+    // one runs on exactly the build that is not the golden. This is read-only,
+    // writes nothing, reads at most ~132 KB of an already-cached file, and seals
+    // the injector when it finishes so no arm can survive into a running desktop.
+    {
+        extern int64_t sys_open_k(const char *path, int flags);
+        extern int64_t sys_read(int fd, void *buf, size_t count);
+        extern int64_t sys_close(int fd);
+
+        uint32_t rchk = 0;
+        int rbad = e2rdio_selftest_rs(&rchk);
+        e2st_check(rbad == 0 && rchk >= 30,
+                   "injector state machine self-test passes (owner keying, "
+                   "shot counting, sealing)");
+
+        // Subject: the largest regular file the scan above found, re-used so
+        // this group discovers nothing of its own. A path, because sys_open_k
+        // takes one; e2st_join leaves subdirectory names RELATIVE ("APPS/X"),
+        // so prepend the root slash when it is missing.
+        char rpath[96];
+        uint32_t ino = g_e2st_subj.big_ino;
+        uint64_t bsz = g_e2st_subj.big_sz;
+        if (ino && g_e2st_subj.big_nm[0] != '/') {
+            rpath[0] = '/';
+            strncpy(rpath + 1, g_e2st_subj.big_nm, sizeof(rpath) - 2);
+            rpath[sizeof(rpath) - 1] = '\0';
+        } else if (ino) {
+            strncpy(rpath, g_e2st_subj.big_nm, sizeof(rpath) - 1);
+            rpath[sizeof(rpath) - 1] = '\0';
+        } else {
+            rpath[0] = '\0';
+        }
+
+        uint32_t bs  = g_ext2.block_size;
+        uint32_t cap = bs * 2;
+        uint8_t *rb  = (uint8_t *)kmalloc(cap);
+
+        if (!ino || bsz < (uint64_t)cap || !rpath[0] || !rb) {
+            selftest_notrun("ext2/readfault",
+                            "no regular file at least two blocks long was found "
+                            "within the scan bound (or a scratch buffer could "
+                            "not be allocated), so the read-error path was NOT "
+                            "exercised on this boot");
+        } else {
+            e2rdio_stats_t s0, s1;
+            memset(&s0, 0, sizeof(s0)); memset(&s1, 0, sizeof(s1));
+            kprintf("[EXT2-SELFTEST]   readfault subject '%s' ino=%u size=%lu "
+                    "bs=%u\n", rpath, (unsigned)ino, (unsigned long)bsz,
+                    (unsigned)bs);
+
+            // ---- 1. NO REGRESSION. Nothing armed: the ordinary read must
+            // still deliver every byte, and must agree with the range reader.
+            // The retry wrapper sits under every read in the filesystem, so
+            // this is the check that it did not break the healthy path.
+            int fd = (int)sys_open_k(rpath, 0 /* O_RDONLY */);
+            int64_t n = (fd >= 0) ? sys_read(fd, rb, cap) : -1;
+            e2st_check(fd >= 0 && n == (int64_t)cap,
+                       "an unarmed read through the fd path returns every byte");
+            {
+                uint8_t *ref = (uint8_t *)kmalloc(cap);
+                int same = 0;
+                if (ref && ext2_read_file_range(ino, 0, cap, ref) == (int64_t)cap) {
+                    same = 1;
+                    for (uint32_t i = 0; i < cap; i++)
+                        if (ref[i] != rb[i]) { same = 0; break; }
+                }
+                e2st_check(same, "those bytes match the range reader exactly");
+                if (ref) kfree(ref);
+            }
+            if (fd >= 0) sys_close(fd);
+
+            // ---- 2. THE FIX. A device failure that survives every retry must
+            // come back as -EIO (-5), NOT as 0. Armed with far more shots than
+            // the refill can consume, so the failure is genuinely persistent.
+            e2rdio_stats_rs(&s0);
+            fd = (int)sys_open_k(rpath, 0);
+            int64_t armed = e2rdio_arm_rs(E2RD_INJ_DEV_FAIL, 4096u, 0, proc_current_pid());
+            n = (fd >= 0) ? sys_read(fd, rb, cap) : 0;
+            e2rdio_disarm_rs();
+            e2rdio_stats_rs(&s1);
+            e2st_check(armed == 0, "the injector arms for a persistent device failure");
+            e2st_check(n == -5,
+                       "a persistent device read failure returns -EIO from read()");
+            e2st_check(n != 0,
+                       "it is NOT reported as end-of-file (the defect this fixes)");
+            e2st_check(s1.launder == s0.launder + 1,
+                       "the refill-failure site was reached exactly once");
+            e2st_check(s1.last_produced == 0,
+                       "the PRE-FIX code would have returned 0 here, i.e. EOF");
+            e2st_check(s1.last_got < 0,
+                       "the refill reported a negative ext2 error, not a short count");
+            e2st_check(s1.exhausted > s0.exhausted,
+                       "the device read was re-issued and still failed, and that "
+                       "is counted");
+            kprintf("[EXT2-SELFTEST]   readfault: read()=%ld pre-fix would have "
+                    "been %u; ext2 rc=%ld; retry=%lu exhausted=%lu\n",
+                    (long)n, (unsigned)s1.last_produced, (long)s1.last_got,
+                    (unsigned long)(s1.retries - s0.retries),
+                    (unsigned long)(s1.exhausted - s0.exhausted));
+            if (fd >= 0) sys_close(fd);
+
+            // ---- 3. A SHORT transfer, not a reported failure. The device seam
+            // checks `!= count`, so a transfer that moves count-1 sectors and
+            // says so must be caught by the same path. This is the S11 half of
+            // the ticket, and it is a DIFFERENT code path from a negative return.
+            e2rdio_stats_rs(&s0);
+            fd = (int)sys_open_k(rpath, 0);
+            e2rdio_arm_rs(E2RD_INJ_DEV_SHORT, 4096u, 0, proc_current_pid());
+            n = (fd >= 0) ? sys_read(fd, rb, cap) : 0;
+            e2rdio_disarm_rs();
+            e2rdio_stats_rs(&s1);
+            e2st_check(n == -5,
+                       "a persistently SHORT device transfer also returns -EIO");
+            e2st_check(s1.launder == s0.launder + 1,
+                       "and reached the refill-failure site exactly once");
+            if (fd >= 0) sys_close(fd);
+
+            // ---- 4. THE RETRY EARNS ITS KEEP. A device read that fails ONCE
+            // and succeeds on re-issue must deliver every byte, with the recovery
+            // counted. This is the arm that turns the fix from "the app now gets
+            // a clean error" into "the app now works", and it is the only way the
+            // `recovered` counter can ever be seen to move.
+            e2rdio_stats_rs(&s0);
+            fd = (int)sys_open_k(rpath, 0);
+            e2rdio_arm_rs(E2RD_INJ_DEV_FAIL, 1u, 0, proc_current_pid());
+            n = (fd >= 0) ? sys_read(fd, rb, cap) : -1;
+            e2rdio_disarm_rs();
+            e2rdio_stats_rs(&s1);
+            e2st_check(n == (int64_t)cap,
+                       "a ONE-SHOT device failure is recovered by the re-issue "
+                       "and the read still returns every byte");
+            e2st_check(s1.recovered == s0.recovered + 1,
+                       "and the recovery is counted exactly once");
+            e2st_check(s1.launder == s0.launder,
+                       "a recovered read never reaches the failure-report site");
+            if (fd >= 0) sys_close(fd);
+
+            // ---- 5. SPARSE FILES ARE NOT AN ERROR. phys == 0 means a hole, and
+            // zeros ARE the correct data for a hole. The error work above must not
+            // have turned that into a failure. Forced on the FIRST data block, so
+            // the first block_size bytes must come back as zeros with a SUCCESSFUL
+            // full-length read. It is counted (holes), because a hole and a lost
+            // block look identical on disk and the count is the only thing that can
+            // ever tell a "this file is corrupt" report which one it was looking at.
+            e2rdio_stats_rs(&s0);
+            fd = (int)sys_open_k(rpath, 0);
+            memset(rb, 0xA5, cap);
+            e2rdio_arm_rs(E2RD_INJ_HOLE, 1u, ino, proc_current_pid());
+            n = (fd >= 0) ? sys_read(fd, rb, cap) : -1;
+            e2rdio_disarm_rs();
+            e2rdio_stats_rs(&s1);
+            int zeroed = (n == (int64_t)cap);
+            if (zeroed)
+                for (uint32_t i = 0; i < bs; i++)
+                    if (rb[i] != 0) { zeroed = 0; break; }
+            e2st_check(n == (int64_t)cap,
+                       "a sparse hole reads as SUCCESS, not as an error");
+            e2st_check(zeroed, "and the hole's bytes are zeros");
+            e2st_check(s1.holes == s0.holes + 1, "and the hole is counted");
+            e2st_check(s1.launder == s0.launder,
+                       "a sparse hole never reaches the failure-report site");
+            if (fd >= 0) sys_close(fd);
+
+            // ---- 6. The arm really is gone. Everything after this point in the
+            // life of this machine reads the disk for real.
+            e2rdio_seal_rs();
+            e2rdio_stats_rs(&s0);
+            fd = (int)sys_open_k(rpath, 0);
+            e2st_check(e2rdio_arm_rs(E2RD_INJ_DEV_FAIL, 4096u, 0, proc_current_pid()) == -1,
+                       "the injector is SEALED and refuses every later arm");
+            n = (fd >= 0) ? sys_read(fd, rb, cap) : -1;
+            e2rdio_stats_rs(&s1);
+            e2st_check(n == (int64_t)cap && s1.injected == s0.injected,
+                       "a read after sealing is a real read with nothing injected");
+            if (fd >= 0) sys_close(fd);
+
+            selftest_ran("ext2/readfault");
+        }
+        if (rb) kfree(rb);
+        // Sealed on EVERY path out of this group, including the not-run one, so a
+        // machine that skipped the test still cannot carry an armed injector.
+        e2rdio_seal_rs();
+        e2rdio_report("boot");
     }
 
     // ---- verdict ---------------------------------------------------------
@@ -5623,4 +5968,215 @@ void ext2_fsck_selftest(void) {
     } else {
         g_e2fsck_ffi_ok = 1;
     }
+}
+
+// ===========================================================================
+// #aicappersist: WHY an ext2 ENOENT happened. See fs/fsenoent.h and
+// rustkern/fsenoent.rs; the classification and the rate limit live there.
+//
+// WHY THE GATHERER IS C, stated because the standing rule is Rust-first: every
+// fact below is file-static state inside THIS translation unit (g_ext2,
+// g_root_ext2) or a static function of it (ext2_resolve_path_on,
+// ext2_read_inode_on, ext2_parent_and_base_on). Exporting them to reach the
+// facts from Rust would widen the surface of the filesystem's private state to
+// get a diagnostic, which is a worse trade than ten lines of glue. The POLICY
+// is in Rust and this function makes no decision of its own.
+//
+// IT RE-RESOLVES THE PARENT, TWICE, AFTER THE REFUSAL. That is the entire
+// discriminating power: the guard has already answered "absent", so a parent
+// that resolves here is evidence the guard was WRONG, and a parent that still
+// does not resolve is evidence it was RIGHT and the caller is at fault. Two
+// resolves rather than one because a lookup that answers differently on two
+// consecutive calls is a third, distinct finding.
+// ===========================================================================
+// ===========================================================================
+// #aicappersist FORENSICS: when an inode reads back ALL ZEROS, say where the
+// zeros came from.
+//
+// MEASURED on golden 2520 (VM 2801, autologin=root): late in boot,
+// ext2_read_inode_on(&g_ext2, 2, &in) returns SUCCESS with in.i_mode == 0, so
+// ext2_parent_dir_exists("/UIPROFIL.YML") answers "the root directory is not a
+// directory" and every create under "/" is refused ENOENT. /CONFIG then resolves
+// to inode 0 as well. e2fsck -fn on the same image afterwards is CLEAN, so the
+// zeros are not on the disk.
+//
+// There are exactly three places the zeros can come from, and they need
+// different fixes, so the instrument separates them instead of narrating:
+//
+//   1. THE BLOCK CACHE holds a zero-filled copy of the inode-table block,
+//      published valid=1. Then a cache-bypassing RAW read of the same block
+//      returns the REAL inode and the cached copy is zeros. Fix at the cache.
+//   2. THE GEOMETRY in g_ext2 is wrong (a clobbered inodes_per_group /
+//      inode_size / group descriptor), so the computation points at a block that
+//      is legitimately zeros. Then the raw read of the COMPUTED block is also
+//      zeros, and the geometry printed here will not match the superblock the
+//      mount logged. Fix where the field is written.
+//   3. THE DEVICE returned zeros with a success status. Then both copies are
+//      zeros, the geometry is right, and a second raw read of the same block
+//      usually differs. Fix in the block/ATA layer, which must not report
+//      success for a transfer it did not make.
+//
+// It reads the same block THREE ways (cache, raw, raw again) because "the cache
+// is stale" and "the device is lying" produce the same single data point and are
+// told apart only by asking twice.
+// ===========================================================================
+static int g_fsen_forensics_done = 0;
+
+void ext2_inode_forensics(uint32_t ino) {
+    if (g_fsen_forensics_done >= 2) return;
+    g_fsen_forensics_done++;
+
+    const ext2_fs_t *fs = &g_ext2;
+    if (!fs->mounted) { kprintf("[FSENFOR] ino=%u: volume not mounted\n", (unsigned)ino); return; }
+
+    kprintf("[FSENFOR] geom bs=%u inode_size=%u ipg=%u groups=%u first_data=%u part_lba=%u\n",
+            (unsigned)fs->block_size, (unsigned)fs->inode_size,
+            (unsigned)fs->inodes_per_group, (unsigned)fs->groups_count,
+            (unsigned)fs->first_data_block, (unsigned)fs->part_start_lba);
+
+    if (ino == 0 || fs->inodes_per_group == 0 || fs->block_size == 0) return;
+    uint32_t group = (ino - 1) / fs->inodes_per_group;
+    uint32_t index = (ino - 1) % fs->inodes_per_group;
+    uint32_t itab = 0;
+    int gr = ext2_group_inode_table(fs, group, &itab);
+    uint64_t byte_off = (uint64_t)itab * fs->block_size + (uint64_t)index * fs->inode_size;
+    uint32_t blk_no = (uint32_t)(byte_off / fs->block_size);
+    uint32_t off_in = (uint32_t)(byte_off % fs->block_size);
+    kprintf("[FSENFOR] ino=%u group=%u index=%u itab_rc=%d itab=%u -> block=%u off=%u\n",
+            (unsigned)ino, (unsigned)group, (unsigned)index, gr,
+            (unsigned)itab, (unsigned)blk_no, (unsigned)off_in);
+
+    // 1. what the CACHE holds for that block, if anything.
+    {
+        int slot = -1; uint8_t first[8]; uint16_t cmode = 0;
+        for (int i = 0; i < 8; i++) first[i] = 0;
+        uint64_t fl = spinlock_acquire_irqsave(&g_e2c_lock);
+        for (int i = 0; i < EXT2_CACHE_SLOTS; i++) {
+            if (g_e2c[i].valid && g_e2c[i].block == blk_no && g_e2c[i].data) {
+                slot = i;
+                for (int k = 0; k < 8; k++) first[k] = g_e2c[i].data[off_in + k];
+                cmode = (uint16_t)(g_e2c[i].data[off_in] | (g_e2c[i].data[off_in + 1] << 8));
+                break;
+            }
+        }
+        spinlock_release_irqrestore(&g_e2c_lock, fl);
+        if (slot < 0) kprintf("[FSENFOR] cache: block %u NOT cached\n", (unsigned)blk_no);
+        else kprintf("[FSENFOR] cache: block %u in slot %d, inode bytes %02x %02x %02x %02x "
+                     "%02x %02x %02x %02x -> i_mode=%o\n", (unsigned)blk_no, slot,
+                     first[0], first[1], first[2], first[3],
+                     first[4], first[5], first[6], first[7], (unsigned)cmode);
+    }
+
+    // 2+3. the same block read RAW, twice, bypassing the cache entirely.
+    uint8_t *b = (uint8_t *)kmalloc(fs->block_size);
+    if (!b) { kprintf("[FSENFOR] raw: kmalloc failed\n"); return; }
+    for (int pass = 1; pass <= 2; pass++) {
+        for (uint32_t z = 0; z < fs->block_size; z++) b[z] = 0xA5;   // poison, so a
+                                                                    // read that writes
+                                                                    // NOTHING is visible
+        int r = ext2_read_block_raw(fs, blk_no, b);
+        uint16_t mode = (uint16_t)(b[off_in] | (b[off_in + 1] << 8));
+        kprintf("[FSENFOR] raw pass%d rc=%d inode bytes %02x %02x %02x %02x %02x %02x %02x %02x "
+                "-> i_mode=%o%s\n", pass, r,
+                b[off_in + 0], b[off_in + 1], b[off_in + 2], b[off_in + 3],
+                b[off_in + 4], b[off_in + 5], b[off_in + 6], b[off_in + 7],
+                (unsigned)mode,
+                (b[off_in] == 0xA5 && b[off_in + 1] == 0xA5) ? "  [POISON INTACT: the read wrote nothing]" : "");
+    }
+    kfree(b);
+    bootlog_write("[FSENFOR] ino=%u block=%u off=%u: see serial for the cache/raw comparison",
+                  (unsigned)ino, (unsigned)blk_no, (unsigned)off_in);
+}
+
+void fsenoent_report(uint32_t site, const char *path, uint32_t guard_said) {
+    fsenoent_facts_t f;
+    memset(&f, 0, sizeof(f));
+    f.site       = site;
+    f.mounted    = g_ext2.mounted ? 1u : 0u;
+    f.root_ext2  = (uint32_t)g_root_ext2;
+    f.guard_said = guard_said;
+    {
+        process_t *p = proc_current();
+        f.uid = p ? (uint32_t)p->euid : 0u;
+    }
+
+    char parent[256];
+    parent[0] = '/';
+    parent[1] = '\0';
+
+    if (f.mounted) {
+        f.root_ino = ext2_resolve_path_on(&g_ext2, "/");
+        if (path && path[0] == '/' && site != FSE_SITE_PATHCOPY) {
+            // Same split the guard used, so the two cannot disagree about WHICH
+            // directory is the parent: a diagnostic that resolved a different
+            // path than the guard refused would be worse than none.
+            int len = 0; while (path[len]) len++;
+            int slash = -1;
+            for (int i = len - 1; i >= 0; i--) if (path[i] == '/') { slash = i; break; }
+            if (slash > 0) {
+                int pl = slash < 255 ? slash : 255;
+                for (int i = 0; i < pl; i++) parent[i] = path[i];
+                parent[pl] = '\0';
+            }
+            // For a failed whole-file READ the interesting object is the FILE,
+            // not its parent: the question is whether the name that would not
+            // read resolves when asked again. For the create guards it is the
+            // PARENT, because that is what the guard refused. One field pair,
+            // two questions, each asked about the object that actually failed.
+            const char *probe = (site == FSE_SITE_READWHOLE) ? path : parent;
+            f.parent_ino_1 = ext2_resolve_path_on(&g_ext2, probe);
+            f.parent_ino_2 = ext2_resolve_path_on(&g_ext2, probe);
+            if (f.parent_ino_1) {
+                ext2_inode_t in;
+                f.inode_rc = ext2_read_inode_on(&g_ext2, f.parent_ino_1, &in);
+                if (f.inode_rc == 0) f.parent_mode = in.i_mode;
+            }
+        }
+    }
+
+    uint32_t v = fsenoent_classify_rs(&f);
+    if (!fsenoent_should_log_rs(site, v)) return;
+
+    static const char *vname[] = {
+        "UNKNOWN", "EXT2-NOT-MOUNTED", "ROOT-INO-LOST",
+        "TRANSIENT-LOOKUP-MISS(the refusal is a LIE)", "FLAPPING-LOOKUP",
+        "PARENT-INODE-UNREADABLE", "PARENT-NOT-A-DIRECTORY",
+        "CORRECT-ABSENT(the refusal is RIGHT, fix the caller)", "PATH-NEVER-REACHED-KERNEL"
+    };
+    static const char *sname[] = { "?", "pathcopy", "parentguard", "nocreate", "readwhole" };
+    const char *olabel = (site == FSE_SITE_READWHOLE) ? "target" : "parent";
+
+    kprintf("[FSENOENT] site=%s verdict=%s path=%s parent=%s mounted=%u "
+            "root_ext2=%u root_ino=%u %s_ino=%u/%u mode=%o inode_rc=%d uid=%u\n",
+            sname[site < 5 ? site : 0], vname[v < 9 ? v : 0],
+            path ? path : "(none)", parent,
+            (unsigned)f.mounted, (unsigned)f.root_ext2, (unsigned)f.root_ino, olabel,
+            (unsigned)f.parent_ino_1, (unsigned)f.parent_ino_2,
+            (unsigned)f.parent_mode, (int)f.inode_rc, (unsigned)f.uid);
+    // #aicappersist: a parent that reads with rc=0 and i_mode=0, or one that
+    // will not resolve at all, is the case worth dissecting: the inode came back
+    // as zeros. Dump where those zeros came from (cache / raw / raw again).
+    if (f.mounted && (f.parent_ino_1 == 0 || (f.inode_rc == 0 && f.parent_mode == 0)))
+        ext2_inode_forensics(f.parent_ino_1 ? f.parent_ino_1 : EXT2_ROOT_INO);
+    bootlog_write("[FSENOENT] site=%s verdict=%s path=%.60s pino=%u/%u mnt=%u rootino=%u uid=%u",
+                  sname[site < 5 ? site : 0], vname[v < 9 ? v : 0],
+                  path ? path : "(none)",
+                  (unsigned)f.parent_ino_1, (unsigned)f.parent_ino_2,
+                  (unsigned)f.mounted, (unsigned)f.root_ino, (unsigned)f.uid);
+}
+
+// Boot wiring: the ABI lock and the classifier self-test. Both run on every
+// boot, because a verdict table that had drifted would mislabel the one line
+// this whole instrument exists to produce.
+void fsenoent_boot_selftest(void) {
+    int abi = fsenoent_abi_check_rs(
+        (uint32_t)sizeof(fsenoent_facts_t),
+        FSE_SITE_PATHCOPY, FSE_SITE_PARENTGUARD, FSE_SITE_NOCREATE, FSE_SITE_READWHOLE,
+        FSE_V_NOT_MOUNTED, FSE_V_TRANSIENT, FSE_V_CORRECT_ABSENT, FSE_V_PATHCOPY);
+    uint32_t checks = 0;
+    int st = fsenoent_selftest_rs(&checks);
+    kprintf("[FSENOENT] ABI %s, classifier self-test %s (%u checks)\n",
+            abi == 0 ? "MATCH" : "DRIFT", st == 0 ? "PASS" : "FAIL", (unsigned)checks);
+    bootlog_write("[FSENOENT] ABI %s classifier self-test %s checks=%u",
+                  abi == 0 ? "MATCH" : "DRIFT", st == 0 ? "PASS" : "FAIL", (unsigned)checks);
 }

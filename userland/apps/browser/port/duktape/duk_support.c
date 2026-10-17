@@ -90,9 +90,39 @@ double log(double x) {
     if (ds_isnan(x)) return x;
     if (x < 0.0) return DS_NAN;
     if (x == 0.0) return -DS_INF;
+    /*
+     * #245 layoutsweep: +INFINITY HUNG THE WHOLE BROWSER HERE, and this is the
+     * same bug shape as the cssvar parse_color() leading-dot alpha (also #245):
+     * a loop whose progress is conditional on the input being what the author
+     * expected. Infinity times 0.5 is still Infinity, so the normalisation loop
+     * below made no progress while its condition stayed true forever.
+     *
+     * This was reachable from any web page in eleven characters of script.
+     * Duktape maps DUK_LOG straight onto this function with no special-casing
+     * of its own (duktape.c duk__log()), js_run_document() runs every inline
+     * <script> on every page load before layout, so
+     * <script>Math.log(Infinity)</script> pegged a core in Ring 3 forever: no
+     * crash, no error, a live process and a blank page. Math.log2, Math.log10
+     * and Math.cbrt all route through here too, and so does Math.pow(Infinity,
+     * 0.5) via the exp(e*log(b)) path, so one guard closes five entry points.
+     *
+     * ECMAScript requires Math.log(+Infinity) === +Infinity, which is also the
+     * mathematically right answer, so returning it is a fix and not a clamp.
+     */
+    if (x == DS_INF) return DS_INF;
     int e = 0; double m = x;
-    while (m >= 1.0) { m *= 0.5; e++; }
-    while (m < 0.5) { m *= 2.0; e--; }
+    /*
+     * BOUNDED BY CONSTRUCTION, not by trusting the guard above. A finite
+     * positive double has a binary exponent in [-1074, 1024], so neither loop
+     * can legitimately need more than 1075 steps; a counter makes termination a
+     * property of the LOOP rather than a property of its caller. That is the
+     * whole lesson of the parse_color hang: the next value this code has no
+     * rule for must cost a wrong answer, never a hung application.
+     */
+    int g = 1100;
+    while (m >= 1.0 && g-- > 0) { m *= 0.5; e++; }
+    g = 1100;
+    while (m < 0.5 && g-- > 0) { m *= 2.0; e--; }
     /* log(m) = 2*atanh(t), t = (m-1)/(m+1), m in [0.5,1) -> |t| small */
     double t = (m - 1.0) / (m + 1.0), t2 = t * t, p = t, sum = 0.0;
     for (int i = 0; i < 30; i++) { sum += p / (2 * i + 1); p *= t2; }
@@ -155,6 +185,25 @@ double atan(double x) {
 }
 
 double atan2(double y, double x) {
+    /*
+     * #245 layoutsweep: BOTH ARGUMENTS INFINITE was wrong, and the self-test
+     * below is what found it. y/x is inf/inf == NaN, so every one of the four
+     * sign combinations fell out of the first branch as NaN. ECMAScript
+     * (and ISO C) require the diagonals: +-pi/4 and +-3pi/4.
+     *
+     * Not a hang, and not currently reachable through Math.atan2 either:
+     * duk_config.h defines DUK_USE_ATAN2_WORKAROUNDS, so Duktape intercepts
+     * exactly this case before calling us. It is still a defect in a libm the
+     * rest of the port links, and leaving a known-wrong answer in place on the
+     * grounds that one caller happens to paper over it is how a latent bug
+     * becomes a live one the moment that caller changes.
+     */
+    if (x > 1.7976931348623157e308 || x < -1.7976931348623157e308) {
+        if (y > 1.7976931348623157e308)
+            return (x > 0.0) ? 0.78539816339744830961 : 2.35619449019234492885;
+        if (y < -1.7976931348623157e308)
+            return (x > 0.0) ? -0.78539816339744830961 : -2.35619449019234492885;
+    }
     if (x > 0.0) return atan(y / x);
     if (x < 0.0) return (y >= 0.0) ? atan(y / x) + DS_PI : atan(y / x) - DS_PI;
     if (y > 0.0) return DS_PI2;
@@ -162,15 +211,28 @@ double atan2(double y, double x) {
     return 0.0;
 }
 
+/*
+ * #245 layoutsweep: OUT OF DOMAIN IS NaN. Both of these used to clamp |x| > 1
+ * to the nearest endpoint, so Math.asin(2) answered 1.5708 and Math.acos(-2)
+ * answered pi. ECMAScript 20.2.2.4 / 20.2.2.1 both require NaN, and unlike the
+ * atan2 case above Duktape does NOT intercept these: duk__asin/duk__acos call
+ * straight through, so the wrong value reached script. Found by the self-test
+ * at the bottom of this file, which is the point of having one.
+ *
+ * |x| == 1 exactly is still answered exactly, which is also what the spec says
+ * and is why the comparisons below are strict.
+ */
 double asin(double x) {
-    if (x <= -1.0) return -DS_PI2;
-    if (x >= 1.0) return DS_PI2;
+    if (ds_isnan(x) || x < -1.0 || x > 1.0) return DS_NAN;
+    if (x == -1.0) return -DS_PI2;
+    if (x == 1.0) return DS_PI2;
     return atan(x / sqrt(1.0 - x * x));
 }
 
 double acos(double x) {
-    if (x <= -1.0) return DS_PI;
-    if (x >= 1.0) return 0.0;
+    if (ds_isnan(x) || x < -1.0 || x > 1.0) return DS_NAN;
+    if (x == -1.0) return DS_PI;
+    if (x == 1.0) return 0.0;
     return DS_PI2 - asin(x);
 }
 
@@ -235,6 +297,167 @@ time_t mktime(struct tm *tm) {
     days += tm->tm_mday - 1;
     return (time_t)(days * 86400L + tm->tm_hour * 3600L + tm->tm_min * 60L + tm->tm_sec);
 }
+
+/* ---------------- non-finite self-test ----------------
+ * Launch-time canary for the values this libm shim is MOST likely to hang or
+ * lie on: the infinities, the NaNs, the zeroes and the two extremes of the
+ * double exponent range. Mirrors cssvar_selftest(): it runs in the OS on every
+ * browser launch, costs microseconds, and reports on serial.
+ *
+ * IT IMPROVES ON THE cssvar IDIOM IN ONE SPECIFIC WAY, and that is the point of
+ * writing it rather than adding four more cases somewhere that cannot fail.
+ * The cssvar cases "cannot report FAIL, only hang", so a hang there is
+ * ANONYMOUS: the serial log shows the launch stopping with no clue which input
+ * did it. Here every case NAMES ITSELF on serial BEFORE it is called, so a case
+ * that never returns is identified by the last line printed, and a case that
+ * returns the wrong answer is identified by a FAIL line. Both failure modes of
+ * a numeric helper are therefore observable, not just one.
+ *
+ * This is the test the log(+Infinity) hang would have caught: case "log(+inf)"
+ * prints, and then nothing else ever does.
+ */
+
+#define DSC_FIN  0
+#define DSC_PINF 1
+#define DSC_NINF 2
+#define DSC_NAN  3
+
+static int ds_class(double v)
+{
+    if (v != v) return DSC_NAN;
+    if (v >  1.7976931348623157e308) return DSC_PINF;
+    if (v < -1.7976931348623157e308) return DSC_NINF;
+    return DSC_FIN;
+}
+
+/* Which call a case makes. One opcode per shim entry point that can be handed a
+ * non-finite value, so the switch below reads as the literal call. */
+enum {
+    DSOP_LOG = 1, DSOP_LOG2, DSOP_LOG10, DSOP_CBRT, DSOP_EXP,
+    DSOP_SIN, DSOP_COS, DSOP_TAN, DSOP_ATAN, DSOP_SQRT,
+    DSOP_ASIN, DSOP_ACOS, DSOP_POW, DSOP_FMOD, DSOP_ATAN2, DSOP_FLOOR
+};
+
+struct dscase { const char *name; int op; double a, b; int want; };
+
+static double ds_apply(int op, double a, double b)
+{
+    switch (op) {
+    case DSOP_LOG:   return log(a);
+    case DSOP_LOG2:  return log2(a);
+    case DSOP_LOG10: return log10(a);
+    case DSOP_CBRT:  return cbrt(a);
+    case DSOP_EXP:   return exp(a);
+    case DSOP_SIN:   return sin(a);
+    case DSOP_COS:   return cos(a);
+    case DSOP_TAN:   return tan(a);
+    case DSOP_ATAN:  return atan(a);
+    case DSOP_SQRT:  return sqrt(a);
+    case DSOP_ASIN:  return asin(a);
+    case DSOP_ACOS:  return acos(a);
+    case DSOP_POW:   return pow(a, b);
+    case DSOP_FMOD:  return fmod(a, b);
+    case DSOP_ATAN2: return atan2(a, b);
+    case DSOP_FLOOR: return floor(a);
+    default:         return DS_NAN;
+    }
+}
+
+static const char *ds_clsname(int c)
+{
+    return c == DSC_PINF ? "+inf" : c == DSC_NINF ? "-inf"
+         : c == DSC_NAN  ? "nan"  : "finite";
+}
+
+/* Append src to dst at *o, capped at cap-1, keeping dst NUL-terminated. */
+static void ds_app(char *dst, int *o, int cap, const char *src)
+{
+    while (*src && *o < cap - 1) dst[(*o)++] = *src++;
+    dst[*o] = 0;
+}
+
+int dsmath_selftest(void (*report)(const char *line))
+{
+    /* DS_INF/DS_NAN are __builtin_inf()/__builtin_nan(""), compile-time
+     * constants, so they are legal initialisers here. */
+    static const struct dscase cases[] = {
+      /* The #245 hang and the four other entry points that reach the same
+       * two normalisation loops. ECMAScript: all five are +Infinity. */
+      { "log(+inf)",        DSOP_LOG,   DS_INF, 0.0, DSC_PINF },
+      { "log2(+inf)",       DSOP_LOG2,  DS_INF, 0.0, DSC_PINF },
+      { "log10(+inf)",      DSOP_LOG10, DS_INF, 0.0, DSC_PINF },
+      { "cbrt(+inf)",       DSOP_CBRT,  DS_INF, 0.0, DSC_PINF },
+      { "pow(+inf,0.5)",    DSOP_POW,   DS_INF, 0.5, DSC_PINF },
+      { "cbrt(-inf)",       DSOP_CBRT, -DS_INF, 0.0, DSC_NINF },
+      /* The two ends of the exponent range: these are what prove the bounded
+       * normalisation loops still converge on legitimate extremes rather than
+       * bailing out early. */
+      { "log(5e-324)",      DSOP_LOG,   5e-324, 0.0, DSC_FIN  },
+      { "log(1.79e308)",    DSOP_LOG,   1.7976931348623157e308, 0.0, DSC_FIN },
+      { "log(1)",           DSOP_LOG,   1.0, 0.0, DSC_FIN  },
+      { "log(0)",           DSOP_LOG,   0.0, 0.0, DSC_NINF },
+      { "log(-1)",          DSOP_LOG,  -1.0, 0.0, DSC_NAN  },
+      { "log(nan)",         DSOP_LOG,   DS_NAN, 0.0, DSC_NAN },
+      /* Everything else in the shim that a script can hand a non-finite to. */
+      { "exp(+inf)",        DSOP_EXP,   DS_INF, 0.0, DSC_PINF },
+      { "exp(-inf)",        DSOP_EXP,  -DS_INF, 0.0, DSC_FIN  },
+      { "exp(nan)",         DSOP_EXP,   DS_NAN, 0.0, DSC_NAN  },
+      { "sin(+inf)",        DSOP_SIN,   DS_INF, 0.0, DSC_NAN  },
+      { "cos(+inf)",        DSOP_COS,   DS_INF, 0.0, DSC_NAN  },
+      { "tan(+inf)",        DSOP_TAN,   DS_INF, 0.0, DSC_NAN  },
+      { "atan(+inf)",       DSOP_ATAN,  DS_INF, 0.0, DSC_FIN  },
+      { "atan(-inf)",       DSOP_ATAN, -DS_INF, 0.0, DSC_FIN  },
+      { "atan2(+inf,+inf)", DSOP_ATAN2, DS_INF, DS_INF, DSC_FIN },
+      { "sqrt(+inf)",       DSOP_SQRT,  DS_INF, 0.0, DSC_PINF },
+      { "sqrt(-1)",         DSOP_SQRT, -1.0, 0.0, DSC_NAN  },
+      /* ECMAScript: out of domain is NaN, not the clamped endpoint. */
+      { "asin(2)",          DSOP_ASIN,  2.0, 0.0, DSC_NAN  },
+      { "acos(-2)",         DSOP_ACOS, -2.0, 0.0, DSC_NAN  },
+      { "asin(1)",          DSOP_ASIN,  1.0, 0.0, DSC_FIN  },
+      { "acos(-1)",         DSOP_ACOS, -1.0, 0.0, DSC_FIN  },
+      { "asin(nan)",        DSOP_ASIN,  DS_NAN, 0.0, DSC_NAN },
+      { "pow(0,-1)",        DSOP_POW,   0.0, -1.0, DSC_PINF },
+      { "pow(2,1e308)",     DSOP_POW,   2.0, 1e308, DSC_PINF },
+      { "pow(nan,2)",       DSOP_POW,   DS_NAN, 2.0, DSC_NAN },
+      { "fmod(1,0)",        DSOP_FMOD,  1.0, 0.0, DSC_NAN  },
+      { "fmod(+inf,2)",     DSOP_FMOD,  DS_INF, 2.0, DSC_NAN },
+      { "floor(+inf)",      DSOP_FLOOR, DS_INF, 0.0, DSC_PINF },
+    };
+    int n = (int) (sizeof cases / sizeof cases[0]);
+    int i, fail = 0;
+
+    for (i = 0; i < n; i++) {
+        char line[160];
+        int o = 0;
+        double r;
+        int got;
+
+        /* NAME FIRST, AND REPORTED BEFORE THE CALL. A case that never returns
+         * is then identified by the last line on serial. This is the half the
+         * cssvar self-test cannot do. */
+        line[0] = 0;
+        ds_app(line, &o, (int) sizeof line, "[DSMATH] run  ");
+        ds_app(line, &o, (int) sizeof line, cases[i].name);
+        if (report) report(line);
+
+        r = ds_apply(cases[i].op, cases[i].a, cases[i].b);
+        got = ds_class(r);
+        if (got == cases[i].want) continue;
+
+        fail++;
+        o = 0; line[0] = 0;
+        ds_app(line, &o, (int) sizeof line, "[DSMATH] FAIL ");
+        ds_app(line, &o, (int) sizeof line, cases[i].name);
+        ds_app(line, &o, (int) sizeof line, " want=");
+        ds_app(line, &o, (int) sizeof line, ds_clsname(cases[i].want));
+        ds_app(line, &o, (int) sizeof line, " got=");
+        ds_app(line, &o, (int) sizeof line, ds_clsname(got));
+        if (report) report(line);
+    }
+    return fail;
+}
+
+int dsmath_selftest_count(void) { return 35; }
 
 /* ---------------- minimal sscanf ----------------
  * Supports whitespace, literal chars, and %[width][l|ll]{d,i,u,x,o,c,s,n}

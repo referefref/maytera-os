@@ -914,6 +914,13 @@ static int grid_tracks(const char *v, size_t len, long *count, long *minpx)
 static cssvar_gradient g_grads[CV_MAX_GRADS];
 static int g_grad_n = 0;
 
+/* engwalkstack (#245): see cssvar.h. Injected by the build; defaults to a
+ * value that names its own absence. */
+#ifndef ENGWALK_CSSVAR_STAMP
+#define ENGWALK_CSSVAR_STAMP "unstamped"
+#endif
+const char *cssvar_src_stamp(void) { return ENGWALK_CSSVAR_STAMP; }
+
 void cssvar_gradients_reset(void) { g_grad_n = 0; }
 int  cssvar_gradient_count(void) { return g_grad_n; }
 const cssvar_gradient *cssvar_gradient_get(int idx)
@@ -1000,16 +1007,52 @@ static int parse_color(const char *v, size_t a, size_t end,
 			int comp[4], nc = 0;
 			size_t q = p + 1;
 			while (q < close && nc < 4) {
+				/*
+				 * #245 renderhang: q0 is a TERMINATION PROOF, not a
+				 * tidy-up. Every advance in this body is conditional on
+				 * the next byte being one the scanner recognises, so a
+				 * SINGLE unrecognised byte froze the whole browser.
+				 * MEASURED on the project's own site: every stop in
+				 * maytera.net's style.css is written
+				 * `rgba(51, 102, 102, .18)`, a leading-dot alpha, which
+				 * is what every CSS minifier emits. With nc == 3 the
+				 * scanner parked on the '.' and neither the number scan
+				 * nor the separator scan would move q, so the outer
+				 * condition stayed true forever. Ring 3, 100% of a core,
+				 * blank page, AFTER a completely successful fetch: the
+				 * browser fetched the site perfectly and never rendered
+				 * it. The '.' and a leading '+' are now consumed below,
+				 * but a scanner whose progress depends on recognising
+				 * its input WILL meet another byte it does not know
+				 * (`rgb(var(--x))`, a `calc()` component, a future CSS
+				 * Color level). This makes progress UNCONDITIONAL, so
+				 * the next unknown byte costs a wrong colour instead of
+				 * a hung application.
+				 */
+				size_t q0 = q;
 				long val = 0; int any = 0, isneg = 0;
 				while (q < close && is_space(v[q])) q++;
-				if (q < close && v[q] == '-') { isneg = 1; q++; }
+				if (q < close && (v[q] == '-' || v[q] == '+')) { isneg = (v[q] == '-'); q++; }
 				while (q < close && is_digit(v[q])) { val = val * 10 + (v[q]-'0'); any = 1; q++; }
+				/*
+				 * A fractional part, with or without an integer part:
+				 * "0.18" and ".18" are both legal CSS. Consumed and
+				 * TRUNCATED toward zero, which loses nothing, because
+				 * this parser reports RGB only and the alpha component
+				 * has no destination in cssvar_gradient. What matters is
+				 * that the scan gets PAST it.
+				 */
+				if (q < close && v[q] == '.') {
+					q++; any = 1;
+					while (q < close && is_digit(v[q])) q++;
+				}
 				/* percentage component: scale 0..100 to 0..255 */
 				if (q < close && v[q] == '%') { val = val * 255 / 100; q++; }
 				if (isneg) val = 0;
 				if (any) comp[nc++] = (int) val;
 				while (q < close && (is_space(v[q]) || v[q] == ',' || v[q] == '/')) q++;
 				if (q < close && v[q] == ')') break;
+				if (q == q0) q++;   /* recognised nothing: advance anyway */
 			}
 			if (nc >= 3) {
 				int r = comp[0], g = comp[1], b = comp[2];
@@ -1122,8 +1165,6 @@ static int parse_gradient_body(int type, const char *inner, size_t len)
 	size_t args[16]; size_t arge[16]; int na = 0;
 	int stopi = 0;
 
-	if (g_grad_n >= CV_MAX_GRADS) return -1;
-
 	/* split into top-level comma-separated arguments */
 	{
 		size_t start = 0; int depth = 0;
@@ -1198,6 +1239,51 @@ static int parse_gradient_body(int type, const char *inner, size_t len)
 	g.nstops = stopi;
 	if (g.nstops < 2) return -1;   /* a gradient needs at least two stops */
 
+	/*
+	 * DEDUPLICATE (#245 enggrad2). Two things make this load-bearing rather
+	 * than tidy, and the first one is a bug waiting to happen without it.
+	 *
+	 * (1) The inline pass runs at COMPUTE time, once per element per layout
+	 *     pass. relayout_page() re-runs the whole layout over the same DOM
+	 *     and deliberately does NOT reset this table (only render_page()
+	 *     does, at page load, because the table is the CSSOM's peer and a
+	 *     resize does not rebuild the CSSOM). Appending blindly would add one
+	 *     entry per gradient element per reflow and walk off CV_MAX_GRADS
+	 *     after a handful of window resizes, at which point
+	 *     gradient_from_value() starts returning -1 and gradients that
+	 *     painted a moment ago stop painting. That is a slow leak that only
+	 *     shows up after the user drags a window edge, which is exactly the
+	 *     kind of fault an A/B render test never sees.
+	 * (2) A page that sets the same gradient on fifty elements now costs one
+	 *     table slot and one rasterised ramp instead of fifty.
+	 *
+	 * Identity is the whole record: type, shape, angle, stop count, and every
+	 * live stop colour and position. Only the first `nstops` stops are
+	 * compared because only those are initialised (the tail of the struct is
+	 * never read by grad_build_lut either). Two gradients that compare equal
+	 * here produce the same ramp BY DEFINITION, so sharing an index cannot
+	 * change a pixel; it can only change which index the carrier names.
+	 */
+	{
+		int k;
+		for (k = 0; k < g_grad_n; k++) {
+			const cssvar_gradient *e = &g_grads[k];
+			int same = (e->type == g.type && e->shape == g.shape &&
+					e->angle == g.angle && e->nstops == g.nstops);
+			int j;
+			for (j = 0; same && j < g.nstops; j++) {
+				if (e->stop_col[j] != g.stop_col[j] ||
+						e->stop_pos[j] != g.stop_pos[j])
+					same = 0;
+			}
+			if (same) return k;
+		}
+	}
+
+	/* Cap checked HERE, after the dedup scan: a full table must still be able
+	 * to hand back a gradient it already holds. */
+	if (g_grad_n >= CV_MAX_GRADS) return -1;
+
 	g_grads[g_grad_n] = g;
 	return g_grad_n++;
 }
@@ -1228,10 +1314,37 @@ static int gradient_from_value(const char *v, size_t vs, size_t ve)
 	}
 }
 
-static void grid_rewrite(const char *s, size_t len, sbuf *out)
+/*
+ * grid_rewrite() modes (#245 enggrad2).
+ *
+ * CV_GR_ALL is the author-sheet pass: every carrier this file owns
+ * (grid-template-columns, gap/row-gap, border-radius, gradient backgrounds).
+ *
+ * CV_GR_GRAD_ONLY is the inline style="" pass: the gradient carrier and NOTHING
+ * else, so an inline declaration that is not a gradient background comes out
+ * byte-identical. A MODE on the existing scanner, not a second scanner: there
+ * is exactly one place in this tree that knows how to find a gradient value in
+ * a declaration list, and the inline path calls it rather than growing a
+ * near-copy that would drift from it.
+ */
+#define CV_GR_ALL       0
+#define CV_GR_GRAD_ONLY 1
+
+static void grid_rewrite(const char *s, size_t len, sbuf *out, int mode)
 {
 	size_t i = 0;
-	int depth = 0;
+	/*
+	 * An inline style attribute is a BRACELESS declaration list, so every
+	 * byte of it is already "inside a rule". Seeding depth to 1 is what makes
+	 * the existing `depth > 0` property tests below fire on it. Without this
+	 * the inline pass would be a silent no-op even with the gradient branch
+	 * reached, which is worth stating because it is NOT the reason the plan
+	 * doc gave for deferring inline gradients: the doc said the inline path
+	 * does not run cssvar_preprocess, which is true, but running it there
+	 * unchanged would ALSO have found nothing, because depth would have been
+	 * 0 for the whole attribute.
+	 */
+	int depth = (mode == CV_GR_GRAD_ONLY) ? 1 : 0;
 
 	while (i < len) {
 		char c = s[i];
@@ -1304,6 +1417,15 @@ static void grid_rewrite(const char *s, size_t len, sbuf *out)
 			 * there is one carrier and four of them, so taking the
 			 * last one seen would be arbitrary. */
 			int is_rad = match_ci(s, len, i, "border-radius");
+			/*
+			 * #245 enggrad2: the inline pass carries GRADIENTS ONLY.
+			 * Cleared in one place rather than four so that a fifth
+			 * carrier added to this function later is off on the
+			 * inline path by default, which is the safe direction.
+			 */
+			if (mode != CV_GR_ALL) {
+				is_gtc = 0; is_gap = 0; is_rgap = 0; is_rad = 0;
+			}
 			if (is_gtc || is_gap || is_rad || is_rgap) {
 				size_t k = i;
 				size_t vs, ve;
@@ -1418,7 +1540,7 @@ char *cssvar_preprocess(const char *src, size_t len,
 	{
 		sbuf g;
 		sb_init(&g);
-		grid_rewrite(b.p ? b.p : "", b.n, &g);
+		grid_rewrite(b.p ? b.p : "", b.n, &g, CV_GR_ALL);
 		free(b.p);
 		if (g.oom) { free(g.p); return NULL; }
 		b = g;
@@ -1432,6 +1554,52 @@ char *cssvar_preprocess(const char *src, size_t len,
 	}
 	if (out_len) *out_len = b.n;
 	return b.p;
+}
+
+/* Inline style="" gradient rewrite. See cssvar.h for the contract. */
+char *cssvar_inline_gradients(const char *decls, size_t len, size_t *out_len)
+{
+	sbuf g;
+	size_t i;
+	int seen = 0;
+
+	if (out_len) *out_len = 0;
+	if (!decls || len == 0) return NULL;
+
+	/*
+	 * CHEAP GATE FIRST, and it is the reason this can sit on a per-element
+	 * path at all. mcs_compute_style() runs for every element on every layout
+	 * pass, and the overwhelming majority of style="" attributes contain no
+	 * gradient. Scanning for the literal "gradient(" is one pass over a short
+	 * string and returns NULL with zero allocation and zero rewriting. It is
+	 * also what makes AE=0 STRUCTURAL for non-gradient inline styles rather
+	 * than merely measured: they never reach the rewriter, so there is no
+	 * path on which they could come out different.
+	 */
+	for (i = 0; i + 9 <= len; i++) {
+		if (match_ci(decls, len, i, "gradient(")) { seen = 1; break; }
+	}
+	if (!seen) return NULL;
+
+	sb_init(&g);
+	grid_rewrite(decls, len, &g, CV_GR_GRAD_ONLY);
+	if (g.oom) { free(g.p); return NULL; }
+	if (!g.p) return NULL;
+
+	/*
+	 * SECOND GATE. Reaching here means the text contained "gradient(" but the
+	 * rewrite may still have changed nothing, because the form is one this
+	 * parser deliberately does not accept: repeating-linear-gradient,
+	 * conic-gradient, a gradient behind an unsupported background layer, or a
+	 * malformed one. Hand back NULL so the caller passes the ORIGINAL bytes
+	 * to libcss and the declaration fails exactly the way it already fails.
+	 * An unsupported gradient must keep its current behaviour, not acquire a
+	 * new one, or this change stops being confined to what it implements.
+	 */
+	if (g.n == len && memcmp(g.p, decls, len) == 0) { free(g.p); return NULL; }
+
+	if (out_len) *out_len = g.n;
+	return g.p;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1451,6 +1619,27 @@ struct cvcase {
 	const char *want;      /* must be present, or NULL */
 	const char *want_not;  /* must be absent, or NULL */
 };
+
+/*
+ * #245 enggrad2: which entry point a case drives.
+ *
+ * A case whose NAME begins "INLINE:" is a braceless declaration list and goes
+ * to cssvar_inline_gradients(); everything else is a stylesheet and goes to
+ * cssvar_preprocess(). ONE case table for both entry points, so the inline path
+ * is covered by the same free per-launch canary the sheet path already had, and
+ * a regression in it shows up in the [CSSVAR] line of every browser launch
+ * instead of only when someone remembers to run a fixture.
+ *
+ * The dispatch rides the name rather than a struct field on purpose. A new
+ * field would have left all 47 pre-existing initialisers incomplete, which is
+ * 45 -Wmissing-field-initializers warnings to add one bit; and the name is
+ * already the authoritative description of each case AND is printed with the
+ * result, so a mislabelled case is visible rather than silent.
+ */
+static int cv_is_inline(const char *name)
+{
+	return name && strncmp(name, "INLINE:", 7) == 0;
+}
 
 int cssvar_selftest(void (*report)(const char *line))
 {
@@ -1585,17 +1774,132 @@ int cssvar_selftest(void (*report)(const char *line))
 	  { "background-color longhand is NOT mistaken for the shorthand",
 	    ".g{background-color:linear-gradient(#f00,#00f)}", 800, 600,
 	    "background-color", "outline-color" },
+	  /* #245 enggrad2: the INLINE style="" entry point (inln = 1). The input
+	   * is a braceless declaration list, exactly what a style attribute
+	   * holds. */
+	  { "INLINE: a linear-gradient background becomes the carrier",
+	    "background:linear-gradient(to right,#f00,#00f)", 800, 600,
+	    "outline-color:#C5", "linear-gradient" },
+	  { "INLINE: background-image radial-gradient is carried too",
+	    "background-image:radial-gradient(circle,#fff,#000)", 800, 600,
+	    "outline-color:#C5", "radial-gradient" },
+	  { "INLINE: a gradient among other declarations keeps them",
+	    "color:#fff;background:linear-gradient(to right,#f00,#00f);padding:4px",
+	    800, 600, "color:#fff;outline-color:#C5", "linear-gradient" },
+	  { "INLINE: a plain background color is left ALONE (no rewrite at all)",
+	    "background:#123456", 800, 600, "(null)", "outline-color" },
+	  { "INLINE: a background url is left ALONE",
+	    "background:url(x.png) no-repeat", 800, 600, "(null)", NULL },
+	  { "INLINE: background-color longhand is not the shorthand",
+	    "background-color:linear-gradient(#f00,#00f)", 800, 600,
+	    "(null)", "outline-color" },
+	  { "INLINE: repeating-linear-gradient is NOT claimed (still deferred)",
+	    "background:repeating-linear-gradient(45deg,#f00,#00f 10px)", 800, 600,
+	    "(null)", "outline-color" },
+	  { "INLINE: conic-gradient is NOT claimed (still deferred)",
+	    "background:conic-gradient(#f00,#00f)", 800, 600,
+	    "(null)", "outline-color" },
+	  { "INLINE: a one-stop gradient is rejected, not half-carried",
+	    "background:linear-gradient(#f00)", 800, 600,
+	    "(null)", "outline-color" },
+	  { "INLINE: var() is NOT resolved here (blast radius is gradients only)",
+	    "color:var(--x);background:linear-gradient(to right,#f00,#00f)",
+	    800, 600, "color:var(--x)", NULL },
+	  { "INLINE: border-radius is NOT carried here",
+	    "border-radius:10px;background:linear-gradient(#f00,#00f)", 800, 600,
+	    "border-radius:10px", "column-rule-width" },
+	  { "INLINE: gap is NOT carried here",
+	    "gap:1rem;background:linear-gradient(#f00,#00f)", 800, 600,
+	    "gap:1rem", "column-gap" },
+	  { "INLINE: no gradient text at all is the zero-work path",
+	    "color:#fff;padding:4px;display:flex", 800, 600, "(null)", NULL },
+	  /* DEDUP (#245 enggrad2): the same gradient twice must reuse one table
+	   * slot. Both declarations therefore carry the SAME index, and with an
+	   * empty table at selftest time that index is 0 for both. If dedup ever
+	   * regressed to a blind append the second would read #C50001. */
+	  { "DEDUP: two identical gradients share one table index",
+	    ".a{background:linear-gradient(to right,#f00,#00f)}"
+	    ".b{background:linear-gradient(to right,#f00,#00f)}", 800, 600,
+	    "outline-color:#C50000}.b{outline-color:#C50000}", "#C50001" },
+	  { "DEDUP: two DIFFERENT gradients do not share an index",
+	    ".a{background:linear-gradient(to right,#f00,#00f)}"
+	    ".b{background:linear-gradient(to right,#f00,#0f0)}", 800, 600,
+	    "#C50001", NULL },
+	  /*
+	   * #245 renderhang. THESE FOUR CASES CANNOT FAIL; THEY CAN ONLY HANG,
+	   * and that is the point. Before the progress guard in parse_color each
+	   * of these inputs spun Ring 3 forever, so a regression does not print
+	   * FAIL, it stops the browser from ever reaching its event loop and
+	   * leaves the serial log ending mid-selftest. That is a louder signal
+	   * than a FAIL line, and it is why they live in the launch-time
+	   * selftest rather than only in a host harness: this engine ships to a
+	   * machine where the only debugger is the serial log.
+	   *
+	   * The first is the LITERAL text from maytera.net/css/style.css that
+	   * hung the shipping browser. Keep it byte-for-byte.
+	   */
+	  { "a leading-dot alpha in an rgba() stop TERMINATES (the renderhang case)",
+	    ".h{background:linear-gradient(180deg, rgba(51, 102, 102, .18), "
+	    "rgba(51, 102, 102, .05))}", 800, 600,
+	    "outline-color:#C5", "linear-gradient" },
+	  { "a leading-dot alpha yields the SAME rgb as the leading-zero form",
+	    ".a{background:linear-gradient(180deg, rgba(51, 102, 102, .18), "
+	    "rgba(51, 102, 102, .05))}"
+	    ".b{background:linear-gradient(180deg, rgba(51, 102, 102, 0.18), "
+	    "rgba(51, 102, 102, 0.05))}", 800, 600,
+	    "outline-color:#C50000}.b{outline-color:#C50000}", "#C50001" },
+	  { "a signed component does not stall the scanner",
+	    ".s{background:linear-gradient(rgb(+51, 102, 102), #00f)}", 800, 600,
+	    "outline-color:#C5", "linear-gradient" },
+	  /*
+	   * A token this scanner has no rule for at all, written as a bare
+	   * ident rather than as var(--a) so that the case depends on NOTHING
+	   * but the progress guard. The var() spelling was tried and also
+	   * passes, but it drags cssvar_preprocess's var-resolution ORDERING
+	   * into a test about a four-line scanner, and a test with two moving
+	   * parts tells you less when it goes red.
+	   */
+	  { "an unparseable component is skipped, not spun on",
+	    ".u{background:linear-gradient(rgb(51, 102, 102, x), #00f)}",
+	    800, 600, "outline-color:#C5", "linear-gradient" },
 	};
 	int n = (int) (sizeof(cases) / sizeof(cases[0]));
 	int fails = 0, i;
 
 	for (i = 0; i < n; i++) {
 		size_t ol = 0;
-		char *got = cssvar_preprocess(cases[i].in, strlen(cases[i].in),
-				cases[i].vw, cases[i].vh, &ol);
-		int ok = (got != NULL);
-		if (ok && cases[i].want && !has(got, cases[i].want)) ok = 0;
-		if (ok && cases[i].want_not && has(got, cases[i].want_not)) ok = 0;
+		char *got;
+		const char *res;
+		int ok;
+		/*
+		 * Reset the gradient table per case. The DEDUP cases assert on the
+		 * literal carrier INDEX, which is only a stable number if each case
+		 * starts from an empty table; without this the selftest's own earlier
+		 * gradient cases would have already consumed indices and the
+		 * assertion would silently depend on case ORDER. The selftest runs
+		 * before any page is rendered, so clearing here cannot disturb a
+		 * live page.
+		 */
+		cssvar_gradients_reset();
+		if (cv_is_inline(cases[i].name))
+			got = cssvar_inline_gradients(cases[i].in,
+					strlen(cases[i].in), &ol);
+		else
+			got = cssvar_preprocess(cases[i].in, strlen(cases[i].in),
+					cases[i].vw, cases[i].vh, &ol);
+		/*
+		 * A NULL result is a legitimate, ASSERTABLE outcome on the inline
+		 * path ("there was no gradient here, so nothing was touched"), and
+		 * is only a failure on the sheet path, which always returns a
+		 * buffer. Matching against the literal "(null)" is what lets a case
+		 * assert the no-rewrite outcome positively, through the same two
+		 * want / want_not fields every other case uses, instead of a third
+		 * field meaning "expect NULL".
+		 */
+		res = got ? got : "(null)";
+		ok = cv_is_inline(cases[i].name) ? 1 : (got != NULL);
+		if (ok && cases[i].want && !has(res, cases[i].want)) ok = 0;
+		if (ok && cases[i].want_not && has(res, cases[i].want_not)) ok = 0;
 		if (!ok) fails++;
 		if (report) {
 			char line[640];
@@ -1618,5 +1922,9 @@ int cssvar_selftest(void (*report)(const char *line))
 		}
 		free(got);
 	}
+	/* Leave no selftest residue in the gradient table. render_page()
+	 * resets it before every page anyway, but a global left holding
+	 * test data is a trap for the next reader. */
+	cssvar_gradients_reset();
 	return fails;
 }

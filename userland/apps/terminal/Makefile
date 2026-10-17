@@ -36,7 +36,7 @@ TARGET = terminal
 OBJS = main.o term_util.o term_grid.o term_scrollback.o term_parse.o \
        term_render.o term_theme.o term_prefs.o term_profile.o term_pty.o \
        term_shell.o term_notify.o term_layout.o term_emu.o term_select.o \
-       term_search.o term_menu.o
+       term_search.o term_menu.o term_contract.o
 
 # Libraries
 CRT0 = $(LIBC_DIR)/crt0.o

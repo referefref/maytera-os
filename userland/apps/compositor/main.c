@@ -88,7 +88,15 @@ static void leakwatch_report(const char *name, size_t before, size_t after) {
     while (nd > 0 && n < (int)sizeof(msg) - 1) msg[n++] = numbuf[--nd];
     if (n < (int)sizeof(msg) - 1) msg[n++] = '\n';
     msg[n] = 0;
-    if (s_leakwatch_fd < 0) s_leakwatch_fd = sys_open("/LEAKWATCH.TXT", 0x41 | 0x200);
+    // #peruserrows: /LEAKWATCH.TXT at the root-owned ext2 root is refused for the
+    // uid the compositor actually runs as (1000), so this report was unavailable
+    // in a normal session. userscratch_path() -> <home>/LEAKWATCH.TXT with an
+    // account, /TMP/LEAKWATCH.TXT without one (and for root, whose home is "/").
+    if (s_leakwatch_fd < 0) {
+        char lwp[192];
+        if (userscratch_path("LEAKWATCH.TXT", lwp, sizeof(lwp)) == 0)
+            s_leakwatch_fd = sys_open(lwp, 0x41 | 0x200);
+    }
     if (s_leakwatch_fd >= 0) sys_write(s_leakwatch_fd, msg, (long)n);
 }
 #define LW_WATCH(name, stmt) do { \
@@ -769,6 +777,23 @@ static int compositor_init(void)
     // BEFORE this process is spawned; this one was a superseded duplicate that
     // still armed a key sink. See the deletion note in CHANGELOG.md.
     lock_init();   // #566 secure session lock overlay
+
+    // The Recycle Bin RECYCLER. Windowless; sweeps <home>/CONFIG/RECYCLE on the
+    // retention set in <home>/CONFIG/RECYCLE.CFG (30 days by default, or never).
+    //
+    // SPAWNED HERE AND NOT FROM kernel/proc/services.c, and the reason is the
+    // one that matters: THE BIN IS PER-USER. This process already runs as the
+    // session user, so the daemon inherits that identity and resolves the
+    // correct home. A kernel service account (uid 100, like svc_hb) would
+    // resolve its OWN home and sweep the wrong bin, or no bin at all, and would
+    // do it silently.
+    //
+    // ITS FAILURE DIRECTION IS SAFE. If the spawn fails, or the daemon is
+    // killed, nothing purges: files stay in the bin longer than the retention
+    // asks. That is the correct way for this to break, and it is why a userland
+    // daemon is the right home for the purge even though the CAPTURE has to be
+    // in the kernel (kernel/fs/recycle_fs.c) to be binding.
+    sys_spawn("/APPS/RECYCLED");
 
     return 0;
 }
@@ -4966,7 +4991,14 @@ int main(int argc, char **argv)
             g_screensaver_active = true;
             screensaver_note_activated();   // #570: starts the input-ignore grace
             g_needs_redraw = true;
-            { static int dfd = -1; if (dfd < 0) dfd = sys_open("/SSDEBUG.TXT", 0x41|0x200);
+            // #peruserrows: was /SSDEBUG.TXT at the root-owned ext2 root, which the
+            // uid-1000 compositor cannot create, so the trace was empty exactly
+            // in the session being traced. userscratch_path() is the session's
+            // own writable location (<home>, else /TMP).
+            { static int dfd = -1;
+              if (dfd < 0) { char ssp[192];
+                  if (userscratch_path("SSDEBUG.TXT", ssp, sizeof(ssp)) == 0)
+                      dfd = sys_open(ssp, 0x41|0x200); }
               if (dfd >= 0) { const char *m = "TRIGGER\n"; sys_write(dfd, m, 8); } }
         }
 
@@ -5491,17 +5523,51 @@ int main(int argc, char **argv)
                 static int quiet = 0;
                 if (_apps > 0) {
                     // (local 80) One or more windows are open but every one of
-                    // them is static. The desktop layer behind them stays
-                    // suppressed (#564): no widgets_collect_damage() here, so
-                    // an occluded pet or desktop clock still costs nothing. The
-                    // always-on-top chrome does NOT stay suppressed, or the
-                    // tray gauges, the bar clock and toasts freeze for as long
-                    // as a window is open. Both collectors below are self-
-                    // throttling and add damage only when a DISPLAYED value
-                    // actually changed (~1Hz for the gauges), so the steady
+                    // them is static. The always-on-top chrome is NOT
+                    // suppressed, or the tray gauges, the bar clock and toasts
+                    // freeze for as long as a window is open. Every collector
+                    // below is self-throttling and adds damage only when a
+                    // DISPLAYED value actually changed (~1Hz), so the steady
                     // state is one small clipped present per second, not a 30Hz
                     // composite: the #564 idle-CPU win is kept.
                     damage_reset();
+                    // #idleclock (OWNER REPORT, MEASURED on a throwaway VM off
+                    // golden 2551): THE DESKTOP CLOCK AND THE UPTIME WIDGET
+                    // FROZE ON AN IDLE MACHINE AND FELL MINUTES BEHIND.
+                    //
+                    // This branch used to skip widgets_collect_damage()
+                    // entirely, on the reasoning that the desktop layer sits
+                    // BEHIND windows and is decoration, so an occluded pet or
+                    // clock should cost nothing. The flaw is the premise: a
+                    // window being open does not mean the desktop is covered.
+                    // The default install proves it - /APPS/AICHAT is spawned
+                    // at startup with g_aichat_enabled defaulting to 1, and its
+                    // window is reported visible and not minimized for the
+                    // whole session, so _apps is >= 1 on a desktop with nothing
+                    // on it. Captured idleprof for that machine read
+                    // `path none=271 idle=0 chrome=8 ... wdg=0 tb=8`: this
+                    // branch every time, the taskbar gauges repainting, the
+                    // desktop widgets never collected and therefore never
+                    // redrawn. The big clock and the uptime widget sat on an
+                    // unchanged pixel for as long as nobody touched the
+                    // machine, which is exactly the report, and a keypress
+                    // "fixed" it only because recent_input forces the full path.
+                    //
+                    // So collect desktop-widget damage here too, and then
+                    // discard the rects that are genuinely hidden - that is
+                    // what keeps the cost honest. damage_drop_inside() removes
+                    // any rect lying wholly inside an opaque, visible window,
+                    // so a maximised window still suppresses the whole desktop
+                    // layer exactly as #564 intended, a fullscreen app
+                    // suppresses it by the same test with no separate gate, and
+                    // only a widget somebody can actually SEE is paid for. What
+                    // survives is a clock-sized rect once a second, the same
+                    // damage the zero-windows path below already presents.
+                    widgets_collect_damage();
+                    for (int _o = 0; _o < _n; _o++)
+                        if (_w[_o].visible && !_w[_o].minimized && _w[_o].opacity >= 255)
+                            damage_drop_inside(_w[_o].x, _w[_o].y,
+                                               _w[_o].width, _w[_o].height);
                     // Nothing to repaint when a fullscreen app is on top:
                     // render_frame_body() gates the taskbar off in that state,
                     // so collecting its damage would present a rect that has no
@@ -5510,7 +5576,11 @@ int main(int argc, char **argv)
                     notif_collect_damage();
                     if (damage_count() > 0) {
                         idleprof_path(IP_P_CHROME);     // #COMPIDLE
-                        idleprof_reason(IP_R_TASKBAR);
+                        // #idleclock: this branch now carries desktop-widget
+                        // damage as well as chrome damage, so report both or
+                        // the capture that diagnosed the freeze would still
+                        // read wdg=0 on a fixed machine.
+                        idleprof_reason(IP_R_TASKBAR | IP_R_WIDGET);
                         LW_WATCH("render_frame_chrome", render_frame_chrome(_w, _n));
                         quiet = 0;
                         loop_sleep_ms = 50;
@@ -5580,9 +5650,11 @@ int main(int argc, char **argv)
             s_drawn_cursor_y = g_mouse_y;
         }
 
-        // Remote screen capture: check for a /SCREENSHOT.REQ trigger at the
+        // Remote screen capture: dequeue the kernel-mediated request queue at the
         // normal frame cadence (no busy-wait). g_fb now holds the frame we just
         // presented, so the capture matches exactly what is on screen.
+        // CORRECTED #peruserrows: this said "check for a /SCREENSHOT.REQ trigger".
+        // That file drop was deleted by MAYTERA-SEC-2026-0035.
         LW_WATCH("screenshot_poll", screenshot_poll());
 
         // Live VNC/RFB server (#440): rides this same adaptive cadence, never

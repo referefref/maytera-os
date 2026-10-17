@@ -244,4 +244,49 @@ int flow_plat_llm_image(const char *system, const char *prompt,
 int flow_plat_input_key(const char *target, int keycode,
                         int hold_ms, int gap_ms, char *err, int errcap);
 
+// ---- #469 START. The step that was missing, and why it belongs here. -------
+//
+// A perceive/decide/act loop targets an app WINDOW. `capture` and `input` both
+// resolve a target and FAIL when nothing matches, which is correct: neither of
+// them should quietly start a program. So a vision workflow could only ever run
+// against an app a human had already launched by hand, which made every such
+// example a two-step demo with an unwritten first step. On a machine where the
+// app is not running, the flow failed on its first node with "no visible window
+// matches target 'app:GBEMU'", and the YAML said so in a comment instead of
+// doing something about it. THAT was the defect, not the capture.
+//
+// `launch` starts an app from the SHARED launch registry (libc/applaunch.h, the
+// same .MENU manifest the Start menu and the AI's app.launch read, so there is
+// one list and no second name table) and then WAITS for the window to exist.
+// Waiting is the whole point: a spawn returns a pid long before the compositor
+// has a mapped, visible window, so a flow that launched and immediately captured
+// would race and usually lose.
+//
+//   app          a launch id: the display-name slug ("gameboy") or the exec
+//                basename slug ("gbemu"). Case-insensitive.
+//   rom          optional content to open, resolved against /ROMS by
+//                case-insensitive substring. No match launches the app bare so
+//                it shows its own picker, and that is REPORTED, not a failure.
+//   arg          optional single argument passed verbatim (ignored with `rom`).
+//   wait_target  the target string (same vocabulary as capture/input) whose
+//                window must appear. Empty means "app:<app>".
+//   timeout_ms   how long to wait for it.
+//
+// IDEMPOTENT BY DESIGN: if `wait_target` already matches a visible window,
+// NOTHING is launched and *out_already is set. Re-running a workflow must not
+// pile up a second copy of the app, and "it is already open" is success.
+//
+// Returns 0 with the matched window's title in out_title, or < 0 with err set
+// (unknown app, launch refused, or launched-but-no-window-within-timeout, each
+// reported as itself).
+int flow_plat_launch(const char *app, const char *rom, const char *arg,
+                     const char *wait_target, int timeout_ms,
+                     char *out_title, int tcap, int *out_already,
+                     char *err, int errcap);
+
+// How long a `launch` node waits for the window by default. Generous because
+// the first launch of a large app on real hardware reads its binary off disk.
+#define FLOW_LAUNCH_TIMEOUT_MS 20000
+
+
 #endif // MAYTERA_FLOW_H

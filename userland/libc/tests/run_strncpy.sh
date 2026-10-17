@@ -51,15 +51,18 @@ build_and_run() {   # $1 = string.c source, $2 = output tag
     # test output at all. That is an environment flake, NOT a result, and must
     # never be reported as either arm passing or failing. Retry a few times and
     # return 3 if it never gets off the ground.
-    local rc=0 try
-    for try in 1 2 3; do
-        ASAN_OPTIONS=detect_leaks=0:abort_on_error=0 "$d/t" >"$d/$tag.out" 2>&1
-        rc=$?
-        if grep -q "#231 strncpy" "$d/$tag.out"; then break; fi
-        if ! grep -q "DEADLYSIGNAL" "$d/$tag.out"; then break; fi
-        rc=3
-        sleep 2
-    done
+    # #deadtests: ONE shared ASan runner (tools/asan/asan-run). It disables
+    # ADDR_NO_RANDOMIZE, which is the ACTUAL cause of the DEADLYSIGNAL
+    # startups this loop used to retry: the host kernel has
+    # vm.mmap_rnd_bits=32 and gcc ASan assumes ~28, so some layouts collide
+    # with the shadow mapping. It is not host LOAD, as the old comment here
+    # said. --expect keeps a crash that happened AFTER startup a result.
+    local rc=0
+    bash ../../../tools/asan/asan-run \
+        --opts detect_leaks=0:abort_on_error=0 \
+        --expect "#231 strncpy" \
+        -- "$d/t" >"$d/$tag.out" 2>&1
+    rc=$?
     cp "$d/$tag.out" "./$tag.out"
     rm -rf "$d"
     return $rc

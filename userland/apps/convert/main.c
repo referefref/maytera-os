@@ -671,6 +671,7 @@ static int ct_key_press(const ct_item_t *it, int argc, char **argv,
     ct_result_line(out, ocap);
     return 0;
 }
+CT_CHECK_ACTFN(ct_key_press);
 
 // Type a decimal value through the app's own editing primitives.
 static int ct_value_action(const ct_item_t *it, int argc, char **argv,
@@ -704,6 +705,21 @@ static int ct_value_action(const ct_item_t *it, int argc, char **argv,
     ct_result_line(out, ocap);
     return 0;
 }
+CT_CHECK_ACTFN(ct_value_action);
+
+// #<config-ref>: the terms for the projected ACTION rows. The two value rows the
+// projection also emits (category, from_unit, to_unit) get theirs DERIVED, which
+// is why this covers only the actions.
+static const ct_terms_t k_t_conv_value = {
+    CT_TIME_INSTANT, 0, CT_TIME_MS_INSTANT,
+    CT_SUCC_ITEM, CT_DEPTH_VIEW, CT_FAIL_RANGE,
+    "input", 0
+};
+static const ct_terms_t k_t_conv_key = {
+    CT_TIME_INSTANT, 0, CT_TIME_MS_INSTANT,
+    CT_SUCC_ITEM, CT_DEPTH_VIEW, 0,
+    "input", 0
+};
 
 static int convert_project(int idx, ct_item_t *out) {
     ct_build();
@@ -740,6 +756,7 @@ static int convert_project(int idx, ct_item_t *out) {
         it.risk = CT_SAFE; it.actfn = ct_value_action;
         it.desc = "Type a decimal value through the app's own input_digit/"
                   "input_dot/input_negate, exactly as the keypad does";
+        it.terms = &k_t_conv_value;
         *out = it; return 1;
     }
     int k = idx - 4;
@@ -754,6 +771,7 @@ static int convert_project(int idx, ct_item_t *out) {
     it.actfn  = ct_key_press;
     it.ctx    = &g_ct_key[k];
     it.desc   = desc;
+    it.terms  = &k_t_conv_key;
     *out = it;
     return 1;
 }
@@ -777,15 +795,30 @@ static int ct_get_rate(char *o, int n) {
 }
 
 static const ct_item_t CONVERT_ITEMS[] = {
-    { "input", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
-      0, 0, 0, 0, ct_get_input, 0, 0,
-      "The typed value shown in the From card" },
-    { "result", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
-      0, 0, 0, 0, ct_get_result, 0, 0,
-      "The converted value shown in the To card, from the same convert()" },
-    { "rate", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
-      0, 0, 0, 0, ct_get_rate, 0, 0,
-      "The 1-unit rate line the window draws under the two cards" },
+    {
+      .name = "input",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_get_input,
+      .desc = "The typed value shown in the From card",
+    },
+    {
+      .name = "result",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_get_result,
+      .desc = "The converted value shown in the To card, from the same convert()",
+    },
+    {
+      .name = "rate",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_get_rate,
+      .desc = "The 1-unit rate line the window draws under the two cards",
+    },
 };
 
 static const ct_contract_t *convert_contract(void);

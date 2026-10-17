@@ -18,6 +18,7 @@
 // style engine (gui_pal()) so the picker follows the active OS theme.
 #include "studio.h"
 #include "../../libc/gui.h"
+#include "../../libc/userconf.h"   // #peruser2: the user's own palette
 
 // ===========================================================================
 // Integer colour-space conversion (H 0..359, S/V 0..255)
@@ -125,7 +126,13 @@ static palette_t g_pal[CP_MAX_PAL];
 static int       g_npal = 0, g_pal_active = 0;
 static recent_t  g_recent;
 static int       g_user_pal = -1;      // index of the editable user palette
-#define USER_PAL_PATH "/CONFIG/PALETTE.GPL"
+// #peruser2: A CUSTOM PALETTE IS THE USER'S OWN WORK, so <home>/CONFIG/
+// PALETTE.GPL, with a fallback read of the system copy so a shipped or
+// administrator-provided palette still loads for a user who has not edited one.
+// Root's home is "/", so root still uses exactly /CONFIG/PALETTE.GPL. Before
+// this, editing the palette in Paint as a non-root user did nothing at all.
+#define USER_PAL_NAME   "PALETTE.GPL"
+#define USER_PAL_LEGACY "/CONFIG/PALETTE.GPL"
 
 // The stock "Maytera" 16 (kept in sync with ui.c SWATCH[] on purpose; this is
 // data, not logic, so a local copy is fine and avoids un-static'ing ui.c).
@@ -363,12 +370,16 @@ static void pal_save_user(void) {
     buf[n++] = '\n'; buf[n++] = '#'; buf[n++] = '\n';
     for (int i = 0; i < p->count; i++)
         n += gpl_row(buf + n, p->entries[i].r, p->entries[i].g, p->entries[i].b);
-    int fd = sys_open(USER_PAL_PATH, O_WRONLY | O_CREAT | O_TRUNC);
-    if (fd >= 0) { sys_write(fd, buf, (unsigned long)n); sys_close(fd); }
+    // #peruser2: checked write into the user's own home (was an unchecked
+    // write/close at a root-owned path).
+    int fd = userconf_open_write(USER_PAL_NAME);
+    if (userconf_finish_write(fd, buf, (unsigned long)n) != 0) {
+        // Reported through sys_bootlog by the shared helpers.
+    }
     free(buf);
 }
 static void pal_load_user(void) {
-    int fd = sys_open(USER_PAL_PATH, O_RDONLY);
+    int fd = userconf_open_read(USER_PAL_NAME, USER_PAL_LEGACY);   // #peruser2
     if (fd < 0) return;
     long cap = 8192;
     char *buf = (char *)malloc((size_t)cap);

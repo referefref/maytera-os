@@ -798,6 +798,321 @@ def load_allowlist(path):
     return entries, bad
 
 
+# ---------------------------------------------------------------------------
+# justification REACHABILITY (#426, added by [badexempt] 2026-10-04)
+# ---------------------------------------------------------------------------
+# The checks above are checks on a row's SHAPE: it must carry a category, it
+# must carry prose, and its fingerprint must match something. None of them
+# reads what the row SAYS, and the prose is the only thing the next human has.
+#
+# A sibling lint shipped this row, green, for two days:
+#
+#   kernel/proc/syscall.c|fat_write_file|ecadf0fc8003  # ... (pw_kp) in
+#   syscall_dispatch_inner() [LEGIT] The /CONFIG password write. A fixed root
+#   path assembled from the /CONFIG prefix; the dispatcher does not take a
+#   path for it.
+#
+# Every clause was false, and `[LEGIT]` means "individually reviewed, do not
+# fix these", so the row told the next reader to stop looking at the one
+# genuinely blind security write. A wrong comment is a bug; a wrong comment
+# wearing a reviewed badge recruits the next reader into the mistake.
+#
+# THE ONE CLAIM IN THIS FILE THAT CAN ROT WITHOUT ANYBODY TOUCHING THE ROW is
+# "this is dead code / has zero callers". 26 of the 151 reviewed rows rest on
+# it, across intel_hda.c, intel_gpu.c, net/ftp.c, ac97_codec_wait and the
+# PROCWAIT_BENCH harness. Every one of them stops being true the day somebody
+# wires the subsystem up, and the edit that does the wiring is in a different
+# file, so nothing brings the reviewer back to this row. That is the exact
+# shape of an exemption that has outlived the thing it exempts.
+#
+# WHAT THIS CHECKS, EXACTLY, and what it does not. It takes the function
+# CONTAINING the exempted site and walks callers transitively. While every
+# caller is in the same file, the claim stands. The first caller in a
+# DIFFERENT file is an escape, and the chain is printed. It is deliberately
+# not a reachability prover: it cannot tell a live caller from a caller that
+# is itself dead, and it says so in the failure text rather than pretending.
+#
+# MEASURED on the shipping allowlist: ftp_init() IS called from net/net.c:744,
+# so a file-level "is net/ftp.c called from anywhere" test goes red on a row
+# that is substantively right (ftp_init is a bare kprintf; ftp_connect,
+# ftp_get, ftp_ls, ftp_put and ftp_session_create have no callers at all).
+# Checking the CONTAINING function instead of the file is what makes the
+# difference between a check and a nuisance.
+DEAD_CLAIM_RE = re.compile(
+    r"\bDEAD CODE\b|\bhas (?:zero|no) callers\b|\bzero callers\b|"
+    r"\bnever called\b", re.I)
+# The same rot, one step weaker: not "nobody calls this" but "only THIS calls
+# this". It carries the whole weight of a row whenever the reason a poll loop
+# is acceptable is the CONTEXT it runs in (a gated worker, a headless install
+# thread, a serial-only shell), because the context is a property of the
+# CALLERS and a new caller is added in a different file.
+#
+# MEASURED on this allowlist, 2026-10-04: two rows failed it.
+#   gui/installer.c "the only live caller is the headless AUTOINST worker on
+#   its own proc" - installer_do_install_target() also has sys_inst_install()
+#   (SYS_INST_INSTALL, called by userland/apps/install) and the GUI path.
+#   net/nfs.c "in the smbtest worker process, never on a UI thread" -
+#   nfs_vfs_mount() also has sys_nfs_mount() and the NETMOUNTS loader, and the
+#   Files app calls it synchronously on its own thread.
+# Both were [LEGIT], so both told the next reader the context question was
+# settled. Neither was.
+SOLE_CALLER_RE = re.compile(
+    r"\bthe only (?:live )?caller is\b|\bits only caller is\b|"
+    r"\bthe sole caller is\b|\bonly ever called (?:from|by)\b|"
+    r"\bonly reached (?:from|by|via)\b|\bcalled only (?:from|by)\b|"
+    r"\blive only (?:via|from|through)\b|\breachable only (?:from|via)\b|"
+    r"\bits (?:other|one other) caller is\b|\bits two callers are\b",
+    re.I)
+UNUSED_ATTR_RE = re.compile(
+    r"\b([a-z_]\w*)\b(?:\s*\(\s*\))?\s+is\s+marked\s+"
+    r"__attribute__\(\(\s*unused\s*\)\)", re.I)
+MAX_CALLER_HOPS = 8
+
+
+class CallerIndex(object):
+    """Comment-stripped sources plus function spans, built once, lazily."""
+
+    def __init__(self, root, dirs):
+        self.root = root
+        self.files = {}
+        # name -> {files that mention it}. Without this, referrers() is a full
+        # regex pass over every .c file for every name, and the transitive walk
+        # does hundreds of names: the first version of this check took longer
+        # than the whole rest of the lint. One word-set pass per file turns it
+        # into a lookup plus a scan of two or three files.
+        self.mentions = {}
+        self._cache = {}
+        word_re = re.compile(r"[A-Za-z_]\w*")
+        for full, rel in walk(root, dirs):
+            if not rel.endswith(".c"):
+                continue
+            try:
+                with open(full, "r", errors="replace") as f:
+                    src = f.read()
+            except OSError:
+                continue
+            clean = strip_comments_only(src)
+            self.files[rel] = (clean, func_spans(clean))
+            for w in set(word_re.findall(clean)):
+                self.mentions.setdefault(w, set()).add(rel)
+
+    def function_at(self, rel, line):
+        ent = self.files.get(rel)
+        if not ent:
+            return None
+        clean, spans = ent
+        off = 0
+        for _ in range(line - 1):
+            nxt = clean.find("\n", off)
+            if nxt < 0:
+                break
+            off = nxt + 1
+        sp = enclosing_span(spans, off)
+        return sp[2] if sp else None
+
+    def defines(self, rel, name):
+        ent = self.files.get(rel)
+        return bool(ent) and any(sp[2] == name for sp in ent[1])
+
+    def referrers(self, name, home=None):
+        """[(relpath, enclosing_fn_or_None)] for every reference to `name`
+        outside its own body. Includes function-pointer table entries, because
+        a name in an initialiser is a way to be called too."""
+        key = (name, home)
+        if key in self._cache:
+            return self._cache[key]
+        out = []
+        word = re.compile(r"\b" + re.escape(name) + r"\b")
+        for rel in sorted(self.mentions.get(name, ())):
+            # NAME COLLISION. A reference in another file that defines its OWN
+            # function of this name resolves to THAT one, not to ours, so it is
+            # not a caller. fat.c has a `static inline fat_cache_invalidate
+            # (void)` while fat_readahead.c has a non-static
+            # `fat_cache_invalidate(fat_fs_t *, uint32_t)`, and the
+            # fat_readahead.c allowlist row warns about exactly this twin. The
+            # first version of this check walked straight into it and reported
+            # a false escape, on the one row whose author had already written
+            # down the trap.
+            if home is not None and rel != home and self.defines(rel, name):
+                continue
+            clean, spans = self.files[rel]
+            for m in word.finditer(clean):
+                sp = enclosing_span(spans, m.start())
+                encl = sp[2] if sp else None
+                if encl == name:
+                    continue            # its own body, or recursion
+                if sp is None:
+                    # File scope. A prototype or a forward declaration is not
+                    # a caller; a name inside an INITIALISER is, because a
+                    # function-pointer table is a way to be called.
+                    #
+                    # This used to be a regex for "looks like a prototype" and
+                    # it quietly matched ordinary call statements: in
+                    #     return installer_do_install_target(&t[i], 0, 0);
+                    # the leading `return ` satisfied the type-token part, so
+                    # the one caller that mattered was classified as a
+                    # declaration and the check reported zero escapes on rows
+                    # that were in fact wrong. Deciding by brace depth instead
+                    # of by shape cannot make that mistake.
+                    seg = clean[max(0, m.start() - 300):m.start()]
+                    if "=" not in seg.split(";")[-1]:
+                        continue
+                out.append((rel, encl))
+        self._cache[key] = out
+        return out
+
+
+def asserted(note):
+    """The part of a note the row ASSERTS, with quoted spans removed.
+
+    A corrected row quotes the clause it is retracting:
+        CORRECTED: this row previously said "the only live caller is the
+        headless AUTOINST worker", and it has four callers: ...
+    Matching claim phrases against the raw note fires on the quotation, which
+    would punish exactly the rows that have already been fixed and would push
+    an author towards deleting the history instead of recording it. A claim is
+    what a row says, not what it quotes. Measured: the kernel/cpu/smp.c
+    DELAY_SPIN row has carried a quoted, retracted "additionally unreachable
+    today" since #SMPDEFAULT and is correct as it stands."""
+    return re.sub(r'"[^"]*"', " ", note)
+
+
+def note_accounts_for(note, caller):
+    """Does `note` name `caller`, loosely enough not to be pedantic?
+
+    Exact name, or any word of 5+ characters in the note that appears inside
+    the caller's name, case-insensitively. That accepts "the headless AUTOINST
+    worker" for installer_autoinstall_worker and "the GUI install path" for
+    installer_start_install, while still rejecting a caller the row never
+    alludes to at all, which is the case that matters."""
+    low = note.lower()
+    if caller.lower() in low:
+        return True
+    cl = caller.lower()
+    for w in re.findall(r"[A-Za-z_]{5,}", low):
+        if w in cl:
+            return True
+    return False
+
+
+def check_dead_claims(hits, allow, root, dirs):
+    """Return [(lineno, fp, why)] for rows whose 'dead code' claim is
+    contradicted by a caller chain that leaves the file."""
+    rows = [(fp, e) for fp, e in allow.items()
+            if e["cat"] in ("LEGIT", "DEBT")
+            and (DEAD_CLAIM_RE.search(asserted(e["note"])) or
+                 UNUSED_ATTR_RE.search(asserted(e["note"])) or
+                 SOLE_CALLER_RE.search(asserted(e["note"])))]
+    if not rows:
+        return []
+    live = {}
+    for h in hits:
+        live.setdefault(h["fp"], h)
+    rows = [(fp, e) for fp, e in rows if fp in live]
+    if not rows:
+        return []
+
+    idx = CallerIndex(root, dirs)
+    bad = []
+    for fp, e in sorted(rows, key=lambda kv: kv[1]["line"]):
+        h = live[fp]
+
+        # (i) "<fn> is marked __attribute__((unused))" is a one-line fact.
+        um = UNUSED_ATTR_RE.search(asserted(e["note"]))
+        if um:
+            name = um.group(1)
+            ent = idx.files.get(h["relpath"])
+            if ent and not re.search(
+                    r"__attribute__\s*\(\(\s*unused\s*\)\)[\w \t\*]*\b"
+                    + re.escape(name) + r"\s*\(", ent[0]):
+                bad.append((e["line"], fp,
+                            'the row states "%s is marked '
+                            '__attribute__((unused))", and the definition in %s '
+                            'no longer carries that attribute. Either the '
+                            'attribute was dropped (so the compiler now expects '
+                            'the function to be used) or the row names the wrong '
+                            'function.' % (name, h["relpath"])))
+                continue
+
+        start = idx.function_at(h["relpath"], h["line"])
+        if not start:
+            continue                     # site is not inside a function body
+
+        # (ii) "the only caller is X": every DIRECT caller must be accounted
+        #      for in the row. A sole-caller claim is a claim about depth 1, so
+        #      this does not walk; it enumerates and asks the row to name them.
+        sm = SOLE_CALLER_RE.search(asserted(e["note"]))
+        if sm and not DEAD_CLAIM_RE.search(asserted(e["note"])):
+            callers = sorted({encl or ("(file scope in %s)" % rel)
+                              for rel, encl in
+                              idx.referrers(start, home=h["relpath"])})
+            unnamed = [c for c in callers if not note_accounts_for(e["note"], c)]
+            if "live" in sm.group(0).lower():
+                # The row said "the only LIVE caller". A caller that has no
+                # callers of its own is not live, so it does not contradict
+                # the claim. drivers/audio.c's audio_beep() is exactly this:
+                # a real caller of sound_play_tone() that nothing reaches.
+                unnamed = [c for c in unnamed
+                           if idx.referrers(c, home=None)]
+            if unnamed:
+                bad.append((e["line"], fp,
+                            'the row rests on "%s", and %s() has %d direct '
+                            'caller(s) the row does not account for: %s\n'
+                            '       (all callers: %s)\n'
+                            '       A context argument is a claim about the '
+                            'CALLERS, and a new caller is added in a different '
+                            'file, so nothing brings a reviewer back here. '
+                            'Name every caller, or give a reason that does not '
+                            'depend on which one it is.'
+                            % (sm.group(0), start, len(unnamed),
+                               ', '.join(unnamed), ', '.join(callers) or 'none')))
+            continue
+
+        if not DEAD_CLAIM_RE.search(asserted(e["note"])):
+            continue
+        chain, seen, frontier = [], {start}, [(start, [start])]
+        escape = None
+        hops = 0
+        while frontier and hops < MAX_CALLER_HOPS and not escape:
+            hops += 1
+            nxt = []
+            for fn, path_so_far in frontier:
+                for rel, encl in idx.referrers(fn, home=h["relpath"]):
+                    if rel == h["relpath"]:
+                        if encl and encl not in seen:
+                            seen.add(encl)
+                            nxt.append((encl, path_so_far + [encl]))
+                        continue
+                    escape = (path_so_far, rel, encl)
+                    break
+                if escape:
+                    break
+            frontier = nxt
+        if escape and (note_accounts_for(e["note"], escape[2] or "")
+                       or os.path.basename(escape[1]) in e["note"]):
+            # The row names the caller that leaves the file, so the caller set
+            # it rests on is the real one. That is the check passing, not a
+            # loophole: the thing being enforced is that the prose and the call
+            # graph agree, and here they do.
+            escape = None
+        if escape:
+            path_so_far, rel, encl = escape
+            chain = " <- ".join(reversed(path_so_far))
+            bad.append((e["line"], fp,
+                        'the row rests on "%s", and the function holding the '
+                        'site is reached from OUTSIDE %s:\n'
+                        '           %s  <-  %s%s\n'
+                        '       The exemption may have outlived the thing it '
+                        'exempted. If that outside caller is itself dead, say '
+                        'so in the row and name it; if it is live, this site '
+                        'is no longer dead code and needs a real reason or a '
+                        'wait_event.'
+                        % (DEAD_CLAIM_RE.search(e["note"]).group(0),
+                           h["relpath"], chain, rel,
+                           ":" + encl + "()" if encl else " (file scope)")))
+    return bad
+
+
 def collect(root, dirs=None):
     all_hits = []
     for full, rel in walk(root, dirs):
@@ -969,6 +1284,30 @@ static void st_park_acquire(void) {
 """
 
 
+# Fixture for the justification arm. The spin sits in drv_wait_ready(), which
+# has a boot-path caller in its own file AND a Ring-3 syscall caller in
+# another: the exact shape of the real gui/installer.c and proc/users.c rows,
+# where the row named the first and not the second.
+SELFTEST_J_DRIVER = r"""
+#include "k.h"
+static int drv_wait_ready(void) {
+    for (int i = 0; i < 100; i++) {
+        if (inb(0x1F7) & 0x40) return 0;
+        proc_sleep(1);
+    }
+    return -1;
+}
+int drv_bringup(void) { return drv_wait_ready(); }
+int drv_poke(void)    { return drv_wait_ready(); }
+"""
+
+SELFTEST_J_CALLER = r"""
+#include "k.h"
+extern int drv_poke(void);
+int64_t sys_drv_poke(void) { return drv_poke(); }
+"""
+
+
 def self_test():
     import tempfile
     ok = True
@@ -1019,6 +1358,56 @@ def self_test():
         ok = ok and good
         print(f"  {'PASS' if good else 'FAIL'}  UNJUSTIFIED_ALLOWLIST      "
               f"-> rejected={bool(_b)}")
+
+        # --- the JUSTIFICATION arm (#426, [badexempt]) ---
+        # A row's prose must agree with the call graph. Proven on a two-file
+        # fixture whose shape is taken from the real finding: a spin inside a
+        # function with a second, out-of-file caller the row does not mention.
+        print("\n  the justification arm: a reviewed row's caller claim must "
+              "match the code")
+
+        def run_j(name, label, note_tail, expect_bad):
+            nonlocal ok
+            root = os.path.join(td, "j_" + name)
+            os.makedirs(os.path.join(root, "kernel", "drivers"), exist_ok=True)
+            os.makedirs(os.path.join(root, "kernel", "proc"), exist_ok=True)
+            with open(os.path.join(root, "kernel", "drivers", "fixture.c"),
+                      "w") as f:
+                f.write(SELFTEST_J_DRIVER)
+            with open(os.path.join(root, "kernel", "proc", "caller.c"),
+                      "w") as f:
+                f.write(SELFTEST_J_CALLER)
+            hits = collect(root, ["kernel"])
+            if len(hits) != 1:
+                print(f"  FAIL  {label:<48} fixture gave {len(hits)} hits, "
+                      f"expected 1")
+                ok = False
+                return
+            ap_ = os.path.join(root, "allow.txt")
+            with open(ap_, "w") as f:
+                f.write("%s  # kernel/drivers/fixture.c:%d %s [LEGIT] %s\n"
+                        % (hits[0]["fp"], hits[0]["line"], hits[0]["rule"],
+                           note_tail))
+            entries, _ = load_allowlist(ap_)
+            found = check_dead_claims(hits, entries, root, ["kernel"])
+            good2 = (len(found) == expect_bad)
+            ok = ok and good2
+            print(f"  {'PASS' if good2 else 'FAIL'}  {label:<48} "
+                  f"bad={len(found)} want={expect_bad}")
+            for _l, _f, why in found:
+                print(f"            -> {why.splitlines()[0][:120]}")
+
+        run_j("sole_false", "RED: 'the only caller is' names 1 of 2 callers",
+              "REVIEWED. Bounded hardware settle, and the only caller is "
+              "drv_bringup() on the boot path.", 1)
+        run_j("sole_true", "GREEN: the same row naming both callers",
+              "REVIEWED. Bounded hardware settle. Its callers are "
+              "drv_bringup() on the boot path and sys_drv_poke() from Ring 3; "
+              "the bound does not depend on which.", 0)
+        run_j("quoted", "GREEN: a CORRECTED row quoting the clause it retracts",
+              'CORRECTED: this row used to say "the only caller is '
+              'drv_bringup()". It has two: drv_bringup() and sys_drv_poke(). '
+              'The bound is what the exemption rests on.', 0)
 
     print("\nconcurrency-lint --self-test: %s" %
           ("PASS (RED on every synthetic spin, GREEN on the clean fixture)"
@@ -1123,6 +1512,19 @@ def main():
               f"dead hashes is not a baseline:")
         for fp in sorted(stale):
             print(f"  STALE  {fp}  ({allow[fp]['cat']}) {allow[fp]['note'][:60]}")
+        print()
+
+    # (b2) a row's prose, held against the code it points at. (a) and (b) check
+    #      a row's SHAPE; this one reads what it SAYS. See check_dead_claims().
+    contra = check_dead_claims(hits, allow, root, dirs)
+    if contra:
+        rc = 1
+        print(f"[concurrency-lint] FAIL: {len(contra)} allowlist "
+              f"justification(s) are contradicted by the code they describe. "
+              f"A wrong reason wearing a [LEGIT] badge tells the next reader "
+              f"to stop looking, which is worse than no exemption at all:")
+        for lineno, fp, why in sorted(contra):
+            print(f"  line {lineno}: {fp}\n      -> {why}")
         print()
 
     # (c) the DEBT ledger, printed loudly on every run so accepted poll loops

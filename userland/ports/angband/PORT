@@ -78,10 +78,30 @@
 # RUNTIME DATA PATH. Angband needs its lib/ tree (edit files, help text,
 # screens, customize/prefs) on disk at ANGBAND_DIR_* paths computed from
 # DEFAULT_CONFIG_PATH/DEFAULT_LIB_PATH/DEFAULT_DATA_PATH (src/config.h),
-# overridden below to "/ANGBAND/" (mirrors upstream's own default of pointing
-# all three at one "./lib/" tree). build/build-golden.sh overlays the
-# read-only lib/ tree onto ext2 /ANGBAND, parallel to the existing /TERMINFO
-# overlay for mports ncurses.
+# overridden below to "/GAMES/ANGBAND/lib/" (mirrors upstream's own default of
+# pointing all three at one "./lib/" tree). build/build-golden.sh overlays the
+# read-only lib/ tree onto ext2 /GAMES/ANGBAND/lib, parallel to the existing
+# /TERMINFO overlay for mports ncurses.
+#
+# #gamedata2: THIS ROOT WAS "/ANGBAND/" AND HAD TO MOVE. userland/libc/pkgdest.c
+# lets an App Store package install only under /APPS, /GAMES or /THEMES, so a
+# bare "/ANGBAND" destination is REFUSED outright (MEASURED against the shipping
+# pkgdest_confine()). The 1.4MB lib tree therefore could not be served by the
+# update server / app repo and had to be baked into every golden. Moved under the
+# /GAMES/ANGBAND directory this port already owns, in a "lib/" subdirectory so
+# that the read-only installed payload and the mutable save tree remain separable
+# rather than intermixed.
+#
+# NO COLLISION WITH THE SAVE PATH, and this is from the code, not an assumption:
+# init_file_paths() (src/init.c) appends VERSION_NAME ("Angband") to
+# PRIVATE_USER_PATH, so ANGBAND_DIR_USER is "/GAMES/ANGBAND/Angband" and save,
+# scores, panic and archive are all under THAT. "lib" and "Angband" are siblings.
+# Trailing slashes are optional either way: init_stuff() (src/main.c) adds one if
+# absent, and path_build() (src/z-file.c) does the same independently.
+#
+# DEFAULT_DATA_PATH IS DEAD CODE FOR THIS BUILD and is kept only so the three
+# macros do not disagree: with both USE_PRIVATE_PATHS and PRIVATE_USER_PATH
+# defined, init_file_paths() never reads `datapath` on any reachable path.
 #
 # THE SAVE/SCORE/PANIC PATH IS NOT "~/.angband", AND THIS WAS MEASURED, NOT
 # ASSUMED. -DUSE_PRIVATE_PATHS keeps save/score/panic out of the shared
@@ -190,7 +210,7 @@ sources=src/borg/borg-attack-munchkin.c src/borg/borg-caution.c src/borg/borg-ca
 #   reason to.
 # -DUSE_PRIVATE_PATHS, -DDEFAULT_CONFIG_PATH/-DDEFAULT_LIB_PATH/
 #   -DDEFAULT_DATA_PATH: see the port header above (runtime data path).
-cflags=-Isrc -DUSE_GCU -DALLOW_BORG -DUSE_PRIVATE_PATHS -DPRIVATE_USER_PATH="/GAMES/ANGBAND" -DDEFAULT_CONFIG_PATH="/ANGBAND/" -DDEFAULT_LIB_PATH="/ANGBAND/" -DDEFAULT_DATA_PATH="/ANGBAND/"
+cflags=-Isrc -DUSE_GCU -DALLOW_BORG -DUSE_PRIVATE_PATHS -DPRIVATE_USER_PATH="/GAMES/ANGBAND" -DDEFAULT_CONFIG_PATH="/GAMES/ANGBAND/lib/" -DDEFAULT_LIB_PATH="/GAMES/ANGBAND/lib/" -DDEFAULT_DATA_PATH="/GAMES/ANGBAND/lib/"
 
 # A program installs no public header, like darkhttpd (the headers=none
 
@@ -203,9 +223,12 @@ cflags=-Isrc -DUSE_GCU -DALLOW_BORG -DUSE_PRIVATE_PATHS -DPRIVATE_USER_PATH="/GA
 # this build never opens (-DUSE_GCU, no USE_GRAPHICS/SOUND) and lib/user is
 # upstream's own optional sample override content, unrelated to our real
 # real save path (/GAMES/ANGBAND, see USE_PRIVATE_PATHS above); both are
-# deliberately left off the image. build/build-golden.sh overlays
-# /data/angband/* onto ext2 /ANGBAND/*, parallel to the existing
-# /TERMINFO overlay for the ncurses port.
+# deliberately left off the image. The DST side of each pair below stays FLAT
+# ("angband/gamedata", not "angband/lib/gamedata") on purpose: out/data/angband
+# is the port's contract, and the "lib/" level belongs to the DESTINATION, which
+# is named once by build/build-golden.sh for the golden and once by
+# userland/apps/angband/appstore-package/INSTALL for the package. Nesting it here
+# would also silently break build-golden's one-level overlay loop.
 install_data=lib/gamedata:angband/gamedata lib/customize:angband/customize lib/help:angband/help lib/screens:angband/screens
 # literal).
 headers=none

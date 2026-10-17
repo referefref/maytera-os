@@ -638,6 +638,30 @@ static int ct_press(const ct_item_t *it, int argc, char **argv,
     ct_state_line(out, ocap);
     return 0;
 }
+CT_CHECK_ACTFN(ct_press);
+
+// #<config-ref>: the terms for every projected button. do_button() flips the
+// app's own timer state variables and nothing else, instantly, and nothing
+// persists or leaves the process.
+//
+// success_ref is picked PER TAB from the SAME g_ct_id[] discrimination the desc
+// line below already uses, so a button's checkable item is derived from the same
+// table entry as its name and its handler. There is deliberately no single
+// "state" item to point all three at: naming one that does not exist would be
+// the #235 fault in one field, and inventing one to satisfy the field would be
+// adding an item to justify a declaration instead of the other way round.
+static const ct_terms_t k_t_timers_sw = {
+    CT_TIME_INSTANT, 0, CT_TIME_MS_INSTANT,
+    CT_SUCC_ITEM, CT_DEPTH_VIEW, 0, "stopwatch.display", 0
+};
+static const ct_terms_t k_t_timers_tm = {
+    CT_TIME_INSTANT, 0, CT_TIME_MS_INSTANT,
+    CT_SUCC_ITEM, CT_DEPTH_VIEW, 0, "timer.display", 0
+};
+static const ct_terms_t k_t_timers_po = {
+    CT_TIME_INSTANT, 0, CT_TIME_MS_INSTANT,
+    CT_SUCC_ITEM, CT_DEPTH_VIEW, 0, "pomodoro.display", 0
+};
 
 static int timers_project(int idx, ct_item_t *out) {
     ct_build();
@@ -664,6 +688,8 @@ static int timers_project(int idx, ct_item_t *out) {
     it.actfn  = ct_press;
     it.ctx    = &g_ct_id[idx];
     it.desc   = desc;
+    it.terms  = g_ct_id[idx] <= B_SW_RESET ? &k_t_timers_sw
+              : (g_ct_id[idx] <= B_TM_RESET ? &k_t_timers_tm : &k_t_timers_po);
     *out = it;
     return 1;
 }
@@ -683,55 +709,148 @@ static const ct_item_t TIMERS_ITEMS[] = {
     // the tab bar are one store, not two. Persisted: which panel you were last
     // using is a preference, and it is the row that makes a contract write
     // observable from a second process.
-    { "tab", CT_ENUM, CT_RW, CT_SAFE, 't', 0, 2, "Stopwatch|Timer|Pomodoro",
-      &g_tab, 0, 0, 0, 0, 0, 0,
-      "Which panel is in view; the same variable the tab bar sets" },
+    {
+      .name = "tab",
+      .type = CT_ENUM,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .cfgkey = 't',
+      .hi = 2,
+      .options = "Stopwatch|Timer|Pomodoro",
+      .var = &g_tab,
+      .desc = "Which panel is in view; the same variable the tab bar sets",
+    },
     // The configured countdown, through the app's own clamp (10s..99h).
-    { "timer.duration_ms", CT_INT, CT_RW, CT_SAFE, 'd', 10000, 356400000, 0,
-      0, ct_get_tm_set, ct_set_tm_set, 0, 0, 0, 0,
-      "Configured countdown duration in ms, clamped by tm_apply_set()" },
+    {
+      .name = "timer.duration_ms",
+      .type = CT_INT,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .cfgkey = 'd',
+      .lo = 10000,
+      .hi = 356400000,
+      .getfn = ct_get_tm_set,
+      .setfn = ct_set_tm_set,
+      .desc = "Configured countdown duration in ms, clamped by tm_apply_set()",
+    },
 
-    { "timer.remaining_ms", CT_INT, CT_READ, CT_SAFE, 0, 0, 356400000, 0,
-      0, ct_get_tm_remain, 0, 0, 0, 0, 0,
-      "Milliseconds left on the countdown right now" },
-    { "timer.display", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
-      0, 0, 0, 0, ct_tm_display, 0, 0,
-      "The countdown as the app draws it, from the same fmt_hms()" },
-    { "timer.running", CT_BOOL, CT_READ, CT_SAFE, 0, 0, 1, 0,
-      &tm_running, 0, 0, 0, 0, 0, 0,
-      "Whether the countdown is counting down" },
-    { "timer.finished", CT_BOOL, CT_READ, CT_SAFE, 0, 0, 1, 0,
-      &tm_finished, 0, 0, 0, 0, 0, 0,
-      "Whether the countdown has expired and is flashing Time's up" },
+    {
+      .name = "timer.remaining_ms",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 356400000,
+      .getfn = ct_get_tm_remain,
+      .desc = "Milliseconds left on the countdown right now",
+    },
+    {
+      .name = "timer.display",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_tm_display,
+      .desc = "The countdown as the app draws it, from the same fmt_hms()",
+    },
+    {
+      .name = "timer.running",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .var = &tm_running,
+      .desc = "Whether the countdown is counting down",
+    },
+    {
+      .name = "timer.finished",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .var = &tm_finished,
+      .desc = "Whether the countdown has expired and is flashing Time's up",
+    },
 
-    { "stopwatch.elapsed_ms", CT_INT, CT_READ, CT_SAFE, 0, 0, 2000000000, 0,
-      0, ct_get_sw_elapsed, 0, 0, 0, 0, 0,
-      "Stopwatch elapsed time in ms, running or paused" },
-    { "stopwatch.display", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
-      0, 0, 0, 0, ct_sw_display, 0, 0,
-      "The stopwatch as the app draws it, tenths included" },
-    { "stopwatch.running", CT_BOOL, CT_READ, CT_SAFE, 0, 0, 1, 0,
-      &sw_running, 0, 0, 0, 0, 0, 0,
-      "Whether the stopwatch is running" },
-    { "stopwatch.lap_count", CT_INT, CT_READ, CT_SAFE, 0, 0, MAX_LAPS, 0,
-      &sw_lap_count, 0, 0, 0, 0, 0, 0,
-      "How many laps are recorded in the lap list" },
+    {
+      .name = "stopwatch.elapsed_ms",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 2000000000,
+      .getfn = ct_get_sw_elapsed,
+      .desc = "Stopwatch elapsed time in ms, running or paused",
+    },
+    {
+      .name = "stopwatch.display",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_sw_display,
+      .desc = "The stopwatch as the app draws it, tenths included",
+    },
+    {
+      .name = "stopwatch.running",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .var = &sw_running,
+      .desc = "Whether the stopwatch is running",
+    },
+    {
+      .name = "stopwatch.lap_count",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = MAX_LAPS,
+      .var = &sw_lap_count,
+      .desc = "How many laps are recorded in the lap list",
+    },
 
-    { "pomodoro.phase", CT_ENUM, CT_READ, CT_SAFE, 0, 0, 2, "Focus|Short break|Long break",
-      &po_phase, 0, 0, 0, 0, 0, 0,
-      "Which pomodoro phase is in progress" },
-    { "pomodoro.remaining_ms", CT_INT, CT_READ, CT_SAFE, 0, 0, 356400000, 0,
-      0, ct_get_po_remain, 0, 0, 0, 0, 0,
-      "Milliseconds left in the current pomodoro phase" },
-    { "pomodoro.display", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
-      0, 0, 0, 0, ct_po_display, 0, 0,
-      "The pomodoro clock as the app draws it" },
-    { "pomodoro.running", CT_BOOL, CT_READ, CT_SAFE, 0, 0, 1, 0,
-      &po_running, 0, 0, 0, 0, 0, 0,
-      "Whether the pomodoro clock is running" },
-    { "pomodoro.sessions", CT_INT, CT_READ, CT_SAFE, 0, 0, 100000, 0,
-      &po_done, 0, 0, 0, 0, 0, 0,
-      "Focus sessions completed since the last pomodoro reset" },
+    {
+      .name = "pomodoro.phase",
+      .type = CT_ENUM,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 2,
+      .options = "Focus|Short break|Long break",
+      .var = &po_phase,
+      .desc = "Which pomodoro phase is in progress",
+    },
+    {
+      .name = "pomodoro.remaining_ms",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 356400000,
+      .getfn = ct_get_po_remain,
+      .desc = "Milliseconds left in the current pomodoro phase",
+    },
+    {
+      .name = "pomodoro.display",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_po_display,
+      .desc = "The pomodoro clock as the app draws it",
+    },
+    {
+      .name = "pomodoro.running",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .var = &po_running,
+      .desc = "Whether the pomodoro clock is running",
+    },
+    {
+      .name = "pomodoro.sessions",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 100000,
+      .var = &po_done,
+      .desc = "Focus sessions completed since the last pomodoro reset",
+    },
 };
 
 // The contract has to be named before load/commit can mention it and after

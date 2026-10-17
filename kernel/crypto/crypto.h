@@ -149,6 +149,48 @@ void aes_decrypt_block(const aes_ctx_t *ctx, const uint8_t in[16], uint8_t out[1
 void aes_cmac(const uint8_t key[16], const uint8_t *msg, size_t msg_len,
               uint8_t mac[16]);
 
+// aes_ctx_t is MIRRORED in rustkern/aesccm.rs so the CCM mode can hold a key
+// schedule and call aes_encrypt_block() on it. Lock the shape here: a silent
+// change to rk[] or nr would have the Rust side reading the wrong offsets, and
+// the symptom would be a cipher that produces plausible-looking wrong bytes.
+_Static_assert(sizeof(aes_ctx_t) == 244,
+               "aes_ctx_t must match AesCtx in rustkern/aesccm.rs");
+_Static_assert(_Alignof(aes_ctx_t) == 4,
+               "aes_ctx_t alignment must match AesCtx in rustkern/aesccm.rs");
+
+// =============================================================================
+// AES-CCM Mode (NIST SP 800-38C / RFC 3610), implemented in rustkern/aesccm.rs
+//
+// WHY THIS EXISTS WHEN AES-GCM IS ALREADY HERE: SMB 3.0 and 3.0.2 fix their
+// encryption at AES-128-CCM and define no way to negotiate anything else;
+// cipher negotiation (and therefore GCM) arrives only with SMB 3.1.1. MEASURED
+// 2026-10-04 against Samba 4.17.12: a GCM-framed message on dialect 0x0302
+// gets the connection killed (NT_STATUS_ACCESS_DENIED in the server's log),
+// while the same message under CCM is accepted. See rustkern/aesccm.rs.
+//
+// Both functions work IN PLACE on `data` and use the forward cipher only.
+// Return 0 on success, or a negative code; the one worth distinguishing is
+// AES_CCM_E_AUTH, which means the tag did not match. On that failure
+// aes_ccm_decrypt() ZEROES `data`, so a caller that ignores the return value
+// cannot act on unauthenticated bytes.
+// =============================================================================
+#define AES_CCM_E_AUTH (-7)
+
+int aes_ccm_encrypt(const uint8_t *key,
+                    const uint8_t *nonce, size_t nonce_len,
+                    const uint8_t *aad, size_t aad_len,
+                    uint8_t *data, size_t data_len,
+                    uint8_t *tag, size_t tag_len);
+int aes_ccm_decrypt(const uint8_t *key,
+                    const uint8_t *nonce, size_t nonce_len,
+                    const uint8_t *aad, size_t aad_len,
+                    uint8_t *data, size_t data_len,
+                    const uint8_t *tag, size_t tag_len);
+
+// RFC 3610's published known-answer vectors, plus the refusal arms. Returns 0
+// on PASS or the 1-based number of the first failing case.
+uint32_t aesccm_selftest_rs(void);
+
 // =============================================================================
 // AES-CBC Mode
 // =============================================================================

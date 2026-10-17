@@ -1,0 +1,14 @@
+<html><body id="b"><p id="out">original</p><div id="box" data-k="v">box</div><script>
+var d = document.getElementById('out');
+console.log('tag=' + d.tagName + ' text=' + d.textContent);
+d.textContent = 'SET:' + (1 + 2 + 3);
+console.log('after=' + document.getElementById('out').textContent);
+d.setAttribute('data-x', 'val99');
+console.log('attr=' + d.getAttribute('data-x') + ' pre=' + document.getElementById('box').getAttribute('data-k'));
+var e = document.createElement('span');
+e.textContent = 'child';
+console.log('made=' + e.tagName + '/' + e.textContent);
+document.getElementById('b').appendChild(e);
+console.log('inner=' + document.getElementById('b').innerHTML.length);
+console.log('missing=' + (document.getElementById('nope') === null));
+</script></body></html>

@@ -296,8 +296,15 @@ laid_out *layout_document(const document *d, int width_px) {
     if (!lo) return 0;
 
     lo_builder_t b; lb_init(&b);
+    // [filesui] WAS `if (!def_ink) def_ink = 0x00FFFFFF;`, which turned a
+    // theme whose label_text is black (retro_unix, the shipping default) into
+    // WHITE document text. It did not show only because apps/writer/main.c
+    // runs a repair pass that recognises the engine's default by comparing
+    // against ITS OWN copy of the same wrong literal: two independent guesses
+    // that happened to agree, so changing either one alone would have put
+    // white text on white paper. Both are gone, and the two now agree on the
+    // REAL value. See libc/theme.h for why the zero test could never work.
     unsigned int def_ink = theme_color(THEME_COLOR_LABEL_TEXT);
-    if (!def_ink) def_ink = 0x00FFFFFF;
 
     int content_w = width_px - LO_LEFT_PAD - LO_RIGHT_PAD;
     if (content_w < 40) content_w = (width_px > 40) ? width_px : 40;
@@ -351,8 +358,7 @@ void layout_free(laid_out *lo) {
 void layout_draw(int win, const laid_out *lo, int scroll_x, int scroll_y, int vh) {
     if (!lo) return;
 
-    unsigned int border = theme_color(THEME_COLOR_BORDER_SUBTLE);
-    if (!border) border = 0x00606060;
+    unsigned int border = theme_color(THEME_COLOR_BORDER_SUBTLE);   // [filesui] zero test removed: 0 is BLACK, never unset (libc/theme.h).
     for (int i = 0; i < lo->nrect; i++) {
         const laid_rect *r = &lo->rects[i];
         int y = r->y - scroll_y;

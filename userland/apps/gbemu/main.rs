@@ -521,6 +521,9 @@ fn sav_path_for(rom_path: &[u8]) -> Vec<u8> {
 // as sys_readdir above: two copies of a sequence like this is how they drift).
 // A short/unreadable ROM is silently ignored (stays on the previous game)
 // rather than crashing the emulator mid-session.
+// Returns true iff a cartridge was actually loaded. The caller needs to know:
+// with an empty slot, closing the navigator after a FAILED pick would leave a
+// blank LCD and no visible way back, so the close is conditional on this.
 fn load_selected_rom(
     path: &[u8],
     g: &mut gb::Gb,
@@ -529,10 +532,10 @@ fn load_selected_rom(
     sav_path: &mut Vec<u8>,
     held_btn: &mut Option<gb::Button>,
     frame_counter: &mut u32,
-) {
+) -> bool {
     let newrom = match read_whole_file(path) {
         Some(r) if r.len() >= 0x150 => r,
-        _ => return,
+        _ => return false,
     };
     *rom_reset = newrom.clone();
     let mut newg = gb::Gb::new(newrom);
@@ -547,6 +550,7 @@ fn load_selected_rom(
     *sav_path = new_sav;
     *held_btn = None;
     *frame_counter = 0;
+    true
 }
 
 fn cstr(s: &[u8]) -> Vec<u8> {
@@ -693,6 +697,11 @@ pub extern "C" fn main(argc: i64, argv: *const *const u8) -> i32 {
         rom_path.extend_from_slice(b"/ROMS/GAME.GB\0");
     }
 
+    // Set false by the None arm below: "the window is open but the slot is empty".
+    // It gates two things only: whether the navigator opens as the HOME SCREEN
+    // rather than on request, and whether <B> is allowed to close it (closing with
+    // an empty slot would leave a blank LCD and no visible way back).
+    let mut cart_inserted = true;
     let rom = match read_whole_file(&rom_path) {
         Some(r) if r.len() >= 0x150 => r,
         Some(_) => show_message(
@@ -702,15 +711,30 @@ pub extern "C" fn main(argc: i64, argv: *const *const u8) -> i32 {
                 b"Game Boy cartridge image.",
             ],
         ),
-        None => show_message(
-            b"Game Boy\0",
-            &[
-                b"No ROM found.",
-                b"Launch gbemu with a .gb ROM path argument,",
-                b"or place one at /ROMS/GAME.GB",
-                b"(no game ROM ships with MayteraOS).",
-            ],
-        ),
+        // NO CARTRIDGE IS NOT AN ERROR. This arm used to call show_message(),
+        // which is `-> !`, so launching gbemu on a machine with no ROMs drew a
+        // dialog and exited: you never saw a Game Boy at all. Owner, 2026-10-01:
+        // "even without roms, the error message shouldnt appear, we should still
+        // see the gameboy and just have the menu to load roms". A real Game Boy
+        // with an empty slot powers on and shows a blank screen; it does not
+        // refuse to be a Game Boy.
+        //
+        // Every piece needed was already in the tree and simply unreachable:
+        // nav::scan_roms() returns an empty Vec when /ROMS does not exist (it
+        // does not on a stock golden), nav::draw() already renders "NO ROMS
+        // FOUND" inside the 160x144 LCD, and load_selected_rom() already swaps a
+        // cartridge in at runtime. So we synthesise an EMPTY SLOT and open the
+        // navigator as the home screen below.
+        //
+        // The blank cart is 32 KiB of 0x00: header byte 0x147 (cartridge type)
+        // reads ROM-ONLY, so has_battery() is false and no .sav is touched; the
+        // title at 0x134 is empty, so the window title falls back to "Game Boy";
+        // and 0x00 is NOP, so even if the user closes the navigator with nothing
+        // loaded the CPU idles over a blank screen instead of executing garbage.
+        None => {
+            cart_inserted = false;
+            alloc::vec![0u8; 0x8000]
+        }
     };
 
     let mut rom_reset = rom.clone();
@@ -777,8 +801,15 @@ pub extern "C" fn main(argc: i64, argv: *const *const u8) -> i32 {
     // a different producer of the one LCD-sized buffer. `nav_mode` gates
     // whether g.run_frame() runs each tick (paused while browsing) and which
     // buffer gets rendered/blitted.
-    let mut nav_mode = false;
-    let mut nav: Option<nav::Navigator> = None;
+    // With an empty slot the navigator IS the home screen: there is no game to
+    // show behind it, and "pick a ROM" is the only thing the user can usefully do.
+    // With a cartridge it stays closed until the Settings button asks for it.
+    let mut nav_mode = !cart_inserted;
+    let mut nav: Option<nav::Navigator> = if cart_inserted {
+        None
+    } else {
+        Some(nav::Navigator::open())
+    };
     let mut nav_fb: Vec<u32> = alloc::vec![0u32; (gb::SCREEN_W * gb::SCREEN_H) as usize];
     while running {
         // Pace to ~60 Hz via the blocking wait-with-timeout on the window
@@ -804,7 +835,7 @@ pub extern "C" fn main(argc: i64, argv: *const *const u8) -> i32 {
                                     b'x' | b'X' => {
                                         // A: load the highlighted ROM and return to the game.
                                         if let Some(path) = n.current_path() {
-                                            load_selected_rom(
+                                            if load_selected_rom(
                                                 &path,
                                                 &mut g,
                                                 &mut rom_reset,
@@ -812,15 +843,26 @@ pub extern "C" fn main(argc: i64, argv: *const *const u8) -> i32 {
                                                 &mut sav_path,
                                                 &mut held_btn,
                                                 &mut frame_counter,
-                                            );
+                                            ) {
+                                                cart_inserted = true;
+                                            }
                                         }
-                                        nav_mode = false;
-                                        nav = None;
+                                        // Closing on a FAILED pick with an empty slot would
+                                        // leave a blank LCD and no visible way back, so stay
+                                        // in the navigator until something is actually loaded.
+                                        if cart_inserted {
+                                            nav_mode = false;
+                                            nav = None;
+                                        }
                                     }
                                     b'z' | b'Z' => {
-                                        // B: back to the game, selection discarded.
-                                        nav_mode = false;
-                                        nav = None;
+                                        // B: back to the game, selection discarded. With an
+                                        // empty slot there is no game to go back TO, so the
+                                        // navigator stays up as the home screen.
+                                        if cart_inserted {
+                                            nav_mode = false;
+                                            nav = None;
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -852,7 +894,7 @@ pub extern "C" fn main(argc: i64, argv: *const *const u8) -> i32 {
                                         Hit::Btn(gb::Button::Down) | Hit::Btn(gb::Button::Right) => n.move_sel(1),
                                         Hit::Btn(gb::Button::A) => {
                                             if let Some(path) = n.current_path() {
-                                                load_selected_rom(
+                                                if load_selected_rom(
                                                     &path,
                                                     &mut g,
                                                     &mut rom_reset,
@@ -860,14 +902,23 @@ pub extern "C" fn main(argc: i64, argv: *const *const u8) -> i32 {
                                                     &mut sav_path,
                                                     &mut held_btn,
                                                     &mut frame_counter,
-                                                );
+                                                ) {
+                                                    cart_inserted = true;
+                                                }
                                             }
-                                            nav_mode = false;
-                                            nav = None;
+                                            // See the keyboard A path: an empty slot keeps
+                                            // the navigator up rather than closing onto a
+                                            // blank screen.
+                                            if cart_inserted {
+                                                nav_mode = false;
+                                                nav = None;
+                                            }
                                         }
                                         Hit::Btn(gb::Button::B) => {
-                                            nav_mode = false;
-                                            nav = None;
+                                            if cart_inserted {
+                                                nav_mode = false;
+                                                nav = None;
+                                            }
                                         }
                                         _ => {}
                                     }

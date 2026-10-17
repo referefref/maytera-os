@@ -1,5 +1,7 @@
 // hotplug.c - USB Hotplug Manager for MayteraOS
 #include "hotplug.h"
+#include "../fs/volblind.h"   // [volaudit] #246 blind-ask detector self-test
+#include "../fs/perms.h"      // [openperm] #246 mount-point ownership row
 #include "usb_msc.h"
 #include "../serial.h"
 #include "../string.h"
@@ -228,6 +230,76 @@ void hotplug_init(void) {
         } else {
             kprintf("[Hotplug] *** volume/path self-test FAIL: %u/%u ***\n", fails, checks);
             bootlog_write("[Hotplug] *** volume/path self-test FAIL %u/%u ***", fails, checks);
+        }
+    }
+
+    // [renamevol] #246 BOOT PROOF for the ROUTING rule, beside the one above
+    // and for the same reason: it protects behaviour that cannot be exercised
+    // without real removable media, and its failure mode is a file silently
+    // opening, moving or being DELETED on the wrong volume.
+    //
+    // It is exhaustive over the whole 32-combination input space of the pair
+    // rule plus all four of the single-path rule, and it prints the COUNT as
+    // well as the verdict, because a self-test that quietly stopped checking
+    // anything would otherwise still print PASS.
+    {
+        extern uint32_t renamevol_selftest_rs(uint32_t *out_checks);
+        uint32_t checks = 0;
+        uint32_t fails = renamevol_selftest_rs(&checks);
+        if (fails == 0) {
+            kprintf("[Hotplug] rename/path ROUTING self-test PASS (%u checks)\n", checks);
+            bootlog_write("[Hotplug] rename/path ROUTING self-test PASS (%u checks)", checks);
+        } else {
+            kprintf("[Hotplug] *** rename/path ROUTING self-test FAIL: %u/%u ***\n", fails, checks);
+            bootlog_write("[Hotplug] *** rename/path ROUTING self-test FAIL %u/%u ***", fails, checks);
+        }
+    }
+
+    // [volaudit] #246 BOOT PROOF for the blind-ask DETECTOR, beside the two
+    // above and for the same reason. The detector is the only thing that will
+    // ever report instance five of this fault class, so its verdict and its
+    // de-duplication table are checked on every boot and the result is printed
+    // either way, with a count.
+    volblind_selftest();
+
+    // [openperm] #246 BOOT PROOF for the two permission POLICY decisions this
+    // work adds, beside the three above and for the same reason: a self-test
+    // that only speaks on failure cannot be told apart from one that never
+    // runs, and blame.md's most-repeated lesson is that in-tree prose lies.
+    // The count is computed by the self-test, not written into the format
+    // string, so "0 of 0" cannot read as a pass.
+    {
+        extern uint32_t volperm_selftest_rs(uint32_t *out_checks);
+        extern int openperm_gate_rs(uint32_t, uint32_t, uint32_t);
+        uint32_t checks = 0;
+        uint32_t fails = volperm_selftest_rs(&checks);
+
+        // AND THE CROSS-LANGUAGE CONSTANT LOCK. The Rust self-test proves the
+        // RUST constants are consistent with each other; it cannot prove that
+        // proc/fdlayer.c's OPENPERM_ENFORCE names the same integer. So the
+        // live function is called here with the two vectors that matter and
+        // compared against the C macros. If these ever drift, every removable
+        // path silently stops being judged, which is exactly the defect this
+        // change exists to remove, and it would otherwise be invisible.
+        int lock_ok = (openperm_gate_rs(0, 0, 1) == OPENPERM_ENFORCE) &&
+                      (openperm_gate_rs(0, 0, 0) == OPENPERM_ENFORCE) &&
+                      (openperm_gate_rs(1, 0, 0) == OPENPERM_EXEMPT) &&
+                      (openperm_gate_rs(0, 1, 0) == OPENPERM_EXEMPT);
+        if (fails == 0 && lock_ok) {
+            kprintf("[Hotplug] [openperm] volume-permission POLICY self-test "
+                    "PASS (%u checks, C/Rust constant lock OK)\n", checks);
+            bootlog_write("[Hotplug] [openperm] volume-permission POLICY "
+                          "self-test PASS (%u checks, C/Rust constant lock OK) "
+                          "- a removable path IS judged by the permission "
+                          "table; SMB/NFS stay server-decided", checks);
+        } else {
+            kprintf("[Hotplug] [openperm] *** volume-permission POLICY "
+                    "self-test FAIL: %u/%u vectors, constant lock %s ***\n",
+                    fails, checks, lock_ok ? "OK" : "BROKEN");
+            bootlog_write("[Hotplug] [openperm] *** volume-permission POLICY "
+                          "self-test FAIL %u/%u, constant lock %s *** "
+                          "permissions on removable volumes are NOT correct",
+                          fails, checks, lock_ok ? "OK" : "BROKEN");
         }
     }
 
@@ -521,6 +593,66 @@ int hotplug_mount(int device_index) {
     if (result >= 0) {
         dev->status = HOTPLUG_STATUS_MOUNTED;
 
+        // [openperm] #246: GIVE THE MOUNT POINT AN OWNERSHIP ANSWER, because
+        // the file-open path now asks for one.
+        //
+        // proc/fdlayer.c sys_open_k() used to skip its permission check
+        // entirely for a removable path (#250). It no longer does, and the
+        // reason that carve-out existed is real: perms_check()'s no-entry
+        // default is root-owned 0755, so WITHOUT a row here an ordinary user
+        // could traverse into the volume (o+x) and could not create anything
+        // in it (no o+w). MEASURED before this line existed, on the same boot
+        // that measured the hole: "[USBOPN-TEST] mount-point row /USB0:
+        // ABSENT (no-entry default root:root 0755)". Enforcement alone would
+        // have traded an integrity hole for a stick that is read-only to the
+        // person holding it, which is the worse bug and would have shipped
+        // looking like a security win.
+        //
+        // root:root 01777 is the /tmp contract and the tree already contains
+        // the argument for it, in fs/perms.c: "01777 AND NOT 0777. The sticky
+        // bit is the entire difference between a shared directory and a
+        // free-for-all." Any user may CREATE on the stick; a file they create
+        // gets THEIR ownership row ([renamevol] CREATE POINT 3), so it is
+        // theirs to empty, overwrite and delete; and S_ISVTX means they may
+        // not remove or replace a name belonging to somebody else. That last
+        // clause is the protection that was decorative before this change.
+        //
+        // NOT owned by "the user who plugged it in", which sounds friendlier
+        // and is worse: the hotplug event arrives from an interrupt and not
+        // from a session, so there is no sound answer to who that is, and if
+        // the mount point WERE owned by a user then the sticky rule's
+        // directory-owner arm (STICKY_DIR_OWNER, rustkern/sticky.rs) would let
+        // that one user delete every other user's files on the volume. root
+        // owning the mount point and owning nothing on the volume is what
+        // makes the sticky rule do the work.
+        //
+        // The mode is NOT synced to /CONFIG/PERMS.DB on purpose. perms_set()
+        // puts it in the live table, hotplug_unmount() takes it out again, and
+        // a mount re-establishes it, so the row's lifetime matches the
+        // volume's and a stale one cannot outlive the medium it describes.
+        //
+        // hotplug_fs_readable() is the writability proxy, and saying so
+        // honestly: in this tree the only filesystem that serves files on a
+        // removable volume is FAT, which is readable and writable together,
+        // while exFAT mounts and serves nothing at all (see that function's
+        // own comment). So a non-readable volume gets the read-only mode,
+        // where every mode is academic because no open can succeed anyway.
+        {
+            extern uint32_t volperm_mount_mode_rs(uint32_t writable);
+            extern uint32_t volperm_mount_uid_rs(void);
+            extern uint32_t volperm_mount_gid_rs(void);
+            uint32_t wr = hotplug_fs_readable(dev->fs_type) ? 1u : 0u;
+            uint16_t vmode = (uint16_t)volperm_mount_mode_rs(wr);
+            perms_set(dev->mount_point, volperm_mount_uid_rs(),
+                      volperm_mount_gid_rs(), vmode);
+            kprintf("[Hotplug] [openperm] mount-point %s permissions %u:%u %04o "
+                    "(writable=%u): any user may create, S_ISVTX stops them "
+                    "removing or replacing somebody else's name\n",
+                    dev->mount_point, (unsigned)volperm_mount_uid_rs(),
+                    (unsigned)volperm_mount_gid_rs(), (unsigned)vmode,
+                    (unsigned)wr);
+        }
+
         // Calculate free space.
         // #250: on a removable FAT volume this is 0 and means UNKNOWN, not
         // "full". fat_mount_lba_usb deliberately skips the whole-FAT free
@@ -578,6 +710,16 @@ int hotplug_unmount(int device_index) {
     }
 
     dev->status = HOTPLUG_STATUS_CONNECTED;
+
+    // [openperm] #246: take the mount point's permission row out again, so its
+    // lifetime matches the volume's. The row describes a medium that is no
+    // longer there, and mount counters are reused: a later volume arriving at
+    // the same /USB<n> would otherwise inherit a row it never earned, and a
+    // path spelled /USB0/... with nothing mounted would be judged 01777 by a
+    // row describing a stick somebody has already pocketed. Re-established by
+    // hotplug_mount_device() on the next mount, which is the only place it is
+    // ever set.
+    perms_remove(dev->mount_point);
 
     // Remove desktop icon
     if (dev->desktop_icon_index >= 0) {
@@ -815,6 +957,44 @@ fat_fs_t *hotplug_volume_fat(int index) {
     if (!hotplug_fs_readable(dev->fs_type)) return NULL;
     if (!dev->fs.fat.mounted) return NULL;
     return &dev->fs.fat;
+}
+
+fat_fs_t *hotplug_volume_for_path(const char *path, const char **rel_out,
+                                  int *matched_out) {
+    if (matched_out) *matched_out = 0;
+    const char *rel = 0;
+    int slot = hotplug_resolve_path(path, &rel);
+    if (slot < 0) return NULL;
+    if (matched_out) *matched_out = 1;
+    fat_fs_t *fs = hotplug_volume_fat(slot);
+    if (!fs) return NULL;              // mounted but not readable (exFAT)
+    if (rel_out) *rel_out = rel;
+    return fs;
+}
+
+// [renamevol] #246: see the contract on the declaration in hotplug.h. The
+// root-or-volume choice for ONE path, in one place.
+//
+// It asks path_route_rs() (rustkern/renamevol.rs) rather than testing the two
+// flags itself, so that the single-path rule and the rename PAIR rule are
+// stated once, in one language, with one boot self-test over both.
+fat_fs_t *hotplug_fs_or_root(const char *path, const char **rel_out) {
+    extern fat_fs_t g_fat_fs;
+    extern int path_route_rs(int matched, int readable);
+
+    int matched = 0;
+    const char *vrel = 0;
+    fat_fs_t *vfs = hotplug_volume_for_path(path, &vrel, &matched);
+
+    int route = path_route_rs(matched, vfs ? 1 : 0);
+    if (route == RNV_SAMEVOL) {
+        if (rel_out) *rel_out = vrel;
+        return vfs;
+    }
+    if (route == RNV_REFUSE) return NULL;    // mounted, cannot serve files
+    if (!g_fat_fs.mounted) return NULL;
+    if (rel_out) *rel_out = path;
+    return &g_fat_fs;
 }
 
 int hotplug_eject_slot(int index) {

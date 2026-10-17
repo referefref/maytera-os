@@ -674,6 +674,14 @@ static TAB: &[Desc] = &[
     Desc { num: 269, args: [s(PATH_MAX), s(PATH_MAX), s(PATH_MAX), s(PATH_MAX), NONE, NONE] },
     // sys_net_list_shares((const char *)arg1 server, (char *)arg2 out, (uint32_t)arg3 maxlen)
     Desc { num: 270, args: [s(PATH_MAX), wa(3), NONE, NONE, NONE, NONE] },
+    // #smbdisk sys_net_cred_tag((const char *)arg1 pass, (char *)arg2 out, (uint32_t)arg3 cap)
+    Desc { num: 461, args: [s(PATH_MAX), wa(3), NONE, NONE, NONE, NONE] },
+    // #secretuse SYS_SECRET_USE(op, idx, out, outcap, in, inlen). arg3 is written
+    // with arg4 bytes, arg5 is read for arg6 bytes. Describable precisely BECAUSE
+    // the syscall takes six arguments instead of overloading one as "index or
+    // pointer": a polymorphic argument cannot be given a static descriptor, so it
+    // would have landed in the syscall-ptr-lint debt ledger instead.
+    Desc { num: 462, args: [NONE, NONE, wa(4), NONE, ra(6), NONE] },
     // sys_net_unmount((const char *)arg1 server, (const char *)arg2 share)
     Desc { num: 271, args: [s(PATH_MAX), s(PATH_MAX), NONE, NONE, NONE, NONE] },
     // sys_net_list_exports((const char *)arg1 server, (char *)arg2 out, (uint32_t)arg3 maxlen)
@@ -764,6 +772,15 @@ static TAB: &[Desc] = &[
     Desc { num: 445, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
     // sys_get_autologin((char*)buf, (int)cap) - writes cap bytes into buf
     Desc { num: 340, args: [wa(2), NONE, NONE, NONE, NONE, NONE] },
+    // #harendezvous: sys_session_home((char*)out, (int)cap) - the SAME shape as
+    // 340 above, a caller-supplied buffer with a caller-supplied length, which is
+    // exactly the "valid base, attacker-chosen length" class this table exists
+    // for. The handler also copy_to_user()s, but a descriptor is not redundant:
+    // the chokepoint rejects an overflowing length BEFORE the handler runs, and
+    // syscall-ptr.manifest's rule is that a pointer syscall in neither place
+    // fails the build, so leaving it undeclared would have been a new hole in
+    // the ledger #565 exists to keep at zero.
+    Desc { num: 463, args: [wa(2), NONE, NONE, NONE, NONE, NONE] },
     // sys_auth_lockout((const char*)user)
     Desc { num: 341, args: [s(64), NONE, NONE, NONE, NONE, NONE] },
 

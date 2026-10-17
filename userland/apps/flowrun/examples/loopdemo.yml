@@ -9,6 +9,10 @@
 # Deterministic and network-independent. Running `/APPS/FLOWRUN loopdemo`
 # writes exactly "ALPHA,BETA,GAMMA" to /HOME/LOOPOUT.TXT and prints FLOWRUN-OK 16.
 name: loopdemo
+# The Library catalog in /APPS/FLOW shows this line. It is part of the
+# additive optional schema: flow.c skips unknown top-level keys, so the
+# runner ignores it.
+description: "For-each loop that upper-cases a constant list into a file"
 nodes:
   - id: t1
     type: trigger

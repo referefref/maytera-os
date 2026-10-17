@@ -190,7 +190,22 @@ static int yp_advance(yctx_t *y) {
 
 static void yp_scalar(yctx_t *y, char *dst, int cap) {
     const char *s = (const char *)y->ev.data.scalar.value;
-    scpy(dst, s ? s : "", cap);
+    if (!s) s = "";
+    // TRUNCATION IS NOT ALLOWED TO BE SILENT. examples/visiongame.yml's decide
+    // prompt was 599 bytes against a 512-byte FLOW_VAL_MAX and was therefore cut
+    // at 511 on EVERY parse, losing the end of the key guidance, with nothing
+    // said anywhere: the flow ran, and ran on a prompt its author had not
+    // written. A value that is quietly shorter than it was authored is a
+    // behaviour change the author cannot see, so say so on stderr (which the
+    // kernel's fd-1/2 fallback also puts on the serial console). This is a
+    // WARNING and not a parse error on purpose: rejecting the file would break
+    // every existing workflow that has silently been over the limit.
+    int sl = (int)strlen(s);
+    if (cap > 0 && sl > cap - 1)
+        fprintf(stderr, "flowrun: WARNING: a %d-byte value was TRUNCATED to %d "
+                        "bytes (\"%.48s...\"); the ceiling is FLOW_VAL_MAX\n",
+                sl, cap - 1, s);
+    scpy(dst, s, cap);
 }
 
 // current event is the first event of a value; consume the whole value.
@@ -1395,6 +1410,65 @@ static int h_input(flow_ctx_t *ctx, flow_node_t *n) {
     return 0;
 }
 
+// ---- #469 launch node: start the app the rest of the flow drives ----------
+// See the flow_plat_launch() comment in flow.h for why this exists. Everything
+// app-specific is TEXT in the YAML; this handler knows only "an id, maybe some
+// content, and a window to wait for".
+static int h_launch(flow_ctx_t *ctx, flow_node_t *n) {
+    char app[FLOW_VAL_MAX] = {0};
+    flow_value_t av;
+    if (flow_input(ctx->g, n, "app", &av)) flow_value_as_str(&av, app, sizeof(app));
+    else {
+        const char *pa = flow_param(n, "app");
+        if (pa) scpy(app, pa, sizeof(app));
+    }
+    if (!app[0]) {
+        snprintf(ctx->err, FLOW_ERR_MAX,
+                 "launch '%s': needs param app (a launch id, e.g. gbemu)", n->id);
+        return -1;
+    }
+
+    char rom[FLOW_VAL_MAX] = {0};
+    flow_value_t rv;
+    if (flow_input(ctx->g, n, "rom", &rv)) flow_value_as_str(&rv, rom, sizeof(rom));
+    else { const char *pr = flow_param(n, "rom"); if (pr) scpy(rom, pr, sizeof(rom)); }
+
+    const char *arg = flow_param(n, "arg");
+
+    // The window to wait for. Defaulting to "app:<app>" is right because the
+    // kernel derives a window's app_id from its owning binary's basename, which
+    // is what the registry's alternate id already is.
+    char wait[FLOW_VAL_MAX];
+    const char *pw = flow_param(n, "wait_for");
+    if (pw && pw[0]) scpy(wait, pw, sizeof(wait));
+    else             snprintf(wait, sizeof(wait), "app:%s", app);
+
+    int timeout = param_int(n, "timeout_ms", FLOW_LAUNCH_TIMEOUT_MS);
+    if (timeout < 100) timeout = 100;
+
+    char title[128] = {0};
+    int already = 0;
+    if (flow_plat_launch(app, rom, arg, wait, timeout,
+                         title, (int)sizeof(title), &already,
+                         ctx->err, FLOW_ERR_MAX) != 0)
+        return -1;
+
+    // Outputs. `target` carries the window target string on purpose: a capture
+    // or input node downstream can be pointed at it rather than repeating the
+    // literal, so the two can never drift apart in an edited workflow.
+    flow_value_t t; flow_value_set_str(&t, wait);
+    flow_set_output(n, "out", &t);
+    flow_set_output(n, "target", &t);
+    flow_value_t ti; flow_value_set_str(&ti, title);
+    flow_set_output(n, "title", &ti);
+    flow_value_t al; flow_value_set_bool(&al, already);
+    flow_set_output(n, "already_running", &al);
+    fprintf(stderr, "flowrun: launch '%s' app=%s%s%s -> %s \"%s\"\n",
+            n->id, app, rom[0] ? " rom=" : "", rom[0] ? rom : "",
+            already ? "ALREADY RUNNING" : "started", title);
+    return 0;
+}
+
 typedef struct { const char *type; flow_handler_fn fn; } registry_ent_t;
 static const registry_ent_t g_registry[] = {
     { "trigger",   h_trigger   },
@@ -1413,6 +1487,9 @@ static const registry_ent_t g_registry[] = {
     // type: a vision call is a completion, not a new kind of thing.)
     { "capture",   h_capture   },
     { "input",     h_input     },
+    // #469: START. A perceive/decide/act loop that cannot start its own target
+    // is a demo with an unwritten first step; see flow_plat_launch() in flow.h.
+    { "launch",    h_launch    },
     // STILL NOT registered, and intentionally so: device, service, merge,
     // branch, variable. The executor returns an explicit "unsupported node
     // type: X" for any type without a handler (see below). We do not fake them.

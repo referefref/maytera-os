@@ -22,6 +22,7 @@
 #define WIFI_STUB_IMPL               // (#237, was WIFI_MOCK_IMPL/#384) this TU owns the stub state
 #include "../../libc/wifi_client.h"  // (#237) Wi-Fi client API + honest stub (no driver)
 #include "userconf.h"   // #683: per-user preference paths
+#include "../../libc/rbindex.h"   // #aidelete: THE Recycle Bin location + retention rule
 #include "../../libc/tz.h"        // #49/#50: THE timezone list, setting and clock
 #include "../../libc/dock_opacity.h"  // #132: shared DOCK_OPACITY_MIN/MAX/DEFAULT/WARN
 
@@ -706,7 +707,9 @@ static char modal_error[64];
 // Extra status variables
 static int ntp_status = 0;      // 0=idle, 1=synced ok, -1=failed
 static int about_status = 0;    // 0=idle, 1=up-to-date, 2=debug exported,
-                                 // 3=update available, 4=check failed, 5=checking (#230)
+                                 // 3=update available, 4=check failed, 5=checking (#230),
+                                 // 6=debug export FAILED (task 3: it used to
+                                 // report 2 whether or not the write happened)
 static int sound_test_status = 0; // 0=idle, 1=no output, 2=no input
 
 // =============================================================================
@@ -853,6 +856,33 @@ static uint64_t trash_size = 0;         // real: sum of /TRASH
 #define CACHE_DIR_SYSTEM "/CACHE"
 #define CACHE_DIR_TRASH  "/TRASH"
 
+// #aidelete: THE RECYCLE BIN IS NOT /TRASH, AND THIS PANEL HAS BEEN SAYING IT
+// IS. Stated rather than quietly repointed, because the difference is a
+// destructive one.
+//
+// MEASURED 2026-10-03: CACHE_DIR_TRASH is "/TRASH". The Recycle Bin is
+// <home>/CONFIG/RECYCLE (libc/rbindex.c, apps/files, apps/recyclebin). No code
+// in this tree creates /TRASH, so "Trash Size" has always read 0 and "Empty
+// Trash" has always deleted nothing, while SETTINGS_ITEMS[]'s
+// storage.empty_trash row describes itself as "Empty the recycle bin
+// permanently". A dead control with a confident description.
+//
+// WHAT WAS AND WAS NOT CHANGED, and why. The two new rows below report the REAL
+// bin: its size and the retention setting that governs it, so the retention
+// control has something true next to it. CACHE_DIR_TRASH is deliberately LEFT
+// POINTING AT /TRASH: repointing it would turn a button that deletes nothing
+// into one that destroys the user's entire Recycle Bin on a single click with
+// no confirmation, which is a strictly worse control than the dead one and not
+// a change to make as a side effect of adding a setting. The Recycle Bin app
+// and the Files bin view both have the shared confirm card on Empty Bin
+// (#745); that is where emptying belongs. The honest fix for this row is its
+// own decision, recorded here so it is a decision and not an oversight.
+static uint64_t recycle_size = 0;        // real: sum of <home>/CONFIG/RECYCLE
+static int      recycle_items = 0;
+// The index into rb_retention_choices[] that the control shows. An int, not an
+// unsigned day count, because that is what a CT_ENUM contract row binds to.
+static int      trash_retention_choice = 4;   // 4 == 30 days, the owner's default
+
 // Sum the byte sizes of the regular files directly inside `path` (non-recursive).
 // Returns 0 if the directory does not exist or is empty. Uses the shared readdir
 // syscall wrapper; no fabricated numbers.
@@ -894,12 +924,48 @@ static int dir_clear_files(const char *path) {
     return removed;
 }
 
+// Count the regular files directly inside `path`.
+static int dir_file_count(const char *path) {
+    int n = 0;
+    dirent_t e;
+    for (int i = 0; i < 4096; i++) {
+        if (sys_readdir(path, i, &e) != 0) break;
+        if (e.name[0] == '.' && (e.name[1] == 0 || (e.name[1] == '.' && e.name[2] == 0)))
+            continue;
+        if (!DIRENT_IS_DIR(e)) n++;
+    }
+    return n;
+}
+
 // Refresh the four cache/trash totals from their real directories.
 static void storage_scan(void) {
     cache_thumbnails = dir_size_bytes(CACHE_DIR_THUMBS);
     cache_apps       = dir_size_bytes(CACHE_DIR_APPS);
     cache_system     = dir_size_bytes(CACHE_DIR_SYSTEM);
     trash_size       = dir_size_bytes(CACHE_DIR_TRASH);
+    // #aidelete: the REAL bin, plus the retention setting that governs it. The
+    // setting is re-read here (not cached at startup) so a change made by the
+    // recycler or by hand shows up when the panel is opened.
+    recycle_size  = dir_size_bytes(rbindex_dir());
+    recycle_items = dir_file_count(rbindex_dir());
+    trash_retention_choice = rbindex_retention_choice_index(rbindex_read_retention());
+}
+
+// #aidelete: persist the retention choice. Called from the click handler and,
+// via the row's commitfn, from a contract write, so both paths write the same
+// file through the same formatter. The value the user picked is written and then
+// READ BACK into the control, so a refused write cannot leave the UI showing a
+// setting that is not on disk.
+static void trash_retention_commit(void) {
+    unsigned days;
+    if (trash_retention_choice < 0) trash_retention_choice = 0;
+    if (trash_retention_choice > 6) trash_retention_choice = 6;
+    days = rb_retention_choices[trash_retention_choice];
+    if (rbindex_write_retention(days) != 0) {
+        printf("[settings] could not write %s; the retention setting is unchanged\n",
+               rbindex_cfg_path());
+    }
+    trash_retention_choice = rbindex_retention_choice_index(rbindex_read_retention());
 }
 
 // =============================================================================
@@ -929,7 +995,18 @@ static void setlog(const char *msg) {
     // NOT acted on: there is no fallback for a breadcrumb, nothing the user
     // needs told about one, and reporting it through save_failed() would
     // recurse straight back into here.
-    int rc = userconf_write_all("/SETLOG.TXT", g_setlog_buf,
+    // #aiaudit: THE MECHANISM FOR REPORTING A FAILED SAVE WAS ITSELF A FAILED
+    // SAVE. "/SETLOG.TXT" sits at the ext2 root, root-owned 0755, so every
+    // non-root session was refused -13 on the very write that exists to record
+    // a refusal. save_failed() has been writing into a void since it was added.
+    //
+    // userhome_path(NULL, ...), not userconf_path(): this is a breadcrumb at
+    // the root of the user's space, mirroring the old root-of-filesystem shape,
+    // and for a root session (home "/") it resolves to exactly "/SETLOG.TXT",
+    // so the shipping root session and tools/appsave-harness are unchanged.
+    char slp[256];
+    if (userhome_path(0, "SETLOG.TXT", slp, sizeof(slp)) != 0) return;
+    int rc = userconf_write_all(slp, g_setlog_buf,
                                 (unsigned long)g_setlog_len);
     (void)rc;
 }
@@ -2167,9 +2244,43 @@ static void update_timezone_offset(void) {
         save_failed("TZ.CFG (time zone)");
 }
 
-static void do_export_debug(void) {
-    long fd = syscall2(SYS_OPEN, (long)"/DEBUG.TXT", 1L);
-    if (fd < 0) return;
+// (task 3) RETURNS A STATUS. It used to return void and simply give up when the
+// open failed, and the About panel then reported "Debug info written to
+// /DEBUG.TXT" anyway. A button that reports a success it never observed is the
+// exact shape this ticket exists to remove, and it is what writing this action's
+// CT_SUCC_PATH term surfaced: the postcondition could not have been false.
+static int do_export_debug(void) {
+    // O_WRONLY|O_CREAT|O_TRUNC. IT USED TO PASS A BARE 1, WHICH IS O_WRONLY WITH
+    // NO O_CREAT, AND kernel/proc/syscall.c's open path does
+    // `if (!fat_exists(...)) { if (!(flags & O_CREAT)) return NULL; }` - so on any
+    // machine that did not ALREADY have a /DEBUG.TXT, this button could never
+    // produce one. Not through the contract and not through a click either: the
+    // feature had never worked on a fresh install.
+    //
+    // MEASURED on booted golden 2513: ABSENT before the call, `ok` from the call,
+    // ABSENT after, and still absent when the image was mounted after shutdown.
+    // O_TRUNC as well, because a second export must not leave the tail of a longer
+    // first one behind and call the result a fresh report.
+    // #peruser2 AGAIN, and this is the THIRD time this exact bug has been fixed in
+    // THIS FILE. settings_save() used to write a hardcoded /CONFIG path and
+    // SETVALS.TXT used to write "/SETVALS.TXT" at the root-owned ext2 root; both
+    // were moved to the per-user helpers because every non-root save failed
+    // correctly and silently. This function was still writing "/DEBUG.TXT".
+    //
+    // MEASURED on booted golden 2514, run B: under a uid-1000 session the kernel
+    // logs `[PERMS-DENY] proc=SETTINGS uid=1000 gid=1000 want=-wx path=/` because
+    // the shipped /CONFIG/PERMS.DB carries an explicit `/:0:0:0755`. So even with
+    // O_CREAT fixed, Export Debug could not work for a normal user - it had merely
+    // stopped LYING about it (the postcondition check reports it now). A button that
+    // only works for root is not fixed, it is diagnosed.
+    //
+    // The report also lands somewhere the user can FIND it, which matters for a
+    // thing whose whole purpose is to be sent to support.
+    char dp[256];
+    if (userhome_path(0, "DEBUG.TXT", dp, sizeof(dp)) != 0) return -1;
+    long fd = syscall2(SYS_OPEN, (long)dp,
+                       (long)(O_WRONLY | O_CREAT | O_TRUNC));
+    if (fd < 0) return -1;
     /* (#263) live version, not a hardcoded stale string */
     char vb[64]; if (get_version(vb, sizeof(vb)) <= 0) { vb[0]='?'; vb[1]=0; }
     char header[96]; int hn = 0;
@@ -2189,6 +2300,7 @@ static void do_export_debug(void) {
         }
     }
     syscall1(SYS_CLOSE, fd);
+    return 0;
 }
 
 // #230 (docs/SETTINGS_CONTROL_AUDIT.md #224): "Check Updates" used to set
@@ -2626,6 +2738,278 @@ static char *sv_putint(char *p, char key, int v) {
 // =============================================================================
 #include "../../libc/contract.h"
 
+// =============================================================================
+// THE PANEL CONTROL TABLE (docs/CONTRACT_COVERAGE_PLAN.md task 3)
+// =============================================================================
+//
+// ONE sctl_t row is ONE discrete control. FOUR readers walk it and there is no
+// fifth description of a control anywhere:
+//
+//   sc_layout()        assigns this row's y from the rows above it
+//   sc_draw()          paints it with the shared widget for its kind
+//   sc_hit()           hit-tests the RECT sc_draw() drew, not a re-derived one
+//   settings_project() emits .tok / .desc / .terms into the contract
+//
+// So a control that is not in a table cannot be drawn, cannot be clicked and
+// cannot be described. That is completeness by CONSTRUCTION, and it is the
+// route contract.h has been pointing at for this app the whole time:
+//
+//     "Static rows exist for the case where an app's control surface is NOT
+//      yet expressed as one table - Settings today, 8809 lines of mostly
+//      bespoke drawing. There, completeness is GATED rather than structural
+//      [...] and the path to making it structural is to finish the #227
+//      conversion, which fixes hit-box drift and brings the panel under the
+//      contract in one move."
+//
+// This is that path, and it really is one move: a converted panel loses its
+// hitbox-lint DEBT row and gains its contract rows in the same edit, because
+// both faults had the same cause - the control's identity was written out twice
+// (once in the draw pass, once in the click handler) and described a third time
+// somewhere else, or not at all.
+//
+// WHAT A ROW DELIBERATELY DOES NOT CARRY: a y coordinate. sc_layout() derives
+// every y from the row ORDER and each row's own `adv`, into a caller-supplied
+// array, so the table can stay `static const` (which is also what makes it
+// visible to contract-lint check 5) and so there is no cached geometry to go
+// stale when a row is inserted.
+//
+// WHAT IS DELIBERATELY NOT IN A TABLE: conditional or computed DECORATION. A
+// hint whose text depends on the control above it stays in the panel body,
+// drawn from the y sc_layout() returns. Putting it in the table would need a
+// text callback per row and would buy nothing: a hint is not a control, it has
+// no token, and nobody can click it.
+
+enum {
+    SC_END = 0,
+    SC_HEAD,      // section header       (decoration: drawn, never hit/projected)
+    SC_SUB,       // subsection heading   (decoration)
+    SC_HINT,      // static hint line     (decoration)
+    SC_TOGGLE,    // labelled 48x24 switch
+    SC_CHECK,     // checkbox
+    SC_SLIDER,    // slider over the inclusive range [lo,hi]
+    SC_DROP,      // dropdown that opens the shared popup (dropdown_open)
+    SC_CYCLE,     // dropdown-looking control that advances to the next option
+    SC_BUTTON     // push button that runs fn()
+};
+
+// A dropdown DRAWS 3px above its row baseline. ONE constant, read by both
+// sc_draw() and sc_hit(), which is how the 3px mismatch the Start Menu panel
+// shipped with cannot come back: it drew the Layout control at y-3..y+25 and
+// hit-tested y..y+28, so the top 3px of the control was dead and the 3px below
+// it were live. Nobody had reported it, which is exactly the point - this is
+// the #227 fault at a scale too small to notice and too small to ever get
+// fixed by hand.
+#define SC_DD_DY   (-3)
+#define SC_TOG_W   48
+#define SC_TOG_H   24
+#define SC_CHK_H   18
+#define SC_CHK_W   220
+#define SC_SLI_H   16
+#define SC_DD_H    28
+#define SC_BTN_H   30
+#define SC_BTNS_H  24
+// The slider's numeric readout sits this far right of the track. One constant
+// instead of the per-panel literals it replaces (x+395 on Alerts against a
+// track ending at x+380, x+350 on Start Menu against one ending at x+340), so
+// the gap is now the same on every panel instead of 15px on one and 10px on
+// another.
+#define SC_SLI_GAP 12
+
+typedef struct sctl {
+    unsigned char kind;
+    unsigned char primary;      // SC_BUTTON: draw as the primary action
+    unsigned char small;        // SC_BUTTON: 24px draw_button_small()
+    const char *label;          // what the user READS
+    const char *tok;            // what the CONTRACT names it; 0 = decoration
+    short indent;               // label x, relative to the panel's content x
+    short ctl_dx;               // widget x, relative to the panel's content x
+    short ctl_w;                // widget width
+    short adv;                  // y advance AFTER this row; 0 = share this y
+    int  *var;                  // THE variable the panel's own UI reads/writes
+    int   lo, hi;               // inclusive value range (SC_SLIDER / SC_INT)
+    const char *const *opts;    // option labels for SC_DROP / SC_CYCLE
+    short nopts;
+    const char *unit;           // suffix on a slider readout, e.g. "s"; 0 = none
+    void (*fn)(void);           // SC_BUTTON: what a click runs
+    void (*after)(void);        // persist/apply after a value change; may be 0
+    // THE LOADER THAT PAIRS WITH `after`, AND IT IS NOT OPTIONAL WHEN `after` IS
+    // SET. A panel saver here writes its WHOLE file from memory (alerts_save()
+    // emits all seven keys), and a --contract invocation runs neither
+    // alerts_load() nor sm_load(): main() calls those only on the GUI path, after
+    // the contract branch has already returned. So without this, `set settings
+    // alerts.do_not_disturb 1` on the spawn path would have written six DEFAULTS
+    // over the user's saved severities and duration - silent data loss, and
+    // exactly the "un-applied and un-saved" shape (#786) that commitfn exists to
+    // fix, reintroduced one layer up by fixing it.
+    //
+    // sc_load_all() calls each DISTINCT loadfn once from settings_load(), which is
+    // the contract's own load hook. A row that sets `after` and forgets `loadfn`
+    // is projected as CT_DENIED rather than silently clobbering (see
+    // settings_project), so the fault is visible in `describe` and refused at the
+    // call instead of costing somebody their preferences.
+    void (*loadfn)(void);
+    int (*present)(void);       // 0 = not drawn and not hit (still DESCRIBED)
+    const char *desc;           // the line `describe` prints; >= 12 chars
+    const ct_terms_t *terms;    // REQUIRED for SC_BUTTON (it is a CT_ACTION row)
+} sctl_t;
+
+// Assign every row's y, and return the y AFTER the last row so the panel can
+// place its trailing decoration. A row whose present() says no takes no space
+// and is marked -1, which sc_draw() and sc_hit() both skip - so an absent
+// control cannot be clicked, which is the bug privacy_geom() had to special
+// case with -1 sentinels by hand.
+static int sc_layout(const sctl_t *t, int n, int start_y, int *ys) {
+    int y = start_y;
+    for (int i = 0; i < n; i++) {
+        if (t[i].present && !t[i].present()) { ys[i] = -1; continue; }
+        ys[i] = y;
+        y += t[i].adv;
+    }
+    return y;
+}
+
+static void sc_draw(const sctl_t *t, int n, int x, const int *ys) {
+    char buf[40];
+    for (int i = 0; i < n; i++) {
+        int y = ys[i];
+        if (y < 0) continue;
+        const sctl_t *r = &t[i];
+        // A row whose widget NEEDS a label but has none would hand a NULL to the
+        // shared TTF primitives, and a fault in draw_all() takes down the app whose
+        // chrome defines the OS's design language. The const tables cannot do this
+        // today; sixteen panels are still to be converted, by other hands, so it
+        // costs one branch to make it unable to happen at all. SLIDER, DROP and
+        // CYCLE legitimately have no label and already test for it.
+        if (!r->label && r->kind != SC_SLIDER &&
+            r->kind != SC_DROP && r->kind != SC_CYCLE) continue;
+        int lx = x + r->indent, cx = x + r->ctl_dx;
+        switch (r->kind) {
+        case SC_HEAD: draw_section_header(lx, y, r->label); break;
+        case SC_SUB:  draw_subsection(lx, y, r->label);     break;
+        case SC_HINT: draw_hint(lx, y, r->label);           break;
+        case SC_TOGGLE:
+            // ctl_dx IS the switch's x, so the label width is derived from it
+            // and the two cannot disagree. Privacy's "Require password on wake"
+            // was 20px off on the X axis for exactly that reason: the draw call
+            // added an indent to a label width and the hit test forgot to.
+            draw_toggle_labeled(lx, y, (int)(r->ctl_dx - r->indent), r->label,
+                                r->var && *r->var != 0);
+            break;
+        case SC_CHECK:
+            draw_checkbox(lx, y, r->label, r->var && *r->var != 0);
+            break;
+        case SC_SLIDER: {
+            if (r->label) draw_label(lx, y, r->label);
+            int span = r->hi - r->lo; if (span < 1) span = 1;
+            int v = (r->var ? *r->var : r->lo) - r->lo;
+            if (v < 0) v = 0;
+            if (v > span) v = span;
+            draw_slider(cx, y, r->ctl_w, v, span, COL_ACCENT);
+            gui_itoa(r->var ? *r->var : r->lo, buf, sizeof(buf));
+            if (r->unit) {
+                int l = my_strlen(buf);
+                for (const char *q = r->unit; *q && l < (int)sizeof(buf) - 1; q++) buf[l++] = *q;
+                buf[l] = 0;
+            }
+            win_draw_text(window_handle, cx + r->ctl_w + SC_SLI_GAP, y, buf, COL_TEXT_SECONDARY);
+            break;
+        }
+        case SC_DROP:
+        case SC_CYCLE: {
+            if (r->label) draw_label(lx, y, r->label);
+            int idx = r->var ? *r->var : 0;
+            if (idx < 0 || idx >= r->nopts) idx = 0;
+            draw_dropdown_n(cx, y + SC_DD_DY, r->ctl_w, r->opts[idx],
+                            r->kind == SC_DROP && g_dd_open && g_dd_sel == r->var,
+                            r->nopts);
+            break;
+        }
+        case SC_BUTTON:
+            if (r->small) draw_button_small(cx, y, r->ctl_w, r->label, r->primary != 0);
+            else          draw_button(cx, y, r->ctl_w, r->label, r->primary != 0, false);
+            break;
+        default: break;
+        }
+    }
+}
+
+// Which row is under (cx_, cy)? The rect tested here is derived from the same
+// ys[] and the same per-kind size constants sc_draw() drew with, so "the hit
+// box and the drawn position come from ONE geometry pass" (#227) holds by
+// construction rather than by a lint noticing they still agree.
+static int sc_hit(const sctl_t *t, int n, int x, const int *ys, int cx_, int cy) {
+    for (int i = 0; i < n; i++) {
+        int y = ys[i];
+        if (y < 0) continue;
+        const sctl_t *r = &t[i];
+        int bx = x + r->ctl_dx, bw = r->ctl_w, bh = 0, dy = 0;
+        switch (r->kind) {
+        case SC_TOGGLE: bw = SC_TOG_W; bh = SC_TOG_H; break;
+        case SC_CHECK:  bx = x + r->indent; bw = r->ctl_w ? r->ctl_w : SC_CHK_W; bh = SC_CHK_H; break;
+        case SC_SLIDER: bh = SC_SLI_H; break;
+        case SC_DROP:
+        case SC_CYCLE:  bh = SC_DD_H; dy = SC_DD_DY; break;
+        case SC_BUTTON: bh = r->small ? SC_BTNS_H : SC_BTN_H; break;
+        default: continue;                  // decoration is never clickable
+        }
+        if (cx_ >= bx && cx_ < bx + bw && cy >= y + dy && cy < y + dy + bh) return i;
+    }
+    return -1;
+}
+
+// Run the row under the cursor exactly as the old per-panel if-chain did.
+// Returns 1 if a control took the click. A SLIDER needs the x, which is why
+// this and not sc_hit() owns the mutation.
+static int sc_click(const sctl_t *t, int n, int x, const int *ys, int cx_, int cy) {
+    int i = sc_hit(t, n, x, ys, cx_, cy);
+    if (i < 0) return 0;
+    const sctl_t *r = &t[i];
+    switch (r->kind) {
+    case SC_TOGGLE:
+    case SC_CHECK:
+        if (!r->var) return 0;
+        *r->var = !*r->var;
+        break;
+    case SC_SLIDER: {
+        if (!r->var || r->ctl_w <= 0) return 0;
+        int span = r->hi - r->lo; if (span < 1) span = 1;
+        // The INVERSE of what sc_draw() drew, from the same three numbers.
+        int v = r->lo + ((cx_ - (x + r->ctl_dx)) * span) / r->ctl_w;
+        if (v < r->lo) v = r->lo;
+        if (v > r->hi) v = r->hi;
+        *r->var = v;
+        break;
+    }
+    case SC_CYCLE:
+        if (!r->var || r->nopts < 1) return 0;
+        *r->var = (*r->var + 1 >= r->nopts) ? 0 : *r->var + 1;
+        break;
+    case SC_DROP:
+        // The shared popup owns the commit (and the Esc/miss-click cancel, #74),
+        // so `after` goes to it as the on_change callback rather than running now.
+        dropdown_open(x + r->ctl_dx, ys[i] + SC_DD_DY, r->ctl_w,
+                      r->opts, r->nopts, r->var, r->after);
+        draw_all();
+        return 1;
+    case SC_BUTTON:
+        if (!r->fn) return 0;
+        r->fn();
+        draw_all();
+        return 1;
+    default:
+        return 0;
+    }
+    if (r->after) r->after();
+    draw_all();
+    return 1;
+}
+
+// Defined after the tables, because they read them. Declared here because
+// SETTINGS_CONTRACT below names settings_project, and settings_load() (also
+// above the tables) calls sc_load_all().
+static int settings_project(int idx, ct_item_t *out);
+static void sc_load_all(void);
+
 // Forward declarations for handlers defined later in this file. The contract
 // calls the SAME functions the click handlers call; it never reimplements one.
 // dir_clear_files()/storage_scan() are defined above; no forward declaration needed.
@@ -2777,6 +3161,7 @@ static int ct_act_theme_by_name(const ct_item_t *it, int argc, char **argv,
         o += snprintf(out + o, ocap - o, i ? "|%s" : "%s", g_th_names[i]);
     return -1;
 }
+CT_CHECK_ACTFN(ct_act_theme_by_name);
 
 static int ct_act_clear(const ct_item_t *it, int argc, char **argv,
                         char *out, int ocap) {
@@ -2786,6 +3171,7 @@ static int ct_act_clear(const ct_item_t *it, int argc, char **argv,
     strlcpy(out, "cleared", (size_t)ocap);
     return 0;
 }
+CT_CHECK_ACTFN(ct_act_clear);
 
 static int ct_act_ntp(const ct_item_t *it, int argc, char **argv,
                       char *out, int ocap) {
@@ -2795,6 +3181,7 @@ static int ct_act_ntp(const ct_item_t *it, int argc, char **argv,
     strlcpy(out, r == 0 ? "synced" : "sync-failed", (size_t)ocap);
     return r == 0 ? 0 : -1;
 }
+CT_CHECK_ACTFN(ct_act_ntp);
 
 // ---- the table --------------------------------------------------------------
 //
@@ -2917,6 +3304,7 @@ static int ct_fw_act_add(const ct_item_t *it, int argc, char **argv,
     snprintf(out, (size_t)ocap, "installed; %d rule(s) now in force", fw_rule_count);
     return 0;
 }
+CT_CHECK_ACTFN(ct_fw_act_add);
 
 static int ct_fw_act_clear(const ct_item_t *it, int argc, char **argv,
                            char *out, int ocap) {
@@ -2933,6 +3321,7 @@ static int ct_fw_act_clear(const ct_item_t *it, int argc, char **argv,
              "every connection");
     return 0;
 }
+CT_CHECK_ACTFN(ct_fw_act_clear);
 
 static int ct_fw_act_reload(const ct_item_t *it, int argc, char **argv,
                             char *out, int ocap) {
@@ -2946,6 +3335,96 @@ static int ct_fw_act_reload(const ct_item_t *it, int argc, char **argv,
     }
     snprintf(out, (size_t)ocap, "reloaded; %d rule(s) in force", fw_rule_count);
     return 0;
+}
+CT_CHECK_ACTFN(ct_fw_act_reload);
+
+
+// ---- the terms for the eleven ACTION rows (#<config-ref>) ------------------
+//
+// Only the ACTION rows. Every value row in this table gets its timing, success
+// and depth DERIVED by contract_terms_of() (contract.h), which is why 150-odd
+// rows below need no edit and therefore cannot carry a wrong one.
+//
+// THE DELETE ACTIONS CANNOT CARRY A PROMISE, and this is worth writing down
+// rather than leaving as a blank field. The escrow promise machinery (#712,
+// libc/escrow.h) enforces its no-delete invariant by never minting a delete
+// grant at all, and its oracle's delete_count must be ZERO for a promise to
+// verify. So "this cache directory is now empty" is not expressible as an escrow
+// postcondition, by the deliberate design of the thing that would have to check
+// it. The honest declaration is CT_SUCC_RC plus a success_ref naming the item a
+// caller CAN read back, not a promise the verifier would refuse.
+static const ct_terms_t k_t_fw_add = {
+    CT_TIME_FAST, 0, CT_TIME_MS_FAST,
+    CT_SUCC_ITEM, CT_DEPTH_SYSTEM,
+    CT_FAIL_DENIED | CT_FAIL_RANGE | CT_FAIL_NOSPACE,
+    "firewall.rules",        // the live rule list read back from the kernel
+    0
+};
+static const ct_terms_t k_t_fw_clear = {
+    CT_TIME_FAST, 0, CT_TIME_MS_FAST,
+    CT_SUCC_ITEM, CT_DEPTH_SYSTEM, CT_FAIL_DENIED,
+    "firewall.rules", 0
+};
+static const ct_terms_t k_t_fw_reload = {
+    CT_TIME_FAST, 0, CT_TIME_MS_FAST,
+    CT_SUCC_ITEM, CT_DEPTH_SYSTEM, CT_FAIL_DENIED | CT_FAIL_IO,
+    "firewall.rules", 0
+};
+// NTP: the wake source is a REMOTE PEER, so the budget is the one honest case
+// for a generous one. It is not unbounded (the sync call itself gives up), but
+// 250 ms would abort a sync that was working.
+static const ct_terms_t k_t_ntp = {
+    CT_TIME_LONG, 0, 15000,
+    CT_SUCC_RC, CT_DEPTH_SYSTEM,
+    CT_FAIL_TIMEOUT | CT_FAIL_IO | CT_FAIL_NOTFOUND,
+    0, 0
+};
+// A CT_DENIED row still declares its terms: enumeration has to be honest about
+// what the surface WOULD be, and "unspecified" on a refused row reads as an
+// oversight rather than a decision.
+static const ct_terms_t k_t_set_clock = {
+    CT_TIME_FAST, CT_TF_MODAL, CT_TIME_MS_FAST,
+    CT_SUCC_RC, CT_DEPTH_SYSTEM, CT_FAIL_DENIED,
+    0, 0
+};
+// Clearing a cache walks a directory tree and unlinks, so SLOW, and the cost
+// scales with what is in there.
+static const ct_terms_t k_t_clear_cache = {
+    CT_TIME_SLOW, 0, CT_TIME_MS_SLOW,
+    CT_SUCC_RC, CT_DEPTH_FS,
+    CT_FAIL_DENIED | CT_FAIL_IO | CT_FAIL_NOTFOUND,
+    // success_ref is 0 DELIBERATELY, and this is a MEASURED GAP, not a shrug:
+    // the Storage panel exposes NO readable state item (no bytes-used, no
+    // file-count), so there is nothing in this contract a caller could read back
+    // to confirm a cache was cleared. CT_SUCC_RC is therefore the only true
+    // claim available. Naming an item that does not exist would be the #235
+    // fault in one field. The fix is a storage.used_mb CT_STR row, which belongs
+    // with the Storage panel work in task 3 of docs/CONTRACT_COVERAGE_PLAN.md.
+    0,
+    0        // see the note above: a delete is not an escrow-expressible promise
+};
+static const ct_terms_t k_t_theme_by_name = {
+    CT_TIME_FAST, 0, CT_TIME_MS_FAST,
+    CT_SUCC_ITEM, CT_DEPTH_PREF, CT_FAIL_NOTFOUND,
+    "appearance.theme_name", 0
+};
+static const ct_terms_t k_t_change_pw = {
+    CT_TIME_FAST, CT_TF_MODAL, CT_TIME_MS_FAST,
+    CT_SUCC_RC, CT_DEPTH_SYSTEM, CT_FAIL_DENIED,
+    0, 0
+};
+
+// (task 3) update.message. Returns the literal "(none)" when idle rather than an
+// empty string, and a caller must NOT treat that as a path or a result: a CT_STR
+// item answers with a PLACEHOLDER before its action has run, which is exactly
+// how an escrow oracle was once fed "(unsaved)" and reported a promise fulfilled
+// on an action that had produced nothing (CONTRACT_COVERAGE_PLAN.md 4b).
+static int ct_str_update_msg(char *out, int ocap) {
+    const char *s = g_update_msg[0] ? g_update_msg : "(none)";
+    int n = 0;
+    while (s[n] && n < ocap - 1) { out[n] = s[n]; n++; }
+    out[n] = 0;
+    return n;
 }
 
 static const ct_item_t SETTINGS_ITEMS[] = {
@@ -2961,151 +3440,510 @@ static const ct_item_t SETTINGS_ITEMS[] = {
 //
 // The two read-only rows are SAFE: knowing the policy is not a capability, and
 // a filter whose state cannot be read is a filter nobody can verify.
-{ "firewall.enabled", CT_BOOL, CT_RW, CT_GUARDED, 0, 0, 1, 0,
-  0, ct_fw_get_enabled, ct_fw_set_enabled, 0, 0, 0, "system.network.firewall",
-  "Turn the kernel packet filter on or off; off means every packet passes" },
-{ "firewall.policy_in", CT_ENUM, CT_RW, CT_GUARDED, 0, 0, 1, "Allow|Deny",
-  0, ct_fw_get_pin, ct_fw_set_pin, 0, 0, 0, "system.network.firewall",
-  "Default action for UNSOLICITED inbound connections; replies always pass" },
-{ "firewall.policy_out", CT_ENUM, CT_RW, CT_GUARDED, 0, 0, 1, "Allow|Deny",
-  0, ct_fw_get_pout, ct_fw_set_pout, 0, 0, 0, "system.network.firewall",
-  "Default action for connections this machine opens to somewhere else" },
-{ "firewall.rules", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
-  0, 0, 0, 0, ct_fw_get_rules, 0, 0,
-  "The live rule list read back from the kernel, dir/action/proto/port" },
-{ "firewall.stats", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
-  0, 0, 0, 0, ct_fw_get_stats, 0, 0,
-  "Live filter counters: packets dropped, flows tracked, cost in TSC cycles" },
-{ "firewall.add_rule", CT_ACTION, CT_WRITE, CT_GUARDED, 0, 0, 0, 0,
-  0, 0, 0, ct_fw_act_add, 0, 0, "system.network.firewall",
-  "Add a rule: add_rule <in|out> <allow|deny> <tcp|udp> <port 1..65535>" },
-{ "firewall.clear_rules", CT_ACTION, CT_WRITE, CT_GUARDED, 0, 0, 0, 0,
-  0, 0, 0, ct_fw_act_clear, 0, 0, "system.network.firewall",
-  "Remove every explicit rule, leaving only the two default policies" },
-{ "firewall.reload", CT_ACTION, CT_WRITE, CT_GUARDED, 0, 0, 0, 0,
-  0, 0, 0, ct_fw_act_reload, 0, 0, "system.network.firewall",
-  "Re-read /CONFIG/FWRULES.CFG; reports how many lines it had to ignore" },
+{
+      .name = "firewall.enabled",
+      .type = CT_BOOL,
+      .access = CT_RW,
+      .risk = CT_GUARDED,
+      .hi = 1,
+      .getfn = ct_fw_get_enabled,
+      .setfn = ct_fw_set_enabled,
+      .cap = "system.network.firewall",
+      .desc = "Turn the kernel packet filter on or off; off means every packet passes",
+    },
+{
+      .name = "firewall.policy_in",
+      .type = CT_ENUM,
+      .access = CT_RW,
+      .risk = CT_GUARDED,
+      .hi = 1,
+      .options = "Allow|Deny",
+      .getfn = ct_fw_get_pin,
+      .setfn = ct_fw_set_pin,
+      .cap = "system.network.firewall",
+      .desc = "Default action for UNSOLICITED inbound connections; replies always pass",
+    },
+{
+      .name = "firewall.policy_out",
+      .type = CT_ENUM,
+      .access = CT_RW,
+      .risk = CT_GUARDED,
+      .hi = 1,
+      .options = "Allow|Deny",
+      .getfn = ct_fw_get_pout,
+      .setfn = ct_fw_set_pout,
+      .cap = "system.network.firewall",
+      .desc = "Default action for connections this machine opens to somewhere else",
+    },
+{
+      .name = "firewall.rules",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_fw_get_rules,
+      .desc = "The live rule list read back from the kernel, dir/action/proto/port",
+    },
+{
+      .name = "firewall.stats",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_fw_get_stats,
+      .desc = "Live filter counters: packets dropped, flows tracked, cost in TSC cycles",
+    },
+{
+      .name = "firewall.add_rule",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_GUARDED,
+      .actfn = ct_fw_act_add,
+      .cap = "system.network.firewall",
+      .desc = "Add a rule: add_rule <in|out> <allow|deny> <tcp|udp> <port 1..65535>",
+      .needs = 0 /*needs*/,
+      .terms = &k_t_fw_add,
+      .commitfn = 0 /*commitfn: SETTINGS.CFG via commit()*/,
+    },
+{
+      .name = "firewall.clear_rules",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_GUARDED,
+      .actfn = ct_fw_act_clear,
+      .cap = "system.network.firewall",
+      .desc = "Remove every explicit rule, leaving only the two default policies",
+      .needs = 0 /*needs*/,
+      .terms = &k_t_fw_clear,
+      .commitfn = 0 /*commitfn: SETTINGS.CFG via commit()*/,
+    },
+{
+      .name = "firewall.reload",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_GUARDED,
+      .actfn = ct_fw_act_reload,
+      .cap = "system.network.firewall",
+      .desc = "Re-read /CONFIG/FWRULES.CFG; reports how many lines it had to ignore",
+      .needs = 0 /*needs*/,
+      .terms = &k_t_fw_reload,
+      .commitfn = 0 /*commitfn: SETTINGS.CFG via commit()*/,
+    },
 
 
 // --- persisted preferences (the SETTINGS.CFG keys) --------------------------
-{ "clock.use_24hour", CT_BOOL, CT_RW, CT_SAFE, 'h', 0, 1, 0,
-  0, ct_get_use24, ct_set_use24, 0, 0, 0, 0,
-  "24-hour clock; read live by the taskbar clock via libc settingscfg_use24h()" },
-{ "appearance.accent_color", CT_ENUM, CT_RW, CT_SAFE, 'a', 0, 7,
-  "Blue|Green|Orange|Purple|Red|Teal|Pink|Amber",
-  &accent_color_idx, 0, 0, 0, 0, 0, 0,
-  "Accent colour index; recolors this app's own buttons (Settings-scoped, #230)" },
-{ "pointer.cursor_style", CT_ENUM, CT_RW, CT_SAFE, 'c', 0, 2, "Light|Dark|Glow",
-  &cursor_theme, 0, 0, 0, 0, 0, 0,
-  "Pointer glyph; the compositor's cursor_render() reads it every frame" },
-{ "pointer.speed", CT_INT, CT_RW, CT_SAFE, 'p', 0, 100, 0,
-  &pointer_speed, 0, 0, 0, 0, 0, 0,
-  "Mouse sensitivity 0-100; scales every packet in kernel mouse_scale_delta()" },
-{ "pointer.double_click_speed", CT_INT, CT_RW, CT_SAFE, 'k', 0, 100, 0,
-  &double_click_speed, 0, 0, 0, 0, 0, 0,
-  "Double-click speed 0-100; the compositor threshold via settingscfg_dblclick_ms()" },
-{ "screensaver.type", CT_INT, CT_RW, CT_SAFE, 's', 0, 40, 0,
-  &screensaver_idx, 0, 0, 0, 0, 0, 0,
-  "Screensaver index; the compositor calls screensaver_set_type() on change" },
-{ "screensaver.delay_minutes", CT_INT, CT_RW, CT_SAFE, 'z', 1, 120, 0,
-  &screensaver_delay_min, 0, 0, 0, 0, 0, 0,
-  "Idle minutes before the screensaver arms; read live by get_ss_delay()" },
+{
+      .name = "clock.use_24hour",
+      .type = CT_BOOL,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .cfgkey = 'h',
+      .hi = 1,
+      .getfn = ct_get_use24,
+      .setfn = ct_set_use24,
+      .desc = "24-hour clock; read live by the taskbar clock via libc settingscfg_use24h()",
+    },
+{
+      .name = "appearance.accent_color",
+      .type = CT_ENUM,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .cfgkey = 'a',
+      .hi = 7,
+      .options = "Blue|Green|Orange|Purple|Red|Teal|Pink|Amber",
+      .var = &accent_color_idx,
+      .desc = "Accent colour index; recolors this app's own buttons (Settings-scoped, #230)",
+    },
+{
+      .name = "pointer.cursor_style",
+      .type = CT_ENUM,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .cfgkey = 'c',
+      .hi = 2,
+      .options = "Light|Dark|Glow",
+      .var = &cursor_theme,
+      .desc = "Pointer glyph; the compositor's cursor_render() reads it every frame",
+    },
+{
+      .name = "pointer.speed",
+      .type = CT_INT,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .cfgkey = 'p',
+      .hi = 100,
+      .var = &pointer_speed,
+      .desc = "Mouse sensitivity 0-100; scales every packet in kernel mouse_scale_delta()",
+    },
+{
+      .name = "pointer.double_click_speed",
+      .type = CT_INT,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .cfgkey = 'k',
+      .hi = 100,
+      .var = &double_click_speed,
+      .desc = "Double-click speed 0-100; the compositor threshold via settingscfg_dblclick_ms()",
+    },
+{
+      .name = "screensaver.type",
+      .type = CT_INT,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .cfgkey = 's',
+      .hi = 40,
+      .var = &screensaver_idx,
+      .desc = "Screensaver index; the compositor calls screensaver_set_type() on change",
+    },
+{
+      .name = "screensaver.delay_minutes",
+      .type = CT_INT,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .cfgkey = 'z',
+      .lo = 1,
+      .hi = 120,
+      .var = &screensaver_delay_min,
+      .desc = "Idle minutes before the screensaver arms; read live by get_ss_delay()",
+    },
 
 // --- Date & Time panel: all five datetime_geom_t fields ---------------------
-{ "datetime.auto_time", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
-  0, ct_get_auto_time, ct_set_auto_time, 0, 0, 0, 0,
-  "Set time automatically; enabling runs an NTP sync, as the panel's toggle does" },
-{ "datetime.timezone", CT_INT, CT_RW, CT_SAFE, 0, 0, 63, 0,
-  0, ct_get_tz, ct_set_tz, 0, 0, 0, 0,
-  "Timezone row in the shared libc/tz.c ZONES list; commits to /CONFIG/TZ.CFG" },
-{ "datetime.week_start", CT_ENUM, CT_RW, CT_SAFE, 0, 0, 1, "Sunday|Monday",
-  &first_day_of_week, 0, 0, 0, 0, 0, 0,
-  "First day of the week shown in calendars" },
-{ "datetime.sync_now", CT_ACTION, CT_WRITE, CT_SAFE, 0, 0, 0, 0,
-  0, 0, 0, ct_act_ntp, 0, 0, 0,
-  "Run an NTP time sync now; the same call the auto-time toggle makes" },
-{ "datetime.set_clock", CT_ACTION, CT_WRITE, CT_DENIED, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0,
-  "Set the hardware RTC (the Set Date & Time modal). DENIED: see the note below" },
+{
+      .name = "datetime.auto_time",
+      .type = CT_BOOL,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_auto_time,
+      .setfn = ct_set_auto_time,
+      .desc = "Set time automatically; enabling runs an NTP sync, as the panel's toggle does",
+    },
+{
+      .name = "datetime.timezone",
+      .type = CT_INT,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 63,
+      .getfn = ct_get_tz,
+      .setfn = ct_set_tz,
+      .desc = "Timezone row in the shared libc/tz.c ZONES list; commits to /CONFIG/TZ.CFG",
+    },
+{
+      .name = "datetime.week_start",
+      .type = CT_ENUM,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .options = "Sunday|Monday",
+      .var = &first_day_of_week,
+      .desc = "First day of the week shown in calendars",
+    },
+{
+      .name = "datetime.sync_now",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = ct_act_ntp,
+      .desc = "Run an NTP time sync now; the same call the auto-time toggle makes",
+      .needs = 0 /*needs*/,
+      .terms = &k_t_ntp,
+      .commitfn = 0 /*commitfn: SETTINGS.CFG via commit()*/,
+    },
+{
+      .name = "datetime.set_clock",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_DENIED,
+      .desc = "Set the hardware RTC (the Set Date & Time modal). DENIED: see the note below",
+      .needs = 0 /*needs*/,
+      .terms = &k_t_set_clock,
+      .commitfn = 0 /*commitfn: SETTINGS.CFG via commit()*/,
+    },
 
 // --- Storage panel: all four storage_geom_t fields --------------------------
 // GUARDED, not SAFE. These delete real files and cannot be undone, and
 // docs/CONTRACT_ARCHITECTURE.md section 7 makes irreversibility the primary
 // axis of risk. A capability token or user consent is required.
-{ "storage.clear_thumbnails", CT_ACTION, CT_WRITE, CT_GUARDED, 0, 0, 0, 0,
-  0, 0, 0, ct_act_clear, 0, CACHE_DIR_THUMBS, "fs.write",
-  "Delete every cached thumbnail; irreversible, so it is capability-gated" },
-{ "storage.clear_app_cache", CT_ACTION, CT_WRITE, CT_GUARDED, 0, 0, 0, 0,
-  0, 0, 0, ct_act_clear, 0, CACHE_DIR_APPS, "fs.write",
-  "Delete the application cache; irreversible, so it is capability-gated" },
-{ "storage.clear_system_cache", CT_ACTION, CT_WRITE, CT_GUARDED, 0, 0, 0, 0,
-  0, 0, 0, ct_act_clear, 0, CACHE_DIR_SYSTEM, "fs.write",
-  "Delete the system cache; irreversible, so it is capability-gated" },
-{ "storage.empty_trash", CT_ACTION, CT_WRITE, CT_GUARDED, 0, 0, 0, 0,
-  0, 0, 0, ct_act_clear, 0, CACHE_DIR_TRASH, "fs.write",
-  "Empty the recycle bin permanently; irreversible, so it is capability-gated" },
+{
+      .name = "storage.clear_thumbnails",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_GUARDED,
+      .actfn = ct_act_clear,
+      .ctx = CACHE_DIR_THUMBS,
+      .cap = "fs.write",
+      .desc = "Delete every cached thumbnail; irreversible, so it is capability-gated",
+      .needs = 0 /*needs*/,
+      .terms = &k_t_clear_cache,
+      .commitfn = 0 /*commitfn: SETTINGS.CFG via commit()*/,
+    },
+{
+      .name = "storage.clear_app_cache",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_GUARDED,
+      .actfn = ct_act_clear,
+      .ctx = CACHE_DIR_APPS,
+      .cap = "fs.write",
+      .desc = "Delete the application cache; irreversible, so it is capability-gated",
+      .needs = 0 /*needs*/,
+      .terms = &k_t_clear_cache,
+      .commitfn = 0 /*commitfn: SETTINGS.CFG via commit()*/,
+    },
+{
+      .name = "storage.clear_system_cache",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_GUARDED,
+      .actfn = ct_act_clear,
+      .ctx = CACHE_DIR_SYSTEM,
+      .cap = "fs.write",
+      .desc = "Delete the system cache; irreversible, so it is capability-gated",
+      .needs = 0 /*needs*/,
+      .terms = &k_t_clear_cache,
+      .commitfn = 0 /*commitfn: SETTINGS.CFG via commit()*/,
+    },
+{
+      .name = "storage.empty_trash",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_GUARDED,
+      .actfn = ct_act_clear,
+      .ctx = CACHE_DIR_TRASH,
+      .cap = "fs.write",
+      .desc = "Empty /TRASH, the temp trash folder; NOT the Recycle Bin (see storage.trash_retention)",
+      .needs = 0 /*needs*/,
+      .terms = &k_t_clear_cache,
+      .commitfn = 0 /*commitfn: SETTINGS.CFG via commit()*/,
+    },
+// #aidelete: the Recycle Bin retention control. SAFE, not GUARDED: writing a
+// retention setting destroys nothing by itself, and the one direction it CAN be
+// dangerous in (shortening it) is bounded by the recycler, which never purges a
+// row whose age is unknown and never purges at all while the value is Never.
+// Persisted to <home>/CONFIG/RECYCLE.CFG by its own commitfn rather than by
+// Settings' app-wide commit(), because that writer only knows SETTINGS.CFG and a
+// contract write that moved the variable into a file with no such key would be
+// silently lost at the next launch.
+{
+      .name = "storage.trash_retention",
+      .type = CT_ENUM,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 6,
+      .options = "Never|1 day|7 days|14 days|30 days|90 days|365 days",
+      .var = &trash_retention_choice,
+      .desc = "How long the Recycle Bin keeps a deleted file before the recycler removes it",
+      .needs = 0 /*needs*/,
+      .commitfn = trash_retention_commit,
+    },
 
 // --- Privacy panel: all six privacy_geom_t fields ---------------------------
-{ "privacy.screen_lock", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
-  &screen_lock_enabled, 0, 0, 0, 0, 0, 0,
-  "Enable the idle screen lock; persisted to /CONFIG/PRIVACY.CFG" },
-{ "privacy.lock_timeout_min", CT_INT, CT_RW, CT_SAFE, 0, 0, 60, 0,
-  &lock_timeout, 0, 0, 0, 0, 0, 0,
-  "Idle minutes before locking; 0 means never" },
-{ "privacy.require_password_wake", CT_BOOL, CT_RW, CT_GUARDED, 0, 0, 1, 0,
-  &require_password_wake, 0, 0, 0, 0, 0, "system.settings.write",
-  "Require a password on wake. GUARDED: turning it off weakens login" },
-{ "privacy.location_services", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
-  &location_services, 0, 0, 0, 0, 0, 0,
-  "Allow apps to request location; persisted to /CONFIG/PRIVACY.CFG" },
-{ "privacy.send_diagnostics", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
-  &diagnostics_enabled, 0, 0, 0, 0, 0, 0,
-  "Send anonymous diagnostics; persisted to /CONFIG/PRIVACY.CFG" },
-{ "privacy.crash_reports", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
-  &crash_reports, 0, 0, 0, 0, 0, 0,
-  "Send crash reports; persisted to /CONFIG/PRIVACY.CFG" },
+{
+      .name = "privacy.screen_lock",
+      .type = CT_BOOL,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .var = &screen_lock_enabled,
+      .desc = "Enable the idle screen lock; persisted to /CONFIG/PRIVACY.CFG",
+    },
+{
+      .name = "privacy.lock_timeout_min",
+      .type = CT_INT,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 60,
+      .var = &lock_timeout,
+      .desc = "Idle minutes before locking; 0 means never",
+    },
+{
+      .name = "privacy.require_password_wake",
+      .type = CT_BOOL,
+      .access = CT_RW,
+      .risk = CT_GUARDED,
+      .hi = 1,
+      .var = &require_password_wake,
+      .cap = "system.settings.write",
+      .desc = "Require a password on wake. GUARDED: turning it off weakens login",
+    },
+{
+      .name = "privacy.location_services",
+      .type = CT_BOOL,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .var = &location_services,
+      .desc = "Allow apps to request location; persisted to /CONFIG/PRIVACY.CFG",
+    },
+{
+      .name = "privacy.send_diagnostics",
+      .type = CT_BOOL,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .var = &diagnostics_enabled,
+      .desc = "Send anonymous diagnostics; persisted to /CONFIG/PRIVACY.CFG",
+    },
+{
+      .name = "privacy.crash_reports",
+      .type = CT_BOOL,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .var = &crash_reports,
+      .desc = "Send crash reports; persisted to /CONFIG/PRIVACY.CFG",
+    },
 
 // --- Appearance: the rows that have a real live setter ----------------------
-{ "appearance.theme", CT_INT, CT_RW, CT_SAFE, 0, 0, 31, 0,
-  0, ct_get_theme_idx, ct_set_theme_idx, 0, 0, 0, 0,
-  "Theme index into the file-based theme list; applies live via SYS_SET_THEME" },
-{ "appearance.theme_name", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
-  0, 0, 0, 0, ct_get_theme_name, 0, 0,
-  "Name of the active theme, from the same g_th_names[] the dropdown draws" },
-{ "appearance.set_theme_by_name", CT_ACTION, CT_WRITE, CT_SAFE, 0, 0, 0, 0,
-  0, 0, 0, ct_act_theme_by_name, 0, 0, 0,
-  "Select a theme by name; answers with the live list of names on a miss" },
-{ "appearance.font_size", CT_ENUM, CT_RW, CT_SAFE, 0, 0, 3, "Small|Medium|Large|XL",
-  0, ct_get_font_size, ct_set_font_size, 0, 0, 0, 0,
-  "UI font size; calls set_font_size(), as the Appearance dropdown does" },
-{ "appearance.window_transparency", CT_INT, CT_RW, CT_SAFE, 0, 5, 100, 0,
-  0, ct_get_transparency, ct_set_transparency, 0, 0, 0, 0,
-  "Window opacity percent (100 = opaque); the same slider the panel draws" },
+{
+      .name = "appearance.theme",
+      .type = CT_INT,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 31,
+      .getfn = ct_get_theme_idx,
+      .setfn = ct_set_theme_idx,
+      .desc = "Theme index into the file-based theme list; applies live via SYS_SET_THEME",
+    },
+{
+      .name = "appearance.theme_name",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_get_theme_name,
+      .desc = "Name of the active theme, from the same g_th_names[] the dropdown draws",
+    },
+{
+      .name = "appearance.set_theme_by_name",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = ct_act_theme_by_name,
+      .desc = "Select a theme by name; answers with the live list of names on a miss",
+      .needs = 0 /*needs*/,
+      .terms = &k_t_theme_by_name,
+      .commitfn = 0 /*commitfn: SETTINGS.CFG via commit()*/,
+    },
+{
+      .name = "appearance.font_size",
+      .type = CT_ENUM,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 3,
+      .options = "Small|Medium|Large|XL",
+      .getfn = ct_get_font_size,
+      .setfn = ct_set_font_size,
+      .desc = "UI font size; calls set_font_size(), as the Appearance dropdown does",
+    },
+{
+      .name = "appearance.window_transparency",
+      .type = CT_INT,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .lo = 5,
+      .hi = 100,
+      .getfn = ct_get_transparency,
+      .setfn = ct_set_transparency,
+      .desc = "Window opacity percent (100 = opaque); the same slider the panel draws",
+    },
 
 // --- Sound / Display: live kernel state, no SETTINGS.CFG key ----------------
-{ "sound.master_volume", CT_INT, CT_RW, CT_SAFE, 0, 0, 100, 0,
-  0, ct_get_volume, ct_set_volume, 0, 0, 0, 0,
-  "Master output volume 0-100; reads and writes the real kernel mixer" },
-{ "sound.mute", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
-  0, ct_get_mute, ct_set_mute, 0, 0, 0, 0,
-  "Mute the master output; the same set_mute() the Mute button calls" },
-{ "display.brightness", CT_INT, CT_RW, CT_SAFE, 0, 0, 100, 0,
-  0, ct_get_brightness, ct_set_brightness, 0, 0, 0, 0,
-  "Display brightness 0-100; committed through apply_display_fx()" },
-{ "display.night_light", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
-  0, ct_get_night_light, ct_set_night_light, 0, 0, 0, 0,
-  "Enable the warm night-light tint; committed through apply_display_fx()" },
-{ "display.night_light_strength", CT_INT, CT_RW, CT_SAFE, 0, 0, 100, 0,
-  0, ct_get_night_strength, ct_set_night_strength, 0, 0, 0, 0,
-  "Night-light strength 0-100; only visible while night_light is on" },
+{
+      .name = "sound.master_volume",
+      .type = CT_INT,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 100,
+      .getfn = ct_get_volume,
+      .setfn = ct_set_volume,
+      .desc = "Master output volume 0-100; reads and writes the real kernel mixer",
+    },
+{
+      .name = "sound.mute",
+      .type = CT_BOOL,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_mute,
+      .setfn = ct_set_mute,
+      .desc = "Mute the master output; the same set_mute() the Mute button calls",
+    },
+{
+      .name = "display.brightness",
+      .type = CT_INT,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 100,
+      .getfn = ct_get_brightness,
+      .setfn = ct_set_brightness,
+      .desc = "Display brightness 0-100; committed through apply_display_fx()",
+    },
+{
+      .name = "display.night_light",
+      .type = CT_BOOL,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_night_light,
+      .setfn = ct_set_night_light,
+      .desc = "Enable the warm night-light tint; committed through apply_display_fx()",
+    },
+{
+      .name = "display.night_light_strength",
+      .type = CT_INT,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 100,
+      .getfn = ct_get_night_strength,
+      .setfn = ct_set_night_strength,
+      .desc = "Night-light strength 0-100; only visible while night_light is on",
+    },
 
 // --- Users: declared and refused --------------------------------------------
 // Present on purpose. Enumeration must be honest that the surface exists and
 // is refused; an API that silently omitted it would let a caller conclude
 // Settings cannot change a password, which is false.
-{ "users.change_password", CT_ACTION, CT_WRITE, CT_DENIED, 0, 0, 0, 0,
-  0, 0, 0, 0, 0, 0, 0,
-  "Change an account password. DENIED through this API in every case" },
+{
+      .name = "users.change_password",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_DENIED,
+      .desc = "Change an account password. DENIED through this API in every case",
+      .needs = 0 /*needs*/,
+      .terms = &k_t_change_pw,
+      .commitfn = 0 /*commitfn: SETTINGS.CFG via commit()*/,
+    },
+
+    // (task 3) Readable state the About panel's three projected actions name as
+    // their success_ref. Each one exists so a caller has something it can go and
+    // LOOK AT: without them the three actions could only declare CT_SUCC_RC,
+    // which is the honest-but-weak answer this ticket exists to stop settling
+    // for. contract-lint check 6 fails the build on a success_ref naming an item
+    // that is not here, which is how these three came to be written.
+    {
+      .name = "update.status",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 6,
+      .var = &about_status,
+      .desc = "Last update check: 0 idle, 1 up-to-date, 2 debug exported, 3 update available, 4 check failed, 5 checking, 6 export failed",
+    },
+    {
+      .name = "update.message",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_str_update_msg,
+      .desc = "The exact text the About panel shows under the buttons, or (none)",
+    },
+    {
+      .name = "ui.modal_open",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 16,
+      .var = &modal_mode,
+      .desc = "Which modal dialog is up (0 = none); a caller reads this to see a dialog opened",
+    },
 };
 
 #define SETTINGS_ITEM_COUNT ((int)(sizeof(SETTINGS_ITEMS)/sizeof(SETTINGS_ITEMS[0])))
@@ -3120,7 +3958,11 @@ static const ct_contract_t SETTINGS_CONTRACT = {
     "and gated by tools/contract-lint, not structural - see "
     "docs/CONTRACT_API.md section 6 for the exact number.",
     SETTINGS_ITEMS, SETTINGS_ITEM_COUNT,
-    0,                 // no projection: this app's controls are not one table
+    settings_project,  // (task 3) the Alerts, Start Menu and About panels ARE
+                       // one table each now, and their rows are projected from
+                       // it; see the sctl_t comment. The panels still drawing
+                       // bespoke geometry keep their STATIC rows above, which is
+                       // what static rows are for.
     settings_load,
     settings_save
 };
@@ -3180,6 +4022,11 @@ static void settings_load(void) {
         while (b[i] && b[i] != '\n') i++;
         if (b[i] == '\n') i++;
     }
+    // (task 3) LOAD EVERY FILE A PROJECTED ROW CAN WRITE. This hook is the only
+    // load a --contract invocation performs, and a panel saver rewrites its whole
+    // file from memory, so anything the contract can SET it must first READ. See
+    // sctl_t.loadfn for the data loss this prevents.
+    sc_load_all();
 }
 static void settings_autosave(void) {
     static int last = -1;
@@ -3213,7 +4060,15 @@ static void alerts_save(void) {
     p = a_putkv(p, "duration", alerts_duration);
     p = a_putkv(p, "dnd", alerts_dnd);
     // #743: was unlink-then-open. See save_failed() above.
-    if (userconf_write_all("/CONFIG/ALERTS.CFG", buf, (unsigned long)(p - buf)) != 0)
+    // #peruser2: was userconf_write_all() with a HARDCODED /CONFIG PATH, which is
+    // the shape that makes this class of bug invisible: the helper is the safe,
+    // checked, non-destructive one, and it was being pointed at a root-owned
+    // destination, so every non-root save failed correctly and reported through a
+    // save_failed() that also could not write. The only change needed is WHERE.
+    // The reader (apps/compositor/notif.c) is migrated in the same commit; a
+    // writer and reader that disagree about the path is worse than neither moving.
+    int fd = userconf_open_write("ALERTS.CFG");
+    if (userconf_finish_write(fd, buf, (unsigned long)(p - buf)) != 0)
         save_failed("ALERTS.CFG");
 }
 static int a_kv(const char *b, const char *key, int def) {
@@ -3233,7 +4088,7 @@ static int a_kv(const char *b, const char *key, int def) {
     return def;
 }
 static void alerts_load(void) {
-    int fd = sys_open("/CONFIG/ALERTS.CFG", 0);
+    int fd = userconf_open_read("ALERTS.CFG", "/CONFIG/ALERTS.CFG");   // #peruser2
     if (fd < 0) return;
     static char b[256];
     long n = sys_read(fd, b, sizeof(b) - 1);
@@ -3265,11 +4120,19 @@ static void privacy_save(void) {
     p = a_putkv(p, "crash_reports", crash_reports);
     // #743: was unlink-then-open. A failed open reset every privacy toggle,
     // including lock timeout and "require password on wake", to its default.
-    if (userconf_write_all("/CONFIG/PRIVACY.CFG", buf, (unsigned long)(p - buf)) != 0)
+    // #peruser2: per-user. The reader is apps/compositor/lockscreen.c's
+    // privacy_cfg_poll(), migrated in the same commit, and it runs as the SAME
+    // uid as this app in the same session, so a per-user file is exactly right:
+    // "lock MY screen after N minutes" is a property of the session, not the
+    // machine. If the idle lock ever becomes enforced in Ring 0 the ENFORCED
+    // values must not live in a file the enforced-upon user can rewrite; that
+    // belongs with the enforcement (#305) and is recorded in the plan doc.
+    int fd = userconf_open_write("PRIVACY.CFG");
+    if (userconf_finish_write(fd, buf, (unsigned long)(p - buf)) != 0)
         save_failed("PRIVACY.CFG");
 }
 static void privacy_load(void) {
-    int fd = sys_open("/CONFIG/PRIVACY.CFG", 0);
+    int fd = userconf_open_read("PRIVACY.CFG", "/CONFIG/PRIVACY.CFG");   // #peruser2
     if (fd < 0) return;
     static char b[256];
     long n = sys_read(fd, b, sizeof(b) - 1);
@@ -3292,10 +4155,13 @@ static void privacy_load(void) {
 // (/CONFIG/STARTMENU.CFG, written on pin/unpin/launch) that this panel never
 // touches, so the two files can never race or clobber each other.
 static int sm_view          = 0;   // 0 = Categories accordion, 1 = All Apps
-static bool sm_show_fav      = true;
-static bool sm_show_recent   = true;
+// (task 3) int, not bool: the control table binds a value row to an `int *`, and
+// a bool is one byte, so a `bool *` cannot be handed to the shared accessor.
+// Every use of these three is already a truth test or a `? 1 : 0`.
+static int  sm_show_fav      = 1;
+static int  sm_show_recent   = 1;
 static int  sm_recent_count  = 5;   // 1-10
-static bool sm_focus_search  = true;
+static int  sm_focus_search  = 1;
 static int  sm_width         = 300; // 220-420
 static int  sm_icon_size     = 20;  // 14-28
 
@@ -3312,11 +4178,15 @@ static void sm_save(void) {
     p = a_putkv(p, "width", sm_width);
     p = a_putkv(p, "icon_size", sm_icon_size);
     // #743: was unlink-then-open. See save_failed() above.
-    if (userconf_write_all("/CONFIG/STARTMENU.PREFS", buf, (unsigned long)(p - buf)) != 0)
+    // #peruser2: per-user; the reader (apps/compositor/startmenu.c
+    // sm_load_prefs()) is migrated in the same commit and keeps its legacy
+    // fallbacks, so an existing machine-wide default still applies.
+    int fd = userconf_open_write("STARTMENU.PREFS");
+    if (userconf_finish_write(fd, buf, (unsigned long)(p - buf)) != 0)
         save_failed("STARTMENU.PREFS");
 }
 static void sm_load(void) {
-    int fd = sys_open("/CONFIG/STARTMENU.PREFS", 0);
+    int fd = userconf_open_read("STARTMENU.PREFS", "/CONFIG/STARTMENU.PREFS");  // #peruser2
     if (fd < 0) return;
     static char b[256];
     long n = sys_read(fd, b, sizeof(b) - 1);
@@ -4856,6 +5726,7 @@ static void draw_privacy_panel(void) {
 // the drawn rect exactly rather than re-deriving it.
 typedef struct {
     int thumb_clear, app_clear, sys_clear, empty_trash;
+    int retention;   // #aidelete: the "Keep deleted files" cycle button
 } storage_geom_t;
 static void storage_geom(storage_geom_t *g) {
     int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
@@ -4871,7 +5742,9 @@ static void storage_geom(storage_geom_t *g) {
     g->app_clear   = y - 3; y += 30;
     g->sys_clear   = y - 3; y += 40;
     y += 25;                 /* "Trash" subsection heading */
-    g->empty_trash = y - 3;
+    g->empty_trash = y - 3; y += 30;
+    y += 30;                 /* #aidelete: "Recycle Bin:" size/count line */
+    g->retention = y - 3;    /* #aidelete: "Keep deleted files" cycle button */
 }
 
 static void draw_storage_panel(void) {
@@ -4971,9 +5844,43 @@ static void draw_storage_panel(void) {
     y += 25;
 
     format_size(trash_size, cache_str, sizeof(cache_str));
-    draw_label_value(x, g.empty_trash + 3, "Trash Size:", cache_str, 140);
+    draw_label_value(x, g.empty_trash + 3, "Temp Trash:", cache_str, 140);
     draw_button_small(x + 280, g.empty_trash, 100, "Empty Trash", false);
-    y = g.empty_trash + 3 + 45;
+    y = g.empty_trash + 3 + 30;
+
+    // #aidelete: the REAL Recycle Bin, and the retention setting that governs
+    // it. Size and item count on one line, the control under it.
+    {
+        char rb_str[48];
+        format_size(recycle_size, rb_str, sizeof(rb_str));
+        int l = my_strlen(rb_str);
+        rb_str[l++] = ' '; rb_str[l++] = '(';
+        char num[12]; gui_itoa(recycle_items, num, sizeof(num));
+        for (int i = 0; num[i] && l < (int)sizeof(rb_str) - 10; i++) rb_str[l++] = num[i];
+        const char *suf = recycle_items == 1 ? " item)" : " items)";
+        for (int i = 0; suf[i] && l < (int)sizeof(rb_str) - 1; i++) rb_str[l++] = suf[i];
+        rb_str[l] = 0;
+        draw_label_value(x, y, "Recycle Bin:", rb_str, 140);
+        y += 30;
+    }
+
+    draw_label_value(x, g.retention + 3, "Keep deleted files:", "", 140);
+    draw_button_small(x + 280, g.retention, 100,
+                      rbindex_retention_label(rb_retention_choices[
+                          (trash_retention_choice < 0 || trash_retention_choice > 6)
+                              ? 4 : trash_retention_choice]), false);
+    {
+        // Say what the setting MEANS, because "Never" has a consequence the user
+        // should not have to infer, and because an unknown-age entry behaving
+        // differently from a dated one is surprising unless it is stated.
+        const char *note = (rb_retention_choices[
+                               (trash_retention_choice < 0 || trash_retention_choice > 6)
+                                   ? 4 : trash_retention_choice] == RB_RETENTION_NEVER)
+            ? "Nothing in the Recycle Bin is ever removed automatically."
+            : "Older items are removed automatically. Items with no recorded date are kept.";
+        win_draw_text(window_handle, x, g.retention + 30, note, COL_TEXT_DISABLED);
+    }
+    y = g.retention + 3 + 55;
 
     // Total summary
     uint64_t total_all = 0, used_all = 0;
@@ -4999,7 +5906,10 @@ static void draw_storage_panel(void) {
 // Panel: About
 // =============================================================================
 
-// #84 Default Apps: pick which app opens each file category. Persisted to /ASSOC.CFG.
+// #84 Default Apps: pick which app opens each file category.
+// #peruser2: persisted to <home>/ASSOC.CFG (libc/assoc.c), with reads falling
+// back to the shipped /ASSOC.CFG. Root's home is "/", so a root session still
+// uses exactly /ASSOC.CFG, which is what build/config-ref-gate.sh checks.
 static int defaults_app_index(int ci, const char *cur) {
     int n; const assoc_category_t *cats = assoc_categories(&n);
     if (ci < 0 || ci >= n) return 0;
@@ -5018,7 +5928,11 @@ static void defaults_set_category(int ci, const char *app) {
         while (*e == ' ') e++;
         int k = 0; while (*e && *e != ' ' && k < 15) ext[k++] = *e++;
         ext[k] = 0;
-        if (k) assoc_set_default(ext, app);
+        // #peruser2: THE RETURN WAS DISCARDED, which is why Settings > Default
+        // Apps looked like it worked for a non-root session: assoc_set_default()
+        // returned -1 from a refused write and this threw it away. It now goes
+        // through the same save_failed() breadcrumb as every other panel.
+        if (k && assoc_set_default(ext, app) != 0) save_failed("ASSOC.CFG");
     }
 }
 // (#262) Cache the per-category "current app" strings. assoc_category_current()
@@ -5043,7 +5957,8 @@ static void draw_defaults_panel(void) {
     int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
     draw_section_header(x, y, "Default Apps");
     y += 36;
-    draw_hint(x, y, "Choose which app opens each file type (saved system-wide to /ASSOC.CFG).");
+    // #peruser2: it is no longer system-wide, and the hint must not say it is.
+    draw_hint(x, y, "Choose which app opens each file type (saved for your account).");
     y += 28;
     int n; const assoc_category_t *cats = assoc_categories(&n);
     if (!g_def_cached) defaults_refresh_cache();
@@ -5254,27 +6169,44 @@ static int draw_about_logo(int dx, int dy_card_top, int card_h) {
     return 1;
 }
 
+// (task 3) THE Alerts control table. Seven controls, one table, and the
+// hitbox-lint DEBT row for PANEL_NOTIFICATIONS goes with it: the click handler
+// used to re-derive base_y + 40/112/138/164/190/228/272 by hand against a draw
+// pass that walked `y += 44/28/26/26/26/38/44`. The two chains AGREED, exactly
+// as Date & Time, Storage, Network, Keyboard, Privacy and Users agreed right up
+// until an edit above them shifted everything below.
+// EVERY ROW USES C99 DESIGNATED INITIALISERS, deliberately and unlike
+// SETTINGS_ITEMS[]. `ct_item_t`'s rows are positional, which is why `terms` and
+// `commitfn` had to be APPENDED to that struct: a field inserted anywhere else
+// silently shifts the one after it and still compiles. That is not a property to
+// inherit. It bit immediately here - adding `loadfn` between `after` and
+// `present` shifted a `const char *desc` into an `int (*present)(void)` slot in
+// every row that had spelled its trailing fields out, and the build reported it as
+// a WARNING, not an error. Designated initialisers make a new field a no-op for
+// every existing row, so `sctl_t` can grow the kinds the remaining 16 panels need
+// without a rewrite and without that hazard.
+
+static const sctl_t SC_ALERTS[] = {
+  { .kind = SC_HEAD, .label = "Alerts", .adv = 40 },
+  { .kind = SC_TOGGLE, .label = "Enable notifications", .tok = "alerts.enabled", .ctl_dx = 220, .adv = 44, .var = &alerts_enabled, .hi = 1, .after = alerts_save, .loadfn = alerts_load, .desc = "Master switch for toast notifications; off means nothing slides in" },
+  { .kind = SC_SUB, .label = "Show toasts for these severities", .adv = 28 },
+  { .kind = SC_CHECK, .label = "Information", .tok = "alerts.severity_info", .ctl_w = 220, .adv = 26, .var = &alerts_info, .hi = 1, .after = alerts_save, .loadfn = alerts_load, .desc = "Show a toast for INFO-severity notifications" },
+  { .kind = SC_CHECK, .label = "Success", .tok = "alerts.severity_success", .ctl_w = 220, .adv = 26, .var = &alerts_success, .hi = 1, .after = alerts_save, .loadfn = alerts_load, .desc = "Show a toast for SUCCESS-severity notifications" },
+  { .kind = SC_CHECK, .label = "Warning", .tok = "alerts.severity_warning", .ctl_w = 220, .adv = 26, .var = &alerts_warning, .hi = 1, .after = alerts_save, .loadfn = alerts_load, .desc = "Show a toast for WARNING-severity notifications" },
+  { .kind = SC_CHECK, .label = "Error", .tok = "alerts.severity_error", .ctl_w = 220, .adv = 38, .var = &alerts_error, .hi = 1, .after = alerts_save, .loadfn = alerts_load, .desc = "Show a toast for ERROR-severity notifications" },
+  { .kind = SC_SLIDER, .label = "Toast duration", .tok = "alerts.toast_seconds", .ctl_dx = 140, .ctl_w = 240, .adv = 44, .var = &alerts_duration, .lo = 1, .hi = 20, .unit = "s", .after = alerts_save, .loadfn = alerts_load, .desc = "How many seconds a toast stays on screen before it auto-dismisses" },
+  { .kind = SC_TOGGLE, .label = "Do not disturb", .tok = "alerts.do_not_disturb", .ctl_dx = 220, .adv = 40, .var = &alerts_dnd, .hi = 1, .after = alerts_save, .loadfn = alerts_load, .desc = "Hide toasts while still logging them in the taskbar bell" },
+};
+
 static void draw_notifications_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
-    char buf[40];
-
-    draw_section_header(x, y, "Alerts"); y += 40;
-    draw_toggle_labeled(x, y, 220, "Enable notifications", alerts_enabled != 0); y += 44;
-
-    draw_subsection(x, y, "Show toasts for these severities"); y += 28;
-    draw_checkbox(x, y, "Information", alerts_info != 0);    y += 26;
-    draw_checkbox(x, y, "Success",     alerts_success != 0); y += 26;
-    draw_checkbox(x, y, "Warning",     alerts_warning != 0); y += 26;
-    draw_checkbox(x, y, "Error",       alerts_error != 0);   y += 38;
-
-    draw_label(x, y, "Toast duration");
-    gui_itoa(alerts_duration, buf, sizeof(buf));
-    { int l = my_strlen(buf); buf[l++] = 's'; buf[l] = 0; }
-    draw_slider(x + 140, y, 240, alerts_duration, 20, COL_ACCENT);
-    win_draw_text(window_handle, x + 395, y, buf, COL_TEXT_SECONDARY); y += 44;
-
-    draw_toggle_labeled(x, y, 220, "Do not disturb", alerts_dnd != 0); y += 40;
+    int ys[ARRAY_COUNT(SC_ALERTS)];
+    int y = sc_layout(SC_ALERTS, ARRAY_COUNT(SC_ALERTS),
+                      PADDING - g_content_scroll.offset, ys);
+    sc_draw(SC_ALERTS, ARRAY_COUNT(SC_ALERTS), x, ys);
+    // Conditional decoration: its text and its icon both depend on the toggle
+    // above it, so it stays here rather than needing a per-row text callback.
+    // A hint has no token and nobody can click it, so it is not a control.
     draw_hint_ic(x, y, alerts_dnd ? "CMINUS" : "INFO", COL_TEXT_SECONDARY,
                  alerts_dnd ? "Do Not Disturb: toasts hidden, still logged in the bell"
                             : "Toasts slide in top-right, stack, and auto-dismiss");
@@ -5286,41 +6218,39 @@ static void draw_notifications_panel(void) {
 // Start Menu itself (right-click an item -> Pin/Unpin, or launch it to grow
 // Recents) - this panel only controls whether those sections show and how
 // many recents to keep, never the app.
+// (task 3) THE Start Menu control table. Seven controls; the PANEL_STARTMENU
+// DEBT row goes with it. This conversion also FIXES a live 3px fault nobody had
+// reported: the Layout dropdown DREW at y-3..y+25 and was HIT-TESTED at
+// y..y+28, so its top 3 pixels were dead and the 3 below it were live. One
+// SC_DD_DY, read by both passes, is why that is no longer expressible.
+// EVERY ROW USES C99 DESIGNATED INITIALISERS, deliberately and unlike
+// SETTINGS_ITEMS[]. `ct_item_t`'s rows are positional, which is why `terms` and
+// `commitfn` had to be APPENDED to that struct: a field inserted anywhere else
+// silently shifts the one after it and still compiles. That is not a property to
+// inherit. It bit immediately here - adding `loadfn` between `after` and
+// `present` shifted a `const char *desc` into an `int (*present)(void)` slot in
+// every row that had spelled its trailing fields out, and the build reported it as
+// a WARNING, not an error. Designated initialisers make a new field a no-op for
+// every existing row, so `sctl_t` can grow the kinds the remaining 16 panels need
+// without a rewrite and without that hazard.
+
+static const sctl_t SC_STARTMENU[] = {
+  { .kind = SC_HEAD, .label = "Start Menu", .adv = 40 },
+  { .kind = SC_DROP, .label = "Layout", .tok = "startmenu.layout", .ctl_dx = 120, .ctl_w = 160, .adv = 40, .var = &sm_view, .hi = 1, .opts = SM_VIEW_OPTS, .nopts = SM_VIEW_OPTS_COUNT, .after = sm_view_changed, .loadfn = sm_load, .desc = "Start menu body: Categories accordion, or one flat All Apps list" },
+  { .kind = SC_TOGGLE, .label = "Show Favorites section", .tok = "startmenu.show_favorites", .ctl_dx = 220, .adv = 40, .var = &sm_show_fav, .hi = 1, .after = sm_save, .loadfn = sm_load, .desc = "Show the pinned-favourites section at the top of the Start menu" },
+  { .kind = SC_TOGGLE, .label = "Show Recent section", .tok = "startmenu.show_recent", .ctl_dx = 220, .adv = 40, .var = &sm_show_recent, .hi = 1, .after = sm_save, .loadfn = sm_load, .desc = "Show the recently-launched section in the Start menu" },
+  { .kind = SC_SLIDER, .label = "Recent items to show", .tok = "startmenu.recent_count", .ctl_dx = 180, .ctl_w = 160, .adv = 40, .var = &sm_recent_count, .lo = 1, .hi = 10, .after = sm_save, .loadfn = sm_load, .desc = "How many recently-launched apps the Recent section keeps" },
+  { .kind = SC_TOGGLE, .label = "Focus search box when menu opens", .tok = "startmenu.focus_search", .ctl_dx = 260, .adv = 40, .var = &sm_focus_search, .hi = 1, .after = sm_save, .loadfn = sm_load, .desc = "Put the keyboard caret in the Start menu search box on open" },
+  { .kind = SC_SLIDER, .label = "Menu width", .tok = "startmenu.width_px", .ctl_dx = 180, .ctl_w = 160, .adv = 40, .var = &sm_width, .lo = 220, .hi = 420, .after = sm_save, .loadfn = sm_load, .desc = "Start menu width in pixels, 220 to 420" },
+  { .kind = SC_SLIDER, .label = "Item icon size", .tok = "startmenu.icon_size_px", .ctl_dx = 180, .ctl_w = 160, .adv = 44, .var = &sm_icon_size, .lo = 14, .hi = 28, .after = sm_save, .loadfn = sm_load, .desc = "Pixel size of each app icon in the Start menu list, 14 to 28" },
+};
+
 static void draw_startmenu_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
-    char buf[16];
-
-    draw_section_header(x, y, "Start Menu"); y += 40;
-
-    draw_label(x, y, "Layout");
-    draw_dropdown_n(x + 120, y - 3, 160, SM_VIEW_OPTS[OPT_CLAMP(sm_view, SM_VIEW_OPTS)],
-                     g_dd_open && g_dd_sel == &sm_view, 2);
-    y += 40;
-
-    draw_toggle_labeled(x, y, 220, "Show Favorites section", sm_show_fav); y += 40;
-    draw_toggle_labeled(x, y, 220, "Show Recent section", sm_show_recent); y += 40;
-
-    draw_label(x, y, "Recent items to show");
-    gui_itoa(sm_recent_count, buf, sizeof(buf));
-    draw_slider(x + 180, y, 160, sm_recent_count - 1, 9, COL_ACCENT);
-    win_draw_text(window_handle, x + 350, y, buf, COL_TEXT_SECONDARY);
-    y += 40;
-
-    draw_toggle_labeled(x, y, 260, "Focus search box when menu opens", sm_focus_search); y += 40;
-
-    draw_label(x, y, "Menu width");
-    gui_itoa(sm_width, buf, sizeof(buf));
-    draw_slider(x + 180, y, 160, sm_width - 220, 200, COL_ACCENT);
-    win_draw_text(window_handle, x + 350, y, buf, COL_TEXT_SECONDARY);
-    y += 40;
-
-    draw_label(x, y, "Item icon size");
-    gui_itoa(sm_icon_size, buf, sizeof(buf));
-    draw_slider(x + 180, y, 160, sm_icon_size - 14, 14, COL_ACCENT);
-    win_draw_text(window_handle, x + 350, y, buf, COL_TEXT_SECONDARY);
-    y += 44;
-
+    int ys[ARRAY_COUNT(SC_STARTMENU)];
+    int y = sc_layout(SC_STARTMENU, ARRAY_COUNT(SC_STARTMENU),
+                      PADDING - g_content_scroll.offset, ys);
+    sc_draw(SC_STARTMENU, ARRAY_COUNT(SC_STARTMENU), x, ys);
     draw_hint_ic(x, y, "INFO", COL_TEXT_SECONDARY,
                  "Favorites are also the dock's pinned apps; manage them from the Start "
                  "Menu itself (right-click an item to Pin/Unpin) or from Settings > Dock. "
@@ -5887,6 +6817,286 @@ static void draw_dock_panel(void) {
     g_content_bottom_y = L.add_y + 30;   // (#227)
 }
 
+// (task 3) THE About action table, and the three handlers it shares with the
+// click path. These wrap what the PANEL_ABOUT click case used to do inline, so
+// a contract call and a click run the SAME function rather than two that agree.
+//
+// act_export_debug() also FIXES an honesty bug found while writing its success
+// term: do_export_debug() returned void and silently gave up when the open
+// failed, and the panel then set about_status = 2 ("Debug exported") anyway. A
+// button that reports success it cannot have observed is the shape this whole
+// ticket exists to remove, so the function now returns a status and the panel
+// reports what actually happened.
+static void act_check_updates(void) {
+    about_status = 5;
+    copy_str(g_update_msg, "Checking for updates...", sizeof(g_update_msg));
+    draw_all();                 // visible feedback BEFORE the blocking fetch
+    check_for_updates();
+}
+static void act_export_debug(void) {
+    about_status = (do_export_debug() == 0) ? 2 : 6;
+}
+static void act_credits(void) {
+    modal_mode = MODAL_CREDITS;
+    modal_num_fields = 0;
+}
+
+// Check Updates does a REAL blocking HTTPS fetch of the OTA manifest
+// (check_for_updates -> sys_http_fetch). LONG rather than UNBOUNDED because the
+// fetch is bounded by the net layer's own recv timeout (#420) and by an
+// immediate sys_net_is_up() refusal when there is no carrier (#381) - so a
+// caller may wait on it, which is precisely what CT_TIME_UNBOUNDED would have
+// forbidden. The outcome is read from update.status, not from the return code.
+static const ct_terms_t k_sc_updates = {
+    CT_TIME_LONG, 0, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    CT_FAIL_IO | CT_FAIL_TIMEOUT | CT_FAIL_NOTFOUND, "update.status", 0
+};
+// Export Debug writes DEBUG.TXT in the CALLING USER's home. The success_ref is
+// the "home:<rel>" TEMPLATE, the same vocabulary ct_promise_t and
+// ct_cap_need_t.scope_tmpl use, deliberately NOT a literal: a literal is something
+// the declaration chose rather than something derived from the call, and here the
+// destination genuinely depends on who is asking. sc_ct_press() resolves it through
+// userhome_path(), the SAME resolver do_export_debug() writes through, so the thing
+// checked and the thing written cannot diverge into two answers.
+static const ct_terms_t k_sc_export = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_PATH, CT_DEPTH_FS,
+    CT_FAIL_IO | CT_FAIL_NOSPACE | CT_FAIL_DENIED, "home:DEBUG.TXT", 0
+};
+// Credits raises a modal this app draws itself. It RETURNS immediately after
+// setting the flag, so it is LIVE_ONLY and NOT modal: CT_TF_MODAL means "blocks
+// waiting for a human" and would be refused on the spawn path. ui.modal_open is
+// the item a caller reads to see that the dialog is up.
+static const ct_terms_t k_sc_credits = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW,
+    0, "ui.modal_open", 0
+};
+
+// Three buttons on ONE row: adv 0 means "the next row shares this y", which is
+// how a horizontal group is expressed without a second layout concept.
+// EVERY ROW USES C99 DESIGNATED INITIALISERS, deliberately and unlike
+// SETTINGS_ITEMS[]. `ct_item_t`'s rows are positional, which is why `terms` and
+// `commitfn` had to be APPENDED to that struct: a field inserted anywhere else
+// silently shifts the one after it and still compiles. That is not a property to
+// inherit. It bit immediately here - adding `loadfn` between `after` and
+// `present` shifted a `const char *desc` into an `int (*present)(void)` slot in
+// every row that had spelled its trailing fields out, and the build reported it as
+// a WARNING, not an error. Designated initialisers make a new field a no-op for
+// every existing row, so `sctl_t` can grow the kinds the remaining 16 panels need
+// without a rewrite and without that hazard.
+
+static const sctl_t SC_ABOUT[] = {
+  { .kind = SC_BUTTON, .primary = 1, .label = "Check Updates", .tok = "about.check_updates", .ctl_w = 130, .adv = 0, .fn = act_check_updates, .desc = "Fetch the OTA security manifest and compare it with the running build", .terms = &k_sc_updates },
+  { .kind = SC_BUTTON, .label = "Export Debug", .tok = "about.export_debug", .ctl_dx = 145, .ctl_w = 130, .adv = 0, .fn = act_export_debug, .desc = "Write version and IP diagnostics to DEBUG.TXT in your home folder, for support", .terms = &k_sc_export },
+  { .kind = SC_BUTTON, .label = "Credits", .tok = "about.credits", .ctl_dx = 290, .ctl_w = 100, .adv = 35, .fn = act_credits, .desc = "Open the contributors and third-party attribution dialog", .terms = &k_sc_credits },
+};
+
+
+// ---- THE PROJECTION ------------------------------------------------------
+// A flat index over every control table, built once so the row order is stable
+// across calls (a caller that lists and then calls by index needs that) and so
+// decoration costs nothing at call time.
+static const sctl_t *g_scflat[64];
+static int g_scflat_n = 0;
+
+static void sc_flat_build(void) {
+    g_scflat_n = 0;
+#define SC_PUSH(t) do { for (int i = 0; i < ARRAY_COUNT(t); i++) \
+        if ((t)[i].tok && g_scflat_n < ARRAY_COUNT(g_scflat)) \
+            g_scflat[g_scflat_n++] = &(t)[i]; } while (0)
+    SC_PUSH(SC_ALERTS); SC_PUSH(SC_STARTMENU); SC_PUSH(SC_ABOUT);
+#undef SC_PUSH
+}
+
+// "A|B|C" for an enum row, joined from the SAME option array the dropdown draws
+// its label from, so the values a caller may write are the values the control
+// can show. Four rotating buffers because a caller may hold more than one
+// projected row at a time.
+static const char *sc_opts_join(const sctl_t *r) {
+    static char bufs[4][CT_OPTS_MAX];
+    static int turn = 0;
+    char *b = bufs[turn]; turn = (turn + 1) & 3;
+    int n = 0;
+    for (int i = 0; i < r->nopts; i++) {
+        if (i && n < CT_OPTS_MAX - 1) b[n++] = '|';
+        for (const char *q = r->opts[i]; *q && n < CT_OPTS_MAX - 1; q++) b[n++] = *q;
+    }
+    b[n] = 0;
+    return b;
+}
+
+// RISK IS DERIVED FROM THE ROW'S DECLARED DEPTH, never written out per row -
+// the same judgement files/main.c's ct_apply_risk() records: a hand-written
+// second field is a second thing that can disagree with the first, and the
+// disagreement is what #235 was made of. A row that reaches the filesystem or
+// another process is GUARDED and goes to the aicap gate; a row that only
+// changes this window or this app's own preference is SAFE. So a row cannot be
+// marked safe while declaring that it writes the disk, because nobody gets to
+// mark it at all. "fs.write" is the aicap CAPABILITY spelling, deliberately not
+// the TOOL spelling: the row says what the gate actually checks
+// (CONTRACT_COVERAGE_PLAN.md 4d flagged that inconsistency).
+static void sc_apply_risk(ct_item_t *it, const ct_terms_t *t) {
+    int deep = t && (t->depth == CT_DEPTH_FS || t->depth == CT_DEPTH_SYSTEM);
+    it->risk = deep ? CT_GUARDED : CT_SAFE;
+    it->cap  = deep ? "fs.write" : 0;
+}
+
+// ONE shared actfn for every projected button. The reply is an OBSERVATION and
+// not an echo of the request: where the row names a success_ref item, that item
+// is read back through the ordinary contract accessor, so an action that did
+// nothing is visible in the ANSWER instead of only in the return code. That is
+// the whole point of the success term, and the reason a bare "rc=0" is the one
+// thing a broken action is most likely to get right.
+static int sc_ct_press(const ct_item_t *it, int argc, char **argv,
+                       char *out, int ocap) {
+    const sctl_t *r = (const sctl_t *)it->ctx;
+    (void)argc; (void)argv;
+    if (!r || !r->fn) return -1;
+    // CT_TF_LIVE_ONLY IS PURELY DECLARATIVE: ct_do_call() refuses only
+    // CT_TIME_UNBOUNDED and CT_TF_MODAL, so a LIVE_ONLY row reached on the SPAWN
+    // path would run, achieve nothing a person can see, and answer `ok`. That is a
+    // small lie of exactly the kind this ticket exists to remove: about.credits
+    // would report a dialog open in a process with no window, which then exits.
+    // So the app refuses it, which is where the rule has to live.
+    if (r->terms && (r->terms->tflags & CT_TF_LIVE_ONLY) && window_handle < 0) {
+        snprintf(out, (size_t)ocap,
+                 "no-live-instance: %s only means anything inside a running "
+                 "Settings window", r->tok);
+        return -1;
+    }
+    r->fn();                       // the SAME function a click on it runs
+    const ct_terms_t *t = it->terms;
+
+    // A DECLARED POSTCONDITION THAT NOTHING CHECKS IS THE FAULT THIS WHOLE TICKET
+    // EXISTS TO REMOVE, and I shipped one. about.export_debug declared
+    // `success: path, success_ref: /DEBUG.TXT` and then answered a bare `ok` for a
+    // file that was ABSENT before the call and ABSENT after it (MEASURED on booted
+    // golden 2513, and confirmed by mounting the image afterwards). Every layer
+    // behaved correctly and the composition lied, which is the same shape as
+    // CONTRACT_COVERAGE_PLAN.md 4d's `promise=fulfilled paths=0/0` - the seventh
+    // recorded instance of "a verifier that asks nothing answers yes".
+    //
+    // Settings deliberately does NOT register the escrow promise backend: it costs
+    // about 330 KB of BSS and an app ELF is a single RWX PT_LOAD whose .bss growth
+    // has broken the loader before. But "no escrow" is not a licence to declare an
+    // unchecked postcondition. A CT_SUCC_PATH naming a LITERAL absolute path is
+    // checkable with one open(), so it is checked here, and the action FAILS when
+    // the file it promised is not there.
+    if (t && t->success == CT_SUCC_PATH && t->success_ref) {
+        // Resolve the template through the SAME helper the action writes through,
+        // so "what was promised" and "what was written" cannot become two
+        // different answers. Accepted: "home:<rel>" and a literal absolute path.
+        // Anything else is a template this app cannot resolve, and an
+        // UNRESOLVED postcondition is NOT an absent one - it is refused, which is
+        // CONTRACT_COVERAGE_PLAN.md 4b's lesson stated in one branch.
+        char vp[256];
+        const char *ref = t->success_ref;
+        if (ref[0] == 'h' && ref[1] == 'o' && ref[2] == 'm' && ref[3] == 'e' &&
+            ref[4] == ':') {
+            if (userhome_path(0, ref + 5, vp, sizeof(vp)) != 0) {
+                snprintf(out, (size_t)ocap,
+                         "postcondition-unresolved: %s promised %s and this session "
+                         "has no home to resolve it against", r->tok, ref);
+                return -1;
+            }
+        } else if (ref[0] == '/') {
+            copy_str(vp, ref, sizeof(vp));
+        } else {
+            snprintf(out, (size_t)ocap,
+                     "postcondition-unresolved: %s promised '%s', which is not a "
+                     "path template this app can resolve", r->tok, ref);
+            return -1;
+        }
+        long pfd = syscall2(SYS_OPEN, (long)vp, (long)O_RDONLY);
+        if (pfd < 0) {
+            snprintf(out, (size_t)ocap,
+                     "postcondition-unmet: %s promised %s and it is not there",
+                     r->tok, vp);
+            return -1;
+        }
+        syscall1(SYS_CLOSE, pfd);
+        snprintf(out, (size_t)ocap, "ran=%s verified-path=%s", r->tok, vp);
+        return 0;
+    }
+
+    if (t && t->success == CT_SUCC_ITEM && t->success_ref) {
+        ct_item_t ref;
+        if (contract_find(&SETTINGS_CONTRACT, t->success_ref, &ref)) {
+            snprintf(out, (size_t)ocap, "ran=%s %s=%d", r->tok,
+                     t->success_ref, contract_get(&ref));
+            return 0;
+        }
+    }
+    snprintf(out, (size_t)ocap, "ran=%s", r->tok);
+    return 0;
+}
+CT_CHECK_ACTFN(sc_ct_press);
+
+static int settings_project(int idx, ct_item_t *out) {
+    if (idx < 0) return 0;
+    if (!g_scflat_n) sc_flat_build();
+    if (idx >= g_scflat_n) return 0;
+    const sctl_t *r = g_scflat[idx];
+    ct_item_t it;
+    __builtin_memset(&it, 0, sizeof(it));
+    it.name = r->tok; it.desc = r->desc; it.terms = r->terms; it.ctx = r;
+    // THIS row's own persistence writer (contract.h ct_item_t.commitfn):
+    // Alerts persists to ALERTS.CFG and Start Menu to STARTMENU.CFG, neither of
+    // which SETTINGS_CONTRACT.commit() writes, so without this a contract set
+    // moved the variable and lost it at the next launch.
+    it.commitfn = r->after;
+    // FAIL CLOSED on a row that persists a file nothing loads. Refusing the row is
+    // survivable; writing six defaults over somebody's preferences is not.
+    int unloadable = (r->after && !r->loadfn);
+    switch (r->kind) {
+    case SC_TOGGLE:
+    case SC_CHECK:
+        it.type = CT_BOOL; it.access = CT_RW; it.var = r->var; break;
+    case SC_SLIDER:
+        it.type = CT_INT;  it.access = CT_RW; it.var = r->var;
+        it.lo = r->lo; it.hi = r->hi; break;
+    case SC_DROP:
+    case SC_CYCLE:
+        it.type = CT_ENUM; it.access = CT_RW; it.var = r->var;
+        it.lo = 0; it.hi = r->nopts - 1; it.options = sc_opts_join(r); break;
+    case SC_BUTTON:
+        it.type = CT_ACTION; it.access = CT_WRITE; it.actfn = sc_ct_press; break;
+    default:
+        return 0;
+    }
+    sc_apply_risk(&it, r->terms);
+    if (unloadable) it.risk = CT_DENIED;
+    *out = it;
+    return 1;
+}
+
+// Call each DISTINCT loadfn once. Walked from the TABLES, so a converted panel
+// brings its loader with it and there is no second list of files to keep in step.
+//
+// SAFE ONLY BECAUSE SETTINGS DOES NOT SERVE LIVE VERBS, and that is worth writing
+// down because it is a precondition, not a property. contract_run_verb() calls
+// c->load() on EVERY verb, including a read-only `probe`. Measured: the apps that
+// call contract_live_poll() are files, terminal and paint - NOT settings - so the
+// only caller of this is a freshly spawned --contract process with no live state to
+// overwrite. The day somebody adds contract_live_poll() to Settings, a live `probe`
+// would re-read ALERTS.CFG and STARTMENU.CFG over whatever the open window is
+// showing, and an open dropdown's uncommitted preview value (#74: on_change fires
+// only on commit) would be silently replaced. Terminal already hit this and its
+// term_contract_load() returns early when the window is live. Do the same here
+// before wiring live delivery.
+static void sc_load_all(void) {
+    void (*done[8])(void); int nd = 0;
+    if (!g_scflat_n) sc_flat_build();
+    for (int i = 0; i < g_scflat_n; i++) {
+        void (*ld)(void) = g_scflat[i]->loadfn;
+        if (!ld) continue;
+        int seen = 0;
+        for (int k = 0; k < nd; k++) if (done[k] == ld) { seen = 1; break; }
+        if (seen || nd >= (int)(sizeof(done)/sizeof(done[0]))) continue;
+        done[nd++] = ld;
+        ld();
+    }
+}
+
 static void draw_about_panel(void) {
     int x = CONTENT_X + PADDING;
     int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
@@ -6046,9 +7256,14 @@ static void draw_about_panel(void) {
     // cannot drift apart again (see the declaration for what happened when
     // they could).
     g_about_btn_y = y;
-    draw_button(x, y, 130, "Check Updates", true, false);
-    draw_button(x + 145, y, 130, "Export Debug", false, false);
-    draw_button(x + 290, y, 100, "Credits", false, false);
+    {
+        // The SAME start_y the click case re-derives from g_about_btn_y, so the
+        // three buttons' rects are one geometry pass even though this panel's
+        // height depends on however many lines of build text sit above them.
+        int ys[ARRAY_COUNT(SC_ABOUT)];
+        sc_layout(SC_ABOUT, ARRAY_COUNT(SC_ABOUT), g_about_btn_y, ys);
+        sc_draw(SC_ABOUT, ARRAY_COUNT(SC_ABOUT), x, ys);
+    }
     y += 35;
     // #230: about_status now has real states from an ACTUAL network check
     // (check_for_updates()) instead of unconditionally printing "up to date"
@@ -6064,6 +7279,9 @@ static void draw_about_panel(void) {
         draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_ERROR), g_update_msg);
     else if (about_status == 5)
         draw_hint(x, y, g_update_msg);
+    else if (about_status == 6)
+        draw_hint_ic(x, y, "CIRCX", theme_color(THEME_COLOR_ERROR),
+                     "Could not write /DEBUG.TXT (the root filesystem refused the open).");
     y += 15;
 
     // Legal. (local 71) Three corrections here, all factual:
@@ -7599,6 +8817,13 @@ static void do_modal_submit(void) {
 // =============================================================================
 
 static void draw_all(void) {
+    // (task 3) NOTHING TO DRAW ON YET. A contract invocation answers --contract
+    // BEFORE win_create() (contract-lint check 8 enforces that order), and a
+    // projected action runs the app's OWN click handler, which may repaint to
+    // show its result. Guarding here rather than in each handler means the whole
+    // class is closed: no handler has to know whether it was reached by a click
+    // or by /APPS/SETTINGS --contract call.
+    if (window_handle < 0) return;
     // #3: confirm the very first draw actually starts and finishes (a hang here,
     // e.g. in a panel asset load, would otherwise look like "window never shown").
     static int s_first_draw = 1;
@@ -8285,61 +9510,26 @@ static void handle_content_click(int local_x, int local_y) {
             }
         } break;
         case PANEL_NOTIFICATIONS: {
-            int en_y = base_y + 40;
-            if (local_x >= x + 220 && local_x < x + 268 && local_y >= en_y && local_y < en_y + 24) {
-                alerts_enabled = !alerts_enabled; alerts_save(); draw_all(); return; }
-            int info_y = base_y + 112;
-            if (local_x >= x && local_x < x + 220 && local_y >= info_y && local_y < info_y + 18) {
-                alerts_info = !alerts_info; alerts_save(); draw_all(); return; }
-            int succ_y = base_y + 138;
-            if (local_x >= x && local_x < x + 220 && local_y >= succ_y && local_y < succ_y + 18) {
-                alerts_success = !alerts_success; alerts_save(); draw_all(); return; }
-            int warn_y = base_y + 164;
-            if (local_x >= x && local_x < x + 220 && local_y >= warn_y && local_y < warn_y + 18) {
-                alerts_warning = !alerts_warning; alerts_save(); draw_all(); return; }
-            int err_y = base_y + 190;
-            if (local_x >= x && local_x < x + 220 && local_y >= err_y && local_y < err_y + 18) {
-                alerts_error = !alerts_error; alerts_save(); draw_all(); return; }
-            int dur_y = base_y + 228;
-            if (local_y >= dur_y && local_y < dur_y + 16 && local_x >= x + 140 && local_x < x + 380) {
-                int v = ((local_x - (x + 140)) * 20) / 240;
-                if (v < 1) v = 1; if (v > 20) v = 20;
-                alerts_duration = v; alerts_save(); draw_all(); return; }
-            int dnd_y = base_y + 272;
-            if (local_x >= x + 220 && local_x < x + 268 && local_y >= dnd_y && local_y < dnd_y + 24) {
-                alerts_dnd = !alerts_dnd; alerts_save(); draw_all(); return; }
+            // (task 3) ONE geometry pass, from the SAME table draw_notifications_
+            // panel() draws: sc_layout() is handed base_y, which is the same
+            // `PADDING - g_content_scroll.offset` the draw pass starts from. What
+            // this replaces was seven hand-written `base_y + 40/112/138/164/190/
+            // 228/272` constants against a draw pass that walked
+            // `y += 44/28/26/26/26/38/44` - two independent chains that agreed,
+            // which is the state Date & Time, Storage, Network, Keyboard, Privacy
+            // and Users were all in before an edit above them broke them.
+            int ys[ARRAY_COUNT(SC_ALERTS)];
+            sc_layout(SC_ALERTS, ARRAY_COUNT(SC_ALERTS), base_y, ys);
+            if (sc_click(SC_ALERTS, ARRAY_COUNT(SC_ALERTS), x, ys, local_x, local_y)) return;
         } break;
         case PANEL_STARTMENU: {
-            int layout_y = base_y + 40;
-            if (local_y >= layout_y && local_y < layout_y + 28 &&
-                local_x >= x + 120 && local_x < x + 120 + 160) {
-                dropdown_open(x + 120, layout_y - 3, 160, SM_VIEW_OPTS, SM_VIEW_OPTS_COUNT, &sm_view, sm_view_changed);
-                draw_all(); return;
-            }
-            int fav_y = base_y + 80;
-            if (local_x >= x + 220 && local_x < x + 268 && local_y >= fav_y && local_y < fav_y + 24) {
-                sm_show_fav = !sm_show_fav; sm_save(); draw_all(); return; }
-            int rec_y = base_y + 120;
-            if (local_x >= x + 220 && local_x < x + 268 && local_y >= rec_y && local_y < rec_y + 24) {
-                sm_show_recent = !sm_show_recent; sm_save(); draw_all(); return; }
-            int rc_y = base_y + 160;
-            if (local_y >= rc_y && local_y < rc_y + 16 && local_x >= x + 180 && local_x < x + 340) {
-                int v = ((local_x - (x + 180)) * 9) / 160 + 1;
-                if (v < 1) v = 1; if (v > 10) v = 10;
-                sm_recent_count = v; sm_save(); draw_all(); return; }
-            int fs_y = base_y + 200;
-            if (local_x >= x + 260 && local_x < x + 308 && local_y >= fs_y && local_y < fs_y + 24) {
-                sm_focus_search = !sm_focus_search; sm_save(); draw_all(); return; }
-            int w_y = base_y + 240;
-            if (local_y >= w_y && local_y < w_y + 16 && local_x >= x + 180 && local_x < x + 340) {
-                int v = ((local_x - (x + 180)) * 200) / 160 + 220;
-                if (v < 220) v = 220; if (v > 420) v = 420;
-                sm_width = v; sm_save(); draw_all(); return; }
-            int is_y = base_y + 280;
-            if (local_y >= is_y && local_y < is_y + 16 && local_x >= x + 180 && local_x < x + 340) {
-                int v = ((local_x - (x + 180)) * 14) / 160 + 14;
-                if (v < 14) v = 14; if (v > 28) v = 28;
-                sm_icon_size = v; sm_save(); draw_all(); return; }
+            // (task 3) as PANEL_NOTIFICATIONS above. This also fixes the Layout
+            // dropdown, which DREW at y-3 and was HIT-TESTED at y: sc_draw() and
+            // sc_hit() now both apply SC_DD_DY, so the 3px dead band at the top
+            // of the control and the 3px live band below it are gone.
+            int ys[ARRAY_COUNT(SC_STARTMENU)];
+            sc_layout(SC_STARTMENU, ARRAY_COUNT(SC_STARTMENU), base_y, ys);
+            if (sc_click(SC_STARTMENU, ARRAY_COUNT(SC_STARTMENU), x, ys, local_x, local_y)) return;
         } break;
         case PANEL_DOCK: {
             // Every y here comes from dock_panel_layout(), the SAME helper
@@ -9104,10 +10294,36 @@ static void handle_content_click(int local_x, int local_y) {
                 local_x >= x + 280 && local_x < x + 340) {
                 dir_clear_files(CACHE_DIR_SYSTEM); storage_scan(); draw_all(); return;
             }
-            // Empty Trash
+            // Empty Trash.
+            //
+            // #aidelete: NEVER MEANS NEVER, and that has to hold for every
+            // sweep in the system, not just the recycler's. This button clears
+            // CACHE_DIR_TRASH ("/TRASH"), which is NOT the Recycle Bin (see the
+            // measured note beside CACHE_DIR_TRASH), so today it cannot reach a
+            // deleted file. The guard is here anyway, for the day somebody
+            // repoints this row at the real bin: a one-line retarget must not
+            // silently acquire the authority to purge a bin whose owner has
+            // said never. The gate is cheap; discovering it was missing after
+            // the retarget is not.
             if (local_y >= g.empty_trash && local_y < g.empty_trash + 24 &&
                 local_x >= x + 280 && local_x < x + 380) {
+                if (rbindex_read_retention() == RB_RETENTION_NEVER &&
+                    strcmp(CACHE_DIR_TRASH, rbindex_dir()) == 0) {
+                    printf("[settings] retention is Never; refusing to empty %s\n",
+                           rbindex_dir());
+                    return;
+                }
                 dir_clear_files(CACHE_DIR_TRASH); storage_scan(); draw_all(); return;
+            }
+            // #aidelete: "Keep deleted files" cycles Never -> 1 -> 7 -> 14 ->
+            // 30 -> 90 -> 365 and persists on every click, so the recycler
+            // (which re-reads RECYCLE.CFG each sweep) picks the change up with
+            // no restart of anything.
+            if (local_y >= g.retention && local_y < g.retention + 24 &&
+                local_x >= x + 280 && local_x < x + 380) {
+                trash_retention_choice = (trash_retention_choice + 1) % 7;
+                trash_retention_commit();
+                storage_scan(); draw_all(); return;
             }
             break;
         }
@@ -9134,40 +10350,17 @@ static void handle_content_click(int local_x, int local_y) {
         }
 
         case PANEL_ABOUT: {
-            // Button row: Check Updates, Export Debug, Credits. The y comes
-            // from the draw (g_about_btn_y), never from a re-derived section
-            // total; see that variable's declaration for the 126px drift this
-            // replaces. draw_button() uses a fixed height of 30.
-            int about_btn_y = g_about_btn_y;
-            if (about_btn_y > 0 &&
-                local_y >= about_btn_y && local_y < about_btn_y + 30) {
-                // Check Updates. #230: real network check (check_for_updates()),
-                // not a fabricated "up to date". Draw the transitional state
-                // first so the click has visible feedback before the blocking
-                // HTTP call (which can take a few seconds on a slow/absent
-                // network) returns.
-                if (local_x >= x && local_x < x + 130) {
-                    about_status = 5;
-                    copy_str(g_update_msg, "Checking for updates...", sizeof(g_update_msg));
-                    draw_all();
-                    check_for_updates();
-                    draw_all();
-                    return;
-                }
-                // Export Debug
-                if (local_x >= x + 145 && local_x < x + 275) {
-                    do_export_debug();
-                    about_status = 2; draw_all(); return;
-                }
-                // Credits
-                if (local_x >= x + 290 && local_x < x + 390) {
-                    modal_mode = MODAL_CREDITS;
-                    modal_num_fields = 0;
-                    draw_all(); return;
-                }
-            }
-            break;
-        }
+            // (task 3) g_about_btn_y is still the one y the DRAW pass recorded
+            // (this panel's height depends on how many lines of build text it
+            // printed), and sc_layout() spreads the three buttons across it from
+            // the same table the draw used. The x offsets 0/145/290 and the
+            // widths 130/130/100 now live in ONE place instead of being written
+            // once in draw_about_panel() and once here.
+            if (g_about_btn_y <= 0) break;
+            int ys[ARRAY_COUNT(SC_ABOUT)];
+            sc_layout(SC_ABOUT, ARRAY_COUNT(SC_ABOUT), g_about_btn_y, ys);
+            if (sc_click(SC_ABOUT, ARRAY_COUNT(SC_ABOUT), x, ys, local_x, local_y)) return;
+        } break;
 
         default:
             break;
@@ -9340,7 +10533,13 @@ static void write_setvals(void) {
 
     // #743: diagnostic dump. Result consumed, and reported through the
     // breadcrumb log (unlike setlog() itself, this one cannot recurse).
-    if (userconf_write_all("/SETVALS.TXT", g_sv_buf, (unsigned long)g_sv_len) != 0)
+    // #peruser2: the diagnostic dump went to "/SETVALS.TXT" at the root-owned
+    // ext2 root, so the dump that exists to tell you what the machine is set to
+    // was itself unwritable for every non-root session. A breadcrumb at the top
+    // of the user's space, same shape as setlog()'s SETLOG.TXT above.
+    char svp[256];
+    if (userhome_path(0, "SETVALS.TXT", svp, sizeof(svp)) != 0) return;
+    if (userconf_write_all(svp, g_sv_buf, (unsigned long)g_sv_len) != 0)
         save_failed("SETVALS.TXT (diagnostic dump)");
 }
 

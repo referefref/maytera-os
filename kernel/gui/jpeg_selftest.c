@@ -12,6 +12,7 @@
 #include "../serial.h"
 #include "../mm/heap.h"
 #include "../fs/fat.h"
+#include "../security/selftest_registry.h"
 
 // Externs provided by other subsystems (see proc/devinfo.c for the pattern).
 extern int  proc_create_ex(const char *name, void (*entry)(void *), void *arg,
@@ -385,6 +386,87 @@ static int jpeg_st_check(const char *tag, const unsigned char *buf, uint32_t n,
     return pass;
 }
 
+// --- jpegdos (#245): measure + bound progressive-JPEG SOS amplification. ---
+// Reads an attacker-shaped progressive JPEG from /CONFIG/JPGDOS.JPG (FAT ESP) if
+// present and times image_load_jpeg() around it with the 1000 Hz tick clock. On
+// an unbounded decoder a crafted many-SOS file re-runs a whole-image block pass
+// per SOS and burns Ring 0 for a long time; with the scan-count bound in
+// jpeg.c it returns quickly. No-op when the file is absent, so a normal boot is
+// unaffected.
+extern volatile uint64_t timer_ticks;
+extern uint32_t g_timer_hz;
+// Deterministic in-kernel proof of the progressive-SOS scan-count bound (#245).
+// Builds two minimal progressive JPEGs that differ ONLY in SOS count and asserts
+// the decoder accepts exactly JPEG_PROG_MAX_SCANS scans and REJECTS one more with
+// JPEG_ERR_UNSUPPORTED. RED arm: on a build without the bound the over-cap case
+// returns JPEG_SUCCESS (and at attack dimensions burns Ring 0 for minutes -
+// MEASURED 136.8 s on a 1.57 MB 4096x4096 file), so this assertion fails. GREEN
+// arm: the over-cap case is rejected in well under a second.
+static uint32_t jpeg_build_prog_scans(uint8_t *b, int nscans) {
+    uint32_t p = 0;
+    b[p++]=0xFF; b[p++]=0xD8;                              // SOI
+    b[p++]=0xFF; b[p++]=0xDB; b[p++]=0x00; b[p++]=0x43; b[p++]=0x00;
+    for (int i=0;i<64;i++) b[p++]=16;                     // DQT Tq0 (valid)
+    b[p++]=0xFF; b[p++]=0xC2; b[p++]=0x00; b[p++]=0x0B; b[p++]=0x08;
+    b[p++]=0x00; b[p++]=0x10; b[p++]=0x00; b[p++]=0x10;   // 16x16
+    b[p++]=0x01; b[p++]=0x01; b[p++]=0x11; b[p++]=0x00;   // 1 comp, id1, 1x1, qt0
+    for (int sidx=0; sidx<nscans; sidx++) {
+        b[p++]=0xFF; b[p++]=0xDA; b[p++]=0x00; b[p++]=0x08;
+        b[p++]=0x01; b[p++]=0x01; b[p++]=0x00;            // ns=1, comp1, td/ta=0
+        b[p++]=0x00; b[p++]=0x00; b[p++]=0x10;            // Ss=0 Se=0 Ah=1 Al=0 (DC refine)
+    }
+    b[p++]=0xFF; b[p++]=0xD9;                             // EOI
+    return p;
+}
+
+static void jpeg_scancap_selftest(void) {
+    uint32_t cap = JPEG_PROG_MAX_SCANS;
+    uint32_t bufsz = 2 + 69 + 13 + (cap + 2) * 10 + 2;
+    uint8_t *b = (uint8_t *)kmalloc(bufsz);
+    if (!b) { selftest_notrun("jpeg/scancap", "kmalloc failed building fixture"); return; }
+    image_t img;
+
+    uint32_t n1 = jpeg_build_prog_scans(b, (int)cap);
+    img.pixels=0; img.width=0; img.height=0;
+    int r1 = image_load_jpeg(b, n1, &img);
+    if (img.pixels) kfree(img.pixels);
+
+    uint32_t n2 = jpeg_build_prog_scans(b, (int)cap + 1);
+    img.pixels=0; img.width=0; img.height=0;
+    int r2 = image_load_jpeg(b, n2, &img);
+    if (img.pixels) kfree(img.pixels);
+    kfree(b);
+
+    int pass = (r1 != JPEG_ERR_UNSUPPORTED) && (r2 == JPEG_ERR_UNSUPPORTED);
+    kprintf("[JPGCAP] cap=%u  at_cap(%u scans) ret=%d(%s)  over_cap(%u scans) ret=%d(%s)  %s\n",
+            cap, (unsigned)cap, r1, jpeg_error_string(r1),
+            (unsigned)cap+1, r2, jpeg_error_string(r2),
+            pass ? "PASS" : "FAIL");
+    selftest_ran("jpeg/scancap");
+}
+
+static void jpeg_dos_probe(void) {
+    uint32_t n = 0;
+    uint8_t *buf = (uint8_t *)fat_read_file(&g_fat_fs, "/CONFIG/JPGDOS.JPG", &n);
+    if (!buf) return;
+    kprintf("[JPGDOS] fixture /CONFIG/JPGDOS.JPG = %u bytes, is_jpeg=%d hz=%u\n",
+            n, image_is_jpeg(buf, n), g_timer_hz);
+    image_t img; img.pixels = 0; img.width = 0; img.height = 0;
+    uint64_t t0 = timer_ticks;
+    kprintf("[JPGDOS] decode START tick=%llu\n", (unsigned long long)t0);
+    int r = image_load_jpeg(buf, n, &img);
+    uint64_t t1 = timer_ticks;
+    uint64_t dt = t1 - t0;
+    kprintf("[JPGDOS] decode END   tick=%llu\n", (unsigned long long)t1);
+    uint64_t hz = g_timer_hz ? g_timer_hz : 1000;
+    uint64_t ms = dt * 1000ULL / hz;
+    kprintf("[JPGDOS] ret=%d (%s) w=%u h=%u elapsed_ticks=%llu hz=%llu (~%llu ms)\n",
+            r, jpeg_error_string(r), img.width, img.height,
+            (unsigned long long)dt, (unsigned long long)hz, (unsigned long long)ms);
+    if (img.pixels) kfree(img.pixels);
+    kfree(buf);
+}
+
 static void jpeg_selftest_worker(void *arg) {
     (void)arg;
     proc_sleep(12000);   // let drivers + desktop settle
@@ -427,6 +509,8 @@ static void jpeg_selftest_worker(void *arg) {
         int p1 = jpeg_st_check("P1-prog-4:4:4-32x32",   jpeg_prog_p1, sizeof(jpeg_prog_p1), 32,32,  3, gt_p1);
         kprintf("[JPGTEST] PROGRESSIVE RESULT: %s\n", (p4 && p1) ? "PASS" : "FAIL");
     }
+    jpeg_scancap_selftest();
+    jpeg_dos_probe();
     kprintf("========== JPEG DECODER SELFTEST: DONE ==========\n");
     kprintf_set_dual_output(0);
 }

@@ -14,12 +14,14 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #include <dom/dom.h>
 #include <hubbub/hubbub.h>
 #include <hubbub/parser.h>
 #include <hubbub/tree.h>
 
+#include <maytera-dom-limits.h>	/* MAYTERA_DOM_MAX_DEPTH (#245) */
 #include "dom_hubbub_bind.h"
 
 /* libdom internal HTML document factory (declared here to avoid pulling the
@@ -212,13 +214,42 @@ static hubbub_error cb_reparent_children(void *ctx, void *node,
 	dom_exception e;
 	(void) ctx;
 
+	/*
+	 * #245 layoutsweep: PROGRESS HERE IS CONDITIONAL ON THE REMOVAL WORKING.
+	 * Each pass re-reads the FIRST child and relies on the removal to make the
+	 * next pass see a different one. A removal that fails leaves the same child
+	 * in place, so the loop re-reads it forever, in Ring 3, on attacker-supplied
+	 * HTML: this runs from the HTML5 adoption agency algorithm, which is driven
+	 * entirely by mis-nested tags on the page.
+	 *
+	 * I COULD NOT CONSTRUCT AN INPUT THAT TRIGGERS IT, and say so rather than
+	 * claim a bug I did not prove. _dom_node_remove_child() can return before
+	 * detaching in three ways: a DOCUMENT parent refusing to drop an element or
+	 * doctype, a readonly parent, or an allocation failure inside the
+	 * DOMNodeRemoval dispatch. The first cannot happen here because libhubbub
+	 * only ever passes stack[furthest_block].node (in_body.c:1779), which is at
+	 * stack index >= 2 and therefore never the document; the second does not
+	 * apply to elements hubbub builds. That leaves OOM, which would turn an
+	 * allocation failure into a permanent spin instead of a failed page load.
+	 *
+	 * So this is a guard, not a fix for a demonstrated hang. It costs one
+	 * comparison on a path that does not currently fire, and it converts the
+	 * one remaining unguarded-progress loop in the engine's HTML tree
+	 * construction into one that cannot spin whatever the callee does.
+	 */
 	for (;;) {
 		dom_node *moved = NULL;
 		e = dom_node_get_first_child((dom_node *) node, &child);
 		if (e != DOM_NO_ERR || child == NULL)
 			break;
 		e = dom_node_remove_child((dom_node *) node, child, &moved);
-		if (e == DOM_NO_ERR && moved != NULL) {
+		if (e != DOM_NO_ERR) {
+			/* The child is still attached, so the next pass would read
+			 * exactly this node again. Stop instead of spinning. */
+			dom_node_unref(child);
+			break;
+		}
+		if (moved != NULL) {
 			dom_node *app = NULL;
 			(void) dom_node_append_child((dom_node *) new_parent,
 					moved, &app);
@@ -402,3 +433,170 @@ void mdb_destroy(mdb_parser *p)
 		dom_node_unref((dom_node *) p->html_doc);
 	free(p);
 }
+
+/* ------------------------------------------------------------------ #245
+ * deepdom: the in-OS launch canary for the deep-DOM depth cap.
+ *
+ * WHAT IT GUARDS. Building an n-deep DOM used to be O(n^2) in both the HTML
+ * parser and the appendChild path, which pegged the browser at 100% CPU on a
+ * page of nested div elements with no script on it at all. Four per-insertion
+ * O(tree depth) walks were the cause (three in libdom, one in libhubbub) and
+ * are now O(1); on top of that the parser clamps the depth it will build,
+ * because libdom destroys a tree by RECURSING and a deep enough tree faults
+ * the process on teardown no matter how fast it was built.
+ *
+ * The complexity fixes live in patched third-party source and cannot be
+ * asserted from here. What CAN be asserted, cheaply, on every launch, is the
+ * structural consequence that bounds the work: the parsed tree is clamped, and
+ * clamping does not cost content. Both halves matter. A cap that dropped the
+ * text would be a truncation bug wearing a fix's clothes, and the case just
+ * under the cap proves the clamp is not firing on ordinary documents.
+ *
+ * Depths are small on purpose: this runs on every browser launch.
+ */
+static int mdb_st_depth(dom_node *n, int d, int *maxd, int *elems, int *texts)
+{
+	dom_node_type ty;
+	dom_node *c = NULL;
+
+	if (dom_node_get_node_type(n, &ty) == DOM_NO_ERR) {
+		if (ty == DOM_ELEMENT_NODE) {
+			(*elems)++;
+			if (d > *maxd) *maxd = d;
+		} else if (ty == DOM_TEXT_NODE) {
+			(*texts)++;
+		}
+	}
+	if (dom_node_get_first_child(n, &c) == DOM_NO_ERR) {
+		while (c) {
+			dom_node *nx = NULL;
+			mdb_st_depth(c, d + 1, maxd, elems, texts);
+			dom_node_get_next_sibling(c, &nx);
+			dom_node_unref(c);
+			c = nx;
+		}
+	}
+	return 0;
+}
+
+/* Build "<html><body>" + n x "<div>" + "X" + n x "</div>" and measure it. */
+static int mdb_st_nest(int n, int *maxd, int *elems, int *texts)
+{
+	/* 6 bytes per open tag + 6 per close + slack; n is bounded below. */
+	static char buf[16384];
+	int i, k = 0;
+	mdb_parser *p;
+	dom_document *doc;
+	dom_element *root = NULL;
+
+	*maxd = *elems = *texts = 0;
+	if (n < 0 || (size_t) (n * 12 + 64) >= sizeof buf)
+		return -1;
+	for (i = 0; i < 12; i++) buf[k++] = "<html><body>"[i];
+	for (i = 0; i < n; i++) {
+		buf[k++] = '<'; buf[k++] = 'd'; buf[k++] = 'i';
+		buf[k++] = 'v'; buf[k++] = '>';
+	}
+	buf[k++] = 'X';
+	for (i = 0; i < n; i++) {
+		buf[k++] = '<'; buf[k++] = '/'; buf[k++] = 'd';
+		buf[k++] = 'i'; buf[k++] = 'v'; buf[k++] = '>';
+	}
+	buf[k] = 0;
+
+	p = mdb_create();
+	if (p == NULL)
+		return -1;
+	if (mdb_parse_chunk(p, (const unsigned char *) buf, (unsigned long) k) != 0 ||
+			mdb_parse_complete(p) != 0) {
+		mdb_destroy(p);
+		return -1;
+	}
+	doc = mdb_document(p);
+	if (doc == NULL ||
+	    dom_document_get_document_element(doc, &root) != DOM_NO_ERR ||
+	    root == NULL) {
+		mdb_destroy(p);
+		return -1;
+	}
+	mdb_st_depth((dom_node *) root, 0, maxd, elems, texts);
+	dom_node_unref((dom_node *) root);
+	mdb_destroy(p);
+	return 0;
+}
+
+static int g_mdb_st_cases;
+
+int mdb_depth_selftest_count(void) { return 5; }
+
+int mdb_depth_selftest(void (*report)(const char *line))
+{
+	int fail = 0, maxd = 0, el = 0, tx = 0;
+	char line[160];
+	const int cap = MAYTERA_DOM_MAX_DEPTH;
+	/* Well under the cap: nothing may be clamped and nothing lost. */
+	const int shallow = 40;
+	/* Comfortably over it, but small enough to parse in microseconds. */
+	const int deep = cap + 200;
+
+	g_mdb_st_cases = 0;
+
+#define MDB_CHK(what, got, want) do {                                        \
+		g_mdb_st_cases++;                                            \
+		if ((got) != (want)) {                                       \
+			fail++;                                              \
+			if (report) {                                        \
+				snprintf(line, sizeof line,                  \
+					"[DEEPDOM]   FAIL %s: got %d want %d",\
+					(what), (int) (got), (int) (want));  \
+				report(line);                                \
+			}                                                    \
+		} else if (report) {                                          \
+			snprintf(line, sizeof line,                          \
+				"[DEEPDOM]   ok   %s = %d", (what),          \
+				(int) (got));                                \
+			report(line);                                        \
+		}                                                            \
+	} while (0)
+
+	/* 1 + 2: a document that does NOT reach the cap is untouched.
+	 * html is at depth 0, body at 1, so the deepest div sits at 1+shallow.
+	 * The element count is html + head + body + shallow divs: the tree
+	 * construction algorithm inserts an implied HEAD even though the source
+	 * has none, which is why this is 3 and not 2. (Written as 2 first; the
+	 * canary caught it on its first run in the OS, which is the only reason
+	 * to have a canary.) */
+	if (mdb_st_nest(shallow, &maxd, &el, &tx) != 0) {
+		fail++;
+		if (report) report("[DEEPDOM]   FAIL shallow parse errored");
+		g_mdb_st_cases += 2;
+	} else {
+		MDB_CHK("shallow maxdepth", maxd, 1 + shallow);
+		MDB_CHK("shallow elements", el, 3 + shallow);
+	}
+
+	/* 3 + 4: over the cap the tree is clamped, and the text survives. The
+	 * open-element stack holds html at index 0 and body at 1, so the last
+	 * div the parser accepts leaves current_node at cap-1, which is a DOM
+	 * depth of cap-1. Pinning the exact value is the point: an off-by-one
+	 * here is the difference between a cap and a truncation. */
+	if (mdb_st_nest(deep, &maxd, &el, &tx) != 0) {
+		fail++;
+		if (report) report("[DEEPDOM]   FAIL deep parse errored");
+		g_mdb_st_cases += 2;
+	} else {
+		MDB_CHK("deep maxdepth clamped", maxd, cap - 1);
+		MDB_CHK("deep text nodes kept", tx, 1);
+		/* And the clamp is a CLAMP, not a truncation of the element
+		 * count: html + head at depths 0 and 1, body at 1, divs at 2
+		 * through cap-1, so cap-2 divs are accepted and the total is
+		 * 2 + 1 + (cap - 2) = cap + 1. Pinning this separately from
+		 * maxdepth is what distinguishes "stopped nesting" from
+		 * "stopped parsing". */
+		MDB_CHK("deep elements accepted", el, cap + 1);
+	}
+#undef MDB_CHK
+	return fail;
+}
+
+int mdb_depth_selftest_cases(void) { return g_mdb_st_cases; }

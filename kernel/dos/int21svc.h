@@ -435,6 +435,12 @@ int dos_svc_allow(dos_svc_ctx_t *ctx, const char *native, int access,
 // PARENT, which is how sys_open() already treats it; checking W_OK on a path
 // with no perms entry would instead hit the root-owned 0755 default and deny
 // every guest create. `leaf_exists` says which of the two questions to ask.
+// #prewrite: the REMOVAL gate for a guest. dos_svc_allow_create() answers "may
+// I write this directory"; this also answers "may I remove THIS name from it",
+// which differs in an all-users (sticky) directory. INT 21h 41h/56h/3Ah use
+// this; everything that only creates keeps using the one below.
+int dos_svc_allow_remove(dos_svc_ctx_t *ctx, const char *native, const char *what);
+
 int dos_svc_allow_create(dos_svc_ctx_t *ctx, const char *native, int leaf_exists,
                          const char *what);
 

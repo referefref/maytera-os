@@ -184,7 +184,16 @@ int contract_live_poll(const ct_contract_t *c) {
     // the verb; argv[1] is the item name for get/set/call.
     char resp[CTLIVE_RESP_MAX];
     contract_capture_begin(resp, sizeof(resp));
+    // #<config-ref>: mark this dispatch LIVE for the duration. The engine answers
+    // every verb identically on both paths except where liveness IS the question:
+    // an action declaring CT_TIME_UNBOUNDED or CT_TF_MODAL is refused on the
+    // spawn path (nobody there, and the caller's sys_waitpid has no timeout) and
+    // allowed here, because contract_invoke_live() has a bounded wait and a
+    // window with a person in front of it. Cleared on every exit from the
+    // dispatch so a later spawn-path call in the same process cannot inherit it.
+    contract_set_serving_live(1);
     contract_run_verb(c, argv[0], nargs - 1, argv + 1);
+    contract_set_serving_live(0);
     contract_capture_end();
 
     // Reply, then remove the request so it is served exactly once.

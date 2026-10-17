@@ -36,6 +36,56 @@ static int g_cfg_activity               = 0;      // Konsole default: OFF
 static int g_cfg_silence                = 0;      // Konsole default: OFF
 static int g_cfg_silence_ms             = 10000;  // Konsole default: 10s
 
+// ---------------------------------------------------------------------------
+// ONE list of the nine keys, and it is now the ONLY list.
+//
+// There used to be THREE hand-maintained copies of it: the `snprintf` format in
+// cfg_defaults_text(), the `else if (str_eq(k, ...))` chain in cfg_apply_line(),
+// and (since the contract rows landed) a third would have been the contract's
+// own value rows. Three lists of the same nine keys is how a key comes to be
+// written but never read, which is the fault the whole contract-coverage effort
+// is about. Writer, reader and contract row all walk this table now, so a key
+// added here is seeded, parsed, clamped, persisted and CONTRACT-VISIBLE in one
+// edit, and a key that is not here cannot be any of those things.
+//
+// lo/hi ARE the clamps the parser used to apply inline, moved to where the key
+// is declared: "finish_ms (n < 0) ? 0 : n" is lo = 0, "visual_bell_ms
+// (n > 5000 ? 5000 : n)" is hi = 5000, "silence_ms (n < 1000) ? 1000 : n" is
+// lo = 1000. The two millisecond keys that had no upper clamp gain one
+// (600000, ten minutes), because a config file is INPUT and an unbounded
+// millisecond count out of one is not a value any of these three rules can use.
+// ---------------------------------------------------------------------------
+typedef struct {
+    const char *key;      // the key as it appears in TERMNOTI.CFG
+    int        *var;       // the live variable it backs
+    int         lo, hi;    // the clamp the parser applies
+} tn_cfg_t;
+
+static const tn_cfg_t TN_CFG[] = {
+    { "enable",                 &g_cfg_enable,                 0, 1 },
+    { "finish_ms",              &g_cfg_finish_ms,              0, 600000 },
+    { "finish_unattended_only", &g_cfg_finish_unattended_only, 0, 1 },
+    { "bell_notify",            &g_cfg_bell_notify,             0, 1 },
+    { "visual_bell",            &g_cfg_visual_bell,             0, 1 },
+    { "visual_bell_ms",         &g_cfg_visual_bell_ms,          0, 5000 },
+    { "activity",               &g_cfg_activity,                0, 1 },
+    { "silence",                &g_cfg_silence,                 0, 1 },
+    { "silence_ms",             &g_cfg_silence_ms,              1000, 600000 },
+};
+#define TN_CFG_N ((int)(sizeof(TN_CFG) / sizeof(TN_CFG[0])))
+_Static_assert(TN_CFG_N == TERM_NCFG_COUNT,
+               "TN_CFG[] and the TERM_NCFG_* indices term_notify.h publishes to "
+               "the contract must describe the same nine keys; a row added to "
+               "one and not the other is a contract item addressing the wrong "
+               "variable.");
+
+static void tn_cfg_store(int i, int v) {
+    if (i < 0 || i >= TN_CFG_N) return;
+    if (v < TN_CFG[i].lo) v = TN_CFG[i].lo;
+    if (v > TN_CFG[i].hi) v = TN_CFG[i].hi;
+    *TN_CFG[i].var = v;
+}
+
 #define BELL_TOAST_MIN_GAP_MS  5000   // a program in a bell loop must not become a toast loop
 
 typedef struct {
@@ -117,27 +167,24 @@ static int tab_attended(int tab) {
 // ---------------------------------------------------------------------------
 // Config file
 // ---------------------------------------------------------------------------
+// The file's whole text, derived from TN_CFG[] rather than from a format string
+// that lists the nine keys a second time. `o` advances by what LANDED, never by
+// snprintf's return value, which is the length it WOULD have written and can
+// therefore point past the buffer.
 static void cfg_defaults_text(char *buf, int cap) {
-    snprintf(buf, cap,
-             "enable=%d\nfinish_ms=%d\nfinish_unattended_only=%d\n"
-             "bell_notify=%d\nvisual_bell=%d\nvisual_bell_ms=%d\n"
-             "activity=%d\nsilence=%d\nsilence_ms=%d\n",
-             g_cfg_enable, g_cfg_finish_ms, g_cfg_finish_unattended_only,
-             g_cfg_bell_notify, g_cfg_visual_bell, g_cfg_visual_bell_ms,
-             g_cfg_activity, g_cfg_silence, g_cfg_silence_ms);
+    int o = 0;
+    buf[0] = 0;
+    for (int i = 0; i < TN_CFG_N && o < cap - 1; i++) {
+        snprintf(buf + o, (size_t)(cap - o), "%s=%d\n", TN_CFG[i].key, *TN_CFG[i].var);
+        while (buf[o]) o++;
+    }
 }
 
 static void cfg_apply_line(const char *k, const char *v) {
-    int n = atoi(v);
-    if      (str_eq(k, "enable"))                 g_cfg_enable = n ? 1 : 0;
-    else if (str_eq(k, "finish_ms"))              g_cfg_finish_ms = (n < 0) ? 0 : n;
-    else if (str_eq(k, "finish_unattended_only")) g_cfg_finish_unattended_only = n ? 1 : 0;
-    else if (str_eq(k, "bell_notify"))            g_cfg_bell_notify = n ? 1 : 0;
-    else if (str_eq(k, "visual_bell"))            g_cfg_visual_bell = n ? 1 : 0;
-    else if (str_eq(k, "visual_bell_ms"))         g_cfg_visual_bell_ms = (n < 0) ? 0 : (n > 5000 ? 5000 : n);
-    else if (str_eq(k, "activity"))               g_cfg_activity = n ? 1 : 0;
-    else if (str_eq(k, "silence"))                g_cfg_silence = n ? 1 : 0;
-    else if (str_eq(k, "silence_ms"))             g_cfg_silence_ms = (n < 1000) ? 1000 : n;
+    for (int i = 0; i < TN_CFG_N; i++)
+        if (str_eq(k, TN_CFG[i].key)) { tn_cfg_store(i, atoi(v)); return; }
+    // Any other key is ignored on purpose, so a file written by a later build
+    // still loads here instead of failing.
 }
 
 // Push the file's values onto every tab's monitor switches.
@@ -240,6 +287,60 @@ void term_notify_init(void) {
     g_win_state = win_get_state(window_handle);
     g_win_poll_ms = uptime_ms();
 }
+
+// ---------------------------------------------------------------------------
+// The nine keys, as a PROGRAMMATIC surface (task 3 of
+// docs/CONTRACT_COVERAGE_PLAN.md).
+//
+// These were real, persisted, READ settings with NO control anywhere: no GUI
+// widget, no contract row, nothing but a hand-edit of TERMNOTI.CFG and a 2s
+// poll. Every one of them has a verified reader in this file (enable: tn_toast
+// and the finish rule; finish_ms: the duration test; finish_unattended_only:
+// the attended test; bell_notify and visual_bell/_ms: term_notify_bell();
+// activity: term_notify_output(); silence/_ms: term_notify_tick()), which is
+// why declaring them is honest rather than the #235 fault - a row that implies
+// a setting works when nothing reads it is exactly what got 27 manifests
+// deleted.
+//
+// term_notify_cfg_load() exists because term_notify_init() CANNOT run in a
+// windowless contract process (it primes its state cache off window_handle),
+// and a contract that answered from the compiled defaults while a user's file
+// said otherwise would be reporting a number nobody is using.
+// ---------------------------------------------------------------------------
+int term_notify_cfg_get(int key) {
+    if (key < 0 || key >= TN_CFG_N) return 0;
+    return *TN_CFG[key].var;
+}
+
+int term_notify_cfg_set(int key, int v) {
+    if (key < 0 || key >= TN_CFG_N) return -1;
+    if (v < TN_CFG[key].lo || v > TN_CFG[key].hi) return -1;
+    tn_cfg_store(key, v);
+    // THE FILE IS THE DEFAULT AND THE PER-TAB SWITCH IS THE OVERRIDE, and a
+    // change to the file is re-applied to every open tab (see cfg_apply_to_tabs
+    // and its note about the measured dead knob: `activity=1` did nothing for
+    // exactly as long as nothing pushed it onto the per-tab switches).
+    cfg_apply_to_tabs();
+    return 0;
+}
+
+int term_notify_cfg_save(void) {
+    char buf[512];
+    cfg_defaults_text(buf, sizeof(buf));
+    int fd = userconf_open_write("TERMNOTI.CFG");
+    // Checked, not discarded (#743): a preference that silently fails to save
+    // is still a bug, and it is the one users report as "it didn't save".
+    if (userconf_finish_write(fd, buf, strlen(buf)) != 0) return -1;
+    // Refresh the poll baseline to OUR OWN write, so cfg_poll() does not
+    // immediately "reload" the value we just applied.
+    unsigned int h = 0;
+    for (int i = 0; buf[i]; i++) h = h * 131 + (unsigned char)buf[i];
+    g_cfg_hash = h;
+    g_cfg_have_baseline = 1;
+    return 0;
+}
+
+void term_notify_cfg_load(void) { cfg_poll(1); }
 
 // ---------------------------------------------------------------------------
 // Toast helpers. EVERY toast in this file goes through here, so there is one

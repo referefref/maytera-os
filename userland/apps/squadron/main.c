@@ -100,6 +100,7 @@
 #include "../../libc/gui.h"
 #include "stdlib.h"    /* O_RDONLY, malloc/free, exit */
 #include "../../libc/pthread.h"   /* #it20: the audio worker thread */
+#include "../../libc/userconf.h"   /* #peruser2: a log the session user can write */
 
 typedef signed char GLbyte;
 #include "../../libgl/src/font8x8_basic.h"
@@ -2277,7 +2278,28 @@ static void draw_background(void) {
  * once a second, capped at FPS_MAX_SAMPLES so it can never grow unbounded,
  * flushed after every sample so a mid-run screendump/mount always sees the
  * latest number. g_perf_fps also drives the live FPS readout in the sidebar. */
-#define FPS_LOG_PATH    "/SQUADRON/FPSLOG.TXT"
+/* #peruser2: THE MEASURED -13 IN THE COMMENT ABOVE IS NOW FIXED, not just
+ * reported. "/SQUADRON" is the game's read-only ASSET directory, root-owned, so
+ * a diagnostic written into it could never work for the uid the game actually
+ * runs as. It goes to <home>/SQUADRON/FPSLOG.TXT: userhome_path("SQUADRON", ...)
+ * keeps the per-game subdirectory, and root's home is "/", so a root session
+ * still writes exactly /SQUADRON/FPSLOG.TXT and the historical path is unchanged
+ * for whoever has been reading it.
+ *
+ * The literal is KEPT for the legacy/root shape and for fps_dead_once()'s
+ * message, which must name the path THIS session used, not a path that is only
+ * correct for root - a diagnostic that lies about where it wrote is the defect
+ * this ticket family exists to stop.                                        */
+#define FPS_LOG_LEGACY  "/SQUADRON/FPSLOG.TXT"
+static const char *fps_log_path(void) {
+    static char p[256];
+    static int resolved = 0;
+    if (!resolved) {
+        if (userhome_path("SQUADRON", "FPSLOG.TXT", p, sizeof(p)) != 0) p[0] = 0;
+        resolved = 1;
+    }
+    return p[0] ? p : FPS_LOG_LEGACY;
+}
 #define FPS_LOG_CAP     3072
 #define FPS_MAX_SAMPLES 90
 static char     g_fps_log[FPS_LOG_CAP];
@@ -2297,7 +2319,12 @@ static void fps_dead_once(int what, long rc) {
     char b[160], n[24]; int i = 0;
     const char *p = "\n[SQPERF] FPS log is DEAD: sys_"; while (*p) b[i++] = *p++;
     p = (what == FPS_DEAD_OPEN) ? "open" : "write"; while (*p) b[i++] = *p++;
-    p = "(\"" FPS_LOG_PATH "\") returned "; while (*p) b[i++] = *p++;
+    /* #peruser2: the RESOLVED path, not a compile-time literal. b[] is 160 and
+     * the fixed text above is ~34 bytes, so clamp the path to 96 to leave room
+     * for the trailing " returned <rc>".                                     */
+    b[i++] = '('; b[i++] = '"';
+    { const char *q = fps_log_path(); for (int k = 0; q[k] && k < 96; k++) b[i++] = q[k]; }
+    p = "\") returned "; while (*p) b[i++] = *p++;
     num_to_str(rc, n); p = n; while (*p) b[i++] = *p++;
     p = ". Nothing is being recorded to that file; the on-screen FPS box and "
         "the SYS_BOOTLOG_WRITE line are the real numbers.\n";
@@ -2345,7 +2372,10 @@ static void fps_append_num(long v) { char b[24]; num_to_str(v, b); fps_append(b)
  * and deleting it would erase the evidence. What is NEW here is that it can
  * no longer fail silently, see fps_dead_once(). */
 static void fps_flush(void) {
-    int fd = sys_open(FPS_LOG_PATH, O_WRONLY | O_CREAT | O_TRUNC);
+    /* #peruser2: userconf_open_write_path() creates the parent (<home>/SQUADRON
+     * does not exist on a fresh home) and reports a refusal through sys_bootlog
+     * as well as through fps_dead_once() below.                              */
+    int fd = userconf_open_write_path(fps_log_path());
     if (fd >= 0) {
         long w = sys_write(fd, g_fps_log, (unsigned long)g_fps_log_len);
         sys_close(fd);
@@ -3106,18 +3136,23 @@ int main(int argc, char *argv[]) {
         if (!g_present || !g_blit) { die_msg("malloc failed for the backbuffers, even at the 1024x768 fallback size"); win_destroy(g_win); return 1; }
     }
     bt("bufs", (long)(unsigned long)g_present, (long)(unsigned long)g_blit);
-#ifdef SQ_BOOTTRACE
-    /* #sqearlyexit: WHERE CAN A RING-3 APP ACTUALLY CREATE A FILE? The #475
-     * FPS log writes to /SQUADRON/FPSLOG.TXT and produces nothing; before
-     * moving it anywhere, measure which destinations work rather than
-     * guessing one. Three opens, three numbers, one line each. */
-    {   int f;
-        f = sys_open("/SQUADRON/FPSLOG.TXT", O_WRONLY | O_CREAT | O_TRUNC); bt("open-sqdir", f, 0); if (f >= 0) { sys_write(f, "probe\n", 6); sys_close(f); }
-        f = sys_open("/SQPROBE.TXT",        O_WRONLY | O_CREAT | O_TRUNC); bt("open-root",  f, 0); if (f >= 0) { sys_write(f, "probe\n", 6); sys_close(f); }
-        f = sys_open("/HOME/SQPROBE.TXT",   O_WRONLY | O_CREAT | O_TRUNC); bt("open-home",  f, 0); if (f >= 0) { sys_write(f, "probe\n", 6); sys_close(f); }
-        f = sys_open("/NOTES/SQPROBE.TXT",  O_WRONLY | O_CREAT | O_TRUNC); bt("open-notes", f, 0); if (f >= 0) { sys_write(f, "probe\n", 6); sys_close(f); }
-    }
-#endif
+    /* #peruserrows: THE SQ_BOOTTRACE FOUR-DESTINATION WRITE PROBE IS GONE. It
+     * asked "where can a Ring-3 app actually create a file?" by opening
+     * /SQUADRON/FPSLOG.TXT, /SQPROBE.TXT, /HOME/SQPROBE.TXT and
+     * /NOTES/SQPROBE.TXT, and its answer (-13 from all four, because the image
+     * carries no /CONFIG/PASSWD so every per-user path resolves to a root-owned
+     * literal) is recorded in the fps_flush() block comment above and still
+     * stands. It is deleted rather than converted for two reasons:
+     *   1. CONVERTING IT WOULD DESTROY IT. Three of the four destinations are
+     *      hardcoded root-owned roots ON PURPOSE: the probe exists to measure the
+     *      refusal, so a per-user accessor would measure nothing.
+     *   2. THE REPO HAS ONE INSTRUMENT FOR THIS QUESTION, and this is not it.
+     *      tools/fs-create-probe/ (fsprobe.c + README.md) measures each rung FOUR
+     *      ways before the open and carries an ABSENT-PARENT NEGATIVE CONTROL,
+     *      which this ladder lacked; a ladder with no rung whose expected answer
+     *      is failure cannot tell "the guard is broken" from "the parent is
+     *      missing", and a report resting on exactly that distinction was
+     *      retracted (commit e30b2471). Use fsprobe. */
     assets_load(); bt("assets", 0, 0);
     stars_init(); bt("stars", 0, 0);
     neb_init(); bt("neb", 0, 0);

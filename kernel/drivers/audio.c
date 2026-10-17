@@ -1773,7 +1773,12 @@ static void uac_mp3test_worker(void *arg) {
         { path[i] = cfg[i]; i++; }
     path[i] = 0;
     kfree(cfg);
-    if (i == 0) { const char *d = "/HOME/SAMPLE.MP3"; for (i = 0; d[i]; i++) path[i] = d[i]; path[i] = 0; }
+    if (i == 0) { // #prewrite: the shared samples moved out of the /HOME root to /MEDIA/MUSIC,
+// so that /HOME can be a home root and a user named `music` does not collide
+// with /HOME/MUSIC. This path is a diagnostic default; it is left pointing at
+// the new location rather than both, because there is nothing here to fall
+// back FROM (a missing sample just means the diagnostic finds no file).
+const char *d = "/MEDIA/MUSIC/SAMPLE.MP3"; for (i = 0; d[i]; i++) path[i] = d[i]; path[i] = 0; }
 
     kprintf_set_dual_output(1);
     kprintf("\n========== #329 MP3 -> USB DAC SELFTEST ==========\n");

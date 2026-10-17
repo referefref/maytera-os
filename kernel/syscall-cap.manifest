@@ -227,6 +227,42 @@ SYS_NET_LAST_ERROR
 SYS_NET_LIST_EXPORTS
 SYS_NET_LIST_SHARES
 SYS_NET_MOUNT
+SYS_NET_CRED_TAG
+# #harendezvous: SYS_SESSION_HOME is [NOCAP], and the reason is that it is
+# already gated by something STRONGER and simpler than a capability grant.
+#
+# It refuses any caller whose euid is not 0 (proc/syscall.c sys_session_home),
+# so the only principals that can call it are ones that can already read
+# /CONFIG/PASSWD directly and work the answer out for themselves. It returns one
+# string, the home directory of the account the login gate admitted, which is not
+# a secret: that account's own processes read it through getpwuid() on every
+# per-user path resolution.
+#
+# AND IT GRANTS NOTHING. The caller still has to pass the ordinary perms_check()
+# on anything it subsequently opens at that path, exactly as before; this syscall
+# moves no boundary, it only answers "which user is logged in" to a principal
+# that is already privileged. A capability class here would be a grant nobody
+# needs to hold in order to do the thing.
+#
+# WHAT WOULD CHANGE THIS LINE: relaxing the euid-0 check. If a non-root caller is
+# ever allowed, this stops being a privileged accessor and becomes a way for any
+# app to learn who is logged in, which is a disclosure worth a class.
+SYS_SESSION_HOME
+# #secretuse: SYS_SECRET_USE is [NOCAP] as a DECIDED position, not a bulk
+# baseline, and the decision is uncomfortable enough to write down.
+#
+# It serves ONLY the calling process's own uid, and the only thing it will ever
+# return is the TOTP code for the CURRENT window, which the user is already
+# looking at on screen. It cannot return a secret and it cannot be asked for
+# another time window (proc/secretuse.h; docs/OPEN_BACKLOG.md A4).
+#
+# What is still true, and is the reason this line is a decision rather than a
+# conclusion: ANY process running as that uid can read the current code without
+# the user being asked. The right control is a secret.use capability class with a
+# consent prompt. It is NOT built here, because a new class that is declared but
+# not issuable (caps.rs cap_is_issuable) would refuse every call and break the
+# app, and wiring the consent path is its own change. Recorded in backlog A3.
+SYS_SECRET_USE
 SYS_NFS_MOUNT
 SYS_NET_PROBE
 SYS_NET_SET_DNS
@@ -379,6 +415,7 @@ SYS_WIN_GET_STATE
 SYS_WIN_INVALIDATE
 SYS_WIN_MOVE
 SYS_WIN_MOVE_BY
+SYS_WIN_SET_OPACITY
 SYS_WIN_SET_ALPHA_CONTENT
 SYS_WIN_SET_NOCHROME
 SYS_WIN_SET_NOCHROME_BG

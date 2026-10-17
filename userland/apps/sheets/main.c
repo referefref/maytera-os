@@ -24,6 +24,7 @@
 #include "../../officelib/officeui/officetk.h"
 #include "../../officelib/include/formats.h"
 #include "../../officelib/include/formula.h"
+#include "../../libc/contract.h"
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
@@ -47,26 +48,139 @@ enum { M_EDIT_UNDO = 20, M_EDIT_REDO, M_EDIT_DELETE,
        M_INS_FUNC = 40, M_INS_SHEET,
        M_VIEW_FXBAR = 50, M_VIEW_GRID };
 
+// Forward declarations: TB_ITEMS/FILE_ITEMS/EDIT_ITEMS/FORMAT_ITEMS/
+// INSERT_ITEMS just below now carry these as their own .afn (task 3 phase 4,
+// otoolbar.h/gui_menu.h), so they must be declared before the tables; bodies
+// are defined later, unchanged from when they were reached only through
+// SHEETS_ITEMS[].
+static int run_file_new(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_file_open(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_file_save(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_file_save_as(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_file_close(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_undo(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_redo(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_clear_cell(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_toggle_bold(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_toggle_italic(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_fmt_number(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_fmt_currency(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_fmt_percent(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_cells_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_autosum(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_insert_function_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_sheet_add(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+static int run_sheet_rename_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap);
+
+static const ct_terms_t k_t_fmt = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_NEEDSLIVE, "sel.bold", 0
+};
+static const ct_terms_t k_t_fmt_kind = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_NEEDSLIVE, "sel.value", 0
+};
+static const ct_terms_t k_t_newdoc = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, 0, "doc.has_path", 0
+};
+static const ct_terms_t k_t_save_to = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_FS, CT_FAIL_IO | CT_FAIL_NOSPACE, "doc.path", 0
+};
+static const ct_terms_t k_t_open_path = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC,
+    CT_FAIL_NOTFOUND | CT_FAIL_IO | CT_FAIL_UNSUPPORTED, "doc.path", 0
+};
+static const ct_terms_t k_t_cell_edit = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_RANGE, "sel.value", 0
+};
+static const ct_terms_t k_t_nav = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, CT_FAIL_RANGE, "sel.ref", 0
+};
+static const ct_terms_t k_t_undo = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_NEEDSLIVE, "undo.count", 0
+};
+static const ct_terms_t k_t_redo = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_NEEDSLIVE, "redo.count", 0
+};
+static const ct_terms_t k_t_autosum = {
+    CT_TIME_INSTANT, CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_NEEDSLIVE, "sel.value", 0
+};
+static const ct_terms_t k_t_sheet_add = {
+    CT_TIME_FAST, 0, 0, CT_SUCC_ITEM, CT_DEPTH_DOC, CT_FAIL_NOSPACE, "doc.sheet_count", 0
+};
+static const ct_terms_t k_t_sheet_switch = {
+    CT_TIME_INSTANT, 0, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, CT_FAIL_RANGE, "doc.current_sheet", 0
+};
+// Dialog-opening actions: MODAL. Refused on the spawn path, allowed against a
+// live instance where a person can answer the dialog.
+static const ct_terms_t k_t_file_dialog = {
+    CT_TIME_SLOW, CT_TF_MODAL | CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_FS,
+    CT_FAIL_IO | CT_FAIL_NOTFOUND, "doc.path", 0
+};
+static const ct_terms_t k_t_file_close = {
+    CT_TIME_FAST, CT_TF_MODAL | CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_VIEW, 0, "doc.has_path", 0
+};
+static const ct_terms_t k_t_modal_dialog = {
+    CT_TIME_SLOW, CT_TF_MODAL | CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_DOC,
+    CT_FAIL_IO | CT_FAIL_UNSUPPORTED, "sel.value", 0
+};
+static const ct_terms_t k_t_sheet_dialog = {
+    CT_TIME_SLOW, CT_TF_MODAL | CT_TF_LIVE_ONLY, 0, CT_SUCC_ITEM, CT_DEPTH_DOC,
+    CT_FAIL_RANGE | CT_FAIL_UNSUPPORTED, "doc.sheet_name", 0
+};
+
 // Calc toolbar (spec 2.2 / 4): SCNEW SCOPEN SCSAVE | WRUNDO WRREDO (borrowed:
 // the SC set has no undo/redo) | SCBOLD SCITALIC | SCFMTNUM SCFMTCUR SCFMTPCT |
 // SCSUM SCFX | SCBRDALL. 384 px at retro metrics, fits 640 without overflow.
+// otb_item_t now carries the contract exposure too (task 3 phase 4): a
+// row's .tok/.afn/.desc/.terms are read by sheets_project() below exactly as
+// .icon/.tooltip are read by otb_draw(), the SAME table on_tool() dispatches
+// from via otb_ctl_dispatch(). tok == 0 means "not exposed" (T_BORDERS,
+// disabled; separators).
 static const otb_item_t TB_ITEMS[] = {
-    { OTB_BUTTON, T_NEW,     "SCNEW",    "New (Ctrl+N)",       0, 0 },
-    { OTB_BUTTON, T_OPEN,    "SCOPEN",   "Open (Ctrl+O)",      0, 0 },
-    { OTB_BUTTON, T_SAVE,    "SCSAVE",   "Save (Ctrl+S)",      0, 0 },
+    { OTB_BUTTON, T_NEW,     "SCNEW",    "New (Ctrl+N)",       0, 0,
+      .tok = "file.new", .afn = run_file_new,
+      .desc = "Discard the current workbook (after an unsaved-changes prompt if dirty) and start a new blank one",
+      .terms = &k_t_newdoc },
+    { OTB_BUTTON, T_OPEN,    "SCOPEN",   "Open (Ctrl+O)",      0, 0,
+      .tok = "file.open", .afn = run_file_open,
+      .desc = "Raise the interactive Open dialog (.xlsx/.ods/.xls) and load the chosen file",
+      .terms = &k_t_file_dialog },
+    { OTB_BUTTON, T_SAVE,    "SCSAVE",   "Save (Ctrl+S)",      0, 0,
+      .tok = "file.save", .afn = run_file_save,
+      .desc = "Save to the current path, or raise Save As when the workbook has none yet",
+      .terms = &k_t_file_dialog },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
-    { OTB_BUTTON, T_UNDO,    "WRUNDO",   "Undo (Ctrl+Z)",      0, 0 },
-    { OTB_BUTTON, T_REDO,    "WRREDO",   "Redo (Ctrl+Y)",      0, 0 },
+    { OTB_BUTTON, T_UNDO,    "WRUNDO",   "Undo (Ctrl+Z)",      0, 0,
+      .tok = "edit.undo", .afn = run_undo,
+      .desc = "Undo the most recent cell edit or style change (Ctrl+Z)", .terms = &k_t_undo },
+    { OTB_BUTTON, T_REDO,    "WRREDO",   "Redo (Ctrl+Y)",      0, 0,
+      .tok = "edit.redo", .afn = run_redo,
+      .desc = "Redo the most recently undone change (Ctrl+Y)", .terms = &k_t_redo },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
-    { OTB_TOGGLE, T_BOLD,    "SCBOLD",   "Bold (Ctrl+B)",      0, 0 },
-    { OTB_TOGGLE, T_ITALIC,  "SCITALIC", "Italic (Ctrl+I)",    0, 0 },
+    { OTB_TOGGLE, T_BOLD,    "SCBOLD",   "Bold (Ctrl+B)",      0, 0,
+      .tok = "format.toggle_bold", .afn = run_toggle_bold,
+      .desc = "Toggle bold on the selected cell's style (Ctrl+B)", .terms = &k_t_fmt },
+    { OTB_TOGGLE, T_ITALIC,  "SCITALIC", "Italic (Ctrl+I)",    0, 0,
+      .tok = "format.toggle_italic", .afn = run_toggle_italic,
+      .desc = "Toggle italic on the selected cell's style (Ctrl+I)", .terms = &k_t_fmt },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
-    { OTB_TOGGLE, T_FMTNUM,  "SCFMTNUM", "Number Format",      0, 1 },
-    { OTB_TOGGLE, T_FMTCUR,  "SCFMTCUR", "Currency",           0, 1 },
-    { OTB_TOGGLE, T_FMTPCT,  "SCFMTPCT", "Percent",            0, 1 },
+    { OTB_TOGGLE, T_FMTNUM,  "SCFMTNUM", "Number Format",      0, 1,
+      .tok = "format.set_number", .afn = run_fmt_number,
+      .desc = "Apply the Number format to the selected cell", .terms = &k_t_fmt_kind },
+    { OTB_TOGGLE, T_FMTCUR,  "SCFMTCUR", "Currency",           0, 1,
+      .tok = "format.set_currency", .afn = run_fmt_currency,
+      .desc = "Apply the Currency format to the selected cell", .terms = &k_t_fmt_kind },
+    { OTB_TOGGLE, T_FMTPCT,  "SCFMTPCT", "Percent",            0, 1,
+      .tok = "format.set_percent", .afn = run_fmt_percent,
+      .desc = "Apply the Percent format to the selected cell", .terms = &k_t_fmt_kind },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
-    { OTB_BUTTON, T_SUM,     "SCSUM",    "AutoSum",            0, 0 },
-    { OTB_BUTTON, T_FX,      "SCFX",     "Insert Function...", 0, 0 },
+    { OTB_BUTTON, T_SUM,     "SCSUM",    "AutoSum",            0, 0,
+      .tok = "function.autosum", .afn = run_autosum,
+      .desc = "Write a =SUM() over the numeric run above or left of the selected cell, or start editing =SUM( if neither exists",
+      .terms = &k_t_autosum },
+    { OTB_BUTTON, T_FX,      "SCFX",     "Insert Function...", 0, 0,
+      .tok = "function.insert_dialog", .afn = run_insert_function_dialog,
+      .desc = "Raise the Insert Function picker and insert the chosen function's skeleton at the edit caret",
+      .terms = &k_t_modal_dialog },
     { OTB_SEPARATOR, 0, 0, 0, 0, 0 },
     // DISABLED: wb_style (sheetmodel.h) carries numfmt_code/bold/italic/color
     // and no border field, and neither xlsx_save nor ods_save writes borders.
@@ -75,36 +189,70 @@ static const otb_item_t TB_ITEMS[] = {
 };
 #define N_TB_ITEMS ((int)(sizeof(TB_ITEMS) / sizeof(TB_ITEMS[0])))
 
+// New/Open/Save are tok == 0: TB_ITEMS above already carries file.new/open/
+// save, and office_app's shell intercepts OAPP_MID_FILE_NEW/OPEN/SAVE/
+// SAVE_AS/CLOSE into OAPP_EVENT_FILE_* before on_menu() ever runs (see
+// on_event()'s own cases), so these five never reach menu_ctl_dispatch() on
+// the live path either way - afn is left unset rather than wired to dead code.
 static const gui_menu_item_t FILE_ITEMS[] = {
     { "New",        "Ctrl+N", OAPP_MID_FILE_NEW,     true, false },
     { "Open...",    "Ctrl+O", OAPP_MID_FILE_OPEN,    true, false },
     { "Save",       "Ctrl+S", OAPP_MID_FILE_SAVE,    true, false },
-    { "Save As...", 0,        OAPP_MID_FILE_SAVE_AS, true, false },
+    { "Save As...", 0,        OAPP_MID_FILE_SAVE_AS, true, false,
+      .tok = "file.save_as", .afn = run_file_save_as,
+      .desc = "Raise the Save As dialog regardless of whether the workbook already has a path",
+      .terms = &k_t_file_dialog },
     { 0, 0, 0, false, false },
-    { "Close",      0,        OAPP_MID_FILE_CLOSE,   true, false },
+    { "Close",      0,        OAPP_MID_FILE_CLOSE,   true, false,
+      .tok = "file.close", .afn = run_file_close,
+      .desc = "Close the workbook (after an unsaved-changes prompt if dirty) back to a new blank one",
+      .terms = &k_t_file_close },
 };
-// Non-const: Undo/Redo enable state follows the undo stacks.
+// Non-const: Undo/Redo enable state follows the undo stacks. Undo/Redo are
+// tok == 0 (TB_ITEMS owns edit.undo/edit.redo) but DO need their own .afn:
+// unlike File's menu, Edit's clicks reach on_menu() live (M_EDIT_UNDO/REDO
+// are not shell-intercepted), so without an afn here, clicking Undo/Redo
+// from THIS menu (as opposed to the toolbar) would silently do nothing.
 static gui_menu_item_t EDIT_ITEMS[] = {
-    { "Undo",   "Ctrl+Z", M_EDIT_UNDO,   false, false },
-    { "Redo",   "Ctrl+Y", M_EDIT_REDO,   false, false },
+    { "Undo",   "Ctrl+Z", M_EDIT_UNDO,   false, false,
+      .afn = run_undo, .terms = &k_t_undo },
+    { "Redo",   "Ctrl+Y", M_EDIT_REDO,   false, false,
+      .afn = run_redo, .terms = &k_t_redo },
     { 0, 0, 0, false, false },
-    { "Delete", "Del",    M_EDIT_DELETE, true,  false },
+    { "Delete", "Del",    M_EDIT_DELETE, true,  false,
+      .tok = "edit.clear_cell", .afn = run_clear_cell,
+      .desc = "Clear the selected cell's content (Delete)", .terms = &k_t_cell_edit },
 };
+// Number/Currency/Percent/Bold/Italic are tok == 0 (TB_ITEMS owns their
+// tokens) but DO carry .afn: M_FMT_* reach on_menu() live, same reasoning as
+// EDIT_ITEMS above. Cells.../Rename Sheet... have no toolbar equivalent, so
+// they carry their own tokens.
 static const gui_menu_item_t FORMAT_ITEMS[] = {
-    { "Cells...",        0,        M_FMT_CELLS,  true, false },
+    { "Cells...",        0,        M_FMT_CELLS,  true, false,
+      .tok = "format.cells_dialog", .afn = run_cells_dialog,
+      .desc = "Raise the Format Cells dialog (category, decimals, thousands, colour, bold, italic) for the selected cell",
+      .terms = &k_t_modal_dialog },
     { 0, 0, 0, false, false },
-    { "Number",          0,        M_FMT_NUM,    true, false },
-    { "Currency",        0,        M_FMT_CUR,    true, false },
-    { "Percent",         0,        M_FMT_PCT,    true, false },
+    { "Number",          0,        M_FMT_NUM,    true, false, .afn = run_fmt_number,   .terms = &k_t_fmt_kind },
+    { "Currency",        0,        M_FMT_CUR,    true, false, .afn = run_fmt_currency, .terms = &k_t_fmt_kind },
+    { "Percent",         0,        M_FMT_PCT,    true, false, .afn = run_fmt_percent,  .terms = &k_t_fmt_kind },
     { 0, 0, 0, false, false },
-    { "Bold",            "Ctrl+B", M_FMT_BOLD,   true, false },
-    { "Italic",          "Ctrl+I", M_FMT_ITALIC, true, false },
+    { "Bold",            "Ctrl+B", M_FMT_BOLD,   true, false, .afn = run_toggle_bold,   .terms = &k_t_fmt },
+    { "Italic",          "Ctrl+I", M_FMT_ITALIC, true, false, .afn = run_toggle_italic, .terms = &k_t_fmt },
     { 0, 0, 0, false, false },
-    { "Rename Sheet...", 0,        M_FMT_RENAME, true, false },
+    { "Rename Sheet...", 0,        M_FMT_RENAME, true, false,
+      .tok = "sheet.rename_dialog", .afn = run_sheet_rename_dialog,
+      .desc = "Raise the Rename Sheet dialog for the tab at argv[0] (an index, default the active tab)",
+      .terms = &k_t_sheet_dialog },
 };
+// Function... is tok == 0 (TB_ITEMS' T_FX owns function.insert_dialog) but
+// carries .afn for the same M_INS_FUNC-reaches-on_menu()-live reason. Sheet
+// has no toolbar equivalent.
 static const gui_menu_item_t INSERT_ITEMS[] = {
-    { "Function...", 0, M_INS_FUNC,  true, false },
-    { "Sheet",       0, M_INS_SHEET, true, false },
+    { "Function...", 0, M_INS_FUNC,  true, false, .afn = run_insert_function_dialog, .terms = &k_t_modal_dialog },
+    { "Sheet",       0, M_INS_SHEET, true, false,
+      .tok = "sheet.add", .afn = run_sheet_add,
+      .desc = "Add a new sheet tab named SheetN and switch to it", .terms = &k_t_sheet_add },
 };
 // Non-const: the check marks track the live view state.
 static gui_menu_item_t VIEW_ITEMS[] = {
@@ -1184,57 +1332,48 @@ static void handle_key(uint32_t kc, char c) {
     }
 }
 
+// Forward-declared: the contract's setters for view.formula_bar and
+// view.gridlines (defined with the rest of the contract, below on_event()),
+// reused here so the View menu and the contract rows cannot disagree.
+static int ct_set_show_fx(int v);
+static int ct_set_gridlines(int v);
+
+// Every toolbar id is table-driven now: run_file_open()/run_toggle_bold()/
+// etc. are the IDENTICAL functions TB_ITEMS[]'s rows carry as .afn, verified
+// against the pre-conversion switch body one case at a time (run_file_open's
+// confirm_discard()+oapp_open_dialog()+load_workbook() is exactly T_OPEN's
+// old inline body; toggle_bold()/toggle_italic() compute !current_state,
+// which equals the toolbar's old "set to the widget's new checked value"
+// because the toolbar's checked state is kept synced to the actual cell
+// style on every selection change (otb_set_checked() near line 421) -
+// one function now serves the toolbar, the Format menu AND the Ctrl+B/I
+// shortcut instead of three separately-maintained copies of "flip bold").
+// T_BORDERS carries no afn (see TB_ITEMS) so dispatch is a correct no-op.
 static int on_tool(int id, int value) {
     if (id != T_FX) settle_fx_edit();
-    switch (id) {
-        case T_NEW:    if (confirm_discard()) new_workbook(); break;
-        case T_OPEN: {
-            if (!confirm_discard()) break;
-            const char *path = oapp_open_dialog(g_app, ".xlsx.ods.xls");
-            if (path) load_workbook(path);
-            break;
-        }
-        case T_SAVE:   do_save(0); break;
-        case T_UNDO:   do_undo(); break;
-        case T_REDO:   do_redo(); break;
-        case T_BOLD:   { int v = value ? 1 : 0; apply_style(mut_bold, &v); break; }
-        case T_ITALIC: { int v = value ? 1 : 0; apply_style(mut_italic, &v); break; }
-        case T_FMTNUM: apply_format_kind(NF_NUMBER); break;
-        case T_FMTCUR: apply_format_kind(NF_CURRENCY); break;
-        case T_FMTPCT: apply_format_kind(NF_PERCENT); break;
-        case T_SUM:    autosum(); break;
-        case T_FX:     insert_function_modal(); break;
-        default: break;   // T_BORDERS is disabled (see TB_ITEMS)
-    }
+    char scratch[80];
+    otb_ctl_dispatch(TB_ITEMS, N_TB_ITEMS, id, value, scratch, sizeof(scratch), 0);
     return 1;
 }
 
+// M_VIEW_FXBAR/M_VIEW_GRID stay special-cased: they toggle VALUE rows
+// (view.formula_bar/view.gridlines), not separate action tokens, same as
+// writer's M_VIEW_RULER. Every other menu item is table-driven.
 static int on_menu(int id) {
     if (id != M_INS_FUNC) settle_fx_edit();
-    switch (id) {
-        case M_EDIT_UNDO:   do_undo(); break;
-        case M_EDIT_REDO:   do_redo(); break;
-        case M_EDIT_DELETE: clear_selected_cell(); break;
-        case M_FMT_CELLS:   format_cells_modal(); break;
-        case M_FMT_NUM:     apply_format_kind(NF_NUMBER); break;
-        case M_FMT_CUR:     apply_format_kind(NF_CURRENCY); break;
-        case M_FMT_PCT:     apply_format_kind(NF_PERCENT); break;
-        case M_FMT_BOLD:    toggle_bold(); break;
-        case M_FMT_ITALIC:  toggle_italic(); break;
-        case M_FMT_RENAME:  rename_sheet_modal(g_cur_sheet); break;
-        case M_INS_FUNC:    insert_function_modal(); break;
-        case M_INS_SHEET:   add_sheet(); break;
-        case M_VIEW_FXBAR:
-            g_show_fx = !g_show_fx; VIEW_ITEMS[0].checked = g_show_fx ? true : false;
-            ofxbar_blur(&g_fx);
-            oapp_set_chrome(g_app, g_show_fx ? ofxbar_height() : 0, OTAB_H);
-            relayout();
-            break;
-        case M_VIEW_GRID:
-            g_gridlines = !g_gridlines; VIEW_ITEMS[1].checked = g_gridlines ? true : false;
-            break;
-        default: break;
+    if (id == M_VIEW_FXBAR) {
+        ct_set_show_fx(!g_show_fx);   // the same setter view.formula_bar's contract row calls
+        return 1;
     }
+    if (id == M_VIEW_GRID) {
+        ct_set_gridlines(!g_gridlines);   // the same setter view.gridlines's contract row calls
+        return 1;
+    }
+    char scratch[80];
+    if (menu_ctl_dispatch(FILE_ITEMS, (int)(sizeof(FILE_ITEMS)/sizeof(FILE_ITEMS[0])), id, scratch, sizeof(scratch), 0)) return 1;
+    if (menu_ctl_dispatch(EDIT_ITEMS, (int)(sizeof(EDIT_ITEMS)/sizeof(EDIT_ITEMS[0])), id, scratch, sizeof(scratch), 0)) return 1;
+    if (menu_ctl_dispatch(FORMAT_ITEMS, (int)(sizeof(FORMAT_ITEMS)/sizeof(FORMAT_ITEMS[0])), id, scratch, sizeof(scratch), 0)) return 1;
+    if (menu_ctl_dispatch(INSERT_ITEMS, (int)(sizeof(INSERT_ITEMS)/sizeof(INSERT_ITEMS[0])), id, scratch, sizeof(scratch), 0)) return 1;
     return 1;
 }
 
@@ -1323,8 +1462,558 @@ static int on_event(office_app *a, int type, int p1, int p2) {
     }
 }
 
+// ===========================================================================
+// THE CONTRACT (docs/CONTRACT_COVERAGE_PLAN.md task 3 phase 4). See
+// writer/main.c's own contract block for the full argument; the summary:
+//
+// PROJECTED, not static, for every action with a toolbar or menu control:
+// otb_item_t/gui_menu_item_t now carry tok/afn/desc/terms, so TB_ITEMS[],
+// FILE_ITEMS[], EDIT_ITEMS[], FORMAT_ITEMS[] and INSERT_ITEMS[] above are
+// the SAME control tables sheets_project() (below) reads - the exact tables
+// on_tool()/on_menu() dispatch from via otb_ctl_dispatch()/menu_ctl_dispatch().
+// Eighteen rows moved from a hand-written SHEETS_ITEMS[] entry into this
+// projection (file.new/open/save/save_as/close, edit.undo/redo/clear_cell,
+// format.toggle_bold/italic, format.set_number/currency/percent,
+// format.cells_dialog, function.autosum/insert_dialog, sheet.add/
+// rename_dialog), each still calling the IDENTICAL run_*() function it
+// always did.
+//
+// FIVE ROWS REMAIN STATIC in SHEETS_ITEMS below: file.save_to, file.open_path,
+// edit.set_cell, nav.select_cell (no toolbar/menu control exists for any of
+// them - they use the exact model functions save_workbook/load_workbook/
+// commit_text/select_cell the interactive paths call) and sheet.switch (the
+// sheet tab strip is a otabs_t widget, clicked by position, not a
+// tok-carrying table). Sheets' 17 value rows also stay static, same as every
+// other contracted app.
+//
+// main() checks contract_is_invocation() right after oapp_create() (see
+// writer/main.c's note on why check 8 does not see this ordering, and why it
+// is still safe: the process returns before oapp_run() is ever entered).
+// Dialog-raising actions (file.open/save/save_as/close, format.cells_dialog,
+// function.insert_dialog, sheet.rename_dialog) declare CT_TF_MODAL and are
+// refused on this spawn path, allowed against a live instance.
+//
+// NOT COVERED: mouse click-to-select-cell, arrow-key navigation, in-cell
+// typing, and column/row scroll drag - gestures rather than discrete
+// controls. nav.select_cell and edit.set_cell are the primitives that reach
+// the same end state without them.
+// ===========================================================================
+
+static void fmt_sel_ref(char *buf, int cap) { rc_to_a1(g_sel_row, g_sel_col, buf, (unsigned long)cap); }
+
+
+// ---- the handler wrappers: each calls the EXACT function the menu/toolbar
+// switch calls. ---------------------------------------------------------
+static int run_file_new(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (confirm_discard()) new_workbook();
+    snprintf(out, (size_t)ocap, "has_path=%d", g_has_path);
+    return 0;
+}
+static int run_file_open(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (confirm_discard()) {
+        const char *path = oapp_open_dialog(g_app, ".xlsx.ods.xls");
+        if (path) load_workbook(path);
+    }
+    snprintf(out, (size_t)ocap, "path=%s", g_has_path ? g_path : "(none)");
+    return 0;
+}
+static int run_file_save(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    int ok = do_save(0);
+    snprintf(out, (size_t)ocap, "path=%s", g_has_path ? g_path : "(none)");
+    return ok ? 0 : -1;
+}
+static int run_file_save_as(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    int ok = do_save(1);
+    snprintf(out, (size_t)ocap, "path=%s", g_has_path ? g_path : "(none)");
+    return ok ? 0 : -1;
+}
+static int run_file_close(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (confirm_discard()) new_workbook();
+    snprintf(out, (size_t)ocap, "has_path=%d", g_has_path);
+    return 0;
+}
+static int run_file_save_to(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0] || !argv[0][0]) { snprintf(out, (size_t)ocap, "need-path"); return -1; }
+    int ok = save_workbook(argv[0]);
+    if (ok) { strncpy(g_path, argv[0], sizeof(g_path) - 1); g_path[sizeof(g_path) - 1] = 0; g_has_path = 1; g_readonly = 0; oapp_set_dirty(g_app, 0); }
+    snprintf(out, (size_t)ocap, "path=%s", g_has_path ? g_path : "(none)");
+    return ok ? 0 : -1;
+}
+static int run_file_open_path(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0] || !argv[0][0]) { snprintf(out, (size_t)ocap, "need-path"); return -1; }
+    if (!confirm_discard()) { snprintf(out, (size_t)ocap, "discard-declined"); return -1; }
+    load_workbook(argv[0]);
+    snprintf(out, (size_t)ocap, "path=%s has_path=%d", g_path, g_has_path);
+    return g_has_path ? 0 : -1;
+}
+static int run_undo(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    do_undo();
+    snprintf(out, (size_t)ocap, "undo_count=%d redo_count=%d", g_undo_n, g_redo_n);
+    return 0;
+}
+static int run_redo(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    do_redo();
+    snprintf(out, (size_t)ocap, "undo_count=%d redo_count=%d", g_undo_n, g_redo_n);
+    return 0;
+}
+static int run_clear_cell(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!cur_sheet()) { snprintf(out, (size_t)ocap, "no-sheet"); return -1; }
+    clear_selected_cell();
+    snprintf(out, (size_t)ocap, "ref=%s", "");
+    char ref[16]; fmt_sel_ref(ref, sizeof(ref));
+    snprintf(out, (size_t)ocap, "ref=%s", ref);
+    return 0;
+}
+// A caller-named cell write with no click: parses the A1 ref, selects it (the
+// SAME select_cell() a click runs), then commits text through the SAME
+// commit_text() Enter/Tab commits through.
+static int run_set_cell(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (!cur_sheet()) { snprintf(out, (size_t)ocap, "no-sheet"); return -1; }
+    if (argc < 2 || !argv[0] || !argv[1]) { snprintf(out, (size_t)ocap, "need-ref-and-value"); return -1; }
+    int row, col;
+    if (a1_to_rc(argv[0], &row, &col) != 0) { snprintf(out, (size_t)ocap, "bad-ref %s", argv[0]); return -1; }
+    select_cell(row, col);
+    commit_text(argv[1]);
+    char ref[16]; fmt_sel_ref(ref, sizeof(ref));
+    char src[512]; cell_source_text(peek_cell(cur_sheet(), g_sel_row, g_sel_col), src, sizeof(src));
+    snprintf(out, (size_t)ocap, "ref=%s value=%s", ref, src);
+    return 0;
+}
+static int run_select_cell(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0]) { snprintf(out, (size_t)ocap, "need-ref"); return -1; }
+    int row, col;
+    if (a1_to_rc(argv[0], &row, &col) != 0) { snprintf(out, (size_t)ocap, "bad-ref %s", argv[0]); return -1; }
+    select_cell(row, col);
+    char ref[16]; fmt_sel_ref(ref, sizeof(ref));
+    snprintf(out, (size_t)ocap, "ref=%s", ref);
+    return 0;
+}
+static int run_toggle_bold(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!cur_sheet()) { snprintf(out, (size_t)ocap, "no-sheet"); return -1; }
+    toggle_bold();
+    const wb_style *cs = cell_style(peek_cell(cur_sheet(), g_sel_row, g_sel_col));
+    snprintf(out, (size_t)ocap, "bold=%d", cs ? cs->bold : 0);
+    return 0;
+}
+static int run_toggle_italic(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!cur_sheet()) { snprintf(out, (size_t)ocap, "no-sheet"); return -1; }
+    toggle_italic();
+    const wb_style *cs = cell_style(peek_cell(cur_sheet(), g_sel_row, g_sel_col));
+    snprintf(out, (size_t)ocap, "italic=%d", cs ? cs->italic : 0);
+    return 0;
+}
+static int run_fmt_number(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!cur_sheet()) { snprintf(out, (size_t)ocap, "no-sheet"); return -1; }
+    apply_format_kind(NF_NUMBER);
+    snprintf(out, (size_t)ocap, "format=number");
+    return 0;
+}
+static int run_fmt_currency(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!cur_sheet()) { snprintf(out, (size_t)ocap, "no-sheet"); return -1; }
+    apply_format_kind(NF_CURRENCY);
+    snprintf(out, (size_t)ocap, "format=currency");
+    return 0;
+}
+static int run_fmt_percent(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!cur_sheet()) { snprintf(out, (size_t)ocap, "no-sheet"); return -1; }
+    apply_format_kind(NF_PERCENT);
+    snprintf(out, (size_t)ocap, "format=percent");
+    return 0;
+}
+static int run_cells_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!cur_sheet()) { snprintf(out, (size_t)ocap, "no-sheet"); return -1; }
+    format_cells_modal();
+    char src[512]; cell_source_text(peek_cell(cur_sheet(), g_sel_row, g_sel_col), src, sizeof(src));
+    snprintf(out, (size_t)ocap, "value=%s", src);
+    return 0;
+}
+static int run_autosum(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!cur_sheet()) { snprintf(out, (size_t)ocap, "no-sheet"); return -1; }
+    autosum();
+    char src[512]; cell_source_text(peek_cell(cur_sheet(), g_sel_row, g_sel_col), src, sizeof(src));
+    snprintf(out, (size_t)ocap, "value=%s", src);
+    return 0;
+}
+static int run_insert_function_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    insert_function_modal();
+    snprintf(out, (size_t)ocap, "editing=%d", g_editing);
+    return 0;
+}
+static int run_sheet_add(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    if (!g_wb) { snprintf(out, (size_t)ocap, "no-workbook"); return -1; }
+    int before = g_wb->nsheet;
+    add_sheet();
+    snprintf(out, (size_t)ocap, "sheet_count=%d current_sheet=%d", g_wb->nsheet, g_cur_sheet);
+    return g_wb->nsheet > before ? 0 : -1;
+}
+static int run_sheet_switch(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (argc < 1 || !argv[0] || !g_wb) { snprintf(out, (size_t)ocap, "need-index"); return -1; }
+    int idx = atoi(argv[0]);
+    if (idx < 0 || idx >= g_wb->nsheet) { snprintf(out, (size_t)ocap, "out-of-range 0..%d", g_wb->nsheet - 1); return -1; }
+    switch_sheet(idx);
+    snprintf(out, (size_t)ocap, "current_sheet=%d", g_cur_sheet);
+    return 0;
+}
+static int run_sheet_rename_dialog(const ct_item_t *it, int argc, char **argv, char *out, int ocap) {
+    (void)it;
+    if (!g_wb) { snprintf(out, (size_t)ocap, "no-workbook"); return -1; }
+    int idx = (argc >= 1 && argv[0]) ? atoi(argv[0]) : g_cur_sheet;
+    if (idx < 0 || idx >= g_wb->nsheet) { snprintf(out, (size_t)ocap, "out-of-range 0..%d", g_wb->nsheet - 1); return -1; }
+    rename_sheet_modal(idx);
+    snprintf(out, (size_t)ocap, "sheet_name=%s", g_wb->sheets[idx].name ? g_wb->sheets[idx].name : "");
+    return 0;
+}
+
+// CT_CHECK_ACTFN: a leading-`it`-parameter mismatch is a warning, not an
+// error (contract.h); these turn it into a build-stopping one.
+CT_CHECK_ACTFN(run_file_new);
+CT_CHECK_ACTFN(run_file_open);
+CT_CHECK_ACTFN(run_file_save);
+CT_CHECK_ACTFN(run_file_save_as);
+CT_CHECK_ACTFN(run_file_close);
+CT_CHECK_ACTFN(run_file_save_to);
+CT_CHECK_ACTFN(run_file_open_path);
+CT_CHECK_ACTFN(run_undo);
+CT_CHECK_ACTFN(run_redo);
+CT_CHECK_ACTFN(run_clear_cell);
+CT_CHECK_ACTFN(run_set_cell);
+CT_CHECK_ACTFN(run_select_cell);
+CT_CHECK_ACTFN(run_toggle_bold);
+CT_CHECK_ACTFN(run_toggle_italic);
+CT_CHECK_ACTFN(run_fmt_number);
+CT_CHECK_ACTFN(run_fmt_currency);
+CT_CHECK_ACTFN(run_fmt_percent);
+CT_CHECK_ACTFN(run_cells_dialog);
+CT_CHECK_ACTFN(run_autosum);
+CT_CHECK_ACTFN(run_insert_function_dialog);
+CT_CHECK_ACTFN(run_sheet_add);
+CT_CHECK_ACTFN(run_sheet_switch);
+CT_CHECK_ACTFN(run_sheet_rename_dialog);
+
+// ---- the readable state a caller checks a control against ------------------
+static int ct_get_has_path(void) { return g_has_path; }
+static int ct_get_readonly(void) { return g_readonly; }
+static int ct_get_dirty(void)    { return g_app ? oapp_is_dirty(g_app) : 0; }
+static int ct_get_sheet_count(void)   { return g_wb ? g_wb->nsheet : 0; }
+static int ct_get_current_sheet(void) { return g_cur_sheet; }
+static int ct_get_sel_row(void)  { return g_sel_row; }
+static int ct_get_sel_col(void)  { return g_sel_col; }
+static int ct_get_sel_bold(void) {
+    sheet *s = cur_sheet(); if (!s) return 0;
+    const wb_style *cs = cell_style(peek_cell(s, g_sel_row, g_sel_col)); return cs ? cs->bold : 0;
+}
+static int ct_get_sel_italic(void) {
+    sheet *s = cur_sheet(); if (!s) return 0;
+    const wb_style *cs = cell_style(peek_cell(s, g_sel_row, g_sel_col)); return cs ? cs->italic : 0;
+}
+static int ct_get_undo_count(void) { return g_undo_n; }
+static int ct_get_redo_count(void) { return g_redo_n; }
+static int ct_str_path(char *o, int n) { snprintf(o, (size_t)n, "%s", g_has_path ? g_path : "(none)"); return 0; }
+static int ct_str_sheet_name(char *o, int n) {
+    sheet *s = cur_sheet();
+    snprintf(o, (size_t)n, "%s", (s && s->name) ? s->name : "(none)");
+    return 0;
+}
+static int ct_str_sel_ref(char *o, int n) { fmt_sel_ref(o, n); return 0; }
+static int ct_str_sel_value(char *o, int n) {
+    sheet *s = cur_sheet();
+    if (!s) { snprintf(o, (size_t)n, "(none)"); return 0; }
+    cell_source_text(peek_cell(s, g_sel_row, g_sel_col), o, n);
+    return 0;
+}
+static int ct_get_show_fx(void) { return g_show_fx; }
+static int ct_set_show_fx(int v) {
+    g_show_fx = v ? 1 : 0;
+    VIEW_ITEMS[0].checked = g_show_fx ? true : false;
+    ofxbar_blur(&g_fx);
+    if (g_app) { oapp_set_chrome(g_app, g_show_fx ? ofxbar_height() : 0, OTAB_H); relayout(); }
+    return 0;
+}
+static int ct_get_gridlines(void) { return g_gridlines; }
+static int ct_set_gridlines(int v) {
+    g_gridlines = v ? 1 : 0;
+    VIEW_ITEMS[1].checked = g_gridlines ? true : false;
+    return 0;
+}
+
+static const ct_item_t SHEETS_ITEMS[] = {
+    // ---- value rows ---------------------------------------------------
+    {
+      .name = "doc.path",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_str_path,
+      .desc = "Absolute path of the open workbook, or (none) for an unsaved Untitled",
+    },
+    {
+      .name = "doc.has_path",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_has_path,
+      .desc = "Whether the open workbook has ever been saved to a path",
+    },
+    {
+      .name = "doc.readonly",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_readonly,
+      .desc = "Whether the open workbook was loaded read-only (legacy .xls)",
+    },
+    {
+      .name = "doc.dirty",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_dirty,
+      .desc = "Whether the workbook has unsaved changes",
+    },
+    {
+      .name = "doc.sheet_count",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1000,
+      .getfn = ct_get_sheet_count,
+      .desc = "Number of sheets in the open workbook",
+    },
+    {
+      .name = "doc.current_sheet",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1000,
+      .getfn = ct_get_current_sheet,
+      .desc = "Index of the active sheet tab",
+    },
+    {
+      .name = "doc.sheet_name",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_str_sheet_name,
+      .desc = "Name of the active sheet tab",
+    },
+    {
+      .name = "sel.ref",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_str_sel_ref,
+      .desc = "A1-style reference of the selected cell",
+    },
+    {
+      .name = "sel.row",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1000000,
+      .getfn = ct_get_sel_row,
+      .desc = "0-based row index of the selected cell",
+    },
+    {
+      .name = "sel.col",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1000000,
+      .getfn = ct_get_sel_col,
+      .desc = "0-based column index of the selected cell",
+    },
+    {
+      .name = "sel.value",
+      .type = CT_STR,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .getstrfn = ct_str_sel_value,
+      .desc = "Source text of the selected cell (a literal, or =formula)",
+    },
+    {
+      .name = "sel.bold",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_sel_bold,
+      .desc = "Whether the selected cell's style is bold",
+    },
+    {
+      .name = "sel.italic",
+      .type = CT_BOOL,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_sel_italic,
+      .desc = "Whether the selected cell's style is italic",
+    },
+    {
+      .name = "view.formula_bar",
+      .type = CT_BOOL,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_show_fx,
+      .setfn = ct_set_show_fx,
+      .desc = "Whether the formula bar strip is shown (View > Formula Bar)",
+    },
+    {
+      .name = "view.gridlines",
+      .type = CT_BOOL,
+      .access = CT_RW,
+      .risk = CT_SAFE,
+      .hi = 1,
+      .getfn = ct_get_gridlines,
+      .setfn = ct_set_gridlines,
+      .desc = "Whether gridlines are drawn (View > Gridlines)",
+    },
+    {
+      .name = "undo.count",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = UNDO_MAX,
+      .getfn = ct_get_undo_count,
+      .desc = "Depth of the undo stack",
+    },
+    {
+      .name = "redo.count",
+      .type = CT_INT,
+      .access = CT_READ,
+      .risk = CT_SAFE,
+      .hi = UNDO_MAX,
+      .getfn = ct_get_redo_count,
+      .desc = "Depth of the redo stack",
+    },
+
+    // ---- action rows: STATIC because there is no toolbar/menu control to --
+    // project them from (see the big comment above). Each still calls the
+    // exact function a UI control would call if one existed for it.
+    {
+      .name = "file.save_to",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_GUARDED,
+      .actfn = run_file_save_to,
+      .ctx = "fs.write",
+      .desc = "Save the workbook to an exact path with no dialog, the same xlsx_save/ods_save Save uses",
+      .terms = &k_t_save_to,
+    },
+    {
+      .name = "file.open_path",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_GUARDED,
+      .actfn = run_file_open_path,
+      .ctx = "fs.read",
+      .desc = "Open an exact path with no dialog (after an unsaved-changes prompt if dirty), the same office_open_workbook() Open uses",
+      .terms = &k_t_open_path,
+    },
+    {
+      .name = "edit.set_cell",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_set_cell,
+      .desc = "Select the cell at argv[0] (an A1 reference) and write argv[1] into it, the same commit_text() Enter runs",
+      .terms = &k_t_cell_edit,
+    },
+    {
+      .name = "nav.select_cell",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_select_cell,
+      .desc = "Move the selection to the cell named by argv[0] (an A1 reference)",
+      .terms = &k_t_nav,
+    },
+    {
+      .name = "sheet.switch",
+      .type = CT_ACTION,
+      .access = CT_WRITE,
+      .risk = CT_SAFE,
+      .actfn = run_sheet_switch,
+      .desc = "Make the sheet tab at argv[0] (an index) active",
+      .terms = &k_t_sheet_switch,
+    },
+};
+#define SHEETS_N_ITEMS ((int)(sizeof(SHEETS_ITEMS) / sizeof(SHEETS_ITEMS[0])))
+
+// sheets_project() chains the five control tables that carry a contract
+// token, toolbar first, in table-declaration order.
+static int sheets_project(int idx, ct_item_t *out) {
+    if (idx < 0) return 0;
+    int n = otb_ctl_count(TB_ITEMS, N_TB_ITEMS);
+    if (idx < n) return otb_ctl_project(TB_ITEMS, N_TB_ITEMS, idx, out);
+    idx -= n;
+#define SH_MENU_N(arr) ((int)(sizeof(arr) / sizeof((arr)[0])))
+    n = menu_ctl_count(FILE_ITEMS, SH_MENU_N(FILE_ITEMS));
+    if (idx < n) return menu_ctl_project(FILE_ITEMS, SH_MENU_N(FILE_ITEMS), idx, out);
+    idx -= n;
+    n = menu_ctl_count(EDIT_ITEMS, SH_MENU_N(EDIT_ITEMS));
+    if (idx < n) return menu_ctl_project(EDIT_ITEMS, SH_MENU_N(EDIT_ITEMS), idx, out);
+    idx -= n;
+    n = menu_ctl_count(FORMAT_ITEMS, SH_MENU_N(FORMAT_ITEMS));
+    if (idx < n) return menu_ctl_project(FORMAT_ITEMS, SH_MENU_N(FORMAT_ITEMS), idx, out);
+    idx -= n;
+    n = menu_ctl_count(INSERT_ITEMS, SH_MENU_N(INSERT_ITEMS));
+    if (idx < n) return menu_ctl_project(INSERT_ITEMS, SH_MENU_N(INSERT_ITEMS), idx, out);
+#undef SH_MENU_N
+    return 0;
+}
+
+static const ct_contract_t SHEETS_CONTRACT = {
+    "sheets", "Sheets",
+    "Every File/Edit/Format/Insert toolbar and menu action is PROJECTED "
+    "from TB_ITEMS[]/FILE_ITEMS[]/EDIT_ITEMS[]/FORMAT_ITEMS[]/INSERT_ITEMS[] "
+    "(sheets_project(), below), the SAME tables otb_draw()/"
+    "gui_menu_bar_draw() and on_tool()/on_menu() read and dispatch from. "
+    "Five rows stay STATIC in SHEETS_ITEMS below because there is no table "
+    "to project them from: file.save_to, file.open_path, edit.set_cell, "
+    "nav.select_cell address a cell by its A1 reference instead of a click, "
+    "so a non-interactive caller can author a spreadsheet; sheet.switch "
+    "addresses the tab strip (an otabs_t widget, clicked by position) by "
+    "index. Dialog-opening rows (file.open/save/save_as/close, "
+    "format.cells_dialog, function.insert_dialog, sheet.rename_dialog) "
+    "declare CT_TF_MODAL and are refused on a fresh spawn; call them against "
+    "a live instance. NOT covered: mouse click-to-select-cell, arrow-key "
+    "navigation, in-cell typing, and column/row scroll drag - gestures "
+    "rather than discrete controls - nav.select_cell and edit.set_cell are "
+    "the primitives that reach the same end state without them.",
+    SHEETS_ITEMS, SHEETS_N_ITEMS,
+    sheets_project,
+    0,   // no persisted config to load
+    0    // no persisted config to commit
+};
+
+
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
     g_app = oapp_create("SHEETS", 960, 640);
     if (!g_app) return 1;
     {
@@ -1342,6 +2031,15 @@ int main(int argc, char **argv) {
     otabs_init(&g_tabs, 0, 0, 960);
     oapp_set_chrome(g_app, ofxbar_height(), OTAB_H);
     new_workbook();
+
+    // ---- THE CONTRACT, ANSWERED BEFORE oapp_run() IS EVER ENTERED ----------
+    // See writer/main.c's own note: contract-lint check 8 does not see this
+    // ordering (it matches a literal win_create()/win_create_bg() token,
+    // which office_app's oapp_create() is not), but the real property holds:
+    // this returns before oapp_run()'s event loop is ever entered, so the
+    // process never paints and never blocks.
+    if (contract_is_invocation(argc, argv))
+        return contract_cli(argc, argv, &SHEETS_CONTRACT);
 #ifdef SHEETS_VERIFY_AUTOOPEN
     // THROWAWAY VERIFICATION BUILD ONLY (never in the shipped/landed source,
     // never defined by the normal Makefile target) - see writer/main.c's own

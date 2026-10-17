@@ -742,8 +742,17 @@ long kb_pcm_tap(const void *pcm, unsigned frames) {
             long n = read(c, &b, 1);
             close(c);
             if (n == 1 && b != '0') {
-                fd = open("/DOSPCM.RAW", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (fd >= 0) state = 1;
+                // #peruserrows: was the /DOSPCM.RAW literal at the root-owned
+                // ext2 root. The DOS interpreter runs in Ring 3 as the session
+                // user, so the one capture that settles "were those the guest's
+                // samples" could not be created by the session that produced
+                // them. userscratch_path(): <home>/DOSPCM.RAW with an account,
+                // /TMP/DOSPCM.RAW without one (root included, whose home is "/").
+                char tapp[192];
+                if (userscratch_path("DOSPCM.RAW", tapp, sizeof tapp) == 0) {
+                    fd = open(tapp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    if (fd >= 0) state = 1;
+                }
             }
         }
         if (state == 0) return -1;

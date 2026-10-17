@@ -106,4 +106,60 @@ void perms_on_create(const char *path, uint32_t uid, uint32_t gid, int is_dir);
 // entry denies this", which a plain perms_check()/perms_get() failure cannot.
 int perms_has_entry(const char *path);
 
+// ---------------------------------------------------------------------------
+// #prewrite: S_ISVTX. THE ONE DECISION for "may this principal remove or
+// replace this name", used by unlink, rmdir, both ends of rename and the DOS
+// INT 21h delete/rename/rmdir gate.
+//
+// WHY IT EXISTS. The owner asked for an all-users pre-writable directory.
+// Implemented naively that is a 0777 directory, and in a system with more than
+// one account a 0777 directory lets EVERY user delete or overwrite EVERY other
+// user's files. Before this there was no concept in this file that could stop
+// that: perms_check_leaf() reads only bits 0..8, so bit 9 was inert.
+//
+// WHAT IT CHANGES, precisely: NOTHING, on any directory whose PERMS.DB mode
+// does not carry 01000. The sticky bit only ever SUBTRACTS, and only where it
+// was deliberately set, which is what makes it safe to wire into five call
+// sites in one change.
+//
+// On a sticky directory a name may be removed by root, by the OWNER OF THE
+// VICTIM, or by the OWNER OF THE DIRECTORY. The third principal is the
+// automation answer and is not decoration: see rustkern/sticky.rs.
+//
+// `parent` and `victim` are absolute paths; both are canonicalized here with
+// the same canonicalizer perms_check() uses. Returns 0 to allow, -1 to deny.
+// It applies the ordinary write-on-the-parent precondition itself, so a caller
+// replaces its perms_check(parent, W_OK) with this rather than adding to it.
+#define PERM_STICKY 01000
+int perms_may_remove(const char *parent, const char *victim,
+                     uint32_t uid, uint32_t gid);
+
+// #prewrite: boot self-test for the rule above. Logs [STICKY-SELFTEST].
+void perms_sticky_selftest(void);
+
+// ===========================================================================
+// [openperm] #246: IS THIS PATH SUBJECT TO THE LOCAL PERMISSION TABLE AT ALL?
+// ===========================================================================
+// The two answers rustkern/volperm.rs's openperm_gate_rs() returns. They live
+// in this header, and not at the one call site, because there are TWO callers
+// and they must name the same integers: the gate itself in sys_open_k()
+// (proc/fdlayer.c), and the boot-time cross-language constant lock in
+// hotplug_init() (drivers/hotplug.c) that proves these C names still match the
+// Rust constants. If they ever drifted, every removable path would silently
+// stop being judged, which is precisely the defect #246 [openperm] removed, so
+// it is checked rather than assumed.
+//
+// EXEMPT is for a medium with a real authority of its own: an SMB or NFS share
+// decides access server-side (NTLM/RPC authentication plus the share ACLs) and
+// knows a remote identity this table has never heard of.
+//
+// A REMOVABLE VOLUME IS **NOT** EXEMPT. It has no server and no ACLs, so
+// either this table decides or nothing does, and "nothing does" was measured
+// as an unprivileged process blanking, overwriting and reading another user's
+// files on a mounted stick. See rustkern/volperm.rs for the measurement and
+// for why the mount point gets a 01777 row so that enforcing this does not
+// make a stick read-only to the person who plugged it in.
+#define OPENPERM_EXEMPT   0   /* skip the local permission table entirely */
+#define OPENPERM_ENFORCE  1   /* consult the local permission table */
+
 #endif // PERMS_H

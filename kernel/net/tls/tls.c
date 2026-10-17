@@ -2519,11 +2519,28 @@ int tls_send(tls_context_t *ctx, const void *data, size_t length) {
     return (int)length;
 }
 
+// CWE-834: max skippable (non-application) TLS 1.3 records per recv before we
+// give up. A real session sends one ChangeCipherSpec plus a few NewSessionTicket
+// post-handshake messages; 64 is far above that and caps a skippable-record flood.
+#define TLS_MAX_SKIP_RECORDS 64
+
 int tls_recv(tls_context_t *ctx, void *buffer, size_t length) {
     if (ctx->state != TLS_STATE_ESTABLISHED) {
         return TLS_ERR_INVALID_PARAM;
     }
     tls_set_deadline(ctx, 30);   // #277/#525: bound app-data record recv in REAL time too
+
+    // CWE-834/stack-exhaustion: the TLS 1.3 skip paths (ChangeCipherSpec and
+    // post-handshake messages such as NewSessionTicket) used to RECURSE into
+    // tls_recv, which re-armed the deadline above on every call, so a peer
+    // flooding skippable records was bounded by neither time (the deadline kept
+    // resetting) nor stack (only gcc -O2 tail-call elision kept the recursion
+    // off the stack - a compiler accident, not a guarantee). Loop instead: the
+    // deadline is set ONCE above and checked here each iteration, and the skip
+    // paths `continue` rather than recurse.
+    int tls_skip_guard = 0;
+    for (;;) {
+        if (tls_deadline_expired(ctx)) return TLS_ERR_TIMEOUT;
 
     // Return buffered data first
     if (ctx->app_buffer_len > 0) {
@@ -2546,7 +2563,8 @@ int tls_recv(tls_context_t *ctx, void *buffer, size_t length) {
         // Skip ChangeCipherSpec
         if (content_type == TLS_CONTENT_CHANGE_CIPHER) {
             kfree(raw);
-            return tls_recv(ctx, buffer, length);
+            if (++tls_skip_guard > TLS_MAX_SKIP_RECORDS) return TLS_ERR_TIMEOUT;
+            continue;
         }
 
         // Handle unencrypted alerts
@@ -2612,7 +2630,8 @@ int tls_recv(tls_context_t *ctx, void *buffer, size_t length) {
         // Skip post-handshake messages (NewSessionTicket, etc.)
         if (inner_type == TLS_CONTENT_HANDSHAKE) {
             kfree(plain);
-            return tls_recv(ctx, buffer, length);
+            if (++tls_skip_guard > TLS_MAX_SKIP_RECORDS) return TLS_ERR_TIMEOUT;
+            continue;
         }
 
         if (inner_type != TLS_CONTENT_APPLICATION) {
@@ -2678,6 +2697,7 @@ int tls_recv(tls_context_t *ctx, void *buffer, size_t length) {
 
     kfree(data);
     return (int)copy;
+    }
 }
 
 int tls_close(tls_context_t *ctx) {

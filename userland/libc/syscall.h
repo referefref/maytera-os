@@ -996,6 +996,30 @@ static inline int get_win_opacity(void) {
     return (int)syscall0(SYS_GET_WIN_OPACITY);
 }
 
+// #791 [winopacity]: declare THIS window's own opacity (0-255, 255=opaque).
+//
+// NOT set_win_opacity() above. That one is the OS-WIDE default, the value
+// behind the Settings "Window Opacity" slider; an app calling it to make
+// itself opaque moves every window on the system, which is the mistake #790
+// made and the owner rejected. This one takes a window HANDLE and touches only
+// that window.
+//
+// Three tiers, and a higher one is never overwritten by a lower one:
+//   0 theme / Settings default   1 THIS call, the app's declaration
+//   2 the user's titlebar Opacity stepper (beats everything)
+// So a theme switch or a slider move will not stomp what you set here, and the
+// user can still override you and keep that override. Returns the EFFECTIVE
+// opacity after the call, clamped to 40..255: if the user has already chosen
+// for this window you get THEIR value back, which is how you can tell you were
+// ignored. Returns -1 on a bad handle.
+//
+// Call it once after win_create(), not every frame: it is idempotent but it
+// invalidates the screen when the value actually changes.
+#define SYS_WIN_SET_OPACITY 464
+static inline int win_set_opacity(int handle, int opacity) {
+    return (int)syscall2(SYS_WIN_SET_OPACITY, (long)handle, (long)opacity);
+}
+
 // Get window event (returns event type, fills event_buf)
 // timeout: 0 = non-blocking, >0 = wait up to timeout ms, -1 = wait forever
 static inline int win_get_event(int handle, void *event_buf, int timeout) {
@@ -2053,6 +2077,14 @@ static inline int sys_user_create_pw(const char *username, const char *password,
 // hardcoded "root" is exactly how the lock screen became unopenable at uid 1000.
 static inline int sys_session_unlock(const char *user, const char *pass) {
     return (int)syscall2(SYS_SESSION_UNLOCK, (long)user, (long)pass); }
+// #harendezvous: the ACTIVE SESSION's home directory, for a privileged service
+// that is not that user. ROOT ONLY (-1 otherwise); pre-login or an account-less
+// session answers "/", which is the legacy path, not an error. Do not call this
+// directly: libc userhome_root_session() wraps it with the right fallback.
+#define SYS_SESSION_HOME       463  // (char *out, int cap) -> len | -1 | -14
+static inline int sys_session_home(char *out, int cap) {
+    return (int)syscall2(SYS_SESSION_HOME, (long)out, (long)cap); }
+
 static inline int sys_session_is_locked(void) {
     return (int)syscall0(SYS_SESSION_IS_LOCKED); }
 static inline int sys_set_autologin(const char *user, const char *pass, int enable) {
@@ -3032,6 +3064,108 @@ static inline int net_unmount(const char *server, const char *share) {
     return (int)syscall2(SYS_NET_UNMOUNT, (long)server, (long)share);
 }
 
+// ---- #smbdisk: the PERSISTABLE form of an SMB credential -----------------
+#define SYS_NET_CRED_TAG    461
+
+// ===========================================================================
+// #secretuse: SYS_SECRET_USE - THE SECRET-USE PROXY.
+//
+// The kernel holds the user's TOTP shared secrets in an encrypted container that
+// Ring 3 cannot read, and this is how an app USES one. The operations below are
+// the ENTIRE surface: there is no call that returns a secret, a base32 seed or a
+// key, and no way to ask for a code at a time of the caller's choosing. If you
+// are looking for one, read kernel/proc/secretuse.h and docs/OPEN_BACKLOG.md A4
+// first: a responder over caller-chosen input is an oracle, not a proxy.
+//
+// The number must match kernel/proc/syscall.h exactly. syscall-number-gate
+// cross-checks both headers, because a silent divergence here compiles on both
+// sides and invokes the WRONG HANDLER at runtime.
+// ===========================================================================
+#define SYS_SECRET_USE      462
+
+#define SECRET_OP_STATUS   0   /* -> account count, or SECRET_E_LOCKED */
+#define SECRET_OP_LIST     1   /* out = secret_totp_info_t[] -> count   */
+#define SECRET_OP_CODES    2   /* out = secret_totp_code_t[] -> count   */
+#define SECRET_OP_ADD      3   /* in  = secret_totp_add_t*   -> 0       */
+#define SECRET_OP_DEL      4   /* idx                        -> 0       */
+
+#define SECRET_E_ARG      (-1)
+#define SECRET_E_LOCKED   (-2)  /* no session key: the user must authenticate */
+#define SECRET_E_IO       (-3)
+#define SECRET_E_AUTH     (-4)  /* the container refused its tag              */
+#define SECRET_E_FORMAT   (-5)
+#define SECRET_E_NOSPACE  (-6)
+#define SECRET_E_FULL     (-7)
+#define SECRET_E_NOCLOCK  (-8)  /* the kernel clock is not plausible          */
+#define SECRET_E_NOTIMPL  (-9)
+
+#define SECRET_NAME_MAX   48
+#define SECRET_B32_MAX    128
+#define SECRET_CODE_MAX   12
+#define SECRET_MAX_ACCOUNTS 32
+
+typedef struct {
+    char     issuer[SECRET_NAME_MAX];
+    char     label[SECRET_NAME_MAX];
+    unsigned short digits;
+    unsigned short period;
+    unsigned short alg;       /* 1 = SHA1, 256 = SHA256 */
+    unsigned short reserved;
+} secret_totp_info_t;
+
+typedef struct {
+    char     code[SECRET_CODE_MAX];   /* NUL-terminated decimal digits */
+    unsigned short remaining;               /* seconds left in this window   */
+    unsigned short period;
+} secret_totp_code_t;
+
+typedef struct {
+    char     issuer[SECRET_NAME_MAX];
+    char     label[SECRET_NAME_MAX];
+    char     b32[SECRET_B32_MAX];     /* INPUT ONLY; never read back out */
+    unsigned short digits;
+    unsigned short period;
+    unsigned short alg;
+    unsigned short reserved;
+} secret_totp_add_t;
+
+static inline int sys_secret_status(void) {
+    return (int)syscall6(SYS_SECRET_USE, SECRET_OP_STATUS, 0, 0, 0, 0, 0);
+}
+static inline int sys_secret_list(secret_totp_info_t *out, unsigned int n) {
+    return (int)syscall6(SYS_SECRET_USE, SECRET_OP_LIST, 0, (long)out,
+                         (long)(n * sizeof(secret_totp_info_t)), 0, 0);
+}
+static inline int sys_secret_codes(secret_totp_code_t *out, unsigned int n) {
+    return (int)syscall6(SYS_SECRET_USE, SECRET_OP_CODES, 0, (long)out,
+                         (long)(n * sizeof(secret_totp_code_t)), 0, 0);
+}
+static inline int sys_secret_add(const secret_totp_add_t *a) {
+    return (int)syscall6(SYS_SECRET_USE, SECRET_OP_ADD, 0, 0, 0,
+                         (long)a, (long)sizeof(*a));
+}
+static inline int sys_secret_del(unsigned int idx) {
+    return (int)syscall6(SYS_SECRET_USE, SECRET_OP_DEL, (long)idx, 0, 0, 0, 0);
+}
+// Derive "nt$" + 32 lowercase hex of nt_hash = MD4(UTF-16LE(pass)) so a saved
+// network location can persist the NT HASH instead of the password. `out` needs
+// at least 36 bytes (35 + NUL). Returns 0 on success, negative on failure.
+//
+// THE DERIVATION LIVES IN THE KERNEL ON PURPOSE. There is no MD4 in userland
+// and there must not become one: kernel/crypto/md4.c plus net/smb.c's
+// ntlm_hash() are the only NT-hash derivation in the tree, and
+// crypto/ntlm_nthash_kat.sh pins them to the published MS-NLMP 4.2.4 vectors. A
+// userland copy would be a SECOND, UNTESTED implementation of the one step that
+// decides whether SMB authentication succeeds, and userland/libc/sha256.c
+// already shows where that habit leads.
+//
+// HONEST LIMIT: the NT hash is password-equivalent for SMB (pass-the-hash), so
+// /CONFIG/NETMOUNTS.CFG stays 0600. What this removes is password-reuse blast
+// radius, not the value of the file to an attacker who can read it.
+static inline int net_cred_tag(const char *pass, char *out, unsigned int outcap) {
+    return (int)syscall3(SYS_NET_CRED_TAG, (long)pass, (long)out, (long)outcap);
+}
+
 // ---- #317 nfsbrowse: NFS export enumeration + on-demand mount ----
 #define SYS_NET_LIST_EXPORTS 458
 #define SYS_NFS_MOUNT        459
@@ -3184,6 +3318,25 @@ static inline int win_draw_image(int handle, int x, int y, int w, int h,
 // kernel is (also) writing to. Added so the compositor's login screen - where
 // the physical iMac14,4 "No user accounts found" bug is actually visible -
 // can record its own state transitions for later offline diagnosis.
+// #aiaudit HARD LIMIT, and it FAILS CLOSED IN THE WRONG DIRECTION: a message
+// of SYS_BOOTLOG_MAX characters or more is DROPPED WHOLE, not truncated.
+// sys_bootlog_write() (kernel/proc/syscall.c) bounces the string with
+// sc_bounce_str(umsg, buf, 200); that is strncpy_from_user() ->
+// validate_user_string(), which returns VALIDATE_STRING_UNTERMINATED when no
+// NUL falls inside the window, so the syscall returns -1 and logs nothing.
+//
+// This bit for real: the AI audit trail's "AUDIT RECORD LOST" reporter grew
+// past 200 characters and produced ZERO output on the machine where the loss
+// actually happened (golden 2486, VM 2497). The more a diagnostic has to say,
+// the more certain it was to say nothing.
+//
+// If your message can exceed this, clamp every variable-length field with a
+// precision specifier (%.60s) and SPLIT it across calls rather than letting
+// one long line carry everything. The kernel guarantees one call is one line.
+// NOT named SYS_* : the syscall-number gate reads "#define SYS_<NAME> <n>"
+// as a syscall number claim, and 199 is already one. Correctly refused.
+#define BOOTLOG_MSG_MAX 199
+
 static inline int sys_bootlog(const char *msg) {
     return (int)syscall1(SYS_BOOTLOG_WRITE, (long)msg);
 }

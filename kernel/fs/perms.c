@@ -6,6 +6,7 @@
 #include "../string.h"
 #include "../serial.h"
 #include "../mm/heap.h"
+#include "../security/seclog.h"             // #prewrite: seclog_report_fs_remove
 #include "bootlog.h"                        // #PERMSKIP: a security self-test
                                             // that only reaches a serial port
                                             // proves nothing on the laptop or
@@ -304,6 +305,38 @@ static const struct { const char *path; uint16_t mode; } perms_system_seed[] = {
     { "/CONFIG/SERVICES.CFG",  0600 },
     { "/CONFIG/LOGIN.CFG",     0600 },
 
+    // #peruser2: NETMOUNTS.CFG STORED SHARE PASSWORDS IN CLEARTEXT AND HAD NO
+    // ENTRY, so it sat on perms_check()'s world-readable no-entry default. Found
+    // while classifying it for the per-user write migration: it is NOT a per-user
+    // preference and must not move, because kernel/net/smb.c:2255 reads it with
+    // fat_read_file() AT BOOT to re-create persisted mounts, long before any
+    // account exists - relocating it into a home would break boot-time mount
+    // restoration exactly the way moving /THEMES/INDEX.TXT would break
+    // theme_init(). So it stays here and gets the mode it always needed.
+    //
+    // At the world-readable default, ANY Ring-3 process of ANY user could read
+    // every saved SMB password on the machine.
+    //
+    // #smbdisk UPDATE, 2026-09-29: THE FILE NO LONGER HOLDS A PASSWORD. The fifth
+    // "|" field is now the NT hash as `nt$<32 lowercase hex>`, and the kernel
+    // migrates any legacy cleartext record at boot (net/smb.c
+    // netmounts_migrate_on_disk). THIS ENTRY MUST STAY 0600 ANYWAY: the NT hash is
+    // password-equivalent for SMB (pass-the-hash), so reading the file still gets
+    // you the share. What the hash removes is PASSWORD-REUSE blast radius, which
+    // is the realistic harm, because a share password is very often also the
+    // user's password somewhere that matters more. If a future pass reads this
+    // comment and concludes the mode can be relaxed, that is the wrong
+    // conclusion, and it is written here because that is where it would be read.
+    //
+    // THE COST, STATED RATHER THAN DISCOVERED LATER: a non-root Files app can no
+    // longer READ the list either, so the "/NET" folder shows no saved locations
+    // for a non-root session. That is the correct direction - it could never WRITE
+    // the file, so it could only ever have been reading somebody else's
+    // credentials - and it fails closed. A genuinely per-user set of saved mounts
+    // needs the kernel's boot-time restore to become per-user first, which is a
+    // separate change and is recorded in the plan doc.
+    { "/CONFIG/NETMOUNTS.CFG", 0600 },
+
     // DELIBERATELY NOT 0600, with reasons, because "lock everything" is how a
     // permission model gets turned back off again:
     //   PASSWD/GROUP: these are Linux's /etc/passwd and /etc/group, and they are
@@ -403,7 +436,7 @@ static const struct { const char *path; uint16_t mode; } perms_dev_node_seed[] =
     { "/DEV/RANDOM",      0666 },
     { "/DEV/URANDOM",     0666 },
     // USB CDC-ACM serial. STAGE 2 (serial.port) TIGHTENED THIS to root-owned
-    // 0600 (MAYTERA-SEC-2026-0021): the desktop uid (1000) can no longer open
+    // 0600 (MAYTERA-SEC-2026-0036): the desktop uid (1000) can no longer open
     // /dev/ttyACM0 raw. The ONLY route to a serial adapter now is
     // SYS_SERIAL_OPEN(name) under a serial.port grant that the compositor's
     // consent produced (drivers/serialport.c). The node itself stays: root can
@@ -515,6 +548,43 @@ static const struct { const char *path; uint16_t mode; } perms_dev_node_seed[] =
 // Read that as the shape for the next title: if a game can be POINTED at a
 // writable directory, do that and put the mode here; if it cannot, redirect it
 // and add nothing here.
+// ---------------------------------------------------------------------------
+// #prewrite: A FOURTH TABLE, AND IT IS THE ONLY ONE WHOSE ROWS ARE STICKY.
+//
+// This is the owner's decision ("we should have an all users type prewritable
+// directory") expressed as policy. Two directories, one rule.
+//
+// WHY TWO AND NOT ONE, since simpler is usually right. There are genuinely two
+// needs and they differ in LIFETIME, not in security:
+//
+//   /SHARED  durable space every account may put things in and keep them.
+//   /TMP     scratch. The App Store's 100 MB streamed download lands here on a
+//            machine with no account yet, and a bootstrap session needs
+//            SOMEWHERE to write or every save, log and preference on a freshly
+//            built golden fails with -13.
+//
+// Conflating them would mean a document people share lives in a directory
+// whose name promises it can be deleted. But there is only ONE security rule,
+// ONE implementation and ONE test: both are 01777, both are decided by
+// perms_may_remove(). The second directory costs one row.
+//
+// 01777 AND NOT 0777. The sticky bit is the entire difference between a shared
+// space and a space in which anyone may destroy anyone else's work. A 0777
+// directory here would have been a regression in the same week /CONFIG/
+// NETMOUNTS.CFG was found world-readable with cleartext SMB passwords.
+//
+// NOT SEEDED HERE, and deliberately: the three 0777 rows below
+// (/GAMES/NETHACK, /GAMES/SIMCITY, /APPS/ANGBAND...) are the SAME hole and
+// they already ship. Changing their constants would achieve nothing, because
+// every seed pass is "operator wins" and a shipped /CONFIG/PERMS.DB already
+// carries those rows, so the new constant would never be applied. Making them
+// sticky needs a MIGRATION, not a seed edit. Recorded in blame.md rather than
+// half-done here.
+static const struct { const char *path; uint16_t mode; } perms_prewritable_seed[] = {
+    { "/SHARED", 01777 },
+    { "/TMP",    01777 },
+};
+
 static const struct { const char *path; uint16_t mode; } perms_shared_state_seed[] = {
     { "/GAMES/NETHACK",        0777 },
     { "/GAMES/NETHACK/RECORD", 0666 },
@@ -552,6 +622,51 @@ static const struct { const char *path; uint16_t mode; } perms_shared_state_seed
     // depending on account state; per-user isolation is a documented
     // follow-up once every shipped image is guaranteed to have run OOBE.
     { "/GAMES/ANGBAND",       0777 },
+    // #gamedata2 AssaultCube (userland/apps/assaultcube, /APPS/ASSAULTCUBE).
+    // Read the shape note above: "if a game can be POINTED at a writable
+    // directory, do that and put the mode here". AssaultCube can, and now is.
+    //
+    // THE GAME MUST WRITE. Its engine keeps a client log, regenerated config
+    // templates, saved cvars and (once the server browser is opened) downloaded
+    // media under its homedir. That homedir was "/profile" at the ext2 root with
+    // NO entry here at all, which means the root-owned 0755 default: every
+    // AssaultCube launch that has ever been verified was a root or AUTORUN
+    // launch, and a desktop session as uid 1000 could not have written a byte.
+    // That is the same defect OpenArena shipped for six weeks (#745, "FS
+    // CreatePath: failed to create path /HOME" for every non-root account),
+    // found only because the App Store's users are OOBE-created non-root
+    // accounts. Moving the root is the moment to fix it, not to re-ship it.
+    //
+    // THREE ROWS, NOT ONE, AND NOT A RECURSIVE RULE. perms_check_leaf() has no
+    // inheritance: creating a NAME needs W_OK|X_OK on the immediate parent, so
+    // each directory the engine writes INTO needs its own row.
+    //   /GAMES/ASSAULTCUBE          the game root. 0777 because an App Store
+    //     install must be able to create packages/ and profile/ inside it, and
+    //     because the elevation grant (proc/elevate.h) deliberately covers ONLY
+    //     /APPS: a system-wide install writing under /GAMES is an ordinary
+    //     permission question, not a privileged one.
+    //   /GAMES/ASSAULTCUBE/profile        the homedir itself.
+    //   /GAMES/ASSAULTCUBE/profile/config where saved cvars land, beside the
+    //     read-only defaults the package installs there.
+    // Anything the engine creates BELOW profile/ at run time (profile/packages/
+    // models/.../world/ for shadow maps) is created by the session user inside a
+    // 0777 directory and is therefore owned and writable by them, so it needs no
+    // row of its own.
+    //
+    // HONEST LIMIT, stated rather than discovered later. These are MACHINE-WIDE
+    // 0777 directories, exactly like the three rows above, so this is a single
+    // shared profile and not per-user isolation, and any local account can
+    // add/remove/rename entries directly under /GAMES/ASSAULTCUBE (the content
+    // FILES the installer writes under packages/ keep their own root-owned 0755
+    // and cannot be rewritten in place). No code is executed from this tree: the
+    // .cfg files are engine console script, interpreted by the engine, and the
+    // textures and models are data. The per-user answer is %HOME%/GAMES/
+    // ASSAULTCUBE and it is the same documented follow-up Angband above is
+    // waiting on, for the same reason: it requires every shipped image to have
+    // completed OOBE before a home directory can be assumed to exist.
+    { "/GAMES/ASSAULTCUBE",                0777 },
+    { "/GAMES/ASSAULTCUBE/profile",        0777 },
+    { "/GAMES/ASSAULTCUBE/profile/config", 0777 },
     // #dosperm: A LAUNCH TARGET THAT DOES NOT LOOK LIKE ONE.
     //
     // rustkern/dosstate.rs grants the write bit by default to a file under
@@ -658,9 +773,15 @@ static void perms_fix_config_dir(void) {
     // always wins" rule intact.
     if (cur != 0700 && cur != 0755) return;
 
-    perms_set("/CONFIG", 0, 0, 0711);
-    kprintf("[PERMS] #745: /CONFIG %04o -> 0711 (searchable, NOT listable); "
-            "secrets protected by their own 0600 entries\n", cur);
+    // #prewrite: OR the high digit back in rather than writing a bare 0711.
+    // This function is the one place that overrides an operator's mode, so it
+    // is also the one place that could silently drop a setuid/setgid/sticky
+    // bit somebody set deliberately. /CONFIG has none today; the point is that
+    // it cannot acquire the ability to lose one.
+    perms_set("/CONFIG", 0, 0, (uint16_t)((mode & ~0777) | 0711));
+    kprintf("[PERMS] #745: /CONFIG %04o -> %04o (searchable, NOT listable); "
+            "secrets protected by their own 0600 entries\n", cur,
+            (unsigned)((mode & ~0777) | 0711));
 }
 
 // ===========================================================================
@@ -1057,23 +1178,138 @@ void perms_selftest(void) {
     {
         st_home_t homes[ST_MAX_HOMES];
         int nh = st_collect_homes(homes, ST_MAX_HOMES);
-        if (nh == 0) {
-            selftest_notrun("perms/traversal(boot)",
-                            "no user home directory exists in /CONFIG/PERMS.DB, so the "
-                            "directory-traversal half of the permission model is UNVERIFIED. "
-                            "Expected on a virgin image before the first-boot wizard; a "
-                            "DEFECT on any machine that has an account");
-            st_notrun++;
-        } else {
-            for (int i = 0; i < nh; i++) {
-                bootlog_write("[PERMS-SELFTEST] traversal vectors on home %d/%d: "
-                              "'%s' %u:%u %04o", i + 1, nh, homes[i].path,
-                              (unsigned)homes[i].uid, (unsigned)homes[i].gid,
-                              (unsigned)(homes[i].mode & 0777));
-                st_home_vectors(&homes[i], "boot");
+
+        // ===================================================================
+        // #deadtests: THE FIXTURE, BECAUSE A TEST THAT NEVER RUNS BY DEFAULT IS
+        // CLOSE TO ONE THAT DOES NOT EXIST.
+        // ===================================================================
+        // MEASURED on golden 2524, on a freshly imaged machine:
+        //
+        //   [SELFTEST] *** DID NOT RUN: perms/traversal(boot) *** no user home
+        //   directory exists in /CONFIG/PERMS.DB
+        //
+        // A stock golden ships no /CONFIG/PASSWD, the first-boot wizard waits for
+        // a human, and unattended that human never arrives, so no home is ever
+        // created and these vectors never run IN THE DEFAULT CONFIGURATION. #PERMSKIP
+        // made that announce itself instead of printing a reassuring SKIP, which was
+        // the right first move and is where the previous change stopped. Announcing
+        // is still not running.
+        //
+        // So the walker now ALWAYS has something to walk. ST_FIXTURE_UID owns a
+        // 0750 home for the length of this function and the row is REMOVED before
+        // it returns, so perms_selftest() keeps the property its header claims:
+        // it does not modify the database. The vectors still go through the real
+        // perms_check() against the real hash table, so this is a fixture, not a
+        // reimplementation.
+        //
+        // TWO THINGS THIS DELIBERATELY DOES NOT DO.
+        //
+        // 1. It does not replace the real homes. Every real home is still walked;
+        //    the fixture is EXTRA. A fixture that displaced the live data would
+        //    turn a test of this machine into a test of a constant.
+        //
+        // 2. It does not swallow the "this machine has no account" signal. That
+        //    signal is real and worth keeping: it is how you tell a provisioned
+        //    machine from an unprovisioned one. If nh == 0 the group
+        //    perms/traversal(real-home) declines, separately and by name, while
+        //    perms/traversal(boot) RAN. Both statements are true at once and
+        //    collapsing them would be overstating coverage.
+        //
+        // WHY 65533 AND NOT 1000. perms_check() returns 0 on its first line for
+        // uid 0, so a root-owned fixture would make every owner-direction vector
+        // pass without consulting the walker: assertions structurally incapable
+        // of failing, which is the defect this whole file is about. uid must
+        // therefore be >= 1000 (st_collect_homes enforces that too). 65534 is
+        // taken by ST_OTHER_UID, the identity the deny direction uses, and real
+        // uids here start at 1000 with MAX_USERS 32, so 65533 cannot collide with
+        // either a real account or the probing identity.
+        #define ST_FIXTURE_HOME "/HOME/_STFIXT"
+        #define ST_FIXTURE_UID  65533u
+        #define ST_FIXTURE_GID  65533u
+        int fixture_ok = 0;
+        {
+            uint32_t fu = 0, fg = 0; uint16_t fm = 0;
+            if (perms_get(ST_FIXTURE_HOME, &fu, &fg, &fm) == 0) {
+                // Somebody really has a home called this. Do not touch it, and do
+                // not pretend the fixture ran: st_collect_homes will have picked it
+                // up as a real home anyway if its uid qualifies.
+                selftest_notrun("perms/traversal(fixture)",
+                                "a real PERMS.DB row already exists at " ST_FIXTURE_HOME
+                                ", so the fixture was NOT installed (it would have "
+                                "overwritten live policy). Rename that entry or rename "
+                                "the fixture.");
+                st_notrun++;
+            } else {
+                // perms_dirty is saved and restored: perms_set/perms_remove both set
+                // it, and a self-test must not be the reason /CONFIG/PERMS.DB gets
+                // rewritten on a boot that changed no policy.
+                bool was_dirty = perms_dirty;
+                perms_set(ST_FIXTURE_HOME, ST_FIXTURE_UID, ST_FIXTURE_GID, 0750);
+                if (perms_get(ST_FIXTURE_HOME, &fu, &fg, &fm) == 0 &&
+                    fu == ST_FIXTURE_UID && (fm & 0777) == 0750) {
+                    st_home_t fx;
+                    int i = 0;
+                    const char *fp = ST_FIXTURE_HOME;
+                    while (fp[i] && i < (int)sizeof(fx.path) - 1) { fx.path[i] = fp[i]; i++; }
+                    fx.path[i] = '\0';
+                    fx.uid = fu; fx.gid = fg; fx.mode = fm;
+                    bootlog_write("[PERMS-SELFTEST] traversal vectors on the FIXTURE home "
+                                  "'%s' %u:%u %04o (installed for this test only, removed "
+                                  "before perms_selftest returns)",
+                                  fx.path, (unsigned)fu, (unsigned)fg,
+                                  (unsigned)(fm & 0777));
+                    st_home_vectors(&fx, "boot-fixture");
+                    fixture_ok = 1;
+                } else {
+                    // The table is full, or perms_set did not take. Either way the
+                    // fixture did not exist, so say so rather than report a pass.
+                    selftest_notrun("perms/traversal(fixture)",
+                                    "perms_set(" ST_FIXTURE_HOME ") did not take (permission "
+                                    "table full?), so the always-on traversal fixture was NOT "
+                                    "exercised this boot");
+                    st_notrun++;
+                }
+                perms_remove(ST_FIXTURE_HOME);
+                perms_dirty = was_dirty;
             }
-            selftest_ran("perms/traversal(boot)");
         }
+
+        for (int i = 0; i < nh; i++) {
+            bootlog_write("[PERMS-SELFTEST] traversal vectors on home %d/%d: "
+                          "'%s' %u:%u %04o", i + 1, nh, homes[i].path,
+                          (unsigned)homes[i].uid, (unsigned)homes[i].gid,
+                          (unsigned)(homes[i].mode & 0777));
+            st_home_vectors(&homes[i], "boot");
+        }
+
+        if (nh == 0) {
+            // NOT the old "traversal did not run" message. The walker DID run,
+            // against the fixture. What did not happen is a check against a home
+            // this machine actually has, and that is a different and still useful
+            // thing to report.
+            selftest_notrun("perms/traversal(real-home)",
+                            "the traversal walker WAS exercised this boot (see "
+                            "perms/traversal(boot)), but against the built-in fixture "
+                            "only: /CONFIG/PERMS.DB holds no non-root home, so no home "
+                            "belonging to a real account was checked. Expected on a virgin "
+                            "image before the first-boot wizard; a DEFECT on any machine "
+                            "that has an account");
+            st_notrun++;
+        }
+
+        if (fixture_ok || nh > 0) {
+            selftest_ran("perms/traversal(boot)");
+        } else {
+            // Neither the fixture nor a real home: the group genuinely did not run.
+            selftest_notrun("perms/traversal(boot)",
+                            "neither the built-in fixture nor any real home was available, "
+                            "so the directory-traversal half of the permission model is "
+                            "UNVERIFIED on this boot");
+            st_notrun++;
+        }
+        #undef ST_FIXTURE_HOME
+        #undef ST_FIXTURE_UID
+        #undef ST_FIXTURE_GID
     }
 
     // #676: the exact predicate the O_CREAT gate consults. Creating a NAME is a
@@ -1253,6 +1489,22 @@ void perms_selftest(void) {
 static const char *const perms_write_probe_dirs[] = {
     "/", "/HOME", "/CONFIG", "/APPS", "/NOTES", "/IMAGES", "/GAMES",
     "/RECYCLE", "/DOS", "/WIN16", "/SQUADRON", "/THEMES",
+    // #prewrite: the two all-users directories. They are in the probe list so the
+    // WRITEMAP line names them, and because their presence stops the loud "CANNOT
+    // CREATE A FILE ANYWHERE" banner below firing for the right reason
+    // (allowed != 0).
+    //
+    // CORRECTED #peruserrows (2026-10-01): this said the WRITEMAP line is "the
+    // EVIDENCE" that these two were created, and that "if these two are not a
+    // plus then /SHARED and /TMP were not created". THAT DOES NOT FOLLOW AND IS
+    // NOT TRUE. perms_path_check_rs() answers from the PERMS.DB ROW; it never
+    // stats the path. MEASURED on golden 2525, whose image carries NEITHER
+    // directory (they are created later in this very boot, by perms_seed_system()
+    // below): the WRITEMAP still printed `+/SHARED +/TMP`. A plus here proves a
+    // ROW, never a DIRECTORY, and an agent reading the old sentence as a
+    // creation test spent an hour on a defect that did not exist. The real test
+    // is a directory listing of the medium.
+    "/SHARED", "/TMP",
 };
 
 void perms_report_session_writability(const char *home, uint32_t uid, uint32_t gid) {
@@ -1372,7 +1624,7 @@ void perms_selftest_session(const char *home, uint32_t uid, uint32_t gid) {
             bootlog_write("[PERMS-SELFTEST] session home '%s' %u:%u %04o (user '%s' as "
                           "provisioned, not a hardcoded name)",
                           h.path, (unsigned)h.uid, (unsigned)h.gid,
-                          (unsigned)(h.mode & 0777), who);
+                          (unsigned)(h.mode & 07777), who);
             st_home_vectors(&h, "session");
             selftest_ran("perms/traversal(session)");
         }
@@ -1398,6 +1650,31 @@ static void perms_seed_system(void) {
         perms_set(perms_dev_node_seed[i].path, 0, 0,
                   perms_dev_node_seed[i].mode);
     }
+    // #prewrite: the all-users pre-writable directories. Seeded FIRST among
+    // the grant tables, and like every other pass an existing row wins, so an
+    // operator who has already chosen a mode for /SHARED or /TMP keeps it.
+    //
+    // THE DIRECTORY IS CREATED HERE TOO. A PERMS.DB row for a path that does
+    // not exist grants nothing at all: sys_open(O_CREAT) resolves the parent
+    // and fails at the missing component long before the mode is consulted.
+    // Seeding the mode without creating the directory would have produced a
+    // change that reads correct and does nothing, which is the exact failure
+    // shape blame.md keeps recording. fat_mkdir() is the ROUTED accessor and
+    // reaches the ext2 root on an ext2-root system; it is idempotent.
+    unsigned np = sizeof(perms_prewritable_seed) / sizeof(perms_prewritable_seed[0]);
+    for (unsigned i = 0; i < np; i++) {
+        if (g_fat_fs.mounted)
+            (void)fat_mkdir(&g_fat_fs, perms_prewritable_seed[i].path);
+        if (perms_lookup(perms_prewritable_seed[i].path)) continue;   // operator wins
+        perms_set(perms_prewritable_seed[i].path, 0, 0,
+                  perms_prewritable_seed[i].mode);
+        kprintf("[PERMS] #prewrite: %s seeded %04o (all-users, sticky: only "
+                "root, the file's owner or this directory's owner may remove "
+                "a name in it)\n",
+                perms_prewritable_seed[i].path,
+                (unsigned)perms_prewritable_seed[i].mode);
+    }
+
     unsigned ns = sizeof(perms_shared_state_seed) / sizeof(perms_shared_state_seed[0]);
     for (unsigned i = 0; i < ns; i++) {
         if (perms_lookup(perms_shared_state_seed[i].path)) continue;   // operator wins
@@ -1506,6 +1783,7 @@ void perms_init(void) {
         // (proc/fdlayer.c). Keeping the loud-skip line was what surfaced this;
         // a test that skipped quietly would have read exactly like a pass.
     }
+    perms_sticky_selftest();   // #prewrite: prove the all-users rule, every boot
     kprintf("[PERMS] Permissions database ready\n");
 }
 
@@ -1786,6 +2064,206 @@ int perms_check(const char *path, uint32_t proc_uid, uint32_t proc_gid, int acce
         }
     }
     return r;
+}
+
+// ===========================================================================
+// #prewrite: S_ISVTX. THE ONE DECISION for "may this principal remove or
+// replace this name".
+// ---------------------------------------------------------------------------
+// WHY IT IS ONE FUNCTION AND NOT FIVE CHECKS.
+//
+// There is no shared VFS chokepoint below this: fs/netfs.c's vfs_remove() has
+// ZERO callers, and fat_delete() (the mechanism everything really funnels into)
+// carries no caller identity at all, because a DOS or Win16 guest reaches it
+// from a kernel thread whose euid is 0 by construction. So the identity-bearing
+// gates are necessarily plural: sys_unlink, sys_rmdir, both ends of sys_rename,
+// and the DOS INT 21h gate in dos/int21svc.c. What must NOT be plural is the
+// RULE. #500's finding applies verbatim: a per-handler rule is a rule every
+// author has to remember, and 171 of 176 forgot. So every one of those five
+// sites calls THIS, and this is the only place the question is answered, in the
+// same spirit as collapsing xhci_may_block() into wq_may_block().
+//
+// IT SUBTRACTS ONLY. The first thing it does is the ordinary write-on-the-
+// parent check every caller already performed, so replacing a caller's
+// perms_check(parent, W_OK) with this can never ALLOW something that was
+// previously denied. On a directory with no sticky bit the Rust decision
+// returns STICKY_NOT_STICKY and this returns exactly what the old check
+// returned. That property is what makes it safe to wire into five call sites in
+// one change.
+//
+// THE AUTOMATION ARGUMENT, because it decides the shape of the rule.
+// If owner-only-delete were an absolute veto, the workaround for "my cleanup
+// job cannot remove that file" would be to run the cleanup job as root, and
+// once that is the habit the sticky bit protects nothing, because everything
+// that matters is privileged. An automation-hostile rule does not produce
+// security, it produces root. So the DIRECTORY OWNER may remove any name in
+// their own directory, as an ordinary unprivileged user, with no grant, no
+// prompt, no password and no elevation. An agent or scheduled job is given a
+// directory it owns; root writes that ownership into /CONFIG/PERMS.DB, which
+// Ring 3 cannot write, so the grant is declarative, administered, survives a
+// reboot and needs no human at a keyboard. Every cross-owner removal it
+// performs is audited.
+//
+// WHAT IS NOT HERE, stated rather than implied. A per-process, time-bounded,
+// revocable capability (CAP_FS_REPLACE through rustkern/caps.rs) would be
+// STRICTLY BETTER than the directory-owner rule for the cross-owner case, and
+// it is not in this change. The reason is concrete, not fatigue: caps.rs Stage
+// 1 can only ISSUE a grant through a consent prompt that the COMPOSITOR draws
+// and a human answers (cap_req_open_rs refuses with CAP_ENOCONSENT when
+// fbown_owner_rs() == 0), or through a standing consent that a human previously
+// approved. There is no headless issuance path; design section 6.3 names it as
+// Stage 5 and deliberately absent. Adding the CLASS and the consumer here
+// without an issuer would have produced a capability that can never be held: a
+// branch that always denies, which caps.rs's own principle 7 calls fiction and
+// which blame.md records as the zero-callers trap. What issuance would need is
+// exactly one thing: a policy-file issuer (a root-written row in
+// /CONFIG/CAPALLOW.CFG matched at process start rather than at prompt time), so
+// that a service identity can hold CAP_FS_REPLACE scoped to one path prefix.
+// When that lands, it belongs at the ONE `return -1` below and nowhere else.
+extern int sticky_decide_rs(uint32_t dir_has_entry, uint32_t dir_mode,
+                            uint32_t dir_uid, uint32_t victim_has_entry,
+                            uint32_t victim_uid, uint32_t caller_uid);
+extern int sticky_is_set_rs(uint32_t mode);
+extern uint32_t sticky_selftest_rs(void);
+
+#define STICKY_NOT_STICKY   0
+#define STICKY_ROOT         1
+#define STICKY_VICTIM_OWNER 2
+#define STICKY_DIR_OWNER    3
+#define STICKY_DENY       (-1)
+
+// Bounded, for the same reason [PERMS-DENY] is bounded: a retry loop in one app
+// must not flood the only debug channel real hardware has, nor push earlier
+// lines out of a captured log. The audit ring (seclog) is NOT capped by this;
+// the durable security record keeps every event.
+#define PERMS_STICKY_LOG_MAX 64u
+
+int perms_may_remove(const char *parent, const char *victim,
+                     uint32_t uid, uint32_t gid) {
+    if (!parent || !victim) return -1;
+
+    // 1. THE UNCHANGED PRECONDITION. Write on the directory, exactly as every
+    //    caller asked before this function existed. Its [PERMS-DENY] line is
+    //    emitted by perms_check() itself, so a refusal here is already
+    //    diagnosable and needs nothing added.
+    if (perms_check(parent, uid, gid, W_OK) != 0) return -1;
+
+    // Root and pre-init callers: perms_check() above already returned 0 on its
+    // first line for both. Repeating the test makes this function correct in
+    // isolation rather than only in the context of its caller.
+    if (uid == 0) return 0;
+    if (!perms_initialized) return 0;
+
+    // 2. GATHER THE FACTS. Canonicalize with perms_canon_rs(), the SAME
+    //    canonicalizer perms_check() uses, so the row this reads is the row the
+    //    gate enforced. A different normalization here would be #674 again:
+    //    "/SHARED/../SHARED/x" must not find a different entry than "/SHARED/x".
+    //    `< 0`, NOT `!= 0`. MEASURED, not reasoned: perms_canon_rs() returns
+    //    the LENGTH of the canonical path, and the pre-existing caller in this
+    //    same file (st_canon) tests `n < 0`. Written as `!= 0` this denied
+    //    EVERY removal in EVERY sticky directory, silently, before the rule was
+    //    ever consulted, because every non-empty path has a non-zero length.
+    //
+    //    IT LOOKED EXACTLY LIKE THE FEATURE WORKING. The two-boot proof showed
+    //    bob correctly refused alice's file in /SHARED; what it also showed,
+    //    and what gave it away, was bob unable to delete his OWN file and the
+    //    absence of any [STICKY-DENY] line for a refusal the rule should have
+    //    made and logged. A security gate that fails closed on a bug is
+    //    indistinguishable from one that works, from the attacker's side only.
+    //    That is why the probe asserts the ALLOWS as well as the DENIES.
+    char cdir[256], cvic[256];
+    if (perms_canon_rs(parent, cdir, (uint32_t)sizeof(cdir)) < 0 ||
+        perms_canon_rs(victim, cvic, (uint32_t)sizeof(cvic)) < 0) {
+        // Never silent. A refusal nobody can see is the bug above, repeated.
+        bootlog_write("[STICKY-DENY] canonicalization FAILED for parent='%s' "
+                      "victim='%s' (path too long?); refusing the removal",
+                      parent, victim);
+        return -1;
+    }
+
+    uint32_t duid = 0, dgid = 0, vuid = 0, vgid = 0;
+    uint16_t dmode = 0, vmode = 0;
+    int dhas = (perms_get(cdir, &duid, &dgid, &dmode) == 0);
+    int vhas = (perms_get(cvic, &vuid, &vgid, &vmode) == 0);
+    (void)dgid; (void)vgid; (void)vmode;
+
+    int d = sticky_decide_rs(dhas ? 1u : 0u, (uint32_t)dmode, duid,
+                             vhas ? 1u : 0u, vuid, uid);
+
+    if (d == STICKY_NOT_STICKY) return 0;   // the overwhelmingly common path
+
+    static unsigned sticky_logged = 0;
+
+    if (d != STICKY_DENY) {
+        // ALLOWED. Only the CROSS-OWNER allow is an event: a user removing
+        // their own file in a shared directory is the ordinary case and
+        // auditing it would bury the case that matters.
+        if (d == STICKY_DIR_OWNER && vhas && vuid != uid) {
+            extern const char *proc_current_name(void);
+            extern uint32_t proc_current_pid(void);
+            char det[176];
+            snprintf(det, sizeof(det),
+                     "ALLOW cross-owner remove: proc=%s uid=%u removed %s "
+                     "(owner %u) in %s (owner %u, mode %04o) under the "
+                     "directory-owner rule",
+                     proc_current_name(), (unsigned)uid, cvic, (unsigned)vuid,
+                     cdir, (unsigned)duid, (unsigned)dmode);
+            seclog_report_fs_remove(proc_current_pid(), det);
+            if (sticky_logged < PERMS_STICKY_LOG_MAX) {
+                sticky_logged++;
+                bootlog_write("[STICKY-ALLOW] %s", det);
+            }
+        }
+        return 0;
+    }
+
+    // DENIED. This is the branch that makes an all-users directory a shared
+    // space instead of a free-for-all, so it says exactly who was refused what
+    // and why, on BOTH channels: bootlog (which reaches /BOOTLOG.TXT, the only
+    // trace on a machine with no serial port, e.g. the iMac14,4) and the
+    // durable, tamper-evident security log.
+    {
+        extern const char *proc_current_name(void);
+        extern uint32_t proc_current_pid(void);
+        char det[176];
+        snprintf(det, sizeof(det),
+                 "DENY remove: proc=%s uid=%u may not remove %s (owner %s%u) "
+                 "in sticky %s (owner %u, mode %04o)",
+                 proc_current_name(), (unsigned)uid, cvic,
+                 vhas ? "" : "default root, no row: ", (unsigned)vuid,
+                 cdir, (unsigned)duid, (unsigned)dmode);
+        seclog_report_fs_remove(proc_current_pid(), det);
+        if (sticky_logged < PERMS_STICKY_LOG_MAX) {
+            sticky_logged++;
+            bootlog_write("[STICKY-DENY] %s", det);
+            if (sticky_logged == PERMS_STICKY_LOG_MAX)
+                bootlog_write("[STICKY-DENY] boot-log cap (%u) reached; further "
+                              "refusals go to the audit log only",
+                              (unsigned)PERMS_STICKY_LOG_MAX);
+        }
+    }
+    return -1;   // <-- the ONE place a capability override would be consulted
+}
+
+// #prewrite: the boot self-test for the rule above. blame.md's most-repeated
+// lesson is that in-tree prose lies, so this runs on every boot and the result
+// is printed whether it passes or fails. It exercises the DECISION function
+// directly with synthetic facts, because the rule must be provably right for
+// ownership combinations that do not happen to exist on this machine, including
+// the one that matters most: a second user trying to remove the first user's
+// file.
+void perms_sticky_selftest(void) {
+    uint32_t bad = sticky_selftest_rs();
+    bootlog_write("[STICKY-SELFTEST] %s (%u failing vectors) - rule: root, the "
+                  "victim's owner, or the DIRECTORY's owner may remove a name "
+                  "in a 01000 directory; nobody else, and an unowned name is "
+                  "root's",
+                  bad == 0 ? "PASS" : "FAIL", (unsigned)bad);
+    if (bad != 0) {
+        kprintf("[STICKY-SELFTEST] *** %u VECTORS FAILED: the all-users "
+                "directories are NOT protected on this boot ***\n",
+                (unsigned)bad);
+    }
 }
 
 // ============================================================================

@@ -38,6 +38,8 @@
 #include <sys/wait.h>
 #include <errno.h>
 
+extern char **environ;
+
 // MayteraOS syscall numbers are NOT hardcoded here. run_spawn.sh greps them
 // out of userland/libc/syscall.h AND kernel/proc/syscall.h, fails if the two
 // disagree, and passes them in as -D. A wrong number cannot silently pass.
@@ -56,6 +58,8 @@ char t_last_outfile[512];
 int  t_last_argc = -1;
 int  t_last_append = -1;
 int  t_last_had_redir = -1;
+int  t_last_envc = -424242;        // #112: what the library asked for
+int  t_last_env_was_environ = -1;  // 1 when envp pointed at our own environ
 
 void t_reset(void) {
     t_calls = 0;
@@ -64,7 +68,36 @@ void t_reset(void) {
     t_last_argc = -1;
     t_last_append = -1;
     t_last_had_redir = -1;
+    t_last_envc = -424242;
+    t_last_env_was_environ = -1;
 }
+
+// #112/#deadtests: THE REQUEST STRUCT, MIRRORED.
+//
+// posix_spawn() stopped issuing SYS_SPAWN_ARGS/SYS_SPAWN_REDIR and now issues
+// ONE SYS_SPAWN_ENV carrying this struct, because the six argument registers
+// were already full and an environment had nowhere to go. This model had not
+// followed, so every syscall the library made landed on this file's
+// unexpected() path and run_spawn.sh exited 2 with "syscall1 issued unexpected
+// syscall 394". Nothing invoked run_spawn.sh, so it stayed that way.
+//
+// The layout MUST match sc_spawn_req_t in BOTH userland/libc/syscall.h and
+// kernel/proc/syscall.h; the kernel side carries a _Static_assert locking it
+// to 56 bytes, and the assert below locks this copy to the same number so a
+// future field cannot silently desynchronise the model from the thing modelled.
+typedef struct {
+    const char  *path;
+    char       **argv;
+    int          argc;
+    int          envc;
+    char       **envp;
+    const char  *infile;
+    const char  *outfile;
+    int          append;
+    int          reserved;
+} m_spawn_req_t;
+_Static_assert(sizeof(m_spawn_req_t) == 56,
+               "m_spawn_req_t must stay byte-identical to sc_spawn_req_t");
 
 // ---------------------------------------------------------------------------
 // Services the freestanding test TU asks for
@@ -115,8 +148,9 @@ static int model_file_ok(const char *path) {
     return hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F';
 }
 
-static long model_spawn(long num, const char *path, char **argv, int argc,
-                        const char *infile, const char *outfile, int append) {
+static long model_spawn_env(long num, const char *path, char **argv, int argc,
+                            const char *infile, const char *outfile, int append,
+                            int envc, char **envp) {
     t_calls++;
     t_last_num = num;
     snprintf(t_last_path, sizeof(t_last_path), "%s", path ? path : "");
@@ -125,8 +159,19 @@ static long model_spawn(long num, const char *path, char **argv, int argc,
     t_last_argc = argc;
     t_last_append = append;
     t_last_had_redir = (infile || outfile) ? 1 : 0;
+    t_last_envc = envc;
+    t_last_env_was_environ = (envp && envp == environ) ? 1 : 0;
 
     if (!path || argc < 0) return -1;
+    // The kernel REFUSES the whole spawn on a malformed entry rather than
+    // dropping it (sc_spawn_req_t's envc semantics); model that, because a
+    // silently-dropped PATH is the defect #112 exists to avoid.
+    if (envc > 0) {
+        for (int i = 0; i < envc; i++) {
+            if (!envp || !envp[i] || !strchr(envp[i], '=')) return -1;
+            if (strlen(envp[i]) > 511) return -1;
+        }
+    }
     if (!model_file_ok(path)) return -1;
 
     char *av[66];
@@ -145,7 +190,14 @@ static long model_spawn(long num, const char *path, char **argv, int argc,
             int fd = open(infile, O_RDONLY);
             if (fd >= 0) { dup2(fd, 0); if (fd != 0) close(fd); }
         }
-        execv(path, av);
+        // envc < 0 means "no environment supplied": the kernel gives the
+        // child its own default block, so the model gives it ours.
+        if (envc < 0) { execv(path, av); _exit(127); }
+        char *ev[65];
+        int en = envc > 64 ? 64 : envc;
+        for (int i = 0; i < en; i++) ev[i] = envp[i];
+        ev[en] = NULL;
+        execve(path, av, ev);
         _exit(127);
     }
     return (long)p;
@@ -178,6 +230,13 @@ long syscall5(long num, long a, long b, long c, long d, long e) {
 
 long syscall1(long num, long a1) {
     if (num == M_SYS_CLOSE) return close((int)a1);
+    if (num == M_SYS_SPAWN_ENV) {   // #112: ONE pointer to the request struct
+        const m_spawn_req_t *r = (const m_spawn_req_t *)a1;
+        if (!r || r->reserved != 0) return -1;   // reserved MUST be 0
+        return model_spawn_env(num, r->path, r->argv, r->argc,
+                               r->infile, r->outfile, r->append,
+                               r->envc, r->envp);
+    }
     unexpected("syscall1", num);
     return -1;
 }
@@ -191,7 +250,8 @@ long syscall2(long num, long a1, long a2) {
 long syscall3(long num, long a1, long a2, long a3) {
     if (num == M_SYS_READ) return (long)read((int)a1, (void *)a2, (size_t)a3);
     if (num == M_SYS_SPAWN_ARGS)
-        return model_spawn(num, (const char *)a1, (char **)a2, (int)a3, NULL, NULL, 0);
+        return model_spawn_env(num, (const char *)a1, (char **)a2, (int)a3,
+                               NULL, NULL, 0, -1, NULL);
     if (num == M_SYS_WAITPID) {
         int raw = 0;
         pid_t r = wait4((pid_t)a1, &raw, 0, NULL);
@@ -206,8 +266,9 @@ long syscall3(long num, long a1, long a2, long a3) {
 
 long syscall6(long num, long a1, long a2, long a3, long a4, long a5, long a6) {
     if (num == M_SYS_SPAWN_REDIR)
-        return model_spawn(num, (const char *)a1, (char **)a2, (int)a3,
-                           (const char *)a4, (const char *)a5, (int)a6);
+        return model_spawn_env(num, (const char *)a1, (char **)a2, (int)a3,
+                               (const char *)a4, (const char *)a5, (int)a6,
+                               -1, NULL);
     unexpected("syscall6", num);
     return -1;
 }

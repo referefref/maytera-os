@@ -28,6 +28,11 @@
 #include "../../proc/users.h"   // #692: resolve the authenticated account
 #include "../../proc/services.h" // #785: register as a built-in service
 #include "../../drivers/tty.h"
+#include "../firewall.h"    // #kfirewall: ask the filter about the port we just bound
+#include "../../fs/bootlog.h" // #kfirewall: from its OWNING header, never a hand
+                             // -written extern (#665 persist-extern-gate: a private
+                             // extern links against a signature you invented, and
+                             // void-vs-int is silent on x86-64 SysV)
 #include "../../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
 #include "../../security/security.h"   // #697: security_audit() + secure_zero()
 
@@ -1043,6 +1048,48 @@ int ssh_server_start_checked(int reload) {
     kprintf("[SSHD] listening on port %u (max %d concurrent sessions)\n",
             (unsigned)g_cfg.port, SSH_MAX_SESSIONS);
     security_audit(AUDIT_SERVICE_STATE, 0, "sshd: listener started");
+
+    // #kfirewall: THE LISTENER IS UP. IS IT REACHABLE?
+    //
+    // "Listening" and "reachable" are two different facts and only one of them
+    // was ever reported. The packet filter's default inbound policy is DENY, so
+    // a listener with no inbound allowance for its port binds successfully, logs
+    // the line above, and has every unsolicited SYN dropped one layer below it.
+    // The compiled-in default policy derives `allow in tcp 22` from MAYTERA_SSHD
+    // (rustkern/fwfilter.rs), which covers the DEFAULT port by construction; it
+    // cannot cover a port moved by `/CONFIG/SSHD.CFG port=`, or an inbound deny
+    // a hand-edited /CONFIG/FWRULES.CFG put in front of the allowance, because
+    // neither is knowable at build time. Here, at bind time, both are.
+    //
+    // IT WARNS AND IT DOES NOT OPEN. Binding a port is not authority to amend
+    // policy: auto-opening would make "whatever is listening is reachable",
+    // which is default-allow wearing a different hat and is the posture A6 of
+    // docs/OPEN_BACKLOG.md exists to avoid. The operator gets the diagnosis and
+    // makes the decision.
+    //
+    // WHY IT IS WORTH THE TEN LINES. The machine this is for (the owner's iMac)
+    // has no usable serial port, which is why remote debugging is wanted at all.
+    // Without this line the symptom there is a server that answers nothing, with
+    // no way to tell a dropped SYN from a broken sshd, and the natural next move
+    // is to switch the firewall off. That trades a diagnosable misconfiguration
+    // for a disabled defence.
+    //
+    // Process context, after the listener exists; fw_admits_in_tcp_rs() is a
+    // pure query that takes no lock and creates no conntrack entry, so asking
+    // changes nothing.
+    if (!fw_admits_in_tcp_rs(g_cfg.port)) {
+        kprintf("[SSHD] WARNING: the packet filter will DROP unsolicited inbound "
+                "TCP to port %u, so this listener is NOT reachable from the "
+                "network. Add `allow in tcp %u` (Settings > Network, or `r 0 0 0 "
+                "%u` in /CONFIG/FWRULES.CFG) - do NOT disable the filter.\n",
+                (unsigned)g_cfg.port, (unsigned)g_cfg.port, (unsigned)g_cfg.port);
+        bootlog_write("[SSHD] listening on %u but the packet filter drops inbound "
+                      "to it; not reachable", (unsigned)g_cfg.port);
+        // A service that is up but unreachable is a security-relevant state, and
+        // the audit trail is where a state nobody was watching for gets found.
+        security_audit(AUDIT_SERVICE_STATE, 0,
+                       "sshd: listener started but the packet filter denies inbound to its port");
+    }
     return 0;
 }
 

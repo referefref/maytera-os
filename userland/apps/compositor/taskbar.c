@@ -2401,18 +2401,23 @@ static bool taskbar_handle_default(int32_t x, int32_t y, bool clicked) {
 // hit-test the launcher, running-app switcher, and tray. They keep the desktop
 // work area correct via taskbar_top_inset()/taskbar_bottom_inset().
 
-// (#wizdock) Owner decision 2026-08-27: the compiled-in starting layout is
-// Marble (DOCK_XFCE), not DOCK_DEFAULT ("classic", 0). DOCK_DEFAULT itself is
-// UNCHANGED - it still names the classic bar, and every "== DOCK_DEFAULT"
-// comparison elsewhere in this file still means exactly that. Only the
-// INITIAL VALUE of the variable changes, which is what a fresh install with
-// no /UIPROFIL.YML yet actually starts from. A machine with an existing
-// profile is unaffected: profile_load() overwrites this the moment it reads
-// a "dock_style:" key, so this line only governs the pre-personalisation
-// default (and the first-boot wizard's Finish step, which persists whatever
-// this session's g_dock_style is if the Appearance page was never visited -
-// see userland/apps/setup/main.rs's matching default).
-int g_dock_style = DOCK_XFCE;
+// (#glassrevert, 2026-10-01) REVERSES the #wizdock 2026-08-27 decision below,
+// on explicit fresh owner direction: "i prefer the previous layout" / "any
+// other app that had this UI change", confirmed to include the dock/taskbar.
+// The compiled-in starting layout is DOCK_DEFAULT (classic bottom taskbar)
+// again, not Marble (DOCK_XFCE). Marble/Lumina remain fully selectable in
+// Settings - Appearance for anyone who wants them; they are simply no longer
+// what a fresh install starts from. A machine with an existing profile is
+// unaffected either way: profile_load() overwrites this the moment it reads
+// a "dock_style:" key.
+//
+// (#wizdock) Prior text, kept for history: "Owner decision 2026-08-27: the
+// compiled-in starting layout is Marble (DOCK_XFCE), not DOCK_DEFAULT
+// ('classic', 0)." DOCK_DEFAULT itself was never touched by that decision or
+// this reversal - it still names the classic bar, and every
+// '== DOCK_DEFAULT' comparison elsewhere in this file still means exactly
+// that. See userland/apps/setup/main.rs's matching default (also reverted).
+int g_dock_style = DOCK_DEFAULT;
 extern int g_draw_blend;   // draw.c global alpha (255 = opaque)
 
 // (Layout metrics LUMINA_*/CLASSIC_UNIX_*/RETRO_BENCH_* are #defined at the top of this file.)

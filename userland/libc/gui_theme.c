@@ -181,17 +181,22 @@ int gui_theme_index_append(const char *filename) {
         if (p < n && idx[p] == '\n') p++;
     }
 
-    // Rewrite the whole (small, bounded) file with the line appended, the
-    // same unlink-then-create idiom Settings uses for its own *.CFG files.
-    sys_unlink(THEME_INDEX_PATH);
-    int fd = sys_open(THEME_INDEX_PATH, 0x0001 | 0x0040); // O_WRONLY|O_CREAT
-    if (fd < 0) return -1;
-    if (n > 0) sys_write(fd, idx, (unsigned long)n);
-    if (n > 0 && idx[n - 1] != '\n') sys_write(fd, "\n", 1);
-    sys_write(fd, filename, (unsigned long)flen);
-    sys_write(fd, "\n", 1);
-    sys_close(fd);
-    return 0;
+    // #peruser2: NOT RELOCATED, ON PURPOSE. /THEMES/INDEX.TXT is the SYSTEM
+    // REGISTRY of the themes installed ON THE MACHINE and it is read by the
+    // KERNEL's theme_init() at boot, before any account exists. The per-user
+    // datum is the SELECTION (THEME.CFG, already per-user above); the catalogue
+    // of what is installed is not. Moving it into a home would break boot on a
+    // machine with no users, which is every freshly built golden.
+    //
+    // What IS fixed is the idiom. The unlink ALWAYS ran and the open could fail,
+    // so a refused or failed create left the machine with NO theme registry at
+    // all rather than an unchanged one, and every write result was discarded.
+    // userconf_write_all() never unlinks, O_TRUNCs only after a successful open,
+    // and checks the write, the fsync and the close (#743).
+    if (n > 0 && idx[n - 1] != '\n' && n < (int)sizeof(idx) - 1) idx[n++] = '\n';
+    for (int i = 0; i < flen && n < (int)sizeof(idx) - 2; i++) idx[n++] = filename[i];
+    if (n < (int)sizeof(idx) - 1) idx[n++] = '\n';
+    return userconf_write_all(THEME_INDEX_PATH, idx, (unsigned long)n);
 }
 
 int gui_theme_activate_path(const char *mtheme_path, const char *index_filename) {
@@ -262,15 +267,23 @@ int gui_theme_activate_path(const char *mtheme_path, const char *index_filename)
     // #683: write the user's own copy. The unlink+create pair is kept (it is how
     // this file has always avoided a stale tail), but both now target the
     // per-user path, so the system default in /CONFIG is never modified.
+    // #peruser2: the RELOCATION was already right; the WRITE was not. The
+    // sys_unlink() ran before the open, so a refused open (an fd-table
+    // exhaustion, a read-only volume, a home that does not exist yet) DESTROYED
+    // the user's saved theme selection instead of leaving it alone, and the
+    // write and close results were discarded so a partial write looked like a
+    // save. userconf_open_write() already O_TRUNCs after a successful open,
+    // which is the ordering the unlink was reaching for.
     char _tw[256];
     if (userconf_path(THEME_CFG_NAME, _tw, sizeof(_tw)) != 0) return -1;
-    sys_unlink(_tw);
     int fd = userconf_open_write(THEME_CFG_NAME);
     if (fd >= 0) {
         char buf[96];
         int n = snprintf(buf, sizeof(buf), "active=%s\n", slug);
-        if (n > 0) sys_write(fd, buf, (unsigned long)n);
-        sys_close(fd);
+        if (n > 0 && userconf_finish_write(fd, buf, (unsigned long)n) != 0)
+            uc_report_write_refusal("gui_theme_activate", _tw, -1);
+        else if (n <= 0)
+            sys_close(fd);
     }
     return idx;
 }

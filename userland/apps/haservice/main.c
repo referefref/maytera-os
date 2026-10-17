@@ -30,6 +30,8 @@
 
 #include "../../libc/maytera.h"
 #include "../../libc/syscall.h"
+#include "../../libc/userconf.h"   // #harendezvous: userhome_path_session()
+#include "../../libc/stdio.h"       // #harendezvous: snprintf for the one log line
 
 #define O_WRONLY  0x0001
 #define O_CREAT   0x0040
@@ -365,15 +367,94 @@ static void run_command(void){
     write_file("/HACMD.RES",res,rl);
 }
 
-// (#419) A request marker (e.g. /HALIST.REQ) is "pending" only if it has real
-// content. remove_file() truncates to 0 bytes (it does not unlink), so the old
-// file_exists() test stayed true forever and re-fetched the catalog every loop.
-static int req_pending(const char *path){
-    char b[8]; int fd=sys_open(path,0); if(fd<0) return 0;
-    long n=sys_read(fd,b,sizeof(b)); sys_close(fd);
+// ===========================================================================
+// #harendezvous: THE WIDGET-OWNED HALF OF THIS PROTOCOL BELONGS TO THE SESSION
+// USER, AND THIS SERVICE IS NOT THAT USER.
+//
+// This service is started by the service manager and the shipped
+// /CONFIG/SERVICES.CFG runs it as UID 0 ("haservice /APPS/HASERVICE svc_ha 0
+// net,fs 1 1"), while the compositor that writes HAENT.TXT and HALIST.REQ runs
+// as the session user (uid 1000). So the two ends are different principals, and
+// for as long as the meeting point was a root-owned literal at the filesystem
+// root the CLIENT's writes were refused (-13) and discarded: the entity picker
+// recorded nothing on any non-root session.
+//
+// They now meet in the session user's home. The kernel resolves WHICH home
+// (SYS_SESSION_HOME -> libc userhome_path_session()), because the kernel holds
+// the only definition of "the session user" (#745) and a service has no session
+// of its own to ask. "The one non-root account" would have been a rule that
+// breaks on the second account; /SHARED and /TMP would have been a
+// world-writable 01777 directory whose STICKY BIT makes delete owner-only, which
+// is exactly what a consume-the-request protocol must not have.
+//
+// READ-ONLY, DELIBERATELY. See consume_req() for why this service no longer
+// writes anything into the client's space.
+// ===========================================================================
+// SAY WHERE WE ARE LOOKING, ONCE PER CHANGE.
+//
+// A service that resolves a rendezvous path in silence is exactly how this whole
+// bug family stayed invisible for so long: the write was refused, the return
+// value was discarded, and nothing anywhere named the path that had been tried.
+// This is the cheapest possible cure, and it is bounded BY CONSTRUCTION rather
+// than by a counter: it logs only when the resolved path DIFFERS from the last
+// one logged, so a steady state is completely silent and the login transition
+// ("/HALIST.REQ" -> "/HOME/<USER>/HALIST.REQ") is a single line that tells you
+// the service followed the session. sys_bootlog() is used because it is the one
+// reporting channel measured to work from any uid on this image and it does not
+// depend on the permission that might have just failed.
+static void log_path_change(const char *tag, const char *p){
+    static char last[2][256];
+    int k = (tag[0]=='R') ? 0 : 1;          // "REQ" / "ENT", two independent slots
+    int same=1;
+    for(int i=0;i<255;i++){ if(last[k][i]!=p[i]){ same=0; break; } if(!p[i]) break; }
+    if(same) return;
+    scopy(last[k],p,sizeof(last[k]));
+    char m[200];
+    snprintf(m,sizeof(m),"[HASVC] #harendezvous %s rendezvous path -> %s",tag,p);
+    sys_bootlog(m);
+}
+
+static void session_path(const char *name, char *out, int cap, const char *legacy){
+    if(userhome_path_session(0,name,out,(unsigned long)cap)!=0) scopy(out,legacy,cap);
+}
+
+// Consume a request WITHOUT depending on being able to write it.
+//
+// The authoritative consume is the caller's token comparison below; this
+// truncate is a best-effort tidy-up so a stale token does not sit in the user's
+// home, and its failure is IGNORED on purpose. O_WRONLY|O_TRUNC with NO O_CREAT:
+// if the file has gone, this must not re-create it as a ROOT-OWNED file in the
+// user's home, which would lock the uid-1000 compositor out of its own request
+// file for good.
+static void consume_req(const char *path){
+    int fd=sys_open(path,0x0001|0x0200);
+    if(fd>=0) sys_close(fd);
+}
+
+// Is there a NEW catalog request? "New" is "the token differs from the last one
+// we acted on", compared for INEQUALITY rather than order so that a restart of
+// either side is harmless (the compositor's token is uptime-derived and resets
+// to a LOWER value when it restarts). An old compositor that still writes the
+// constant "1" is handled by consume_req() clearing the file, so both protocol
+// versions work against this service.
+//
+// THIS REPLACES req_pending() (#419), whose lesson it keeps: the predecessor
+// test was file_exists(), and because the consume was a TRUNCATE rather than an
+// unlink the file stayed present forever and the catalog was re-fetched on every
+// single loop. req_pending() fixed that by requiring non-whitespace CONTENT.
+// Comparing the content itself is the same idea carried one step further, and it
+// is what lets the consume stop being a write at all.
+static char g_last_req[24]="";
+static int req_is_new(const char *path){
+    char b[24]; int n=read_file(path,b,sizeof(b));
     if(n<=0) return 0;
-    for(int i=0;i<n;i++){ if(b[i]>' ') return 1; }   // non-whitespace => pending
-    return 0;
+    while(n>0 && b[n-1]<=' ') b[--n]=0;          // trim the trailing newline
+    if(n<=0) return 0;
+    int same=1;
+    for(int i=0;i<=n;i++){ if(g_last_req[i]!=b[i]){ same=0; break; } }
+    if(same) return 0;
+    scopy(g_last_req,b,sizeof(g_last_req));
+    return 1;
 }
 
 int main(int argc,char**argv){
@@ -392,8 +473,19 @@ int main(int argc,char**argv){
         // call site - after refresh_list() returns by ANY of its paths
         // (completed catalog, exhausted retries, or the refresh_list_states()
         // fallback), so the marker can never be left stuck non-empty.
-        if(req_pending("/HALIST.REQ")){
-            remove_file("/HALIST.REQ");
+        // #harendezvous: RE-RESOLVED EVERY PASS, not cached at startup. This
+        // service starts before anybody has logged in, when the kernel's answer
+        // is still "/" (a freshly built golden ships no /CONFIG/PASSWD on
+        // purpose, #226/#202), and it must pick up the real home the moment a
+        // session exists. Re-resolving costs one syscall per refresh interval.
+        char p_req[256], p_ent[256];
+        session_path("HALIST.REQ",p_req,sizeof(p_req),"/HALIST.REQ");
+        session_path("HAENT.TXT", p_ent,sizeof(p_ent), "/HAENT.TXT");
+        log_path_change("REQ",p_req);
+        log_path_change("ENT",p_ent);
+
+        if(req_is_new(p_req)){
+            consume_req(p_req);
             write_file("/HALIST.PRG","1",1);
             refresh_list();
             remove_file("/HALIST.PRG");
@@ -402,8 +494,12 @@ int main(int argc,char**argv){
         // Control commands (guarded).
         run_command();
 
-        // Per-entity cache refresh from /HAENT.TXT.
-        char ents[1024]; read_file("/HAENT.TXT",ents,sizeof(ents));
+        // Per-entity cache refresh from the session user's HAENT.TXT, falling
+        // back to the legacy root literal so an image written before this moved
+        // keeps working (the #683 asymmetric rule: READ per-user then legacy).
+        char ents[1024];
+        if(read_file(p_ent,ents,sizeof(ents))<=0)
+            read_file("/HAENT.TXT",ents,sizeof(ents));   // legacy, pre-#683
         int i=0,slot=0; char first_eid[96]; first_eid[0]=0;
         while(ents[i]&&slot<8){
             char eid[96]; int e=0;

@@ -157,6 +157,47 @@ static inline open_mode_t open_mode_decode(int flags) {
     return m;
 }
 
+// ---------------------------------------------------------------------------
+// #747: ONE decoding of the CONSEQUENCE of the mode above, for every fd family.
+//
+// open_mode_decode() gave the kernel one decoding of the flags WORD. It did not
+// give it one decoding of what that mode REQUIRES OF THE DESCRIPTOR, and the
+// four fd families then disagreed about the same open_mode_t: the SMB and NFS
+// branches of sys_open_k() tested the raw bits inline and started an EMPTY
+// write buffer for a plain O_RDWR open of an existing file, so writing 4 bytes
+// to a 1 MB file on a share left a 4-byte file and read() on that same
+// descriptor returned -1. The /MNT aux branch did the same AND marked the
+// buffer dirty at open, so open-then-close with no write at all truncated the
+// file to zero.
+//
+// THE POLICY IS IN RUST (rustkern/fdopenpolicy.rs), per the 2026-07-16 rule,
+// with its own absolute-value self-test. This header carries only the C face
+// and the layout, which is locked by _Static_assert in
+// proc/syscall_argtab_lock.c.
+//
+// THE ONE NOTION OF TRUNCATION IS STILL open_mode_t::trunc. fd_open_plan_t
+// re-exports it as `owes_empty` and that is the ONLY field a caller may use to
+// decide to empty a file. Nothing here adds a second notion.
+// ---------------------------------------------------------------------------
+typedef struct {
+    int whole_file;   // hold the WHOLE file in one buffer, read+write at ONE position
+    int preload;      // fill that buffer from the file's current contents
+    int owes_empty;   // O_TRUNC: the medium is owed a zero-length file NOW
+    int at_end;       // O_APPEND: every write lands at end-of-file
+    int noread;       // the fd must refuse read() (O_WRONLY)
+} fd_open_plan_t;
+
+// `native_append` = 1 if the backend can add bytes to an existing file without
+// rewriting it (ext2 can, via ext2_append_file). 0 if its only commit is
+// "replace the whole file" (SMB, NFS, and the /MNT aux mounts), in which case
+// an append-only buffer IS a destructive rewrite and the whole file must be
+// held. Returns 0, or -1 (writing nothing) if either pointer is NULL.
+int fd_open_plan_rs(const open_mode_t *m, int native_append, fd_open_plan_t *out);
+// Non-inline face for open_mode_decode(), so the Rust self-test can ask C for
+// the decoding instead of re-implementing the bit arithmetic (which is the
+// exact drift #746/#747 exist to end). Defined in proc/fdlayer.c.
+void open_mode_decode_c(int flags, open_mode_t *out);
+
 // POSIX-ish seek whences.
 #define SEEK_SET    0
 #define SEEK_CUR    1
@@ -321,10 +362,11 @@ void fd_close_all(void);
 // proc/fdlayer.c; declared here because that is where the fd families live.
 int64_t sys_ftruncate(int fd, int64_t length);
 
-// Bump the refcount on every open fd in the fd table. Used from proc_fork
-// so the child inherits each parent file description with a fresh reference.
-// (A3 will add CLOEXEC handling and move this into proc_copy_files.)
-void fd_refcount_all_plus_plus(void);
+// #heapdbl: fd_refcount_all_plus_plus() is DELETED. Its comment here claimed it
+// was "Used from proc_fork"; it had ZERO CALLERS in every commit, and fork's real
+// inheritance loop lives in proc/process.c and takes its own references. See
+// fs/vfs.c where the body was, for why calling it would have leaked rather than
+// fixed anything.
 
 // Duplicate oldfd to the lowest available fd >= min. Returns the new fd or
 // -1 on error. Bumps the underlying file_t refcount.

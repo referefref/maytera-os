@@ -22,6 +22,7 @@
 #include "../../libc/notify.h"
 #include "arc.h"
 #include "../../libc/pkgsig.h"
+#include "../../libc/pkgman.h"    // ONE definition of what an INSTALL rule means
 #include "../../libc/startmenu_reg.h"   // #<startmenu-rust> live Start-menu registration
 
 /* Hostname, not a LAN IP: see the note in appstore/main.c. HTTP is
@@ -266,27 +267,56 @@ static int apply_update(const char *id, const char *name, const char *ver, const
     if (ii < 0) { arc_free_entries(ents, count); return -1; }
     char *man = (char *)ents[ii].data; size_t mlen = ents[ii].size;
     char launch[96]; launch[0] = 0; int wrote = 0;
-    size_t p = 0;
-    while (p < mlen) {
-        char line[256]; int ll = 0;
-        while (p < mlen && man[p] != '\n' && ll < 255) line[ll++] = man[p++];
-        if (p < mlen) p++; line[ll] = 0;
-        if (line[0] == '#' || !line[0]) continue;
-        char *ar = strstr(line, "->"); if (!ar) continue;
-        char src[128], dst[128]; int si = 0; char *s = line;
-        while (s < ar && *s == ' ') s++;
-        while (s < ar && *s != ' ' && si < 127) src[si++] = *s++; src[si] = 0;
-        char *d = ar + 2; while (*d == ' ') d++;
-        int di = 0; while (*d && *d != ' ' && *d != '\r' && di < 127) dst[di++] = *d++; dst[di] = 0;
-        if (!src[0] || !dst[0]) continue;
-        int fe = find_entry(ents, count, id, src);
-        if (fe < 0) continue;
-        int rc = pkg_write(dst, ents[fe].data, ents[fe].size);
-        printf("[upd]   pkg_write %s (%u) -> rc=%d\n", dst, (unsigned)ents[fe].size, rc);
-        if (rc >= 0) wrote++;
-        if (!launch[0] && strncmp(dst, "/APPS/", 6) == 0) {
-            int lower = 1; for (const char *c = dst + 6; *c; c++) if (*c >= 'A' && *c <= 'Z') { lower = 0; break; }
-            if (lower) strcpy(launch, dst);
+
+    // The rule grammar has ONE definition, userland/libc/pkgman.c, shared with
+    // the App Store client. This loop used to be a third hand-rolled copy of
+    // "split on ->, strcmp the source", which meant the updater and the App
+    // Store could disagree about what a manifest means, and neither understood
+    // a TREE rule.
+    //
+    // THE LOOP IS INVERTED, deliberately. It used to walk manifest LINES and
+    // look up the archive entry each named. A tree rule names no single entry,
+    // so the walk is now over MEMBERS, each resolved through pkgman. That also
+    // picks up fan-out (a member named by several rules) for free, which the
+    // line walk got right only by accident and the App Store got wrong.
+    //
+    // HONEST LIMITATION, unchanged by this: the updater still buffers the WHOLE
+    // package in g_dl and uses arc_targz_extract(), so it is bounded by that
+    // buffer and cannot carry a large game. Large packages install through the
+    // App Store app, which streams (#613). Making the updater stream too is
+    // separate work and is not done here.
+    {
+        int mrc_line = 0;
+        int mrc = pkgman_check_manifest(man, (unsigned long)mlen, &mrc_line);
+        if (mrc != 0) {
+            printf("[upd] REFUSED %s: malformed INSTALL manifest at line %d\n", id, mrc_line);
+            ulog("REFUSED package %s: malformed INSTALL manifest at line %d", id, mrc_line);
+            arc_free_entries(ents, count);
+            return -1;
+        }
+    }
+    for (int e = 0; e < count; e++) {
+        if (ents[e].is_dir || !ents[e].name[0]) continue;
+        char dests[PKGMAN_MAX_DESTS][PKGMAN_DEST_MAX];
+        int nd = pkgman_dest_all(man, (unsigned long)mlen, id, ents[e].name,
+                                 dests, PKGMAN_MAX_DESTS);
+        if (nd < 0) {
+            // FAIL CLOSED: a member the manifest claims but cannot express as a
+            // path is a bad package, not a file to skip.
+            printf("[upd] REFUSED %s member %s: %s\n", id, ents[e].name, pkgman_strerror(nd));
+            ulog("REFUSED package %s member %s: %s", id, ents[e].name, pkgman_strerror(nd));
+            arc_free_entries(ents, count);
+            return -1;
+        }
+        for (int k = 0; k < nd; k++) {
+            const char *dst = dests[k];
+            int rc = pkg_write(dst, ents[e].data, ents[e].size);
+            printf("[upd]   pkg_write %s (%u) -> rc=%d\n", dst, (unsigned)ents[e].size, rc);
+            if (rc >= 0) wrote++;
+            if (!launch[0] && strncmp(dst, "/APPS/", 6) == 0) {
+                int lower = 1; for (const char *c = dst + 6; *c; c++) if (*c >= 'A' && *c <= 'Z') { lower = 0; break; }
+                if (lower && strlen(dst) < sizeof(launch)) strcpy(launch, dst);
+            }
         }
     }
     arc_free_entries(ents, count);

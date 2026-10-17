@@ -35,6 +35,7 @@ extern void settings_launch(void);
 #include "../proc/process.h"
 #include "../proc/affinity.h"   // #affinity: pin the compositor to one core
 #include "../proc/signal.h"   // #126 session teardown: SIGKILL + sig_raise()
+#include "../sync/waitq.h"    // #317: autorun waits on the real event, not a duration
 
 // External timer ticks from ISR
 extern volatile uint64_t timer_ticks;
@@ -3018,13 +3019,57 @@ void desktop_draw_cursor(int32_t x, int32_t y) {
 }
 
 // Main desktop event loop (new event-driven architecture)
+// #317: THE READINESS GATE FOR THE BOOT AUTO-LAUNCH.
+//
+// Every waiter here goes through the wait queue. See rustkern/uiready.rs for
+// why the previous proc_sleep(14000) was wrong (short version: timer_ticks is
+// not a wall clock, so it was not even reliably 14 s, and 14 s was a guess at a
+// condition that desktop_run() already observes exactly).
+//
+// STATICALLY INITIALISED, deliberately. desktop_run() is re-entered once per
+// login-gate iteration (#126), so a wait_queue_head_init() call inside it would
+// re-zero a head that a live autorun waiter is linked onto. There is nothing to
+// initialise at run time: an empty queue IS the zero state.
+static wait_queue_head_t g_uiready_wq = {
+    .head = NULL,
+    .lock = SPINLOCK_INIT_NAMED("uiready")
+};
+
+// Called from desktop_run() at each point a real UI reaches the screen. Safe
+// from any context wake_up_all() is safe from; both call sites are in the
+// kernel desktop thread. Sets the state BEFORE waking, so a wake cannot be
+// lost: wait_event_timeout() re-tests the condition before it sleeps, and a
+// wake that arrives "too early" is simply the condition already being true.
+static void uiready_signal(int fallback) {
+    extern void uiready_mark_compositor_rs(void);
+    extern void uiready_mark_fallback_rs(void);
+    if (fallback) uiready_mark_fallback_rs();
+    else          uiready_mark_compositor_rs();
+    wake_up_all(&g_uiready_wq);
+}
+
 // #317 pass 2: optional boot auto-launch. /CONFIG/AUTORUN.CFG holds one app
-// path (e.g. "/APPS/files"); launched a few seconds after boot once the
-// compositor has rendered. No-op when the file is absent (kiosk/test aid).
+// path (e.g. "/APPS/files"); launched once a real UI is on screen. No-op when
+// the file is absent (kiosk/test aid).
 static void autorun_worker(void *arg) {
     (void)arg;
-    extern void proc_sleep(uint32_t ms);
-    proc_sleep(14000);
+    extern int uiready_up_rs(void);
+    extern unsigned int uiready_state_rs(void);
+    // WAIT FOR THE EVENT, NOT FOR A DURATION. The 60 s bound is belt and
+    // braces only: it exists so that a future third route to a live desktop
+    // (one that reaches neither signal site) degrades into "autorun is late"
+    // rather than "autorun never runs at all". It is NOT the mechanism, and a
+    // WAIT_TIMEOUT here is a BUG REPORT about a missing uiready_signal() call,
+    // which is why it is logged as one instead of being swallowed.
+    int rc = wait_event_timeout(&g_uiready_wq, uiready_up_rs() != 0,
+                               wq_ms_to_ticks(60000));
+    unsigned int ust = uiready_state_rs();
+    bootlog_write("[Autorun] UI-ready gate released: rc=%d state=0x%x (%s)",
+                  rc, ust,
+                  rc != WAIT_OK ? "TIMEOUT - no uiready_signal() ever fired, "
+                                  "which is a bug, not a slow boot"
+                  : (ust & 2) ? "kernel-desktop fallback engaged"
+                              : "compositor presented its first frame");
     uint32_t sz = 0;
     char *cfg = (char *)fat_read_file(&g_fat_fs, "/CONFIG/AUTORUN.CFG", &sz);
     if (!cfg) return;
@@ -3327,6 +3372,18 @@ void desktop_run(void) {
                                   cpid, cp0->session);
                 }
             }
+            // #317: one line of boot evidence that the readiness gate's state
+            // machine is correct, run over the PURE core in rustkern/uiready.rs
+            // so it cannot perturb the live state it is reporting on. This
+            // stands in for a RUST_* differential (there is no C twin).
+            {
+                extern int uiready_selftest_rs(void);
+                int ubad = uiready_selftest_rs();
+                kprintf("[Autorun] (#317) UI-ready gate selftest: %s (%d failing)\n",
+                        ubad == 0 ? "PASS" : "FAIL", ubad);
+                bootlog_write("[Autorun] (#317) UI-ready gate selftest: %s (%d failing)",
+                              ubad == 0 ? "PASS" : "FAIL", ubad);
+            }
             proc_create_ex("autorun", autorun_worker, 0, PRIO_LOW, 64*1024);
             kprintf("[Desktop] Compositor launched (pid %d); keeping splash until it renders\n", cpid);
             {
@@ -3611,6 +3668,14 @@ pttest_after_launch:;   // #430: gate jumps here, skipping the compositor path
                         // bootlog_rotate_previous() in fs/bootlog.c.
                         bootlog_mark_boot_complete();
                     }
+                    // #317: release the autorun gate here rather than at a
+                    // guessed offset from the spawn. This is the SAME
+                    // observation the display handover is made on, so the two
+                    // can never disagree about when a real UI appeared.
+                    // Outside the gfx_boot_owns_display() branch above because
+                    // that branch is once-only and the gate must be released
+                    // even on a path where the console was handed over earlier.
+                    uiready_signal(0);
                 } else if (!s_gave_up) {
                     uint32_t hz = g_timer_hz ? g_timer_hz : 100;
                     uint32_t secs = (uint32_t)((timer_ticks - s_wait_t0) / hz);
@@ -3636,6 +3701,11 @@ pttest_after_launch:;   // #430: gate jumps here, skipping the compositor path
                             gfx_boot_release_display();
                             g_compositor_launched = 0;
                             s_gave_up = 1;
+                            // #317: a UI is about to be on screen, just not the
+                            // intended one. Without this the autorun gate would
+                            // sit on its full timeout on exactly the boot that
+                            // already went wrong.
+                            uiready_signal(1);
                             continue;   // next iteration draws the kernel desktop
                         }
                         s_gave_up = 1;   // inhibited: stop reporting, keep waiting

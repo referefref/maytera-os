@@ -6,6 +6,7 @@
 #include "oui.h"
 #include "../../libc/gui_menu.h"
 #include "../../libc/string.h"
+#include "../../libc/stdio.h"
 
 #define OTB_INSET     8
 #define OTB_GAP       2
@@ -576,4 +577,90 @@ int otb_key(otb_toolbar_t *tb, unsigned int keycode, char key_char, int win_w, i
         return otb_activate(tb, i);
     }
     return -2;                                    // focus swallows other keys
+}
+
+// ===========================================================================
+// CONTRACT PROJECTION + GENERIC DISPATCH (docs/CONTRACT_COVERAGE_PLAN.md
+// task 3 phase 4).
+//
+// otb_item_t is the SAME table otb_draw()/otb_press() already read; adding
+// tok/afn/desc/risk/cap/terms to it (otoolbar.h) means a click and a
+// contract call now run through ONE row instead of two independently
+// maintained descriptions (the app's switch, and a hand-written
+// ct_item_t row) - the exact #235 shape, closed by construction rather than
+// by review, the same move files/main.c's fctl_t made for Files.
+//
+// otb_ctl_invoke is the ONE actfn every projected row shares (mirroring
+// files/main.c's ct_press): contract_cli() calls it with `it->ctx` pointing
+// at the otb_item_t row the projection came from, so it only has to unwrap
+// ctx and call that row's own afn - one indirection, not a per-row wrapper.
+static int otb_ctl_invoke(const struct ct_item *it, int argc, char **argv,
+                          char *out, int ocap) {
+    const otb_item_t *a = (const otb_item_t *)it->ctx;
+    if (!a || !a->afn) {
+        if (out && ocap > 0) snprintf(out, (size_t)ocap, "no-handler");
+        return -1;
+    }
+    return a->afn(it, argc, argv, out, ocap);
+}
+
+int otb_ctl_count(const otb_item_t *items, int n) {
+    int c = 0;
+    for (int i = 0; i < n; i++) if (items[i].tok) c++;
+    return c;
+}
+
+int otb_ctl_project(const otb_item_t *items, int n, int idx, ct_item_t *out) {
+    if (idx < 0) return 0;
+    for (int i = 0; i < n; i++) {
+        if (!items[i].tok) continue;
+        if (idx == 0) {
+            __builtin_memset(out, 0, sizeof(*out));
+            out->name   = items[i].tok;
+            out->type   = CT_ACTION;
+            out->access = CT_WRITE;
+            out->risk   = items[i].risk;
+            out->cap    = items[i].cap;
+            out->actfn  = otb_ctl_invoke;
+            out->ctx    = &items[i];
+            out->desc   = items[i].desc;
+            out->terms  = items[i].terms;
+            return 1;
+        }
+        idx--;
+    }
+    return 0;
+}
+
+// Live dispatch: look item `id` up in this table and, if it carries an afn,
+// call it. `value` is the toolbar event's own value (a toggle's new state, a
+// combo's committed index); >= 0 is synthesised into argv[0] as a decimal
+// string (the SAME shape run_set_bold()-style actfns already read via
+// `argc >= 1 && argv[0]`, because they are the identical functions the
+// contract rows call), < 0 means "no value" (argc = 0), which is how a plain
+// button press and a toggle's own internal toggle-on-no-arg behaviour both
+// already work.
+//
+// Returns 1 if a row in THIS table matched `id` (whether or not its afn
+// itself succeeded - *outcode carries that, if the caller wants it), 0 if no
+// row here has this id, so a caller chaining several tables can fall through
+// in order, same as menu_ctl_dispatch().
+int otb_ctl_dispatch(const otb_item_t *items, int n, int id, int value,
+                     char *out, int ocap, int *outcode) {
+    for (int i = 0; i < n; i++) {
+        if (items[i].id != id) continue;
+        if (!items[i].afn) return 1;      // matched, nothing to call (combo slot etc)
+        char argbuf[16];
+        char *argv[1];
+        int argc = 0;
+        if (value >= 0) {
+            snprintf(argbuf, sizeof(argbuf), "%d", value);
+            argv[0] = argbuf;
+            argc = 1;
+        }
+        int rc = items[i].afn(0, argc, argc ? argv : 0, out, ocap);
+        if (outcode) *outcode = rc;
+        return 1;
+    }
+    return 0;
 }

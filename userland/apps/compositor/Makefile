@@ -39,7 +39,9 @@ endif
 
 # #compleak2: throwaway per-callsite heap-highwater profiler (main.c). OFF by
 # default, same idiom as TESTHOOK/FAVDEBUG above - never in the golden.
-# make LEAKPROFILE=1 for a measurement-only build; writes /LEAKWATCH.TXT
+# make LEAKPROFILE=1 for a measurement-only build; writes LEAKWATCH.TXT through
+# userscratch_path() (#peruserrows): <home>/LEAKWATCH.TXT with an account, else
+# /TMP/LEAKWATCH.TXT - never the root-owned ext2 root, which uid 1000 cannot write
 # whenever a periodic call's malloc_heap_highwater() moves, naming the call.
 ifdef LEAKPROFILE
 CFLAGS += -DMAYTERA_LEAKPROFILE=1

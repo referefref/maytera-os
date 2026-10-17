@@ -28,7 +28,7 @@
 //   - AUDITED  : every enforcement DECISION (allow and deny) lands in the kernel's
 //                tamper-evident hash-chained journal (Stage 3); the request /
 //                grant / verdict / close breadcrumbs also go to the plaintext
-//                /CONFIG/AIAUDIT.LOG via aicap_audit(), which stays human-readable
+//                the per-user AIAUDIT.LOG via aicap_audit(), which stays human-readable
 //                belt-and-braces, not the source of truth.
 //   - REVERSIBLE-ON-FAILURE: on an UNMET promise, escrow_close() calls
 //                SYS_ESCROW_ABORT so the KERNEL rolls back the contract's recorded
@@ -76,8 +76,25 @@ typedef struct {
 } escrow_move_t;
 
 typedef struct {
-    char path[256];             // date folder that must exist after
+    char path[256];             // path that must exist after
+    // #<config-ref>: WHAT KIND of thing must be there. Added because the primitive
+    // was too narrow, not to work around it. escrow_verify() checked every
+    // promised path with esc_is_dir(), which is right for photorg's date FOLDERS
+    // (#712, the only caller at the time) and wrong for the general case: a
+    // contract action that promises "the file I just saved exists" had its
+    // postcondition reported UNMET on a file that was demonstrably there, because
+    // a file is not a directory. Measured by libc/tests/run_ctpromise.sh.
+    //
+    // Widening the shared primitive rather than adding a second one is the rule
+    // in CLAUDE.md, and the folder check stays STRICT: kind 0 still means "must
+    // be a directory", so no existing promise is weakened by this.
+    unsigned char kind;         // ESCROW_PC_DIR (0) or ESCROW_PC_EXISTS
 } escrow_folder_t;
+
+// Postcondition kinds for escrow_folder_t.kind. 0 = DIR keeps every pre-existing
+// promise (and every memset-to-zero contract) behaving exactly as before.
+#define ESCROW_PC_DIR    0   // must exist AND be a directory
+#define ESCROW_PC_EXISTS 1   // must exist, as a file or a directory
 
 typedef struct {
     int  used;
@@ -136,6 +153,13 @@ int escrow_do_move(escrow_contract_t *c, const char *src, const char *dst);
 // and content hash for the later identity check. Both dedup. Return 0 on
 // success, -1 if the promise table is full or src is unreadable.
 int escrow_promise_add_folder(escrow_contract_t *c, const char *folder);
+
+// #<config-ref>: the same postcondition, relaxed to "this PATH must exist", for a
+// promised FILE. Shares escrow_folder_t's table, its dedup and its counters
+// (folders_ok/folders_total), so a caller mixing both gets one verdict and one
+// unmet list rather than two. Used by libc/ctpromise.c for a contract item's
+// CT_POST_PATH. Returns 0 on success, -1 if the table is full.
+int escrow_promise_add_path(escrow_contract_t *c, const char *path);
 int escrow_promise_add_move(escrow_contract_t *c, const char *src, const char *dst);
 
 // Verify the AFTER state against the declared promise. Fills *out (optional)

@@ -13,6 +13,10 @@
 # reply is e.g. "100 m = 328.084 ft". This dispatch needs the real OS (it spawns
 # the Convert binary); it is not exercised by the network-independent host test.
 name: appdemo
+# The Library catalog in /APPS/FLOW shows this line. It is part of the
+# additive optional schema: flow.c skips unknown top-level keys, so the
+# runner ignores it.
+description: "App node driving the Convert app tool contract"
 nodes:
   - id: t1
     type: trigger

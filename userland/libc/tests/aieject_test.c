@@ -42,11 +42,99 @@ static void mapped(const char *vpath, char *out, int ocap) {
     if (vpath && vpath[0] == '/') snprintf(out, ocap, "%s%s", g_root, vpath);
     else                          snprintf(out, ocap, "%s/%s", g_root, vpath ? vpath : "");
 }
+
+// ---------------------------------------------------------------------------
+// #aiaudit: aicap.c resolves its audit / metrics sinks through userconf_path()
+// instead of a hardcoded "/CONFIG/..." literal, because on the real OS /CONFIG
+// is root-owned and no Ring-3 session could ever write there. objcopy prefixes
+// aicap.o's UNDEFINED symbols too, so the rig has to supply ad_userconf_*.
+//
+// The shim resolves to the SAME virtual "/CONFIG/<name>" this harness has
+// always mapped, which is exactly what the real resolver yields for a root
+// session (userhome_root() is "/"). Real userconf.c is deliberately not linked
+// in: it would drag the passwd table and the host's own getuid() into a rig
+// whose whole point is a fake root, and what is under test here is the gate,
+// not the path join (which has its own coverage).
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// #aiaudit: TWO SHIMS THIS RIG HAS BEEN MISSING SINCE dev 45cffc93, which is
+// how long all four of these host tests have been RED. MEASURED on dev
+// 7b7f0d58: "undefined reference to `ad_getuid'", every arm, "RESULT: BROKEN".
+//
+// 45cffc93 added getuid() to aicap.c's lost-record reporter; #469 added
+// b64_encode() to aiclient.c's vision path. Both are real libc symbols that the
+// SHIPPING build resolves, and neither harness supplies them, so the link died
+// and the scripts reported BROKEN rather than FAIL. Nothing in the build calls
+// these scripts, so nobody saw it. A test that cannot build is not a test that
+// passes and is not a test that fails: it is a test nobody is running.
+//
+// getuid() returns 0 because this rig models a ROOT session: that is the same
+// assumption ad_userconf_path() above encodes by resolving to /CONFIG/<name>,
+// and the two must agree or the reporter would describe a different session
+// from the one the sink belongs to.
+// ---------------------------------------------------------------------------
+int ad_getuid(void) { return 0; }
+
+// ---------------------------------------------------------------------------
+// #aiaudit: the rest of the rig rot, same cause as ad_getuid above. aiclient.c
+// grew the #aitools tool-table emitter and the live-contract registry after
+// these harnesses were written, and neither symbol was ever added here, so the
+// three aiclient-linking scripts have been RED for as long as ad_getuid has.
+//
+// The contract registry reports NO declared contracts, which is the correct
+// state for a rig that installs none: the tools under test are the built-in
+// ones. aitools.c itself IS linked in by the run script (it is a pure table),
+// so the tool surface exercised is the shipping one, not a stub.
+// ---------------------------------------------------------------------------
+int ad_contract_declared(const char *app) { (void)app; return 0; }
+int ad_contract_declared_list(char *out, int ocap) {
+    if (out && ocap > 0) out[0] = 0;
+    return 0;
+}
+
+// Plain re-exports of host libc, matching the ad_str* shims already here.
+char *ad_strchr(const char *s, int c) { return strchr((char *)s, c); }
+
+long ad_b64_encode(const unsigned char *in, long inlen, char *out, long outcap) {
+    static const char T[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (!in || !out || inlen < 0) return -1;
+    long need = ((inlen + 2) / 3) * 4;
+    if (outcap < need + 1) return -1;
+    long o = 0;
+    for (long i = 0; i < inlen; i += 3) {
+        unsigned v = (unsigned)in[i] << 16;
+        if (i + 1 < inlen) v |= (unsigned)in[i + 1] << 8;
+        if (i + 2 < inlen) v |= (unsigned)in[i + 2];
+        out[o++] = T[(v >> 18) & 63];
+        out[o++] = T[(v >> 12) & 63];
+        out[o++] = (i + 1 < inlen) ? T[(v >> 6) & 63] : '=';
+        out[o++] = (i + 2 < inlen) ? T[v & 63]        : '=';
+    }
+    out[o] = 0;
+    return o;
+}
+
+int ad_userconf_path(const char *name, char *out, unsigned long cap) {
+    int n = snprintf(out, (size_t)cap, "/CONFIG/%s", name ? name : "");
+    return (n > 0 && (unsigned long)n < cap) ? 0 : -1;
+}
+void ad_userconf_ensure_parent_dir(const char *path) {
+    char hp[700]; mapped(path, hp, (int)sizeof(hp));
+    char *last = 0;
+    for (char *s = hp; *s; s++) if (*s == '/') last = s;
+    if (last && last != hp) { *last = 0; mkdir(hp, 0755); }
+}
 static void host_mkparents(const char *hostpath) {
     char tmp[600]; snprintf(tmp, sizeof(tmp), "%s", hostpath);
     for (char *p = tmp + 1; *p; p++)
         if (*p == '/') { *p = 0; mkdir(tmp, 0755); *p = '/'; }
 }
+
+// #deadtests: the ENVIRONMENT stubs these units need, in ONE place.
+// See ai_env_stubs.h for why four tests could not link before this.
+#define AIES_NO_PRINTF 1   // this harness already defines ad_printf
+#include "ai_env_stubs.h"
 
 // ---- maytera syscall numbers (from syscall.h) -------------------------------
 #define SYS_OPEN 10

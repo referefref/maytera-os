@@ -1,0 +1,36 @@
+# INSTALL manifest for the Angband App Store package (#gamedata2).
+#
+# WHY THIS PACKAGE EXISTS AT ALL. Angband's 1.4 MB lib data tree (gamedata,
+# customize, help, screens: 69 files) used to live at "/ANGBAND/", and
+# userland/libc/pkgdest.c permits a package destination ONLY under /APPS, /GAMES
+# or /THEMES, so that root was REFUSED outright and the data had to be baked into
+# every golden. The port now compiles with
+# -DDEFAULT_CONFIG_PATH/-DDEFAULT_LIB_PATH="/GAMES/ANGBAND/lib/" and the whole
+# payload is one TREE rule.
+#
+# See the AssaultCube package's INSTALL for the rule grammar and for why the
+# min-client line is load-bearing rather than decorative.
+#!mpkg-min-client 2
+#
+# The binary, from the same package as its data: shipping one without the other
+# is exactly the #627 defect, and invariant-gate.sh check 14b now enforces the
+# pair for this game the way check 14 does for AssaultCube.
+ANGBAND -> /APPS/ANGBAND
+#
+# THE READ-ONLY LIB TREE. init_file_paths() (src/init.c) derives
+# ANGBAND_DIR_GAMEDATA and ANGBAND_DIR_CUSTOMIZE from configpath and
+# ANGBAND_DIR_HELP and ANGBAND_DIR_SCREENS from libpath; this port sets both
+# macros to the same value, so all four land here.
+#
+# IT IS A "lib/" SUBDIRECTORY OF THE SAVE ROOT, NOT THE SAVE ROOT ITSELF, and
+# there is no collision: Angband appends VERSION_NAME to PRIVATE_USER_PATH, so
+# every WRITABLE directory sits under /GAMES/ANGBAND/Angband/{save,scores,panic,
+# archive}, a differently-named sibling of lib/. Keeping them apart is what lets
+# the installed payload stay read-only while the save tree stays writable, rather
+# than intermixing a package's files with a player's.
+#
+# create_needed_dirs() (src/init.c) creates ONLY those five writable directories;
+# its own comment says the data directories "are assumed to contain required files
+# and therefore must exist at startup". So this tree is never created at run time:
+# if the package does not put it here, the game quits before its first screen.
+lib/ -> /GAMES/ANGBAND/lib/

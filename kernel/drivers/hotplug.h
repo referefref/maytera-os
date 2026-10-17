@@ -232,6 +232,53 @@ int hotplug_resolve_path(const char *path, const char **rel_out);
 // fat_fs_t, so no second open path is needed.
 fat_fs_t *hotplug_volume_fat(int index);
 
+// The two above, as the ONE question every caller actually has: "which
+// filesystem serves this absolute path, and what is the path inside it?"
+//
+// Returns that volume's fat_fs_t, or NULL. *rel_out gets the volume-relative
+// path (always starting with '/') when the return is non-NULL.
+//
+// *matched_out, when supplied, is the part a caller CANNOT reconstruct from a
+// NULL return and must not get wrong: 1 means the path lies under a mounted
+// removable volume's mount point even though this returned NULL, because the
+// volume is mounted-but-not-readable (exFAT). Such a path must be REFUSED,
+// never served by the root filesystem, which is what a plain NULL check would
+// silently do. 0 means the path is not on a removable volume at all and the
+// caller's normal root/ext2 routing applies.
+//
+// Added for #246: fs/recycle_fs.c captured a deleted file by calling the fat
+// helpers with g_fat_fs and the FULL path, so a file on /USB0 was simply not
+// found and a marked AI actor's delete on a removable volume failed closed.
+// The fd layer had this routing and nothing else did; it lives here now so the
+// next caller does not make it a second copy.
+fat_fs_t *hotplug_volume_for_path(const char *path, const char **rel_out,
+                                  int *matched_out);
+
+// [renamevol] #246: THE ROUTE OUTCOMES. Must match RNV_ROOT / RNV_SAMEVOL /
+// RNV_REFUSE in rustkern/renamevol.rs, which owns the decision; the Rust boot
+// self-test FAILS if those values move, so the two cannot drift silently.
+#define RNV_ROOT      0    // the root family (ext2 root, FAT ESP, /SMB, /NFS, image)
+#define RNV_SAMEVOL   1    // one mounted, readable removable volume serves it
+#define RNV_REFUSE  (-1)   // nothing may perform this: refuse, touch nothing
+
+// [renamevol] #246: "WHICH fat_fs_t SERVES THIS ONE PATH, root or volume?"
+//
+// hotplug_volume_for_path() above answers only the removable half and hands
+// back NULL for an ordinary root path, which every caller then had to turn into
+// "use g_fat_fs" by itself. Four callers did; fs/recycle_fs.c did it in a
+// file-static rcy_victim_fs() and proc/syscall.c did not do it at all, which is
+// why mkdir, rmdir, unlink and rename ALL failed on a mounted USB stick. One
+// definition, here, next to the resolver it is built on.
+//
+// Returns the fat_fs_t to use and sets *rel_out to the path to use WITH IT
+// (the volume-relative path for a removable volume, the unchanged absolute path
+// for the root family), or NULL when nothing here can reach it: a mounted
+// volume whose filesystem cannot serve files (exFAT), or no mounted root. A
+// NULL return must be treated as a hard failure and must NEVER be retried
+// against the root filesystem, because the root may have a DIFFERENT file at
+// the same spelling and a write would destroy it.
+fat_fs_t *hotplug_fs_or_root(const char *path, const char **rel_out);
+
 // Eject by slot index, from a syscall. Flushes, unmounts, then tells the
 // device it is safe to remove. Returns 0 on success.
 int hotplug_eject_slot(int index);

@@ -366,4 +366,24 @@ void     ext2_mark_error(const char *why);
 uint16_t ext2_state_at_mount(void);
 uint16_t ext2_mnt_count(void);
 
+// ---------------------------------------------------------------------------
+// #e2rdio: the ext2 read path's device-I/O ledger. All state and policy live in
+// rustkern/e2rdio.rs; fs/ext2.c owns the device seam and the reporting, and
+// proc/fdlayer.c's ext2 read branch is the other recording site. Declared here
+// rather than as a private extern in fdlayer.c (#742: the owning header).
+// ---------------------------------------------------------------------------
+// Print the ledger: serial always, /BOOTLOG.TXT only when something actually
+// happened. Safe from any context that may print; NEVER from inside a device
+// read, where bootlog's flush would re-enter blk_write().
+void e2rdio_report(const char *why);
+// Record that sys_read() reached the site that used to convert a refill error
+// into read() == 0. `produced` is what the PRE-FIX code would have returned,
+// which is how the boot self-test asserts the old behaviour was wrong without
+// re-introducing it.
+void e2rdio_note_launder_rs(uint32_t produced, int64_t got, uint32_t ino);
+// 1 if anything worth printing has happened since the last report, and clears
+// the flag. Lets a caller in a safe context do the printing that the recording
+// sites must not do.
+int  e2rdio_pending_rs(void);
+
 #endif // EXT2_H

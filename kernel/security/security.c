@@ -574,14 +574,30 @@ void seclog_report_elevation(unsigned int pid, const char *detail) {
     security_audit(AUDIT_ELEVATION, (uint32_t)pid, detail);
 }
 
-/* #745: the AI prompt-injection screen. WARNING severity, deliberately: unlike
- * the elevation records above (which narrate one install the user is watching),
- * a blocked LLM request is something the user asked for that did NOT happen,
- * and something the user did not ask for that DID. Both belong on screen, not
- * only in the log. */
-void seclog_report_ai_injection(unsigned int pid, const char *detail) {
-    security_audit(AUDIT_AI_INJECTION, (uint32_t)pid, detail);
-}
+/* #745's seclog_report_ai_injection() WAS HERE AND IS DELETED (2026-09-29).
+ *
+ * Its only caller was sys_http_post_start()'s Nova keyword screen, removed at
+ * #469m aititleinject. From that day it was a producer-less sink: MEASURED,
+ * grep -rn matched the definition and the declaration and nothing else.
+ *
+ * DELETED RATHER THAN RE-WIRED, and the reason is this tree's own doctrine, not
+ * convenience. docs/AI_PROMPT_INJECTION.md section 7 rule 1 reads "Do not add a
+ * content detector and call it a control", and the defence that REPLACED Nova is
+ * structural: app-chosen bytes no longer reach the model's running-app state
+ * line at all, so there is no detection event left to report. Wiring this to a
+ * new keyword matcher would have meant adding the exact thing that document
+ * forbids, purely to give an existing function something to say.
+ *
+ * A security function that cannot fire is WORSE than an absent one, because it
+ * reads as coverage: this is the #653 shape, and it was flagged in blame.md and
+ * in AI_PROMPT_INJECTION.md before being fixed here.
+ *
+ * WHAT IS DELIBERATELY KEPT: the AUDIT_AI_INJECTION ordinal in security.h and
+ * its sec_event_name/sec_event_severity arms in rustkern.rs. The enum is
+ * APPEND-ONLY because /CONFIG/SECURITY.LOG records decode BY ORDINAL, so
+ * removing ordinal 12 would silently relabel every historical AI_INJECTION line
+ * as IO_BOUNDARY and every IO_BOUNDARY line as CAPABILITY. Keeping a retired
+ * ordinal decodable costs nothing; renumbering rewrites the past. */
 
 /* #fdguard: cross-process I/O boundary refusals (a legacy fd owned by
  * another process, or a /dev/pts attach the caller does not own). WARNING
@@ -605,6 +621,31 @@ void seclog_report_io_boundary(unsigned int pid, const char *detail) {
  * straight into the journal from proc/caps.c. Non-blocking by construction. */
 void seclog_report_capability(unsigned int pid, const char *detail) {
     security_audit(AUDIT_CAPABILITY, (uint32_t)pid, detail);
+}
+
+/* #prewrite: the same narrow-producer shape for removals and replacements in
+ * an all-users (sticky) directory, so fs/perms.c needs no security.h include
+ * (it already includes seclog.h) and the audit ordinal stays in one place.
+ *
+ * BOTH outcomes are reported, and the ALLOW is the important one. An absolute
+ * owner-only veto is automation-hostile, and an automation-hostile rule does
+ * not produce security, it produces root. So the directory OWNER is permitted
+ * to remove another principal's file inside their own workspace, without
+ * elevation, and that cross-owner removal lands here with the actor, the
+ * victim and the rule that permitted it. A refusal is recorded too, because a
+ * process repeatedly trying to delete other users' files is itself a signal. */
+void seclog_report_fs_remove(unsigned int pid, const char *detail) {
+    security_audit(AUDIT_FS_REMOVE, (uint32_t)pid, detail);
+}
+
+// #kfirewall: packet-filter policy changes. Same narrow-producer pattern, so
+// net/firewall.c needs no security.h include and the audit ordinal stays in one
+// place. BOTH outcomes are reported, not only refusals: a filter that was turned
+// off, or an inbound policy moved from DENY to ALLOW, is the event you most want
+// a timestamped record of, and it is a SUCCESS, so a trail that logged only
+// failures would be silent about exactly the change that mattered.
+void seclog_report_firewall(unsigned int pid, const char *detail) {
+    security_audit(AUDIT_FIREWALL, (uint32_t)pid, detail);
 }
 
 uint64_t security_audit_seq(void) {

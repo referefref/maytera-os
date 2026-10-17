@@ -9,8 +9,13 @@
 #   [DEBT]    it IS one quantity and the copies HAVE drifted. Known, judged not
 #             worth the blast radius of fixing right now, and the reason states
 #             the concrete consequence so the next person can judge it too.
-#   [LEGACY]  bulk-baselined at #222 and not individually reasoned. There are
-#             deliberately NONE of these: every row below was looked at. The
+#   [LEGACY]  bulk-baselined at #222 and not individually reasoned.
+#             CORRECTED 2026-10-04 [badexempt]: this used to read "there
+#             are deliberately NONE of these: every row below was looked
+#             at", and TWO rows ARE [LEGACY] (M_PI at line 125 and
+#             ethreads at 127, both vendored XaoS). Treat those two as
+#             the backlog the tag means and every other row as reviewed.
+#             The
 #             status exists so that "nobody actually checked" stays available as
 #             an honest thing to write, rather than being disguised as [LEGIT].
 #
@@ -89,7 +94,7 @@ GFS_REL_CONFIG_FOR	[DEBT]	kernel/fs/graphfs/fold.h defines it as the integer rel
 GFS_REL_DERIVED_FROM	[DEBT]	Same fault as GFS_REL_CONFIG_FOR: integer 3 in fold.h, string "derived_from" in node.h, one name for an id and its label.
 PATH_MAX	[DEBT]	1024 in libc/limits.h and libc/sys/param.h, 4096 in argtab.rs and the vendored compat headers, 255 in rustkern/dos4gw.rs, 512 in the msh app. argtab.rs is the one that matters: it is the length the kernel validates a user path pointer against, and it is 4x the libc buffer, so libc's own limit is the only thing keeping a path inside its buffer.
 NAME_MAX	[DEBT]	255 everywhere except rustkern/elevate.rs, which uses 64 for its own argument buffer. Not a filename limit there, but it borrowed the name of one.
-SYS_MAX	[DEBT]	399 in kernel/proc/syscall.h versus 215 in the vendored userland/apps/python/port/src-kernel/syscall.h, which is a snapshot of the header from when the port was made. kernel/tools/syscall-number-lint deliberately skips SYS_MAX for this same reason. The whole vendored header is stale, not just this line.
+SYS_MAX	[DEBT]	465 in kernel/proc/syscall.h:1578 versus 215 in the vendored (CORRECTED 2026-10-04 [badexempt]: the row said 399, which was the value when it was written; the divergence it records is real and the kernel side has moved 66 syscalls since. A row that quotes a moving number should say which side moves) userland/apps/python/port/src-kernel/syscall.h, which is a snapshot of the header from when the port was made. kernel/tools/syscall-number-lint deliberately skips SYS_MAX for this same reason. The whole vendored header is stale, not just this line.
 COLOR_ORANGE	[DEBT]	0x00FF8800 in kernel/gui/colors.h versus 0x00FF8C00 in userland/libc/gui.h. Cosmetic, four units of green apart, but it is two palettes claiming to be one.
 
 # ---- the terminal palette: one RGB set, two alpha conventions ---------------

@@ -19,12 +19,18 @@
 #include "../../libc/stdlib.h"
 #include "../../libc/string.h"
 
-// #684: was KEY_PATH "/CONFIG/KIMI.KEY", a THIRD private copy of the key
-// reader. It now reads the same per-user AISVC.CFG as libc/aiclient.c and
-// Settings. The duplicated parser is debt, recorded in the CHANGELOG; the
-// point of this change is that no app opens /CONFIG/KIMI.KEY.
+// Was KEY_PATH "/CONFIG/KIMI.KEY", a THIRD private copy of the key reader
+// (#684). That change repointed this file at the per-user AISVC.CFG and called
+// the surviving duplicate "debt, recorded in the CHANGELOG". It was worse than
+// debt: the duplicate did not parse, so this client sent "api_key=" in front of
+// every token and got HTTP 401 for months. There is now no duplicate to be in
+// debt about; libc/aisvc.c is the only reader and this file calls it.
 #include "userconf.h"
-#define AISVC_NAME "AISVC.CFG"
+#include "../../libc/aisvc.h"
+// API_URL / API_MODEL are now only the DEFAULTS. They are what a machine with
+// no per-user AISVC.CFG uses, so an install that never touched Settings behaves
+// exactly as it did before; anything the file states wins. g_svc below holds
+// the resolved values.
 #define API_URL    "https://api.moonshot.ai/v1/chat/completions"
 #define API_MODEL  "kimi-k2.6"
 #define RESP_MAX   65536
@@ -43,35 +49,52 @@
 // Stated plainly because this client now has NO prompt screen at all.
 
 
-static char g_key[256];
 static int  g_key_state = -1;         // -1 unknown, 0 missing, 1 present
 static char *g_resp = 0;              // malloc'd response buffer
 static char *g_body = 0;              // malloc'd request body
 static char *g_content = 0;           // malloc'd extracted assistant content
 
 // ---------------------------------------------------------------------------
-// Key handling (same file + trim behavior as aiclient.c load_key)
+// Config handling.
+//
+// THIS USED TO BE A PRIVATE READER AND IT WAS WRONG. #684 repointed it from
+// /CONFIG/KIMI.KEY (whose whole content IS the key) to the per-user AISVC.CFG
+// (a key=value file), and left the body unchanged: it slurped the file and used
+// it verbatim as the bearer token. The kernel's login provisioner writes exactly
+// one line, "api_key=<key>", so Studio has been presenting a token with the
+// literal "api_key=" glued to the front, and the endpoint has been answering
+// HTTP 401. Measured on golden 2509: a flow's llm node answered correctly
+// through libc/aiclient.c while this client 401'd, same user, same key, same
+// minute.
+//
+// There is now ONE reader (libc/aisvc.c) and this calls it. Studio still does
+// NOT link the aiclient ReAct loop - sharing the CONFIG is not sharing the
+// TOOL SURFACE, and the closed-vocabulary argument at the top of this file is
+// untouched.
 // ---------------------------------------------------------------------------
+static aisvc_cfg_t g_svc;
+
 static void load_key(void) {
     g_key_state = 0;
-    g_key[0] = 0;
-    int fd = userconf_open_read(AISVC_NAME, 0);   // #684: no legacy fallback
-    if (fd < 0) return;
-    long n = sys_read(fd, g_key, sizeof(g_key) - 1);
-    sys_close(fd);
-    if (n <= 0) return;
-    g_key[n] = 0;
-    int i = (int)n - 1;
-    while (i >= 0 && (g_key[i] == '\n' || g_key[i] == '\r' ||
-                      g_key[i] == ' '  || g_key[i] == '\t')) {
-        g_key[i] = 0; i--;
-    }
-    if (g_key[0]) g_key_state = 1;
+    memset(&g_svc, 0, sizeof(g_svc));
+    strlcpy(g_svc.endpoint, API_URL,   sizeof(g_svc.endpoint));
+    strlcpy(g_svc.model,    API_MODEL, sizeof(g_svc.model));
+    g_svc.api_style = AISVC_STYLE_BEARER;
+    aisvc_load(&g_svc);                  // absent file: defaults stand, no key
+    if (g_svc.have_key && g_svc.api_key[0]) g_key_state = 1;
 }
 
 int ai_available(void) {
     if (g_key_state < 0) load_key();
-    return g_key_state == 1;
+    if (g_key_state != 1) return 0;
+    // STATED BOUND, not a silent failure: this client builds an OpenAI-style
+    // chat/completions body. The Anthropic Messages API is a different request
+    // shape, and sending this body to it would earn an HTTP 400 that looked
+    // like a network fault. Every other provider the setup wizard offers
+    // (Moonshot, OpenAI, OpenRouter, GLM, xAI, Custom) is bearer-style and
+    // works. Teaching Studio the Messages shape is separate work.
+    if (g_svc.api_style != AISVC_STYLE_BEARER) return 0;
+    return 1;
 }
 
 static int buffers_ok(void) {
@@ -221,7 +244,9 @@ static int obj_int(const char *obj, const char *end, const char *key, int dflt) 
 // ---------------------------------------------------------------------------
 static int body_open(const char *system_prompt) {
     int n = 0;
-    n = str_app(g_body, n, BODY_MAX, "{\"model\":\"" API_MODEL "\",\"messages\":["
+    n = str_app(g_body, n, BODY_MAX, "{\"model\":\"");
+    n = json_esc_app(g_body, n, BODY_MAX, g_svc.model);
+    n = str_app(g_body, n, BODY_MAX, "\",\"messages\":["
                                      "{\"role\":\"system\",\"content\":\"");
     n = json_esc_app(g_body, n, BODY_MAX, system_prompt);
     n = str_app(g_body, n, BODY_MAX, "\"}");
@@ -258,10 +283,10 @@ static int kimi_start(void) {
     if (g_job >= 0) return -1;                // one request at a time
     snprintf(g_headers, sizeof(g_headers),
              "Authorization: Bearer %s\r\nContent-Type: application/json\r\n",
-             g_key);
+             g_svc.api_key);
     g_resp[0] = 0;
     g_job_status = 0;
-    int job = http_post_start(API_URL, g_headers, g_body);
+    int job = http_post_start(g_svc.endpoint, g_headers, g_body);
     if (job < 0) return -1;
     g_job = job;
     g_job_t0 = uptime_ms();

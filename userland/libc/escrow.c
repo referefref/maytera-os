@@ -26,7 +26,8 @@
 // NO SECOND SOURCE OF TRUTH. The old userland aicap grant/deny (allowed_paths
 // scoping + fs.delete denylist) is GONE from this file: it duplicated what the
 // kernel now enforces. aicap_audit() is retained only for the human-readable
-// /CONFIG/AIAUDIT.LOG breadcrumb; the AUTHORITATIVE per-decision record is the
+// AIAUDIT.LOG breadcrumb (#aiaudit: per-user, aicap_audit_path()); the
+// AUTHORITATIVE per-decision record is the
 // kernel's tamper-evident journal.
 //
 // THE MARKED WINDOW (an honest operational note). Between escrow_request() and
@@ -253,14 +254,30 @@ int escrow_do_move(escrow_contract_t *c, const char *src, const char *dst) {
 // ---------------------------------------------------------------------------
 // Promise declaration (userland postcondition oracle; not an enforcement path).
 // ---------------------------------------------------------------------------
-int escrow_promise_add_folder(escrow_contract_t *c, const char *folder) {
-    if (!c || !c->used || !folder || !folder[0]) return -1;
+static int add_pc(escrow_contract_t *c, const char *path, unsigned char kind) {
+    if (!c || !c->used || !path || !path[0]) return -1;
     for (int i = 0; i < c->n_folders; i++)
-        if (!strcmp(c->folders[i].path, folder)) return 0;   // dedup
+        if (!strcmp(c->folders[i].path, path)) {
+            // DEDUP, and the STRICTER kind wins: if one caller needs this path to
+            // be a directory and another merely needs it to exist, the promise
+            // that must hold is the directory one. Taking the looser kind on a
+            // second add would silently weaken a postcondition already declared.
+            if (kind == ESCROW_PC_DIR) c->folders[i].kind = ESCROW_PC_DIR;
+            return 0;
+        }
     if (c->n_folders >= ESCROW_MAX_FOLDERS) return -1;
-    strlcpy(c->folders[c->n_folders].path, folder, sizeof(c->folders[0].path));
+    strlcpy(c->folders[c->n_folders].path, path, sizeof(c->folders[0].path));
+    c->folders[c->n_folders].kind = kind;
     c->n_folders++;
     return 0;
+}
+
+int escrow_promise_add_folder(escrow_contract_t *c, const char *folder) {
+    return add_pc(c, folder, ESCROW_PC_DIR);
+}
+
+int escrow_promise_add_path(escrow_contract_t *c, const char *path) {
+    return add_pc(c, path, ESCROW_PC_EXISTS);
 }
 
 int escrow_promise_add_move(escrow_contract_t *c, const char *src, const char *dst) {
@@ -295,11 +312,20 @@ int escrow_verify(escrow_contract_t *c, escrow_verify_t *out) {
     memset(&v, 0, sizeof(v));
     int ok = 1;
 
-    // (a) every promised date folder exists as a directory.
+    // (a) every promised path is there, in the KIND it was promised as:
+    // ESCROW_PC_DIR must be a directory (photorg's date folders, #712, and the
+    // parent of every promised file), ESCROW_PC_EXISTS must merely exist (a file
+    // a contract action promised it wrote, #<config-ref>).
     v.folders_total = c->n_folders;
     for (int i = 0; i < c->n_folders; i++) {
-        if (esc_is_dir(c->folders[i].path)) v.folders_ok++;
-        else { add_unmet(&v, "date folder not created: %s", c->folders[i].path); ok = 0; }
+        const char *p = c->folders[i].path;
+        int good = (c->folders[i].kind == ESCROW_PC_EXISTS) ? esc_exists(p) : esc_is_dir(p);
+        if (good) v.folders_ok++;
+        else if (c->folders[i].kind == ESCROW_PC_EXISTS) {
+            add_unmet(&v, "promised path does not exist: %s", p); ok = 0;
+        } else {
+            add_unmet(&v, "date folder not created: %s", p); ok = 0;
+        }
     }
 
     // (b) every promised move landed bytes-intact with its source gone.

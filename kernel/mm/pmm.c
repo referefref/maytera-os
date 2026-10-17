@@ -2,6 +2,7 @@
 // Uses a bitmap to track 4KB page frames
 
 #include "pmm.h"
+#include "heapshadow.h"   // #aicappersist
 #include "../sync/spinlock.h"   // #745 (#75): the SHARED irqsave spinlock
 #include "../proc/schedrace.h"  // #745 (#75): SR_SITE_PMM_HOLD reproducer
 #include "../boot_info.h"
@@ -27,6 +28,10 @@ extern char __text_start, __rodata_end, __bss_end, __kernel_end;
 static uint8_t page_bitmap[PMM_BITMAP_SIZE] __attribute__((aligned(4096)));
 
 // Statistics
+// #heapinvptr: how many times a page has been handed back while already free.
+// pmm_free_page() has always PRINTED this; the count is for a self-test that has
+// to compare before and after without reading a serial log.
+static uint64_t g_pmm_double_free = 0;
 static uint64_t total_pages = 0;
 static uint64_t free_pages = 0;
 static uint64_t used_pages = 0;
@@ -397,6 +402,20 @@ uint64_t pmm_alloc_page(void) {
     scp_span_t __sp = scp_begin();   // #121
     uint64_t __r = pmm_alloc_page_inner();
     scp_end(SCP_PMMALLOC, __sp);
+    // #aicappersist: THE IDENTITY INVARIANT, CHECKED WHERE EVERY CALLER MEETS IT.
+    //
+    // Callers dereference this return value as a VIRTUAL address (there is no
+    // PHYS_TO_VIRT in this tree), so handing out a page whose identity mapping
+    // mm/heap.c has replaced is handing out a pointer into the heap. heap_init()
+    // reserves that window, so this can only fire if the reservation has stopped
+    // covering it (HEAP_MAX_SIZE raised, the heap moved, a second non-identity
+    // mapping added). One line here beats rediscovering it from a zeroed ext2
+    // group descriptor: that cost three agents and two retracted reports.
+    if (__r && heapshadow_is_shadowed_rs(__r) && heapshadow_violation_rs())
+        kprintf("[HEAPSHADOW] VIOLATION: pmm_alloc_page handed out 0x%llx, which is "
+                "inside the heap's virtual window, so (void*)0x%llx points into the "
+                "HEAP and not at that page. Expect metadata corruption.\n",
+                (unsigned long long)__r, (unsigned long long)__r);
     return __r;
 }
 // #121: START THE SCAN WHERE THE LAST ONE FINISHED.
@@ -477,7 +496,38 @@ static uint64_t pmm_alloc_page_inner(void) {
     return 0;
 }
 
-// Allocate multiple contiguous physical pages
+// Allocate multiple contiguous physical pages.
+//
+// #heapdbl: THE IDENTITY INVARIANT IS CHECKED HERE TOO NOW, AND IT WAS NOT.
+// #aicappersist put the check on pmm_alloc_page() alone, which is the wrong half
+// to pick if you can only have one: the single-page path starts its scan at a
+// ROTATING HINT, while this one restarts at memory_start on every call, so it is
+// THIS allocator that walks the bottom of physical memory over and over and is
+// likelier to land inside the heap's virtual window. It is also the one behind
+// kernel stacks (mm/kstack.c calls pmm_alloc_pages(16)), i.e. memory that is
+// written immediately and hard.
+//
+// MEASURED, and this is how the gap was found: on a VM booted with the
+// reservation deliberately removed (`make HEAPSHADOWREVERT=1`), pmm_alloc_page()
+// never reported a single violation for the whole boot even though the hint
+// plainly had to cross the window, because the pages inside it had already been
+// taken by THIS function, silently. A one-sided detector reads exactly like a
+// clean machine.
+//
+// AND THE FIRST VERSION OF THIS NOTE WAS A FALSE ALARM, WHICH IS WHY THE WORDING
+// MATTERS. It said "Expect metadata corruption", copying the single-page message.
+// It then fired 125 times on one boot, every time from blk_alloc_chunks(), which
+// ALREADY recognises a window-overlapping run and PARKS it instead of
+// dereferencing it. A run handed to a caller that rejects it is not a corruption,
+// so this is COUNTED SEPARATELY from a violation and says whose job it is. A
+// detector that cries wolf 125 times a boot is one nobody reads on the boot that
+// matters.
+//
+// Neither case is live today - heap_init() reserves the window, so neither
+// allocator can be handed one - but a detector that only watches one of two doors
+// is the thing that makes the NEXT change to HEAP_MAX_SIZE or to the heap's base
+// look safe when it is not. The whole span is tested, not just the first page: a
+// run can start below the window and end inside it.
 uint64_t pmm_alloc_pages(uint64_t count) {
     if (count == 0) return 0;
     if (count == 1) return pmm_alloc_page();
@@ -509,7 +559,22 @@ uint64_t pmm_alloc_pages(uint64_t count) {
             pmm_live_check(start_page * PMM_PAGE_SIZE, count,
                            (uint64_t)__builtin_return_address(0));
 #endif
-            return start_page * PMM_PAGE_SIZE;
+            {
+                uint64_t pa = start_page * PMM_PAGE_SIZE;
+                // #heapdbl: the whole run, because it can straddle the edge.
+                if (heapshadow_range_overlaps_rs(pa, count * PMM_PAGE_SIZE) &&
+                    heapshadow_note_span_rs())
+                    kprintf("[HEAPSHADOW] SPAN: pmm_alloc_pages(%llu) handed out "
+                            "0x%llx-0x%llx, which overlaps the heap's virtual window. "
+                            "That is SAFE ONLY IF THE CALLER REJECTS THE RANGE rather "
+                            "than dereferencing it (blk_alloc_chunks parks such runs). "
+                            "Reported once per boot; the rest are counted. "
+                            "Caller ra=%p\n",
+                            (unsigned long long)count, (unsigned long long)pa,
+                            (unsigned long long)(pa + count * PMM_PAGE_SIZE - 1),
+                            __builtin_return_address(0));
+                return pa;
+            }
         }
     }
 
@@ -544,6 +609,7 @@ void pmm_free_page(uint64_t phys_addr) {
     uint64_t irqf = pmm_acquire_lock();
 
     if (!bitmap_test(page)) {
+        g_pmm_double_free++;              // #heapinvptr: counted under the lock
         pmm_release_lock(irqf);
         kprintf("[PMM] WARNING: Double free of page 0x%lx\n", phys_addr);
         return;
@@ -575,6 +641,9 @@ uint64_t pmm_get_free_pages(void) {
 uint64_t pmm_get_used_pages(void) {
     return used_pages;
 }
+
+// #heapinvptr: see g_pmm_double_free's declaration.
+uint64_t pmm_double_free_count(void) { return g_pmm_double_free; }
 
 // ===========================================================================
 // #647: reservation of memory that is LIVE but has no linker symbol.

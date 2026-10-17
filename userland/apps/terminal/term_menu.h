@@ -97,4 +97,28 @@ extern int term_menu_quit;
 // 1 while a foreground child owns the FOCUSED pane. Dims the shell-only rows.
 void term_menu_set_pty(int active);
 
+// ---------------------------------------------------------------------------
+// THE MENU SURFACE, PROJECTED INTO THE TOOL CONTRACT
+//
+// TM_ACTS[] in term_menu.c is the ONE table term_menu_action() dispatches
+// through, so the thirty-one fixed commands are named, invocable and described
+// from the same braces; the three RUNTIME families (colour schemes, profiles,
+// bookmarks) are projected from the same live arrays the bar is built from.
+// term_contract.c chains these into TERMINAL_CONTRACT's projection.
+//
+// term_menu_ct_count() is TM_ACT_N plus the three live list lengths, so it moves
+// when a scheme is installed, a profile created or a directory bookmarked.
+int  term_menu_ct_count(void);
+int  term_menu_ct_project(int idx, ct_item_t *out);
+// Force a rebuild of the projected runtime rows when a list changed WITHOUT its
+// length changing - a profile rename being the case that exists. Called from the
+// profile actions in term_contract.c.
+void term_menu_ct_invalidate(void);
+
+// Readable state the contract's value rows answer from. Owned here because this
+// module owns the state; a second copy in term_contract.c would be a second
+// answer to one question.
+int  term_menu_bar_visible(void);
+int  term_menu_bookmark_count(void);
+
 #endif // TERM_MENU_H

@@ -735,7 +735,44 @@ class Manifest:
                 rep.bad("B1", "manifest: %s:%d no longer contains %r. Either the "
                               "site moved (fix the line number) or it was FIXED "
                               "(delete the entry). A ledger of things that used to "
-                              "be true is how #514 happened." % (f, n, sub[:40]))
+                              "be true is how #514 happened.%s"
+                              % (f, n, sub[:40], B1_HINT))
+
+
+# #harendezvous: NAME THE FIX AT THE POINT OF FAILURE.
+#
+# Rule B1 fires once per shifted entry, so ANY edit that inserts lines into a
+# listed file produces a wall of identical-looking errors that have nothing to do
+# with the change (69 inserted lines in proc/syscall.c shifted 33 entries; the
+# same thing happened at #692 with 59 and at #695 with 21). The tool that fixes
+# it exactly, by diffing the baseline rather than searching for content, has been
+# checked in since #695 as tools/smap-uaccess-lint/reanchor-manifest, and its own
+# header says "the third time is a command, not a rediscovery". It then happened
+# a third time anyway, because NOTHING THAT FAILS POINTS AT IT: the tool is
+# discoverable only by already knowing it exists. So the failure message names it.
+# One line, printed once per run, and the wall becomes an instruction.
+_b1_hint_shown = [False]
+
+
+class _B1Hint:
+    """Renders the hint on the FIRST B1 of a run and nothing thereafter."""
+    def __mod__(self, _):
+        return str(self)
+
+    def __str__(self):
+        if _b1_hint_shown[0]:
+            return ""
+        _b1_hint_shown[0] = True
+        return ("\n       IF AN UNRELATED EDIT SHIFTED THESE LINES (inserting or "
+                "deleting lines in a\n       listed file moves every entry below "
+                "it), do not hand-edit the numbers:\n         python3 "
+                "kernel/tools/smap-uaccess-lint/reanchor-manifest --baseline "
+                "<rev-where-it-passed> --check\n       then drop --check to apply. "
+                "It maps old lines to new BY DIFF, which is exact, and\n       "
+                "REFUSES to guess at an entry whose line was deleted.")
+
+
+B1_HINT = _B1Hint()
 
 
 # ---------------------------------------------------------------------------

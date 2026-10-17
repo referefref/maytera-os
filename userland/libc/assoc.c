@@ -7,8 +7,22 @@
 #include "syscall.h"
 #include "string.h"
 #include "unistd.h"   // access() - see assoc_app_for()
+#include "userconf.h" // #peruser2: per-user write, legacy read fallback
 
-#define ASSOC_PATH "/ASSOC.CFG"
+// #peruser2: WHICH APP OPENS A .PNG IS A PREFERENCE, so the #683 rule applies
+// verbatim: READ the user's own copy first and fall back to the shipped system
+// one, WRITE only into the user's home. Before this, assoc_set_default() wrote
+// "/ASSOC.CFG" at the ext2 root (root-owned), so Settings > Default Apps was
+// dead for every non-root session on every machine and said nothing about it.
+//
+// userhome_path(NULL, ...) and NOT userconf_path(): the legacy location is the
+// ROOT of the volume, not /CONFIG. Root's home is "/", so the join yields
+// exactly "/ASSOC.CFG" - the file build/build-golden.sh ships and
+// build/config-ref-gate.sh checks - and a root session is byte-for-byte
+// unchanged. Using userconf_path() here would have silently moved root's file
+// to /CONFIG/ASSOC.CFG and left the build gate checking a file nothing reads.
+#define ASSOC_NAME   "ASSOC.CFG"
+#define ASSOC_LEGACY "/ASSOC.CFG"
 
 static void lc(char *s) { for (; *s; s++) if (*s >= 'A' && *s <= 'Z') *s += 32; }
 
@@ -43,7 +57,7 @@ static const defmap_t DEFAULTS[] = {
 #define NDEF ((int)(sizeof(DEFAULTS) / sizeof(DEFAULTS[0])))
 
 static int read_cfg(char *buf, int bufsz) {
-    int fd = sys_open(ASSOC_PATH, 0);
+    int fd = userhome_open_read(0, ASSOC_NAME, ASSOC_LEGACY);
     if (fd < 0) return 0;
     int n = (int)sys_read(fd, buf, bufsz - 1);
     sys_close(fd);
@@ -143,12 +157,16 @@ int assoc_set_default(const char *ext, const char *apppath) {
     if (o < (int)sizeof(out) - 1) out[o++] = '\n';
     out[o] = 0;
 
-    sys_unlink(ASSOC_PATH);
-    int fd = sys_open(ASSOC_PATH, 0x41);   // O_WRONLY | O_CREAT
-    if (fd < 0) return -1;
-    sys_write(fd, out, (unsigned long)o);
-    sys_close(fd);
-    return 0;
+    // #peruser2: was sys_unlink() then an UNCHECKED open/write/close at a
+    // root-owned path. Three defects in four lines: the unlink always ran while
+    // the open could fail (so a refusal DELETED the association table instead of
+    // failing to update it, #743), no O_TRUNC so a shorter table left a stale
+    // tail, and the write and close results were discarded so the caller was
+    // told "0" either way. userhome_open_write() never unlinks and reports a
+    // refusal; userconf_finish_write() checks the write, the fsync and the
+    // close, and always closes the fd.
+    int fd = userhome_open_write(0, ASSOC_NAME);
+    return userconf_finish_write(fd, out, (unsigned long)o);
 }
 
 static const char *TEXT_APPS[] = {"/APPS/editor", "/APPS/mvi"};

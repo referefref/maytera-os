@@ -653,7 +653,21 @@ int http2_get(tls_context_t *tls, const char *host, const char *path,
     uint8_t fhdr[9];
     uint8_t *payload = NULL;
 
+    // CWE-834: WHOLE-fetch deadline, set ONCE and never re-armed. h2_read_full's
+    // own 20s cap is a NO-PROGRESS cap only (it extends on every byte), so a peer
+    // that dribbles one small frame every few seconds makes real progress on each
+    // read and keeps this frame loop alive forever, holding the worker and one of
+    // only six global async-fetch slots (shared machine-wide) indefinitely. This
+    // is the same shape as the real resize-wedge incident. Match the genuine
+    // whole-fetch cap in https.c (recv_deadline_ms, 30s of sched_now_ms() real
+    // time, not timer_ticks): past it we stop and use what we have.
+    uint64_t fetch_deadline_ms = sched_now_ms() + 30000;
+
     while (!done) {
+        if ((int64_t)(sched_now_ms() - fetch_deadline_ms) >= 0) {
+            if (g_http2_dbg) kprintf("[H2DBG] whole-fetch deadline hit; using partial response\n");
+            break;  // overall fetch cap: do not hold a global slot on a trickling peer
+        }
         if (h2_read_full(tls, fhdr, 9) != 0) {
             if (g_http2_dbg) kprintf("[H2DBG] read frame header failed (closed/timeout)\n");
             break;  // connection closed / timeout: use what we have

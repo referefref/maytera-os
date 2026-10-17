@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-ROOT=<workspace>
+ROOT=${MAYTERA_NS_ROOT:-<workspace>}   # see Makefile: MAYTERA_NS_ROOT
 CC=$ROOT/cc.sh
 PU=$ROOT/libparserutils/include
 WC=$ROOT/libwapcaplet/include

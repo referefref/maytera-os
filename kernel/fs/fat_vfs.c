@@ -164,18 +164,55 @@ static const file_ops_t fat_file_ops = {
 // (0x80): O_CREAT|O_EXCL fails (returns NULL) if the file already exists.
 //
 // Caller receives one reference; drop via file_put() or install in an fd.
-file_t *fat_vfs_open(const char *path, int flags) {
-    if (!path) return NULL;
+// [provetwo] #246: THE SAME FUNCTION, WITH THE FILESYSTEM AS A PARAMETER.
+//
+// WHY THIS EXISTS. fat_vfs_open() was hard-wired to &g_fat_fs in five places,
+// so nothing that needed a struct file_t could be opened on a hot-plugged
+// removable volume at all. sys_open_k() worked around that with its own
+// volume branch in proc/fdlayer.c, which fills a raw fat_file_t in the fd
+// table and returns early; open_redir_file() (shell output redirection) had no
+// such branch and so could not write to a stick through any route.
+//
+// MEASURED, not reasoned: on golden 2575's kernel plus the PKGRDR launcher,
+// an unprivileged redirect onto its OWN file on a mounted stick returned
+// spawn-rc=-1 and left the file untouched, while the identical call on the
+// root filesystem returned a pid and landed its bytes. So the permission gate
+// one layer up could not be judged at all: both the deny arm and the allow arm
+// refused, and a refusal that happens whatever the permissions are is not
+// evidence about permissions.
+//
+// `rel` is the path RELATIVE TO `fs` (what hotplug_fs_or_root() hands back);
+// `abspath` is the path userland named, and is used for the recorded handle
+// name. Those differ on a volume and are the same pointer on the root, which
+// is exactly the distinction [renamevol] recorded getting wrong: a handle
+// stamped with the volume-relative path names a file in the ROOT directory.
+//
+// THE WRITE BUFFER IS CLAIMED ONLY FOR THE ROOT HANDLE, and that is a
+// correctness requirement rather than a simplification. The singleton flush at
+// fat_file_flush() commits through fat_write_file(&g_fat_fs, g_wbuf_path, ...),
+// a root-handle call with an ABSOLUTE path: handing it a volume file would
+// write the bytes to the root filesystem at that spelling, which is the very
+// two-answers-for-one-path fault this work exists to close. A handle that does
+// not own the buffer takes the fat_write(fp, ...) path, which uses the
+// fat_file_t's OWN fs back-pointer and is write-through, so a volume file is
+// correct there with no further change. Making the flush volume-aware instead
+// would be a second place that has to agree about which medium a path is on.
+file_t *fat_vfs_open_on(fat_fs_t *fs, const char *rel, const char *abspath,
+                        int flags) {
+    if (!fs || !rel || !abspath) return NULL;
 
     fat_file_t *fp = (fat_file_t *)kmalloc(sizeof(fat_file_t));
     if (!fp) return NULL;
 
+    // Only the root handle may take the 1 MB coalescing buffer: see above.
+    const int wbuf_allowed = (fs == &g_fat_fs);
+    const char *path = rel;      // every fat_* call below is fs-relative
     int needs_wbuf = 0;
 
-    if (fat_open(&g_fat_fs, path, fp) != 0) {
+    if (fat_open(fs, path, fp) != 0) {
         if (flags & O_CREAT) {
-            if (fat_create(&g_fat_fs, path) != 0) { kfree(fp); return NULL; }
-            if (fat_open(&g_fat_fs, path, fp) != 0) { kfree(fp); return NULL; }
+            if (fat_create(fs, path) != 0) { kfree(fp); return NULL; }
+            if (fat_open(fs, path, fp) != 0) { kfree(fp); return NULL; }
             needs_wbuf = 1;
         } else {
             kfree(fp);
@@ -194,9 +231,9 @@ file_t *fat_vfs_open(const char *path, int flags) {
         }
         if (flags & O_TRUNC) {
             fat_close(fp);
-            fat_delete(&g_fat_fs, path);
-            if (fat_create(&g_fat_fs, path) != 0) { kfree(fp); return NULL; }
-            if (fat_open(&g_fat_fs, path, fp) != 0) { kfree(fp); return NULL; }
+            fat_delete(fs, path);
+            if (fat_create(fs, path) != 0) { kfree(fp); return NULL; }
+            if (fat_open(fs, path, fp) != 0) { kfree(fp); return NULL; }
             needs_wbuf = 1;
         }
     }
@@ -210,20 +247,34 @@ file_t *fat_vfs_open(const char *path, int flags) {
 
     // #487/#349: record the path so Task Manager / Process Explorer can name
     // this handle. Bounded + always terminated (Rust seam under -DRUST_VFS_PATH).
-    file_set_path(f, path);
+    // [provetwo] #246: the ABSOLUTE path, never `rel`. On a volume these differ,
+    // and both readers of this field (Task Manager's handle list and the escrow
+    // pre-image hooks) decide where a user's data is from it.
+    file_set_path(f, abspath);
 
     // Claim the write buffer if we created/truncated and nobody else has it.
-    if (needs_wbuf && g_wbuf_owner == NULL) {
+    // g_wbuf_path is ABSOLUTE because the flush is a root-handle call, which is
+    // also why `wbuf_allowed` keeps a volume handle out of here entirely.
+    if (needs_wbuf && wbuf_allowed && g_wbuf_owner == NULL) {
         g_wbuf_owner = f;
         g_wbuf_len = 0;
         g_wbuf_dirty = 0;   // #695: fat_create() already made the (empty) file
         int n = 0;
-        while (path[n] && n < (int)sizeof(g_wbuf_path) - 1) {
-            g_wbuf_path[n] = path[n];
+        while (abspath[n] && n < (int)sizeof(g_wbuf_path) - 1) {
+            g_wbuf_path[n] = abspath[n];
             n++;
         }
         g_wbuf_path[n] = '\0';
     }
 
     return f;
+}
+
+// The original entry point, now ONE line over the function above, so the root
+// filesystem and a removable volume cannot grow two different open behaviours.
+// Every existing caller is byte-for-byte unaffected: fs is the root handle, rel
+// and abspath are the same pointer, and wbuf_allowed is true.
+file_t *fat_vfs_open(const char *path, int flags) {
+    if (!path) return NULL;
+    return fat_vfs_open_on(&g_fat_fs, path, path, flags);
 }

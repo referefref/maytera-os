@@ -399,6 +399,16 @@ static void theme_fill_v2_defaults(theme_t *t, const uint8_t *seen_c, const uint
     // both the window body and titlebar without becoming the "heavy bespoke
     // glass" look the owner explicitly rejected elsewhere. A theme file that
     // states metric.window_opacity explicitly always wins over this default.
+    //
+    // REVERTED 2026-10-02 (#790). I briefly raised this to 242 and then 250 to
+    // answer "the transparency is too high" about the FIRST-RUN WIZARD. That was
+    // the wrong lever twice over, and the owner said so: this is the OS-WIDE
+    // default behind the Settings "Window Opacity" slider, so moving it changes
+    // every window under every non-retro theme to fix one app, and an app's
+    // opacity is supposed to COME FROM that setting rather than be dictated by
+    // whichever app complained last. The wizard's own card glass is the
+    // wizard-local knob and is where that fix belongs. This value is a product
+    // decision and a user setting; it is not a workaround slot.
     DEF_I(m_window_opacity, TM_WINDOW_OPACITY, retro ? 255 : 215);
     DEF_I(d_style, TM_DECOR_STYLE, retro ? TDECOR_BEVELED : TDECOR_GRADIENT);
     // Pre-#711 this decision was a case-insensitive substring match on the
@@ -1085,8 +1095,9 @@ void theme_set(int theme_id) {
 
         // #osglass (2026-09-16): push this theme's OS-wide glass opacity as
         // the new default. wm_set_default_opacity() (kernel/gui/window.c)
-        // only touches windows WITHOUT an explicit per-window override (see
-        // window_t::opacity_override), so a window the user has deliberately
+        // only touches windows still at tier 0 / WIN_OPACITY_SRC_DEFAULT (see
+        // window_t::opacity_src, #791), so a window an APP has declared for
+        // itself or a window the user has deliberately
         // set to its own opacity via the titlebar decorator popup survives a
         // theme switch unchanged - only the OS-wide default moves. This is
         // what makes the opacity value "come from the theme setting" rather

@@ -3,7 +3,7 @@
 # C only. Builds .o objects for libwapcaplet, libparserutils, libhubbub, libcss, libdom
 # against the MayteraOS freestanding userland toolchain. Run on the build server.
 set -e
-ROOT=<workspace>
+ROOT=${MAYTERA_NS_ROOT:-<workspace>}   # see Makefile: MAYTERA_NS_ROOT
 CC=$ROOT/cc.sh
 PU=$ROOT/libparserutils/include
 WC=$ROOT/libwapcaplet/include

@@ -139,7 +139,13 @@ static void notify_spool_post(int severity, const char *title, const char *body)
     size_t blen = 0;
     uint32_t sz = 0;   /* fat_read_file takes uint32_t*, not size_t* */
     char spool[256];
-    if (userconf_kpath(NOTIFY_SPOOL_NAME, spool, sizeof(spool)) != 0) return;
+    // [foundbugs] userconf_kpath_scratch(), not userconf_kpath(): a no-account
+    // session's path is "/CONFIG/NOTIFY.TXT", and /CONFIG ends up root-owned
+    // 0711 (searchable, not writable) before any userland process runs, so no
+    // Ring-3 app, including the compositor, can ever be the one to CREATE
+    // this file, even though this Ring-0 write always succeeds; see
+    // kernel/fs/userconf.h for the full rule.
+    if (userconf_kpath_scratch(NOTIFY_SPOOL_NAME, spool, sizeof(spool)) != 0) return;
     void *cur = fat_read_file(&g_fat_fs, spool, &sz);
     if (cur) {
         if (sz > SPOOL_CAP) sz = SPOOL_CAP;
@@ -159,6 +165,23 @@ static void notify_spool_post(int severity, const char *title, const char *body)
     if (fat_write_file(&g_fat_fs, spool, buf, (uint32_t)(p - buf)) != 0)
         kprintf("[SECLOG] FAILED to spool a security event to %s: the audit "
                 "trail has a GAP\n", spool);
+}
+
+// The notification spool, exported.
+//
+// WHY: fs/recycle_fs.c has to ANNOUNCE an AI deletion to the user, and the
+// owner's requirement is explicit that it must be announced and "not buried in
+// a log". That is precisely what this spool is for, and it already has three
+// writers (this file, userland/libc/notify.c, and the compositor) agreeing on
+// one file and one record format. Adding a fourth private copy of the format
+// is how the three would become four that drift, so the existing one is
+// exported instead. CLAUDE.md: improve the shared primitive, never fork it.
+//
+// Blocking (it reads and rewrites a file), so process context only. Severity
+// follows the libc/notify.c scale: 0 info, 1 success, 2 warning, 3 error.
+void seclog_notify_user(int severity, const char *title, const char *body) {
+    if (!title || !body) return;
+    notify_spool_post(severity, title, body);
 }
 
 static void seclog_drain(void) {
@@ -322,5 +345,5 @@ void seclog_init(void) {
         return;
     }
     kprintf("[SECLOG] security event sink started (-> %s + %s)\n",
-            SECLOG_PATH, "<home>/CONFIG/" NOTIFY_SPOOL_NAME);
+            SECLOG_PATH, "<home>/CONFIG/" NOTIFY_SPOOL_NAME " (or /TMP/" NOTIFY_SPOOL_NAME " with no account yet)");
 }

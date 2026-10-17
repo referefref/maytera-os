@@ -17,6 +17,8 @@
 #include "stlview.h"
 #include "../../libc/syscall.h"
 #include "../../libc/stdio.h"
+#include "../../libc/notify.h"   // [deadbtn] toast when curaslice/etc cannot be launched
+#include "../../libc/userconf.h"   // [foundbugs] userscratch_path(): a writable output path even pre-account
 
 // Route all in-window text through the antialiased TrueType path (as Settings).
 #define win_draw_text(h, x, y, s, c)       win_draw_text_ttf((h), (x), (y), (s), 14, (c))
@@ -708,9 +710,21 @@ static void draw_all(void) {
     win_invalidate(win);
 }
 
-// Where CuraEngine writes the sliced g-code. Kept short (8.3-safe) so it lands
-// cleanly on both the FAT ESP and the ext2 root.
-#define SLICE_OUT "/SLICED.GCO"
+// Where CuraEngine writes the sliced g-code.
+// [foundbugs] This used to be the hardcoded literal "/SLICED.GCO", at the
+// filesystem ROOT. kernel/fs/perms.c perms_set("/", 0, 0, 0755) makes "/"
+// writable only by uid 0, so CuraEngine's own O_CREAT on that path is refused
+// with EACCES (-13) for any ordinary desktop session, and on a freshly built
+// golden (no account yet, #226) EVERY session is in that position. That is
+// the reported "cannot save its output, permissions mismatch" bug. The fix is
+// the same shared accessor userland/libc/userconf.c already built for this
+// exact situation: userscratch_path() resolves to the user's home when there
+// is an account, and to the world-writable /TMP when there is not, instead of
+// a second app reinventing the per-user/no-account fallback. SLICE_OUT_NAME
+// is the bare 8.3-safe filename passed to it; the resolved path is a local
+// buffer at each use site, not a macro, because the right path can change
+// mid-session (OOBE can create the first account while this app is open).
+#define SLICE_OUT_NAME "SLICED.GCO"
 
 // Slice the selected STL model to g-code with the CuraEngine port (/APPS/curaslice).
 // #660: this used to spawn /APPS/CURASLIC, the 2026-07-12 asset-base binary. The
@@ -725,8 +739,14 @@ static void draw_all(void) {
 // Win16 launcher already run a child to completion.
 static void do_slice(void) {
     if (g_sel < 0 || !g_files[g_sel].is_stl) return;
+    char slice_out[160];
+    if (userscratch_path(SLICE_OUT_NAME, slice_out, sizeof(slice_out)) != 0) {
+        set_status("Slice failed: could not resolve a writable output path.");
+        notify_post("Slice failed", "No writable location for the sliced g-code", NOTIFY_ERROR);
+        return;
+    }
     // Clear any stale output so a failed slice cannot look like a success.
-    sys_unlink(SLICE_OUT);
+    sys_unlink(slice_out);
     set_status("Slicing model with CuraEngine, please wait...");
     draw_all();
 
@@ -759,25 +779,35 @@ static void do_slice(void) {
     av[n++] = (char *)"-s"; av[n++] = b_inf;
     av[n++] = (char *)"-s"; av[n++] = b_sa;
     av[n++] = (char *)"-s"; av[n++] = b_se;
-    av[n++] = (char *)"-o"; av[n++] = (char *)SLICE_OUT;
+    av[n++] = (char *)"-o"; av[n++] = slice_out;
     av[n++] = g_files[g_sel].path;
     av[n] = 0;
     int pid = sys_spawn_args("/APPS/curaslice", av, n);
-    if (pid < 0) { set_status("Slice failed: could not start CuraEngine (/APPS/curaslice)."); return; }
+    if (pid < 0) {
+        // [deadbtn] curaslice is excluded from the public image by a licence
+        // decision (AGPLv3 CuraEngine + an unlicensed Clipper copy; see
+        // build/app-presence.policy), so this DOES fire on that image. The
+        // status bar message below was easy to miss; also raise a toast
+        // through the shared notify_post() so the failure is visible even if
+        // the user is not looking at the window's status line.
+        set_status("Slice failed: could not start CuraEngine (/APPS/curaslice).");
+        notify_post("Slice failed", "CuraEngine (curaslice) is not on this build", NOTIFY_ERROR);
+        return;
+    }
     int st = 0;
     sys_waitpid(pid, &st, 0);   // blocks on the child-exit wait-queue
 
     // Verify CuraEngine produced g-code.
-    int fd = sys_open(SLICE_OUT, O_RDONLY);
+    int fd = sys_open(slice_out, O_RDONLY);
     if (fd < 0) { set_status("Slice produced no g-code (CuraEngine could not read the model?)."); return; }
     sys_close(fd);
 
     // Insert the sliced g-code into the file list and load it for printing.
-    int idx = find_by_path(SLICE_OUT);
+    int idx = find_by_path(slice_out);
     if (idx < 0) {
         if (g_nfiles >= 64) { set_status("Sliced OK, but the file list is full."); return; }
         idx = g_nfiles++;
-        strncpy(g_files[idx].path, SLICE_OUT, sizeof(g_files[idx].path)-1);
+        strncpy(g_files[idx].path, slice_out, sizeof(g_files[idx].path)-1);
         g_files[idx].path[sizeof(g_files[idx].path)-1] = 0;
         strncpy(g_files[idx].name, "Sliced model (g-code)", sizeof(g_files[idx].name)-1);
         g_files[idx].name[sizeof(g_files[idx].name)-1] = 0;
@@ -893,8 +923,25 @@ int main(int argc, char **argv) {
     refresh_theme();
 
     // open the phase-1 virtual printer log
-    g_tx_ok = (m3d_transport_open(&g_tx, M3D_BACKEND_VIRTUAL, "/M3DOUT.TXT") == 0);
-    if (!g_tx_ok) set_status("Could not open /M3DOUT.TXT (virtual printer).");
+    // [foundbugs] same bug, same fix as SLICE_OUT above: "/M3DOUT.TXT" at the
+    // filesystem root was refused to every non-root session; resolve a path
+    // this session can actually write before trying to open it.
+    {
+        char m3dout[160];
+        if (userscratch_path("M3DOUT.TXT", m3dout, sizeof(m3dout)) != 0) {
+            g_tx_ok = 0;
+            set_status("Could not resolve a writable path for the virtual printer log.");
+            notify_post("3D Print", "No writable location for the virtual printer log", NOTIFY_ERROR);
+        } else {
+            g_tx_ok = (m3d_transport_open(&g_tx, M3D_BACKEND_VIRTUAL, m3dout) == 0);
+            if (!g_tx_ok) {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "Could not open %.60s (virtual printer).", m3dout);
+                set_status(msg);
+                notify_post("3D Print", "Could not open the virtual printer log", NOTIFY_ERROR);
+            }
+        }
+    }
 
     scan_files();
     if (argc > 1 && argv[1] && argv[1][0]) {

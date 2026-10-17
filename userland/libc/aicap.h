@@ -19,7 +19,9 @@
 //     app shows a dialog); on grant a token is minted, on deny the tool returns
 //     CAPABILITY_DENIED. An out-of-scope / expired / exhausted token returns
 //     CAPABILITY_DENIED / TOKEN_EXPIRED / TOKEN_EXHAUSTED.
-//   - Every authorization decision is appended to /CONFIG/AIAUDIT.LOG.
+//   - Every authorization decision is appended to the session user's own audit
+//     trail, <home>/CONFIG/AIAUDIT.LOG (aicap_audit_path()). See the THREAT
+//     MODEL block below for what that record is and is not evidence of.
 //
 // Enforcement currently lives in userland (at the aiclient dispatch boundary).
 // Task #305 will move this into a protected, immutable kernel core. The API here
@@ -53,11 +55,12 @@ enum {
 typedef int (*aicap_consent_fn)(const char *tool_id, const char *cap, int risk,
                                 const char *args, const char *target);
 
-// Initialize the subsystem: load persisted grants from /CONFIG/AICAPS.CFG. Safe
-// to call repeatedly (a second call is a no-op once loaded).
+// Initialize the subsystem: load persisted grants from this session's grant
+// store (aicap_grants_path(); "/CONFIG/AICAPS.CFG" for a root session). Safe to
+// call repeatedly (a second call is a no-op once loaded).
 void aicap_init(void);
 
-// Re-read /CONFIG/AICAPS.CFG, DISCARDING the cached grant table. aicap_init()
+// Re-read the grant store, DISCARDING the cached grant table. aicap_init()
 // caches on first use for the AI loop's sake, but a LONG-RUNNING process that
 // gates on behalf of others (a live-contract app answering delivered calls,
 // contract.c) must reflect a grant made mid-session, exactly as a freshly
@@ -96,10 +99,67 @@ int  aicap_authorize(const char *tool_id, const char *args,
 // tests after it has shown the dialog (so a screendump still captures it).
 int  aicap_preseed_consent(const char *tool_id, const char *cap);
 
-// Append one record to /CONFIG/AIAUDIT.LOG:
+// ---------------------------------------------------------------------------
+// #aiaudit THREAT MODEL. Read this before citing the audit trail as a control.
+//
+// WHAT IT IS FOR: answering "what did the AI do on my behalf?" for the person
+// whose session it is. Which tool ran, with which arguments, how it was
+// authorized (low-risk / token / consent), and what came back. It is the
+// user's own record of their own assistant's behaviour.
+//
+// WHAT IT IS NOT. It is NOT evidence against the machine's owner, and it is NOT
+// evidence against a hostile Ring-3 process. Two separate reasons, and the
+// second is the load-bearing one:
+//
+//  1. The file lives in the user's home, so the user can truncate or delete it.
+//     That is deliberate. Making a record of a person's own AI conversations
+//     un-expungeable by that person is a different product decision, with a
+//     privacy cost, that nobody asked for. The threat model is "what did my
+//     assistant do", not "prove it to a third party against a hostile owner".
+//
+//  2. MORE IMPORTANTLY, the integrity ceiling of this log is set by where the
+//     ENFORCEMENT lives, not by where the FILE lives. aicap is pure userland:
+//     a hostile app does not have to call aicap_authorize(), so it does not
+//     have to call aicap_audit() either. Relocating the sink to a root-owned
+//     file, or behind a new Ring-0 syscall, would not record one action of an
+//     actor who simply declines to log. It would buy assurance the design
+//     cannot deliver, and it would mix PROCESS CLAIMS into
+//     /CONFIG/SECURITY.LOG, every line of which is currently something Ring 0
+//     WITNESSED. A log in which a reader cannot tell a witnessed fact from a
+//     claim is worth less than two logs. So: one sink, honestly scoped.
+//     Tamper-evidence for AI actions arrives with #305 (the protected
+//     immutable core), when the GATE moves, not before.
+//
+// What IS tamper-evident today is the subset Ring 0 witnesses for itself:
+// proc/caps.c records every capability grant, refusal and revocation through
+// seclog_report_capability() into /CONFIG/SECURITY.LOG. That covers the
+// kernel-gated operations (input injection, screen capture) and NOT the
+// majority of AI tools, which are userland dispatches.
+// ---------------------------------------------------------------------------
+
+// Append one record to the session user's audit trail:
 //   <rtc-timestamp>|<tool>|<cap>|<args-truncated>|<result>|<how>
+// A refused append is NEVER silent: see log_append() in aicap.c.
 void aicap_audit(const char *tool_id, const char *cap, const char *args,
                  const char *result, const char *how);
+
+// Resolve where THIS SESSION's audit trail / loop-metrics file lives, so that a
+// reader (a test, a future viewer app) asks the same function the writer does
+// instead of hardcoding a path that the writer has since moved. Writes an
+// absolute path into `out`. Returns 0, or -1 if it will not fit.
+//
+// For a ROOT session, and for a session with no passwd entry at all, both
+// resolve to the historic "/CONFIG/<NAME>".
+int aicap_audit_path(char *out, unsigned long cap);
+int aicap_metric_path(char *out, unsigned long cap);
+
+// #peruserpath: where THIS SESSION's persisted GRANT STORE lives,
+// "<home>/CONFIG/AICAPS.CFG" (so "/CONFIG/AICAPS.CFG" for root). Same rule and
+// same reason as the two above, and there is NO legacy read fallback here: a
+// grant is an authorization, so inheriting another principal's persisted grants
+// would be an escalation, not an upgrade convenience. See the long comment at
+// the AICAPS_NAME define in aicap.c for what was measured.
+int aicap_grants_path(char *out, unsigned long cap);
 
 // ---------------------------------------------------------------------------
 // #469m AI LOOP INSTRUMENTATION. One record per phase-bearing step of the AI
@@ -128,7 +188,10 @@ void aicap_audit(const char *tool_id, const char *cap, const char *args,
 // real elapsed time during exactly the stalls an instrument needs to see.
 // 0 means NOT MEASURED for this record kind, never "took no time".
 // ---------------------------------------------------------------------------
-#define AIMETRIC_LOG "/CONFIG/AIMETRIC.LOG"
+// The per-user metrics sink. Resolve it with aicap_metric_path(); this is only
+// the leaf name and the pre-#aiaudit absolute path it falls back to.
+#define AIMETRIC_NAME   "AIMETRIC.LOG"
+#define AIMETRIC_LEGACY "/CONFIG/AIMETRIC.LOG"
 
 typedef struct {
     const char *op;        // "chat" | "vision" | "action" | "capture"
@@ -178,7 +241,31 @@ void aicap_metric(const aicap_metric_t *m);
 //   - mint a scoped grant (aicap_grant_scoped) instead of hand-rolling tokens,
 //   - revoke the grant as a set for an early close (aicap_revoke_tag),
 //   - forbid a capability outright for a contract's lifetime
-//     (aicap_deny_capability), which is how the no-delete promise is enforced.
+//     (aicap_deny_capability).
+//
+// CORRECTED 2026-10-03. THIS COMMENT USED TO END "..., which is how the
+// no-delete promise is enforced", AND THAT WAS NOT TRUE OF ANY SHIPPED BUILD.
+// Measured: `aicap_deny_capability` had exactly three mentions in the whole
+// tree, this comment, its declaration below, and its definition in aicap.c.
+// NOTHING CALLED IT. The escrow grant/deny half moved to Ring 0 when the
+// kernel chokepoint landed (escrow.c says so in as many words: "the old
+// userland aicap grant/deny ... is GONE from this file"), and this sentence was
+// not updated, so the file claiming to be the enforcement was the one place
+// the enforcement provably was not.
+//
+// WHERE THE ENFORCEMENT ACTUALLY IS: kernel/fs/escrow_guard.c
+// escrow_fs_guard(), called from every FS-mutation syscall. A Ring-3 process
+// cannot bypass it by issuing raw syscalls, which is exactly why the userland
+// version was not good enough. And since 2026-10-03 the rule it enforces is no
+// longer "no delete": a delete by a marked process SUCCEEDS and is REDIRECTED
+// into the user's Recycle Bin (kernel/fs/recycle_fs.c), announced to the user,
+// and restorable. See docs/AI_ESCROW_PROMISE.md.
+//
+// THE DENYLIST BELOW IS STILL REAL CODE AND IS STILL WIRED INTO THE GATE: a
+// denied capability is refused by aicap_authorize()/aicap_path_in_scope() ahead
+// of any token or consent, and that path has a measured negative control. What
+// it does NOT have is a shipping caller. Do not describe it as an enforcement
+// mechanism for anything until one exists.
 // A denied capability is refused by aicap_authorize()/aicap_path_in_scope()
 // regardless of any token or consent. Denies are refcounted so nested contracts
 // forbidding the same capability compose correctly.

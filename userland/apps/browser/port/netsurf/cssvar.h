@@ -112,4 +112,43 @@ int cssvar_gradient_count(void);
 /* Gradient at `idx`, or NULL if out of range. Valid until the next reset. */
 const cssvar_gradient *cssvar_gradient_get(int idx);
 
+/*
+ * Inline style="" gradients (#245 enggrad2).
+ *
+ * The inline-style path builds its one-off declaration sheet in
+ * mcs_compute_style() and does NOT run cssvar_preprocess(), so
+ * `<div style="background:linear-gradient(...)">` never reached the carrier and
+ * libcss dropped the whole declaration: the box lost its background entirely.
+ * This is the NARROW entry point for that path. It rewrites gradient
+ * backgrounds onto the carrier and touches NOTHING else: var(), clamp(),
+ * calc(), grid-template-columns, gap/row-gap and border-radius are deliberately
+ * NOT resolved here. That is what keeps this change's blast radius to
+ * gradients, and it is why the inline pass could be added without reopening the
+ * broader question of what inline var() should mean.
+ *
+ * `decls` is a BRACELESS declaration list (the raw style attribute value), not
+ * a stylesheet.
+ *
+ * Returns a malloc'd NUL-terminated rewrite with *out_len set, or NULL when
+ * there is no gradient to carry, which includes gradient syntax this parser
+ * does not accept (repeating-*, conic-*, malformed). On NULL the caller uses
+ * the ORIGINAL bytes, which is byte-for-byte today's behaviour. The caller
+ * frees a non-NULL result.
+ */
+char *cssvar_inline_gradients(const char *decls, size_t len, size_t *out_len);
+
+/*
+ * engwalkstack (#245): md5 of the engine sources this object was compiled from,
+ * injected by the build as -DENGWALK_CSSVAR_STAMP.
+ *
+ * It covers cssvar.c, cssvar.h AND css_select_bind.c together, because the
+ * gradient carrier now spans all three: a stamp that covered only layout.c and
+ * main.c (the two that already had one) would be blind to the exact edit an A/B
+ * run of this feature is measuring, and a stamp gate that cannot see the change
+ * is the same failure as no stamp gate at all. "unstamped" when the build did
+ * not pass one, so a build that skipped the injection says so rather than
+ * printing a plausible wrong thing.
+ */
+const char *cssvar_src_stamp(void);
+
 #endif

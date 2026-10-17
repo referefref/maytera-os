@@ -622,6 +622,35 @@ void perms_set  (const char *p, uint32_t u, uint32_t g, uint16_t m) {
     (void)p; (void)u; (void)g; (void)m; ABSENT("perms_set");
 }
 void perms_remove(const char *p) { (void)p; ABSENT("perms_remove"); }
+// perms_may_remove() - #prewrite. REAL to the limit of what Ring 3 can ask, and
+// the limit is stated rather than papered over.
+//
+// In the KERNEL this answers two questions: "may I write the parent" and, on an
+// all-users (sticky) directory, "may THIS principal remove THIS name". Here it
+// can honestly answer only the first, because SYS_ACCESS offers an access-mode
+// question and nothing else, and inventing a second "may I remove" oracle in
+// this file would be exactly the Ring-3 copy of the rule the comment above
+// perms_check() says must never exist.
+//
+// THAT IS SAFE, AND HERE IS WHY IT IS NOT A BYPASS. This binary does not
+// delete anything itself: the guest's INT 21h 41h/56h/3Ah reach fat_delete()/
+// fat_rename(), which in this build are the shim's sys_unlink()/sys_rename(),
+// which are the ORDINARY SYSCALLS. The kernel then applies the real
+// perms_may_remove() at sys_unlink/sys_rmdir/sys_rename with this process's own
+// identity. So the sticky decision IS enforced for a Ring-3 DOS guest; it is
+// simply enforced at the syscall rather than pre-checked in here.
+//
+// The consequence, so nobody is surprised by it: a refused removal reaches the
+// guest as a DOS error from the syscall rather than from this gate, which means
+// the guest sees the same failure a beat later and the [STICKY-DENY] audit line
+// names the DOSRING3 process rather than the guest program. That is a slightly
+// coarser attribution, not a weaker rule.
+int perms_may_remove(const char *parent, const char *victim,
+                     uint32_t uid, uint32_t gid) {
+    (void)victim;
+    if (!parent) return -1;
+    return perms_check(parent, uid, gid, 2 /*W_OK*/);
+}
 void perms_on_create(const char *p, uint32_t u, uint32_t g, int d) {
     (void)p; (void)u; (void)g; (void)d;   // the kernel applies the creating
                                           // process's own credentials already

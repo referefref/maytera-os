@@ -208,6 +208,38 @@ static struct {
     // creation is the userland wizard's PG_ACCOUNT page now.
 } login_ctx;
 
+// secure_zero() lives in security/security.c. Declared locally rather than by
+// including security/security.h, matching the idiom already used for this exact
+// function in proc/syscall.c, which keeps gui/ free of a security/ include.
+extern void secure_zero(void *ptr, size_t size);
+
+// ONE definition of "forget the password that was typed into the login gate".
+//
+// WHY THIS IS A FUNCTION AND NOT A TWO-LINE IDIOM. Before this change there
+// were ELEVEN copies of
+//     login_ctx.password[0] = '\0';
+//     login_ctx.password_pos = 0;
+// and every one of them cleared the FIRST BYTE ONLY, leaving up to 63 bytes of
+// the attempted password in kernel .bss. Worse, the two SUCCESS paths
+// (login_attempt and login_attempt_typed) did not clear at all, so after a
+// NORMAL login the session user's plaintext password stayed in Ring-0 .bss for
+// the life of the boot, where any crash dump, any memory image and any Ring-0
+// read would find it. There is no syscall that returns it, so this was not a
+// Ring-3 disclosure; it was an at-rest-in-RAM exposure of the single
+// highest-value credential on the machine.
+//
+// #smbnt removed a cleartext SMB SHARE password from kernel .bss for precisely
+// this reason, and left the LOGIN password, which is the more valuable secret
+// and the one users reuse elsewhere, sitting in the same class of buffer. This
+// closes that gap rather than adding a twelfth partial copy.
+//
+// secure_zero(), not memset(): a memset of a buffer that nothing reads again is
+// exactly what the compiler is entitled to delete.
+static void login_password_forget(void) {
+    secure_zero(login_ctx.password, sizeof(login_ctx.password));
+    login_ctx.password_pos = 0;
+}
+
 // ============================================================================
 // Darkened wallpaper backdrop (#569): built ONCE (a full-resolution wallpaper
 // blit plus a scrim is too expensive for a per-frame redraw, #426) into a
@@ -1126,8 +1158,7 @@ static void login_handle_mouse_click(int32_t mx, int32_t my) {
             if (mx >= rx && mx < rx + LOGIN_ROW_W && my >= ry && my < ry + LOGIN_ROW_H) {
                 login_ctx.selected_user = login_ctx.list_first + r;
                 login_ctx.state = LOGIN_STATE_PASSWORD;
-                login_ctx.password[0] = '\0';
-                login_ctx.password_pos = 0;
+                login_password_forget();
                 login_ctx.error_msg[0] = '\0';
                 return;
             }
@@ -1165,8 +1196,7 @@ static void login_handle_mouse_click(int32_t mx, int32_t my) {
             if (my >= g.back_y && my < g.back_y + LOGIN_BODY_PX + 8 &&
                 mx >= g.cx - lw / 2 && mx < g.cx + lw / 2) {
                 login_ctx.state = LOGIN_STATE_SELECT_USER;
-                login_ctx.password[0] = '\0';
-                login_ctx.password_pos = 0;
+                login_password_forget();
                 login_ctx.error_msg[0] = '\0';
             }
         }
@@ -1239,8 +1269,7 @@ static int login_attempt(login_result_t *result) {
             strncpy(login_ctx.error_msg, "Incorrect password. Try again.",
                     sizeof(login_ctx.error_msg) - 1);
         }
-        login_ctx.password[0] = '\0';
-        login_ctx.password_pos = 0;
+        login_password_forget();
         login_ctx.state = LOGIN_STATE_PASSWORD;
         return -1;
     }
@@ -1254,6 +1283,9 @@ static int login_attempt(login_result_t *result) {
     kprintf("[LOGIN] User '%s' (uid=%u) authenticated successfully\n",
             sel_user->username, sel_user->uid);
 
+    // The password has done its job. Forget it here, on the SUCCESS path, which
+    // is the path that used to keep it for the life of the boot.
+    login_password_forget();
     return 0;
 }
 
@@ -1279,8 +1311,7 @@ static int login_attempt_typed(login_result_t *result) {
         login_ctx.error_msg[sizeof(login_ctx.error_msg) - 1] = '\0';
         // The field clears and keeps focus; the error border is held until the
         // next keystroke (which is what clears error_msg).
-        login_ctx.password[0] = '\0';
-        login_ctx.password_pos = 0;
+        login_password_forget();
         login_ctx.tu_field = 1;
         login_ctx.state = LOGIN_STATE_TYPED;
         return -1;
@@ -1292,6 +1323,8 @@ static int login_attempt_typed(login_result_t *result) {
     strncpy(result->home, u->home, sizeof(result->home) - 1);
     kprintf("[LOGIN] User '%s' (uid=%u) authenticated successfully (typed)\n",
             u->username, u->uid);
+    // Same on the typed-name path.
+    login_password_forget();
     return 0;
 }
 
@@ -1531,8 +1564,7 @@ int login_run(login_result_t *result) {
             login_ctx.state = LOGIN_STATE_TYPED;
             login_ctx.tu_user[0] = '\0';
             login_ctx.tu_field = 0;
-            login_ctx.password[0] = '\0';
-            login_ctx.password_pos = 0;
+            login_password_forget();
         } else if (login_active(-1, NULL) == 1) {
             // #569/#745: LIST mode with exactly one account renders the
             // single-account view directly. A list of one is not a list, it is
@@ -1540,8 +1572,7 @@ int login_run(login_result_t *result) {
             // stays recorded as LIST, so the moment a second account exists the
             // list appears without anyone going back to Settings.
             login_ctx.selected_user = 0;
-            login_ctx.password[0] = '\0';
-            login_ctx.password_pos = 0;
+            login_password_forget();
             login_ctx.state = LOGIN_STATE_PASSWORD;
         } else {
             login_select_default();   // #218: never default-highlight root (row 0)
@@ -1571,8 +1602,7 @@ int login_run(login_result_t *result) {
                     if (login_ctx.selected_user >= 0 &&
                         login_ctx.selected_user < active_count) {
                         login_ctx.state = LOGIN_STATE_PASSWORD;
-                        login_ctx.password[0] = '\0';
-                        login_ctx.password_pos = 0;
+                        login_password_forget();
                         login_ctx.error_msg[0] = '\0';
                     }
                 } else if (key >= '1' && key <= '9') {
@@ -1581,8 +1611,7 @@ int login_run(login_result_t *result) {
                         login_ctx.selected_user = idx;
                         login_list_clamp(active_count);
                         login_ctx.state = LOGIN_STATE_PASSWORD;
-                        login_ctx.password[0] = '\0';
-                        login_ctx.password_pos = 0;
+                        login_password_forget();
                         login_ctx.error_msg[0] = '\0';
                     }
                 }
@@ -1599,8 +1628,7 @@ int login_run(login_result_t *result) {
                     login_ctx.tu_field ^= 1;
                 } else if (key == 27) {
                     login_ctx.tu_user[0] = '\0';
-                    login_ctx.password[0] = '\0';
-                    login_ctx.password_pos = 0;
+                    login_password_forget();
                     login_ctx.tu_field = 0;
                     login_ctx.error_msg[0] = '\0';
                 } else if (key == '\b') {
@@ -1638,8 +1666,7 @@ int login_run(login_result_t *result) {
                     // person onto a one-row screen they were never shown.
                     if (login_ctx.mode == LOGIN_MODE_LIST && login_active(-1, NULL) > 1) {
                         login_ctx.state = LOGIN_STATE_SELECT_USER;
-                        login_ctx.password[0] = '\0';
-                        login_ctx.password_pos = 0;
+                        login_password_forget();
                         login_ctx.error_msg[0] = '\0';
                     }
                 } else if (key >= ' ' && key < 127) {
@@ -1711,8 +1738,7 @@ int login_lock_screen(uint32_t uid) {
 
     // Go directly to password state
     login_ctx.state = LOGIN_STATE_PASSWORD;
-    login_ctx.password[0] = '\0';
-    login_ctx.password_pos = 0;
+    login_password_forget();
 
     login_result_t result;
     return login_run(&result);

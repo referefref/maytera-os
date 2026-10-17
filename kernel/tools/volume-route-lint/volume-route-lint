@@ -1,0 +1,849 @@
+#!/usr/bin/env python3
+# volume-route-lint - MayteraOS "the ROOT filesystem was asked about a path that
+# may be on a REMOVABLE VOLUME" detector (#246).
+#
+# WHAT THIS BUG CLASS IS
+# ==========================================================================
+# `g_fat_fs` routes the ext2 root, the FAT ESP, /SMB, /NFS and a mounted disk
+# image. It does NOT route a hot-plugged removable volume; only
+# `hotplug_fs_or_root()` and `hotplug_volume_for_path()` (kernel/drivers/
+# hotplug.h) do. Code that hands `&g_fat_fs` a path under a mount point like
+# /USB0 is told the file is ABSENT when it is plainly there, and then does
+# something wrong with a straight face.
+#
+# In two days the SAME fault was found FOUR separate times in four unrelated
+# subsystems, every time by somebody tripping over a symptom:
+#   * the Recycle-Bin capture ([escrowred]) - an AI could not delete on a stick;
+#   * four of five non-delete capture hooks ([usbescrow]) - an AI could DESTROY
+#     a file on a stick with nothing kept;
+#   * rename/mkdir/rmdir/unlink in proc/syscall.c ([renamevol]) - a stick was
+#     read-mostly for every ordinary user AND a permission check silently did
+#     not run;
+#   * one of three ownership-stamping sites, missing from the removable branch
+#     of the open path.
+# Four for four by accident. This tool exists so the fifth is caught by a build
+# instead of by a user.
+#
+# WHAT THIS TOOL CLAIMS, EXACTLY
+# ==========================================================================
+# It does NOT claim "this call is a bug". It cannot: whether a path can ever
+# name a removable volume depends on where the string came from, and that is
+# interprocedural taint. `sc_path_is_dir(kpath)` was blind, but its parameter
+# is tainted two frames up in `sys_chdir`, and no regex follows that.
+#
+# What it claims is narrower and checkable: **this call hands the ROOT
+# filesystem handle a path argument the tool cannot PROVE is a fixed root
+# path.** Everything it can prove is already green and silent, which is most of
+# the tree:
+#   * a string literal starting with '/'                 (247 sites)
+#   * an identifier whose #define / static const char[]
+#     is such a literal
+#   * a local buffer whose EVERY write inside the
+#     enclosing function is a snprintf/strcpy/strncpy
+#     from a literal starting with '/'
+# Those three rules are what keep this from being a 500-line wall of noise.
+# The remainder is recorded in allowlist.txt with a category and a real reason,
+# exactly as kernel/tools/concurrency-lint does, and a NEW one fails the build.
+#
+# AND WHY IT IS NOT THE PRIMARY DEFENCE
+# ==========================================================================
+# Said plainly, because a tool that oversells itself is worse than none. A
+# static rule of this shape has the wrong error profile for this fault class:
+# the bad argument is almost never a literal, so the candidate set is large and
+# mostly innocent. The PRIMARY defence is the runtime detector in
+# kernel/fs/volblind.c + kernel/rustkern/volblind.rs, which fires if and only
+# if a path that GENUINELY lies under a GENUINELY mounted removable volume
+# reaches the root handle: zero false alarms by construction, and it sees the
+# routes no static tool can follow (a path built at runtime, a path arriving
+# through the DOS layer, a path a GUI app took from a directory listing).
+#
+# The two are kept together because their blind spots are opposite. The lint
+# catches a new instance at commit time, in the shapes it can read, on a
+# machine with nothing plugged in. The detector catches any instance at all,
+# but only one that is EXERCISED, on a machine with a volume present. Neither
+# is sufficient and this file does not pretend otherwise.
+#
+# USAGE
+#   volume-route-lint [--dirs kernel] [--report] [--update-allowlist]
+#   volume-route-lint --self-test
+#
+# Exit 0 = no new violations. Exit 1 = a new violation, or an allowlist that
+# has rotted (an entry with no category, no justification, or a fingerprint
+# that matches nothing in the tree).
+
+import hashlib
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ALLOWLIST = os.path.join(HERE, 'allowlist.txt')
+
+# ---------------------------------------------------------------------------
+# The functions whose PATH arguments are served by whichever fat_fs_t they are
+# handed, and the 0-based index of each path argument after the fs pointer.
+#
+# GROUND TRUTH, not guessed: every one of these is a declaration in
+# kernel/fs/fat.h taking (fat_fs_t *fs, const char *path, ...). Re-derive with
+#   grep -n 'fat_fs_t \*fs, const char \*' kernel/fs/fat.h
+# A new one must be added here or the lint silently stops covering it, which is
+# why --self-test also checks this table against fat.h.
+# ---------------------------------------------------------------------------
+PATH_FN = {
+    'fat_open':             [1],
+    'fat_exists':           [1],
+    'fat_read_file':        [1],
+    'fat_read_file_retry':  [1],
+    'fat_write_file':       [1],
+    'fat_delete':           [1],
+    'fat_mkdir':            [1],
+    'fat_create':           [1],
+    'fat_list_dir':         [1],
+    'fat_set_times':        [1],
+    'fat_rename':           [1, 2],
+    'fat_copy':             [1, 2],
+    'fat_move':             [1, 2],
+}
+
+CALL_RE = re.compile(r'\b(' + '|'.join(sorted(PATH_FN)) + r')\s*\(\s*&\s*g_fat_fs\s*,')
+
+# A path expression is PROVEN root-only when it is a literal starting with '/'.
+# "/USB" is deliberately NOT special-cased as unsafe: no code in this tree
+# names a mount point as a literal, and if any ever does it should be RED.
+LIT_RE = re.compile(r'^\s*"(/[^"]*)"')
+
+# Writes into a local buffer the tool can follow.
+FILL_RE = re.compile(
+    r'\b(?:snprintf|sprintf|strcpy|strncpy|strlcpy)\s*\(\s*([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*,'
+    r'[^;]*?"(/[^"]*)"', re.S)
+# Any other write into the buffer the tool CANNOT follow -> not provable.
+OPAQUE_RE_T = (
+    r'\b(?:snprintf|sprintf|strcpy|strncpy|strlcpy|memcpy|strcat|strncat)\s*\(\s*{0}\s*,'
+    r'(?![^;]*?"/)')
+
+
+def strip_comments(src):
+    """Remove // and /* */ comments, preserving string literals and newlines.
+
+    This is not cosmetic. proc/syscall.c carries the fixed code's own
+    explanation of the OLD broken call, verbatim, inside a comment:
+        // [renamevol] #246: This was fat_mkdir(&g_fat_fs, path) ...
+    A lint that reads comments reports the fix as the bug, and a lint that
+    reports fixes is a lint that gets switched off.
+    """
+    out = []
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == '/' and i + 1 < n and src[i + 1] == '/':
+            j = src.find('\n', i)
+            if j < 0:
+                break
+            out.append(' ' * (j - i))
+            i = j
+            continue
+        if c == '/' and i + 1 < n and src[i + 1] == '*':
+            j = src.find('*/', i + 2)
+            if j < 0:
+                j = n - 2
+            chunk = src[i:j + 2]
+            out.append(''.join(ch if ch == '\n' else ' ' for ch in chunk))
+            i = j + 2
+            continue
+        if c in '"\'':
+            q = c
+            out.append(c)
+            i += 1
+            while i < n:
+                out.append(src[i])
+                if src[i] == '\\':
+                    if i + 1 < n:
+                        out.append(src[i + 1])
+                        i += 2
+                        continue
+                elif src[i] == q:
+                    i += 1
+                    break
+                i += 1
+            continue
+        out.append(c)
+        i += 1
+    return ''.join(out)
+
+
+def split_args(s):
+    """s begins just after the open paren. Return top-level comma-split args."""
+    out, cur, depth = [], '', 0
+    i, n = 0, len(s)
+    instr = None
+    while i < n:
+        c = s[i]
+        if instr:
+            cur += c
+            if c == '\\' and i + 1 < n:
+                cur += s[i + 1]
+                i += 2
+                continue
+            if c == instr:
+                instr = None
+            i += 1
+            continue
+        if c in '"\'':
+            instr = c
+            cur += c
+            i += 1
+            continue
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            if depth == 0:
+                out.append(cur)
+                return out
+            depth -= 1
+        elif c == ',' and depth == 0:
+            out.append(cur)
+            cur = ''
+            i += 1
+            continue
+        cur += c
+        i += 1
+    out.append(cur)
+    return out
+
+
+def enclosing_function(src, pos):
+    """(name, body) of the function containing `pos`, by brace depth."""
+    # walk back to the last line at column 0 that looks like a definition
+    head = src.rfind('\n}', 0, pos)
+    start = head + 1 if head >= 0 else 0
+    seg = src[start:pos]
+    m = None
+    for m2 in re.finditer(r'\n([A-Za-z_][\w \t\*]*?)\b([A-Za-z_]\w*)\s*\([^;{]*\)\s*\{', seg):
+        m = m2
+    if not m:
+        return ('?', '')
+    bstart = start + m.end() - 1
+    depth, i, n = 0, bstart, len(src)
+    while i < n:
+        if src[i] == '{':
+            depth += 1
+        elif src[i] == '}':
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    return (m.group(2), src[bstart:i + 1])
+
+
+def resolve_const(name, src, tree_defs):
+    """A literal '/...' behind a #define or a static const char[]."""
+    v = tree_defs.get(name)
+    if v:
+        return v
+    m = re.search(r'#\s*define\s+' + re.escape(name) + r'\s+"(/[^"]*)"', src)
+    if m:
+        return m.group(1)
+    m = re.search(r'\b' + re.escape(name) + r'\s*\[\s*\]\s*=\s*"(/[^"]*)"', src)
+    if m:
+        return m.group(1)
+    return None
+
+
+def provable_root(expr, src, body, tree_defs):
+    """Can the tool PROVE this path expression is a fixed root path?
+
+    Returns a reason string when yes, None when it cannot tell.
+    """
+    e = expr.strip()
+    m = LIT_RE.match(e)
+    if m:
+        return 'literal "%s"' % m.group(1)
+
+    # a plain identifier (possibly with a cast or & / array index stripped)
+    bare = re.sub(r'^\(\s*(?:const\s+)?char\s*\*\s*\)\s*', '', e).strip()
+    if re.fullmatch(r'[A-Za-z_]\w*', bare):
+        lit = resolve_const(bare, src, tree_defs)
+        if lit:
+            return 'constant %s = "%s"' % (bare, lit)
+        if body:
+            fills = [(b, p) for (b, p) in FILL_RE.findall(body) if b == bare]
+            if fills:
+                opaque = re.search(OPAQUE_RE_T.format(re.escape(bare)), body, re.S)
+                if not opaque:
+                    pres = sorted({p.split('%')[0] for _, p in fills})
+                    return 'built in-function from literal prefix(es) %s' % ', '.join(
+                        '"%s"' % p for p in pres)
+    return None
+
+
+def fingerprint(relpath, fn, snippet):
+    norm = re.sub(r'\s+', ' ', snippet).strip()
+    h = hashlib.sha1(('%s|%s|%s' % (relpath, fn, norm)).encode()).hexdigest()[:12]
+    return '%s|%s|%s' % (relpath, fn, h)
+
+
+def scan_tree(root, dirs):
+    """Return (hits, scanned_files). hit = dict."""
+    hits = []
+    scanned = 0
+    tree_defs = {}
+    files = []
+    for d in dirs:
+        base = os.path.join(root, d)
+        for dp, dn, fns in os.walk(base):
+            dn[:] = [x for x in dn
+                     if x not in ('.git', 'obj', 'rust-target', 'tools', 'media')]
+            for f in fns:
+                if f.endswith('.c') or f.endswith('.h'):
+                    files.append(os.path.join(dp, f))
+
+    # one pass for tree-wide #define path constants
+    for p in files:
+        try:
+            raw = open(p, errors='replace').read()
+        except OSError:
+            continue
+        for m in re.finditer(r'#\s*define\s+([A-Za-z_]\w*)\s+"(/[^"]*)"', raw):
+            tree_defs[m.group(1)] = m.group(2)
+
+    for p in files:
+        if not p.endswith('.c'):
+            continue
+        scanned += 1
+        raw = open(p, errors='replace').read()
+        src = strip_comments(raw)
+        rel = os.path.relpath(p, root)
+        fbody_cache = {}
+        for m in CALL_RE.finditer(src):
+            fn = m.group(1)
+            line = src.count('\n', 0, m.start()) + 1
+            # CALL_RE consumes "&g_fat_fs," including the comma, so what
+            # follows starts at the PATH argument. Re-seat index 0 on the fs
+            # pointer so PATH_FN's indices mean what fat.h's prototypes mean.
+            args = ['&g_fat_fs'] + split_args(src[m.end():])
+            key = m.start() // 4096
+            if key not in fbody_cache:
+                fbody_cache[key] = enclosing_function(src, m.start())
+            encl, body = enclosing_function(src, m.start())
+            for ai in PATH_FN[fn]:
+                expr = args[ai] if ai < len(args) else '<MISSING>'
+                why = provable_root(expr, src, body, tree_defs)
+                if why:
+                    continue
+                snippet = re.sub(r'\s+', ' ', src[m.start():m.start() + 120]).strip()
+                hits.append({
+                    'path': rel, 'line': line, 'fn': fn, 'arg': ai,
+                    'expr': expr.strip()[:60], 'encl': encl,
+                    # Keyed on ENCLOSING FUNCTION + arg index + expression, and
+                    # deliberately NOT on the line number. Line numbers drift
+                    # whenever anything above is edited, which is how a
+                    # fingerprint baseline rots into noise. The enclosing
+                    # function is what distinguishes two sites that happen to
+                    # call the same function with a variable of the same name,
+                    # so a NEW blind call in a file that already has one IS
+                    # still flagged.
+                    'fp': fingerprint(rel, fn, '%s#%s#%d:%s'
+                                      % (encl, fn, ai, expr.strip())),
+                    'snippet': snippet,
+                })
+    return hits, scanned
+
+
+# ---------------------------------------------------------------------------
+# allowlist
+# ---------------------------------------------------------------------------
+CATS = ('[LEGIT]', '[DEBT]', '[LEGACY]')
+TODO_MARK = 'TODO:'
+
+
+def load_allowlist():
+    rows = {}
+    if not os.path.exists(ALLOWLIST):
+        return rows
+    for ln, raw in enumerate(open(ALLOWLIST, errors='replace'), 1):
+        s = raw.rstrip('\n')
+        if not s.strip() or s.lstrip().startswith('#'):
+            continue
+        fp, _, rest = s.partition('#')
+        rows[fp.strip()] = (rest.strip(), ln)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# justification consistency (#246, added by [badexempt] 2026-10-04)
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS. The checks above reject a row with no category, a row whose
+# reason is still a TODO, and a row whose fingerprint matches nothing. All
+# three are checks on the SHAPE of a row. None of them reads what the row
+# SAYS, and the prose is the only thing the next human has.
+#
+# This row shipped, green, for two days:
+#
+#   kernel/proc/syscall.c|fat_write_file|ecadf0fc8003  # kernel/proc/syscall.c:
+#   2946 fat_write_file arg1 (pw_kp) in syscall_dispatch_inner() [LEGIT] The
+#   /CONFIG password write. A fixed root path assembled from the /CONFIG
+#   prefix; the dispatcher does not take a path for it.
+#
+# Every clause was false. `pw_` is PACKAGE write, not password. The path was
+# not fixed: `sc_path_from_user(pw_path, pw_kp, sizeof(pw_kp))` fills it from
+# arg1, 58 lines above the exempted call. And `[LEGIT]` is defined in
+# allowlist.txt as "individually reviewed ... do not fix these", so the row
+# instructed the next reader to leave the one genuinely blind security write
+# alone. A wrong comment is a bug; a wrong comment wearing a reviewed badge
+# recruits the next reader into the mistake.
+#
+# Two arms, both narrow on purpose. Neither understands the justification.
+# Each takes ONE clause whose negation is visible in the code and checks it.
+
+# Arm A: the row's human-readable half must describe the hit the fingerprint
+# resolves to. path / function / arg index / expression / enclosing function
+# are all inputs to the hash, so the AUTHORITATIVE values are known exactly
+# and the text that spells them out can be compared for free. The line number
+# is deliberately NOT checked: it drifts on every edit above the site, which
+# is the whole reason the fingerprint exists.
+SELFDESC_RE = re.compile(
+    r'^(?P<path>[^\s:]+):(?P<line>\d+)\s+(?P<fn>\w+)\s+arg(?P<arg>\d+)\s+'
+    r'\((?P<expr>.*?)\)\s+in\s+(?P<encl>[\w?]+)\(\)')
+
+# Arm B: a claim that the exempted path is NOT caller-supplied, checked
+# against the enclosing function actually filling it from Ring 3.
+#
+# Scoped to [LEGIT] and [DEBT] only. The [LEGACY] boilerplate contains the
+# words "by a fixed prefix the tool could not follow through a helper" as a
+# hedged statement about the CLASS, not a claim about the row, and matching it
+# would make this arm fire on 87 honest backlog rows. Measured: 10 of the 81
+# reviewed rows make a claim this arm recognises.
+FIXED_CLAIM_RE = re.compile(
+    r'fixed root path|fixed path|fixed root scratch|a literal path|'
+    r'is a literal|literal root path|constant path|does not take a path|'
+    r'takes no path|never takes a path|not caller-supplied|'
+    r'no path argument', re.I)
+
+# GROUND TRUTH, not guessed. These are the three primitives that move a path
+# from Ring 3 into kernel memory in this tree. Re-derive with:
+#   grep -rohE '\b(sc_path_from_user|copy_from_user|strncpy_from_user)\b' \
+#        kernel --include=*.c --include=*.h | sort | uniq -c
+# which answered 32 / 91 / 45 on 2026-10-04. A new one must be added here or
+# the arm silently stops covering it.
+USER_FILL_FNS = ('sc_path_from_user', 'strncpy_from_user', 'copy_from_user')
+USER_FILL_RE_T = (r'\b(?:' + '|'.join(USER_FILL_FNS) +
+                  r')\s*\([^;]*?\b{0}\b[^;]*?\)')
+
+
+def check_justifications(hits, allow, root):
+    """Return a list of (lineno, fingerprint, why) for rows whose prose is
+    contradicted by the code the row points at."""
+    bad = []
+    by_fp = {}
+    for h in hits:
+        by_fp.setdefault(h['fp'], h)
+
+    # bodies are re-read per file, cached, because arm B needs the enclosing
+    # function text and scan_tree does not keep it.
+    body_cache = {}
+
+    for fp, (note, ln) in sorted(allow.items(), key=lambda kv: kv[1][1]):
+        h = by_fp.get(fp)
+        if h is None:
+            continue                      # already reported as STALE
+        m = SELFDESC_RE.match(note)
+        if not m:
+            bad.append((ln, fp, 'the row does not spell out which site it '
+                                'exempts. Expected a leading '
+                                '"<path>:<line> <fn> arg<n> (<expr>) in <fn>()" '
+                                'before the category tag; got %r' % note[:70]))
+            continue
+
+        # --- arm A: does the row describe its own site? ---
+        claimed = (m.group('path'), m.group('fn'), int(m.group('arg')),
+                   m.group('expr').strip(), m.group('encl'))
+        actual = (h['path'], h['fn'], h['arg'], h['expr'], h['encl'])
+        if claimed != actual:
+            fields = ('path', 'fat function', 'arg index', 'expression',
+                      'enclosing function')
+            diff = ['%s: row says %r, code has %r' % (f, c, a)
+                    for f, c, a in zip(fields, claimed, actual) if c != a]
+            bad.append((ln, fp, 'the row describes a DIFFERENT site from the '
+                                'one its fingerprint matches, so a reviewer '
+                                'following the comment reads the wrong code. '
+                                + '; '.join(diff)))
+            continue
+
+        # --- arm B: "it is not a caller-supplied path" vs. the code ---
+        if '[LEGACY]' in note:
+            continue
+        claim = FIXED_CLAIM_RE.search(note)
+        if not claim:
+            continue
+        expr = h['expr']
+        if not re.fullmatch(r'[A-Za-z_]\w*', expr):
+            continue                      # only plain identifiers are tractable
+        key = h['path']
+        if key not in body_cache:
+            full = os.path.join(root, h['path'])
+            try:
+                body_cache[key] = strip_comments(open(full, errors='replace').read())
+            except OSError:
+                body_cache[key] = ''
+        src = body_cache[key]
+        _, body = enclosing_function_named(src, h['encl'])
+        if not body:
+            continue
+        fill = re.search(USER_FILL_RE_T.format(re.escape(expr)), body, re.S)
+        if fill:
+            ev = re.sub(r'\s+', ' ', fill.group(0)).strip()
+            bad.append((ln, fp,
+                        'the justification claims the path is not supplied by '
+                        'the caller ("%s"), but %s() fills %s from RING 3:\n'
+                        '           %s\n'
+                        '       This is the exact shape of the #246 pw_kp row: '
+                        'a [LEGIT] badge on a genuinely blind caller-supplied '
+                        'path. Either route the call through '
+                        'hotplug_fs_or_root(), or rewrite the reason to '
+                        'describe what the code actually does.'
+                        % (claim.group(0), h['encl'], expr, ev[:160])))
+    return bad
+
+
+def enclosing_function_named(src, name):
+    """(name, body) of the definition of `name` in comment-stripped `src`."""
+    if not name or name == '?':
+        return ('?', '')
+    m = re.search(r'\b' + re.escape(name) + r'\s*\([^;{]*\)\s*\{', src)
+    if not m:
+        return ('?', '')
+    bstart = m.end() - 1
+    depth, i, n = 0, bstart, len(src)
+    while i < n:
+        if src[i] == '{':
+            depth += 1
+        elif src[i] == '}':
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    return (name, src[bstart:i + 1])
+
+
+def main():
+    argv = sys.argv[1:]
+    if '--self-test' in argv:
+        return self_test()
+
+    root = os.path.abspath(os.path.join(HERE, '..', '..', '..'))
+    dirs = ['kernel']
+    if '--dirs' in argv:
+        dirs = [argv[argv.index('--dirs') + 1]]
+    report = '--report' in argv
+
+    hits, scanned = scan_tree(root, dirs)
+    allow = load_allowlist()
+
+    if '--update-allowlist' in argv:
+        with open(ALLOWLIST, 'w') as f:
+            f.write(HEADER)
+            written = set()
+            for h in sorted(hits, key=lambda x: (x['path'], x['line'])):
+                # ONE line per FINGERPRINT, not per hit. Several identical calls
+                # inside one function share a fingerprint by design, and writing
+                # a row for each produced a file with 190 lines for 168 keys,
+                # every duplicate silently shadowed by the first. A baseline
+                # with shadowed rows is a baseline nobody can audit by reading.
+                if h['fp'] in written:
+                    continue
+                written.add(h['fp'])
+                old = allow.get(h['fp'], ('', 0))[0]
+                note = old if old else ('%s:%d %s arg%d (%s) in %s() [LEGACY] %s '
+                                        'bulk-baselined, NOT individually reviewed.'
+                                        % (h['path'], h['line'], h['fn'], h['arg'],
+                                           h['expr'], h['encl'], TODO_MARK))
+                f.write('%s  # %s\n' % (h['fp'], note))
+        print('[volume-route-lint] wrote %d row(s) to %s' % (len(written), ALLOWLIST))
+        return 0
+
+    new = [h for h in hits if h['fp'] not in allow]
+    seen = {h['fp'] for h in hits}
+
+    bad_rows = []
+    for fp, (note, ln) in allow.items():
+        if not any(c in note for c in CATS):
+            bad_rows.append((ln, fp, 'no category tag (%s)' % '/'.join(CATS)))
+        elif TODO_MARK in note:
+            bad_rows.append((ln, fp, 'justification is still a %s placeholder' % TODO_MARK))
+        elif len(note) < 40:
+            bad_rows.append((ln, fp, 'justification too short to be a real reason'))
+        if fp not in seen:
+            bad_rows.append((ln, fp, 'STALE: matches nothing in the tree. A list of '
+                                     'dead fingerprints is not a baseline.'))
+
+    # The three checks above are checks on a row's SHAPE. This one reads what
+    # the row SAYS and holds it against the code it points at. See
+    # check_justifications() for the row that shipped green for two days with
+    # every clause false.
+    bad_rows.extend(check_justifications(hits, allow, root))
+
+    cats = {c: 0 for c in CATS}
+    for fp in seen:
+        note = allow.get(fp, ('', 0))[0]
+        for c in CATS:
+            if c in note:
+                cats[c] += 1
+                break
+
+    if report:
+        for h in sorted(hits, key=lambda x: (x['path'], x['line'])):
+            tag = 'NEW' if h['fp'] not in allow else 'known'
+            print('%-6s %s:%d %s arg%d = %s   [%s()]'
+                  % (tag, h['path'], h['line'], h['fn'], h['arg'], h['expr'], h['encl']))
+
+    debt = [(fp, allow[fp][0]) for fp in sorted(seen) if '[DEBT]' in allow.get(fp, ('', 0))[0]]
+    if debt:
+        print('\n[volume-route-lint] DEBT LEDGER - %d reviewed, accepted, still blind '
+              'on a removable volume:' % len(debt))
+        for fp, note in debt:
+            print('  DEBT   %s' % note[:150])
+        print('')
+
+    if new or bad_rows:
+        print('=' * 78)
+        print('volume-route-lint: FAILED')
+        print('=' * 78)
+        for h in sorted(new, key=lambda x: (x['path'], x['line'])):
+            print('\n  NEW  %s:%d  %s(&g_fat_fs, %s)  in %s()'
+                  % (h['path'], h['line'], h['fn'], h['expr'], h['encl']))
+            print('       The ROOT filesystem cannot see a hot-plugged removable')
+            print('       volume. If this path can ever name one, route it:')
+            print('           const char *rel = 0;')
+            print('           fat_fs_t *fs = hotplug_fs_or_root(path, &rel);')
+            print('           if (!fs) return <failure>;   /* NEVER retry on the root */')
+            print('           %s(fs, rel, ...);' % h['fn'])
+            print('       (kernel/drivers/hotplug.h. A NULL return means a mounted')
+            print('       medium that cannot serve files; falling back to the root')
+            print('       may destroy a different file of the same spelling.)')
+            print('       If it genuinely cannot, add it to allowlist.txt with a')
+            print('       category and a real reason:')
+            print('         %s  # %s:%d %s [LEGIT] <why>'
+                  % (h['fp'], h['path'], h['line'], h['fn']))
+        for ln, fp, why in sorted(bad_rows):
+            print('\n  ALLOWLIST line %d: %s\n       %s' % (ln, fp, why))
+        print('')
+        return 1
+
+    print('[volume-route-lint] OK: %d file(s) scanned, %d unprovable path arg(s) '
+          'allowlisted (%d LEGIT / %d DEBT / %d LEGACY-unreviewed), 0 new.'
+          % (scanned, len(seen), cats['[LEGIT]'], cats['[DEBT]'], cats['[LEGACY]']))
+    return 0
+
+
+HEADER = '''# volume-route-lint allowlist (#246, baselined 2026-10-04 by [volaudit]).
+#
+# Line format:
+#   <fingerprint>  # <path>:<line> <fn> arg<n> (<expr>) in <fn>() [CATEGORY] <why>
+#
+# Fingerprint = path|function|sha1(fn#argindex:expression)[:12]. It is keyed on
+# the EXPRESSION, not the line number, so unrelated edits above a site do not
+# spuriously trip the lint, and renaming the variable DOES (because that is a
+# different site that nobody has reviewed).
+#
+# CATEGORIES. The lint REJECTS a row with no category, a row whose
+# justification is still a TODO placeholder, and a row whose fingerprint
+# matches nothing in the tree, so this file cannot silently grow and cannot rot
+# into dead hashes:
+#   [LEGIT]  individually reviewed. Either the path is confined to the root
+#            namespace by construction in a way the tool cannot see, or the
+#            site is already below a removable-path guard. Do not "fix" these.
+#   [DEBT]   individually reviewed, GENUINELY BLIND on a removable volume,
+#            accepted for now. Printed as a loud ledger on every build.
+#   [LEGACY] bulk-baselined at #246 and NOT individually reviewed. Treat as a
+#            backlog. NEVER add one of these by hand.
+#
+# A new hit is either ROUTED through hotplug_fs_or_root() or reviewed into
+# [LEGIT]/[DEBT] with a real reason. Regenerate only with --update-allowlist,
+# which writes TODO notes that the lint then rejects until a human fills them
+# in.
+
+'''
+
+
+# ---------------------------------------------------------------------------
+# --self-test: prove it goes RED on a real historical instance and GREEN on
+# correct code. Exit statuses read WITHOUT a pipe.
+# ---------------------------------------------------------------------------
+SELF_RED = r'''
+#include "fat.h"
+extern fat_fs_t g_fat_fs;
+/* The REAL pre-fix sys_mkdir body, taken from commit 716367de~1
+   (proc/syscall.c). This is instance three of the fault class. */
+int64_t sys_mkdir(const char *upath) {
+    char path[1024];
+    if (strncpy_from_user(path, upath, sizeof(path)) < 0) return -14;
+    return fat_mkdir(&g_fat_fs, path) == 0 ? 0 : -1;
+}
+'''
+
+# The real #246 site, reduced to the three lines that matter. Taken from
+# kernel/proc/syscall.c at 84c9a92c:2888-2946, where the [LEGIT] row claiming
+# "a fixed root path ... the dispatcher does not take a path for it" sat on a
+# buffer filled by sc_path_from_user() from arg1.
+JUSTIFY_RED_SRC = r'''
+#include "fat.h"
+extern fat_fs_t g_fat_fs;
+int64_t syscall_dispatch_inner(const char *pw_path, const void *pw_data,
+                               unsigned pw_len) {
+    char pw_kp[1024];
+    if (sc_path_from_user(pw_path, pw_kp, sizeof(pw_kp)) != 0) return -14;
+    return fat_write_file(&g_fat_fs, pw_kp, pw_data, pw_len);
+}
+'''
+
+SELF_GREEN = r'''
+#include "fat.h"
+extern fat_fs_t g_fat_fs;
+/* The FIXED form. */
+int64_t sys_mkdir(const char *upath) {
+    char path[1024];
+    if (strncpy_from_user(path, upath, sizeof(path)) < 0) return -14;
+    const char *mrel = 0;
+    fat_fs_t *mfs = hotplug_fs_or_root(path, &mrel);
+    if (!mfs) return -1;
+    return fat_mkdir(mfs, mrel) == 0 ? 0 : -1;
+}
+/* A fixed ROOT path: a literal. */
+void cfg(void) { fat_exists(&g_fat_fs, "/CONFIG/PASSWD"); }
+/* A fixed ROOT path behind a #define. */
+#define SEED_DIR "/CONFIG/SEED"
+void seed(void) { fat_mkdir(&g_fat_fs, SEED_DIR); }
+/* A fixed ROOT path built in-function from a literal prefix. */
+void per_user(unsigned u) {
+    char p[64];
+    snprintf(p, sizeof(p), "/CONFIG/USER%u.CFG", u);
+    fat_write_file(&g_fat_fs, p, "", 0);
+}
+/* THE COMMENT TRAP: the fix explaining the bug it replaced must not be read
+   as the bug. This line is a comment and must stay invisible:
+   // was fat_mkdir(&g_fat_fs, path), which cannot see a removable volume */
+'''
+
+
+def self_test():
+    global ALLOWLIST
+    ok = True
+
+    def run_case(label, body, want_new):
+        global ALLOWLIST
+        d = tempfile.mkdtemp(prefix='vrl-')
+        os.makedirs(os.path.join(d, 'kernel', 'fs'))
+        with open(os.path.join(d, 'kernel', 'fs', 'case.c'), 'w') as f:
+            f.write(body)
+        hits, _ = scan_tree(d, ['kernel'])
+        got = len(hits)
+        verdict = 'PASS' if got == want_new else 'FAIL'
+        print('  %-58s hits=%d want=%d  %s' % (label, got, want_new, verdict))
+        for h in hits:
+            print('        -> %s:%d %s arg%d = %s'
+                  % (h['path'], h['line'], h['fn'], h['arg'], h['expr']))
+        return got == want_new
+
+    print('[volume-route-lint] --self-test')
+    print(' A. RED on a real pre-fix instance from git history:')
+    ok &= run_case('sys_mkdir as it was at 716367de~1 (user path -> root fs)',
+                   SELF_RED, 1)
+    print(' B. GREEN on the fixed form and on the three provable root shapes:')
+    ok &= run_case('routed call + literal + #define + snprintf-prefix + comment',
+                   SELF_GREEN, 0)
+
+    print(' C. the covered-function table still matches kernel/fs/fat.h:')
+    fath = os.path.abspath(os.path.join(HERE, '..', '..', 'fs', 'fat.h'))
+    if os.path.exists(fath):
+        decl = set(re.findall(r'\b(fat_\w+)\s*\(\s*fat_fs_t \*fs,\s*const char \*',
+                              open(fath, errors='replace').read()))
+        missing = sorted(decl - set(PATH_FN) - {'fat_path_on_ext2'})
+        print('        fat.h declares %d path-taking function(s); table covers %d; '
+              'uncovered: %s' % (len(decl), len(PATH_FN), missing or 'none'))
+        if missing:
+            print('        FAIL: a path-taking fat function is not in PATH_FN, so '
+                  'the lint silently does not cover it.')
+            ok = False
+        else:
+            print('        PASS')
+    else:
+        print('        SKIP (fat.h not found from %s)' % HERE)
+
+    print(' D. JUSTIFICATION CHECK goes RED on the real false row from history')
+    print('    (84c9a92c, kernel/proc/syscall.c pw_kp, [LEGIT], every clause false):')
+    ok &= run_justify_case(
+        'arm B: "a fixed root path ... does not take a path for it"',
+        JUSTIFY_RED_SRC,
+        lambda h: ('%s  # kernel/fs/case.c:5 fat_write_file arg1 (pw_kp) in '
+                   'syscall_dispatch_inner() [LEGIT] The /CONFIG password write. '
+                   'A fixed root path assembled from the /CONFIG prefix; the '
+                   'dispatcher does not take a path for it.' % h['fp']),
+        want_bad=1)
+    ok &= run_justify_case(
+        'arm A: row points the reviewer at a different function',
+        JUSTIFY_RED_SRC,
+        lambda h: ('%s  # kernel/fs/case.c:5 fat_write_file arg1 (pw_kp) in '
+                   'pkg_write_permit() [LEGIT] Reviewed: the permit helper only '
+                   'ever sees its own internal scratch buffer.' % h['fp']),
+        want_bad=1)
+    print(' E. and GREEN on an honest row for the same site:')
+    ok &= run_justify_case(
+        'same site, reason that describes what the code does',
+        JUSTIFY_RED_SRC,
+        lambda h: ('%s  # kernel/fs/case.c:5 fat_write_file arg1 (pw_kp) in '
+                   'syscall_dispatch_inner() [DEBT] GENUINELY BLIND: pw_kp is '
+                   'the caller path copied in by sc_path_from_user, so a package '
+                   'write to a stick lands on the root instead.' % h['fp']),
+        want_bad=0)
+
+    print(' F. and GREEN on the allowlist this tree actually ships:')
+    hits, _ = scan_tree(os.path.abspath(os.path.join(HERE, '..', '..', '..')),
+                        ['kernel'])
+    if not hits:
+        print('        SKIP (no kernel sources found from %s)' % HERE)
+    else:
+        real = check_justifications(
+            hits, load_allowlist(),
+            os.path.abspath(os.path.join(HERE, '..', '..', '..')))
+        print('        %d row(s) scanned, %d contradicted  %s'
+              % (len(load_allowlist()), len(real), 'PASS' if not real else 'FAIL'))
+        for ln, fp, why in real:
+            print('        -> line %d %s: %s' % (ln, fp, why.split('\n')[0]))
+        ok &= not real
+
+    print('\n[volume-route-lint] --self-test %s' % ('PASS' if ok else 'FAIL'))
+    return 0 if ok else 1
+
+
+def run_justify_case(label, body, row_for, want_bad):
+    """Write `body` as a one-file tree, fingerprint its single hit, build an
+    allowlist row from `row_for(hit)`, and count contradictions."""
+    global ALLOWLIST
+    d = tempfile.mkdtemp(prefix='vrl-j-')
+    os.makedirs(os.path.join(d, 'kernel', 'fs'))
+    with open(os.path.join(d, 'kernel', 'fs', 'case.c'), 'w') as f:
+        f.write(body)
+    hits, _ = scan_tree(d, ['kernel'])
+    if len(hits) != 1:
+        print('  %-58s FAIL (fixture produced %d hits, expected 1)'
+              % (label, len(hits)))
+        return False
+    allow_path = os.path.join(d, 'allowlist.txt')
+    with open(allow_path, 'w') as f:
+        f.write(row_for(hits[0]) + '\n')
+    saved, ALLOWLIST = ALLOWLIST, allow_path
+    try:
+        bad = check_justifications(hits, load_allowlist(), d)
+    finally:
+        ALLOWLIST = saved
+    verdict = 'PASS' if len(bad) == want_bad else 'FAIL'
+    print('  %-58s bad=%d want=%d  %s' % (label, len(bad), want_bad, verdict))
+    for _, _, why in bad:
+        print('        -> %s' % why.split('\n')[0][:150])
+    return len(bad) == want_bad
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -9,7 +9,9 @@
 # already differs from the repo's. Default to the source of truth, and stay
 # overridable so a checkout elsewhere can point at its own libc.
 LIBC=${LIBC:-<repo>/userland/libc}
-SHIM=<workspace>
+# Overridable for the same reason LIBC above is: see the Makefile comment on
+# MAYTERA_NS_ROOT. The shared port tree is a cross-agent race, not just a path.
+SHIM=${MAYTERA_NS_ROOT:-<workspace>}/shim-include
 GCCINC=/usr/lib/gcc/x86_64-linux-gnu/12/include
 exec gcc -m64 -ffreestanding -fno-builtin -nostdinc -nostdlib \
   -fno-stack-protector -mno-red-zone -mcmodel=large -fno-pic -O2 \

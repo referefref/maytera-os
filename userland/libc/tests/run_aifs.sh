@@ -35,11 +35,17 @@ build() {   # $1 = aicap source to use, $2 = output binary
         echo "  compile of aiclient.c FAILED:"; sed -n 1,25p "$WORK/cc1.log"; return 2; }
     gcc $UUT_FLAGS -x c -c "$1" -o "$WORK/aicap_raw.o" 2>"$WORK/cc2.log" || {
         echo "  compile of aicap.c FAILED:"; sed -n 1,25p "$WORK/cc2.log"; return 2; }
+    # #aiaudit: aitools.c is the shipping tool table aiclient.c emits from.
+    # Link the REAL one rather than stubbing it, so the rig exercises the tool
+    # surface the OS ships instead of one invented for the test.
+    gcc $UUT_FLAGS -x c -c "$LIBC/aitools.c" -o "$WORK/aitools_raw.o" 2>"$WORK/cc_at.log" || {
+        echo "  compile of aitools.c FAILED:"; sed -n 1,25p "$WORK/cc_at.log"; return 2; }
+    objcopy --prefix-symbols=ad_ "$WORK/aitools_raw.o" "$WORK/aitools.o" || return 2
     objcopy --prefix-symbols=ad_ "$WORK/aiclient_raw.o" "$WORK/aiclient.o" || return 2
     objcopy --prefix-symbols=ad_ "$WORK/aicap_raw.o" "$WORK/aicap.o" || return 2
     gcc -m64 -O1 -g -c aifs_test.c -o "$WORK/t.o" 2>"$WORK/cc3.log" || {
         echo "  compile of harness FAILED:"; sed -n 1,25p "$WORK/cc3.log"; return 2; }
-    gcc -m64 "$WORK/t.o" "$WORK/aiclient.o" "$WORK/aicap.o" -o "$2" 2>"$WORK/ld.log" || {
+    gcc -m64 "$WORK/t.o" "$WORK/aiclient.o" "$WORK/aicap.o" "$WORK/aitools.o" -o "$2" 2>"$WORK/ld.log" || {
         echo "  link FAILED:"; sed -n 1,25p "$WORK/ld.log"; return 2; }
     return 0
 }

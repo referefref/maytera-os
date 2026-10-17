@@ -8,7 +8,8 @@
 //   (a) NO REGRESSION FIRST: as an ORDINARY (unmarked) process it can freely
 //       create / write / rename / delete, in scope and out. THE GATE.
 //   (b) IN SCOPE under a grant: a marked actor can mkdir and move within scope.
-//   (c) ENFORCEMENT: the SAME marked actor is refused, BY THE KERNEL, a delete
+//   (c) ENFORCEMENT: the SAME marked actor has its delete REDIRECTED into the
+//       Recycle Bin, and is refused, BY THE KERNEL, an rmdir and
 //       (no-delete invariant) and an out-of-scope write, issuing the RAW
 //       syscall directly - the userland aicap/escrow layer is never called.
 //   (d) AFTER CLOSE: escrow_exit() clears the marker and the same ops work again.
@@ -89,30 +90,43 @@ int main(void) {
     line("IN-SCOPE(actor may write in scope)", inscope);
 
     // -- Phase E: ENFORCEMENT. The kernel MUST refuse these RAW syscalls. ---
-    int e_del   = (r_unlink(SC "/todel.txt") < 0);        // no-delete invariant
+    // 2026-10-03: a marked actor's file delete SUCCEEDS and is redirected into
+    // the Recycle Bin rather than refused. See /APPS/ESCRVT for the full
+    // recoverability proof.
+    int e_del   = (r_unlink(SC "/todel.txt") == 0) && !exists(SC "/todel.txt");
     int e_rmdir = (r_rmdir(SC "/edir") < 0);              // no-delete invariant
     int e_outw  = (r_open_w(OUTF) < 0);                   // out-of-scope write
     int e_outmk = (r_mkdir(OUTD) < 0);                    // out-of-scope mkdir
     int e_outmv = (r_rename(SC "/2026/photo.jpg", "/ESCROWOUT_ph.jpg") < 0); // dst out of scope
     int denied  = e_del && e_rmdir && e_outw && e_outmk && e_outmv;
-    // and the refused ops must NOT have taken effect
-    int intact  = exists(SC "/todel.txt") && exists(SC "/edir") &&
+    // ...and the REFUSED ops must not have taken effect. todel.txt is NOT in
+    // this list, and that is the whole point: on 2026-10-03 the delete stopped
+    // being refused and became a REDIRECT into the Recycle Bin, so e_del above
+    // requires todel.txt to be GONE. This conjunction still required it to be
+    // PRESENT, so the two could not both pass and this line was red on every
+    // boot from the moment the semantics changed. The delete arm is e_del's
+    // business; what is checked here is only the ops that are still refusals.
+    int intact  = exists(SC "/edir") &&
                   !exists(OUTF) && exists(SC "/2026/photo.jpg");
     int enforce = denied && intact;
-    line("ENFORCE.delete-refused",        e_del);
+    line("ENFORCE.delete-REDIRECTED-to-recycle-bin", e_del);
     line("ENFORCE.rmdir-refused",         e_rmdir);
     line("ENFORCE.out-of-scope-write-refused", e_outw);
     line("ENFORCE.out-of-scope-mkdir-refused", e_outmk);
     line("ENFORCE.out-of-scope-move-refused",  e_outmv);
-    line("ENFORCE.refused-ops-had-no-effect",  intact);
-    line("ENFORCEMENT(kernel refused raw delete+out-of-scope write)", enforce);
+    line("ENFORCE.still-refused-ops-left-the-FS-unchanged", intact);
+    line("ENFORCEMENT(kernel redirected raw delete, refused rmdir+out-of-scope write)", enforce);
 
     // -- Phase F: EXIT (contract close) ------------------------------------
     int x = escrow_exit();
     line("EXIT(rc==0)", x == 0);
 
     // -- Phase G: after close, the marker is cleared -> ordinary proc again -
-    int g_del  = (r_unlink(SC "/todel.txt") == 0);   // delete works again
+    // After a SELF actor exits its contract it is an ordinary process again, so
+    // this is a plain hard delete. The file was recycled above, so re-create it
+    // first rather than asserting on something the redirect already moved.
+    r_creat(SC "/todel.txt");
+    int g_del  = (r_unlink(SC "/todel.txt") == 0);   // a plain delete, unmarked
     long gfd   = r_open_w(OUTF);
     int g_outw = (gfd >= 0);                          // out-of-scope write works again
     if (gfd >= 0) syscall1(SYS_CLOSE, gfd);

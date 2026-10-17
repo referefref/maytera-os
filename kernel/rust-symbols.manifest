@@ -131,6 +131,30 @@ ext2_dirblock_insert_rs
 # ---------------------------------------------------------------------------
 ext2_dirblock_repoint_rs
 
+# ---------------------------------------------------------------------------
+# rustkern/e2rdio.rs - #e2rdio: the ext2 read path's device-I/O ledger and its
+# deterministic fault injector. New code with no C twin and no -DRUST_* flag:
+# nothing in this kernel counted a failed sector read before, which is why "did
+# a transient disk fault happen" was never an answerable question. The injector
+# is reachable ONLY from the in-kernel boot self-test, which SEALS the module
+# when it finishes; no syscall exposes it. e2rdio_stats_rs feeds the C-side
+# _Static_assert layout lock in fs/ext2.c.
+# ---------------------------------------------------------------------------
+e2rdio_arm_rs
+e2rdio_disarm_rs
+e2rdio_seal_rs
+e2rdio_sealed_rs
+e2rdio_dev_take_rs
+e2rdio_hole_take_rs
+e2rdio_note_retry_rs
+e2rdio_note_recovered_rs
+e2rdio_note_exhausted_rs
+e2rdio_note_hole_rs
+e2rdio_note_launder_rs
+e2rdio_pending_rs
+e2rdio_stats_rs
+e2rdio_selftest_rs
+
 # rustkern/ext2fsck.rs - #610: the read-only ext2 consistency checker core.
 # All parsing/arithmetic/verdicts; fs/ext2.c keeps every byte of I/O, kmalloc
 # and locking. ext2_fsck_sizeof_rs feeds the C-side _Static_assert layout lock.
@@ -148,6 +172,17 @@ md4_transform_rs
 aes_encrypt_block_rs
 aes_decrypt_block_rs
 
+# #smbdisk: rustkern/ntsecret.rs - the ON-DISK form of a saved SMB credential,
+# "nt$" + 32 hex of the NT hash. The only part of that change that parses
+# attacker-influenceable bytes (a line of /CONFIG/NETMOUNTS.CFG) into a
+# fixed-size buffer, so it is the part that is in Rust. Callers: net/smb.c
+# (mount chokepoint + boot-time migration) and proc/syscall.c
+# (SYS_NET_CRED_TAG). nt_secret_selftest_rs runs on every boot from main.c.
+nt_secret_is_tagged
+nt_secret_parse
+nt_secret_format
+nt_secret_selftest_rs
+
 # #615: AES-GCM GHASH, 4-bit table method (rustkern/ghash.rs). Replaces the
 # bit-serial crypto/crypto.c multiply that was measured at 36-40% of one core
 # for an entire App Store download. Live under -DRUST_GHASH.
@@ -158,6 +193,23 @@ chacha20_block_rs
 hmac_sha256_rs
 hmac_sha384_rs
 hmac_md5_rs
+
+# #secretuse: rustkern/sha1.rs - SHA-1 (FIPS 180-4) + rustkern/hmac.rs's
+# HMAC-SHA1 arm. NEW code, not a port: the kernel had no SHA-1 at all, so there
+# is no C twin, no _c symbol and no -DRUST_SHA1 flag, and these are the ONLY
+# implementations of these functions in the image. C API in crypto/sha1.h;
+# crypto/sha1.c exposes the live hmac_sha1() over hmac_sha1_rs and gives the
+# sizeof(sha1_ctx_t) == 96 layout lock a translation unit. sha1_selftest_rs runs
+# the RFC 3174 / RFC 2202 known-answer vectors on every boot from main.c.
+# SHA-1 is collision-broken and is here ONLY because RFC 6238 TOTP requires
+# HMAC-SHA1, which the collision attacks do not break. Never add a signature,
+# certificate or content-address caller.
+sha1_init
+sha1_update
+sha1_final
+sha1
+hmac_sha1_rs
+sha1_selftest_rs
 
 # ---------------------------------------------------------------------------
 # rustkern/icmp.rs, arp.rs, dns.rs, dhcp.rs, url.rs
@@ -363,8 +415,28 @@ sshd_cfg_render_rs
 # ---------------------------------------------------------------------------
 # rustkern/userconf.rs - #683: joins a user's home and a preference name into
 # <home>/CONFIG/<NAME>. The passwd-table lookup stays in C (fs/userconf.c).
+# [noaccount]: and decides WHICH ROOT that join starts from, which is the half
+# every caller used to work out for itself. The user-table home when the
+# session uid has an entry (root's says "/"), /TMP when it has none at all,
+# which is every machine until the first-boot wizard finishes. Ring 3 keeps its
+# own copy of the literal (it cannot link rustkern); the selftest asserts it.
 # ---------------------------------------------------------------------------
 userconf_join_rs
+userconf_state_root_rs
+userconf_state_root_selftest_rs
+
+# rustkern/binmigrate.rs - [binmigrate] the first-boot bootstrap session writes
+# its per-account state under the no-account state root ("/TMP/CONFIG"), and the
+# setup wizard then creates an account AT THE SAME UID whose home is
+# /HOME/<NAME8>. Everything deleted during setup was left in a directory nothing
+# resolves again. These are the armed one-shot signal, the per-entry disposition
+# and the bounded join. Consumed by fs/binmigrate.c.
+binmig_plan_rs
+binmig_join_rs
+binmig_arm_rs
+binmig_armed_uid_rs
+binmig_claim_rs
+binmig_selftest_rs
 
 # ---------------------------------------------------------------------------
 # rustkern/bmp.rs, png.rs, jpeg.rs, inflate.rs - #404 Phases U-X (#502):
@@ -657,6 +729,14 @@ rqlock_selftest_rs
 bkl_window_rs
 bkl_window_bad_rs
 bkl_stat_selftest_rs
+
+# rustkern/vmascale.rs - #245: is some address space's VMA list long enough that
+# every mmap and every first-touch page fault in it pays a linear list walk?
+# do_mmap() coalesces now, so these must stay SILENT on a healthy boot; the
+# selftest is what proves the silence is a result and not a dead instrument.
+vmascale_note_mmap
+vmascale_totals_rs
+vmascale_selftest_rs
 
 # rustkern/hdadma.rs - #71: did the HD Audio output stream DMA engine actually
 # RUN while a sound was supposed to come out? A single LPIB read cannot tell
@@ -1285,6 +1365,95 @@ cfgread_report_rs
 cfgread_abi_check_rs
 cfgread_selftest_rs
 
+# fsenoent.rs (#aicappersist) - WHICH of the three causes made an ext2 ENOENT.
+# A Ring-3 -2 from open(O_CREAT) can mean the path never reached the kernel, the
+# parent really is absent (refusal CORRECT), or the parent exists and the lookup
+# missed it (refusal a LIE). Three agents reasoned about which from the bare
+# number and two reached opposite conclusions on the same image, so the kernel
+# now says. fsenoent_abi_check_rs locks fs/fsenoent.h's site/verdict constants
+# and the facts-struct size against this module; a swapped verdict code would
+# relabel a vanished filesystem as a correct refusal, which is the single
+# mistake the instrument exists to prevent.
+fsenoent_classify_rs
+fsenoent_should_log_rs
+fsenoent_abi_check_rs
+fsenoent_selftest_rs
+
+# heapshadow.rs (#aicappersist) - the physical window whose identity mapping
+# mm/heap.c has REPLACED. The kernel dereferences pmm_alloc_page()'s return as a
+# virtual address, so a page inside that window is a pointer into the heap: a
+# user PML4 allocated there was cleared ON TOP OF the ext2 block cache's group
+# descriptor block, inode 2 then read back all zeros with success, and every
+# create under the root directory was refused ENOENT. Measured on goldens 2519,
+# 2520 and 2521. heap_init() reserves the window; the predicate stays exported so
+# the check at pmm_alloc_page() can catch a future regression.
+# heapzero.rs (#heapdbl) - a kfree() refusal printing `magic=0x0` has TWO
+# possible causes and the message cannot tell them apart: coalesce_blocks()
+# setting ONE u32 to zero after a genuine first free, or a 4 KB bulk clear
+# written through a shadowed physical==virtual pointer (#aicappersist). blame.md
+# recorded only the first, so eleven refusals in one field capture were filed as
+# three unexplained double frees. The two are trivially separable by counting how
+# much is zero, which is what this does.
+heapzero_count_zeros_rs
+heapzero_count_magics_rs
+heapzero_verdict_rs
+heapzero_verdict_name_rs
+heapzero_selftest_rs
+
+heapshadow_set_window_rs
+heapshadow_is_shadowed_rs
+heapshadow_note_reserve_rs
+# #heapdbl: the same, told whether the firmware types the page as usable RAM.
+# One bucket called 2299 firmware-reserved pages "live corruptions" on a 576 MB VM.
+heapshadow_note_reserve2_rs
+heapshadow_firmware_count_rs
+heapshadow_counts_rs
+heapshadow_violation_rs
+heapshadow_range_overlaps_rs
+heapshadow_note_span_rs
+heapshadow_span_count_rs
+heapshadow_selftest_rs
+
+# ---------------------------------------------------------------------------
+# heapwin.rs (#heapwin) - WHO already owned a page inside the heap window before
+# heap_init() ran. heapshadow.rs counts those pages; this names the reservation
+# that owns each one, so the "must be 0" alarm stops firing on 1024 pages that
+# vmm_init() reserved on purpose two function calls earlier. Owner: mm/heap.c.
+# ---------------------------------------------------------------------------
+heapwin_reset_rs
+heapwin_note_rs
+heapwin_counts_rs
+heapwin_lowest_rs
+heapwin_highest_rs
+heapwin_overlap_rs
+heapwin_selftest_rs
+
+# ---------------------------------------------------------------------------
+# heapframe.rs (#deadpml4) - what the heap's page mappings COST, and how high the
+# arena may safely grow. heap_expand_once() used to take a frame per heap page and
+# map it with vmm_map_page(), which writes into `kernel_pml4`: a static .bss array
+# vmm_init() zeroes and NEVER loads into CR3. Those frames were allocated and then
+# addressed by nothing (128 MB on a 576 MB VM, on top of the 256 MB the window
+# reservation withholds). Reclaiming them also removes the accidental brake that
+# kept the heap short of the firmware's write-protected blocks, so the ceiling
+# here is a PRECONDITION of the reclaim, not a nicety beside it.
+# Owner: mm/heap.c.
+# ---------------------------------------------------------------------------
+heapframe_set_window_rs
+heapframe_set_floor_rs
+heapframe_floor_defeated_rs
+heapframe_raw_ceiling_rs
+heapframe_reset_rs
+heapframe_note_window_page_rs
+heapframe_ceiling_rs
+heapframe_ceiling_cause_rs
+heapframe_scan_counts_rs
+heapframe_clamp_rs
+heapframe_note_page_rs
+heapframe_page_counts_rs
+heapframe_inert_frames_rs
+heapframe_selftest_rs
+
 # rtcenc.rs (#135) - THE MC146818 register codec, both directions. Owner:
 # drivers/rtc.c, which is the only file that touches the chip. These exist
 # because the tree previously had FOUR hand-rolled DECODERS that consulted
@@ -1448,6 +1617,9 @@ fdown_release_rs
 fdown_check_rs
 fdown_owner_rs
 fdown_mark_dead_if_owner_rs
+fdown_take_for_reap_rs
+fdown_state_rs
+fdown_reaped_rs
 fdown_refusals_rs
 fdown_exit_marks_rs
 fdown_selftest_rs
@@ -1812,12 +1984,246 @@ hotplug_selftest_rs
 wakeloss_verdict_rs
 wakeloss_selftest_rs
 # ---------------------------------------------------------------------------
+# rustkern/kstackid.rs (#heapinvptr) - is an UNREGISTERED kernel-stack pointer
+# actually a kernel stack? Called from kstack_free() in mm/kstack.c on a registry
+# miss, to tell a benign kmalloc fallback apart from a guarded stack being freed a
+# second time. The second case used to be laundered into kfree(), which reported
+# it as a bad HEAP pointer (magic=0xbaadb4dd, which is KSTACK_POISON). Proves
+# itself red-and-green at boot; make KSTACKIDTEST=1 is the negative control.
+# ---------------------------------------------------------------------------
+kstack_foreign_verdict_rs
+kstackid_selftest_rs
+# ---------------------------------------------------------------------------
+# rustkern/kstackreg.rs - the kernel-stack live-block registry of mm/kstack.c,
+# arbitrated so two concurrent kstack_alloc() calls cannot be handed the same
+# row. The old scan returned an index and wrote it only after a PMM allocation
+# and a 4 KiB poison loop, so the second writer silently lost the first
+# registration and that stack's free became an orphan. C owns the array (the
+# layout is locked by a _Static_assert in mm/kstack.c); these decide which row.
+# Every one must be called with mm/kstack.c's g_ks_lock held. Proves itself
+# red-and-green at boot; make KSTACKREGTEST=1 is the negative control.
+# ---------------------------------------------------------------------------
+kstackreg_claim_rs
+kstackreg_commit_rs
+kstackreg_abort_rs
+kstackreg_take_rs
+kstackreg_find_rs
+kstackreg_selftest_rs
+# ---------------------------------------------------------------------------
 # rustkern/fstatkind.rs - #120 the file-KIND classification behind SYS_FSTAT.
 # C face + the type layout are in fs/vfs.h; the layout is locked by a
 # _Static_assert in proc/syscall_argtab_lock.c.
 # ---------------------------------------------------------------------------
 fstat_kind_rs
 fstat_kind_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/fdopenpolicy.rs - #747 the ONE answer to "does this open destroy the
+# file's contents, and does the descriptor need to hold the whole file". Called
+# from all four fd families in proc/fdlayer.c. C face + both struct layouts are
+# in fs/vfs.h; the layouts are locked by _Static_assert in
+# proc/syscall_argtab_lock.c.
+# ---------------------------------------------------------------------------
+fd_open_plan_rs
+fd_open_plan_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/smbseq.rs - #749 the SMB2 message sequence and credit window, bound
+# to the TCP connection it belongs to. MessageId and credits are per TRANSPORT
+# CONNECTION (MS-SMB2 2.2.1.2) and a server TERMINATES a connection whose
+# request falls outside the window it granted; our client carried the counter
+# across a reconnect and reported the resulting teardown as an authentication
+# failure. Called from net/smb.c only. C face and the struct layout are in
+# net/smb.h, where the layout is locked by _Static_assert.
+# ---------------------------------------------------------------------------
+smbseq_bind
+smbseq_unbind
+smbseq_next
+smbseq_note_grant
+smbseq_condemn
+smbseq_check_reply
+smbseq_fault
+smbseq_is_healthy
+smbseq_last_sent
+smbseq_fault_text
+smbseq_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/smbident.rs - #749 pass 2: the SMB session IDENTITY policy. Compares
+# the identity the server actually granted (the SESSION_SETUP response flags)
+# against the identity the caller asked for, and refuses an anonymous
+# substitution. Called from net/smb.c and main.c only. NO constants are
+# mirrored into C: smbident_check returns 0 for allow and an opaque non-zero
+# reason code, which C passes straight back to smbident_verdict_text.
+# ---------------------------------------------------------------------------
+smbident_name_is_anonymous
+smbident_check
+smbident_same
+smbident_verdict_text
+smbident_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/smbpreauth.rs - SMB 3.1.1 PRE-AUTHENTICATION INTEGRITY: authenticate
+# the OPENING HANDSHAKE itself.
+#
+# Signing protects messages after the handshake and cannot protect the handshake
+# (no key exists yet). Encryption used to block a version downgrade only as a
+# SIDE EFFECT of being required, so relaxing `encrypt=` silently removed
+# downgrade protection. This module is where that protection now lives: a
+# running SHA-512 over the NEGOTIATE and SESSION_SETUP messages, mixed into the
+# key schedule, so a tampered handshake produces keys that do not match.
+#
+# Two defences, for two different attacks: the DIALECT FLOOR (floor_check) is
+# the only possible answer to 0x0311 being deleted from our dialect list, and
+# the HASH (fold + derive) is the answer to anything edited inside 3.1.1.
+#
+# C face, struct layout and the floor constants are in net/smb.h, where the
+# layout is locked by _Static_assert and the constants at boot by
+# smbpreauth_floor_abi_check. Self-test registered in main.c.
+# ---------------------------------------------------------------------------
+smbpreauth_floor_set
+smbpreauth_floor
+smbpreauth_floor_text
+smbpreauth_floor_parse
+smbpreauth_floor_abi_check
+smbpreauth_reset
+smbpreauth_is_active
+smbpreauth_is_verified
+smbpreauth_folded
+smbpreauth_cipher
+smbpreauth_signalg
+smbpreauth_hash_copy
+smbpreauth_reason_text
+smbpreauth_offer_311
+smbpreauth_build_contexts
+smbpreauth_fold
+smbpreauth_floor_check
+smbpreauth_note_negotiate
+smbpreauth_derive
+smbpreauth_note_verified
+smbpreauth_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/smbsign.rs - SMB2 MESSAGE SIGNING: produce it outbound and VERIFY it
+# inbound. Closes the gap that `smb_connection_t::signing_required` was written
+# once in net/smb.c and read by NOTHING in any file, and that
+# `::session_key[16]` was declared and never written, so nothing authenticated
+# a file server to MayteraOS at all. Two dialect families: HMAC-SHA256 for SMB
+# 2.0.2/2.1 and AES-128-CMAC for 3.0/3.0.2 (which is what this client actually
+# negotiates against Samba). SMB 3.1.1 is NOT covered and is refused rather
+# than guessed at. No crypto is implemented there: it calls the hmac_sha256()
+# and aes_cmac() crypto/crypto.h already ships. Called from net/smb.c only
+# (the two chokepoints are smb_send_packet and smb_recv_packet) plus the boot
+# self-test in main.c. C face and the struct layout are in net/smb.h, where the
+# layout is locked by _Static_assert and the two policy constants are locked at
+# boot by smbsign_policy_abi_check.
+# ---------------------------------------------------------------------------
+smbsign_policy_set
+smbsign_policy
+smbsign_policy_parse
+smbsign_policy_abi_check
+smbsign_reset
+smbsign_client_security_mode
+# WIDENED KDF, taking a 64-byte context and returning a CODE. The older
+# smbsign_kdf128_shared returns void, so its refusal was invisible; a key
+# schedule whose failure is invisible is worse than none, because the session
+# comes up with the wrong keys. rustkern/smbpreauth.rs uses this one.
+smbsign_kdf128_ctx
+# SMB 3.1.1 signing, keyed from the pre-authentication integrity hash rather
+# than from the session key alone. Separate entry point because smbsign_begin's
+# signature has nowhere to put a 64-byte hash.
+smbsign_begin311
+smbsign_note_negotiate
+smbsign_begin
+smbsign_is_armed
+smbsign_requires
+smbsign_algo
+smbsign_algo_text
+smbsign_counts
+smbsign_sign
+smbsign_check_response
+smbsign_pdu_session_id
+smbsign_reason_text
+smbsign_selftest_rs
+# How many cases smbsign_selftest_rs() declares, so the boot line can print
+# "80/80 cases PASS" and not merely "PASS". The test stops at the first
+# failure, so a stale expectation on case 25 silently stopped cases 26 to 80
+# from running at all; a pass/fail word cannot show that and a count can.
+smbsign_selftest_cases_rs
+# The SP800-108 KDF, shared with rustkern/smbcrypt.rs rather than copied into
+# it: the label/context byte layout, with three NULs in a 29-byte PRF input, is
+# the most error-prone thing in either module and two copies of it would be two
+# things to get wrong.
+smbsign_kdf128_shared
+
+# ---------------------------------------------------------------------------
+# rustkern/aesccm.rs - AES-CCM (NIST SP 800-38C / RFC 3610) as an AEAD mode.
+# The ONE new crypto primitive SMB3 encryption needed, and it is a MODE only:
+# the key schedule and the block cipher come from crypto/aes.c through
+# aes_set_encrypt_key() / aes_encrypt_block(), which is also the entry point
+# that picks up the Rust AES core under -DRUST_AES.
+#
+# Why it exists when crypto/crypto.h already ships AES-GCM: SMB 3.0 and 3.0.2
+# fix their encryption at AES-128-CCM and define no way to negotiate anything
+# else (cipher negotiation arrives with 3.1.1). MEASURED 2026-10-04 against
+# Samba 4.17.12: a GCM-framed message on dialect 0x0302 gets the connection
+# killed, the same message under CCM is accepted. Called from
+# rustkern/smbcrypt.rs and from the boot self-test in main.c; the C face is in
+# crypto/crypto.h, which also locks the aes_ctx_t layout by _Static_assert.
+# ---------------------------------------------------------------------------
+aes_ccm_encrypt
+aes_ccm_decrypt
+aesccm_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/smbcrypt.rs - SMB3 ENCRYPTION. Before this, every byte of every file
+# read or written over SMB crossed the network in plain text: measured on
+# golden 2576 with tcpdump, 89 SMB2 messages, all signed, none encrypted, and
+# the test file's contents readable three times over in the capture. Signing
+# proves who sent a message; it does nothing to stop it being read.
+#
+# AES-128-CCM for dialects 3.0 and 3.0.2, which is what this client negotiates.
+# NOT AES-GCM, which is what "SMB3 encryption" usually means and what this tree
+# already had: measured, GCM at 3.0.2 gets the connection killed. SMB 3.1.1 is
+# NOT covered, not offered and refused rather than guessed at, exactly as the
+# signing module says of it. 2.0.2 and 2.1 cannot encrypt at all.
+#
+# No crypto here either: it calls aes_ccm_encrypt/decrypt and derives its keys
+# through smbsign_kdf128_shared. Called from net/smb.c only (three chokepoints:
+# smb_send_packet, smb_recv_packet and the mount-time negotiation) plus the boot
+# self-test in main.c. C face and the struct layout are in net/smb.h, where the
+# layout is locked by _Static_assert and the three policy constants are locked
+# at boot by smbcrypt_policy_abi_check.
+# ---------------------------------------------------------------------------
+smbcrypt_policy_set
+smbcrypt_policy
+smbcrypt_policy_text
+smbcrypt_policy_parse
+smbcrypt_policy_abi_check
+smbcrypt_client_capabilities
+# SMB 3.1.1 encryption, taking the two directional keys ALREADY derived from the
+# pre-auth integrity hash. The seal/unseal paths are unchanged: AES-128-CCM is
+# wire-identical at 3.0.2 and 3.1.1 (MEASURED), only the key schedule differs.
+smbcrypt_begin311
+smbcrypt_reset
+smbcrypt_note_negotiate
+smbcrypt_begin
+smbcrypt_note_session_flags
+smbcrypt_note_share_flags
+smbcrypt_is_armed
+smbcrypt_is_active
+smbcrypt_server_capable
+smbcrypt_server_requires
+smbcrypt_algo_text
+smbcrypt_counts
+smbcrypt_should_seal
+smbcrypt_seal
+smbcrypt_pdu_is_transform
+smbcrypt_unseal
+smbcrypt_check_clear_response
+smbcrypt_pdu_session_id
+smbcrypt_reason_text
+smbcrypt_selftest_rs
 
 # ---------------------------------------------------------------------------
 # rustkern/clickacct.rs - #197 click delivery ledger for the #334 test-input
@@ -1832,6 +2238,18 @@ clickacct_note_inject_rs
 clickacct_note_sample_rs
 clickacct_note_routed_rs
 clickacct_get_rs
+
+# --- rustkern/uiready.rs: #317 BOOT AUTO-LAUNCH READINESS --------------------
+# "A real UI is on screen", as a CONDITION rather than the proc_sleep(14000)
+# guess it replaced. gui/desktop.c owns the wait_queue_head_t and calls
+# wake_up_all() at each event site; this module owns the state and the policy
+# (which events count). uiready_up_rs is the wait_event_timeout() condition and
+# is a pure atomic read, so it is legal with interrupts off.
+uiready_mark_compositor_rs
+uiready_mark_fallback_rs
+uiready_up_rs
+uiready_state_rs
+uiready_selftest_rs
 
 # --- rustkern/uiscale.rs: THE GLOBAL UI SCALE FACTOR -------------------------
 # Owner: UI/UX. One value, one place, reached by the kernel (theme metrics,
@@ -1883,6 +2301,9 @@ fw_default_config_rs
 fw_parse_cfg_rs
 fw_format_cfg_rs
 fw_selftest_rs
+# #kfirewall: pure query, "would a NEW inbound TCP connection to this port be
+# admitted by the policy in force". Caller: net/ssh/ssh2_server.c, at bind time.
+fw_admits_in_tcp_rs
 
 # ---------------------------------------------------------------------------
 # rustkern/mprotect.rs - #404 SYS_MPROTECT Ring-3 argument validation.
@@ -1941,6 +2362,63 @@ battery_selftest_rs
 perm_home_shape_rs
 permhome_selftest_rs
 
+# rustkern/sticky.rs - #prewrite: S_ISVTX. THE ONE DEFINITION of "may this
+# principal remove or replace this name", for an all-users pre-writable
+# directory (/SHARED, /TMP). Pure functions of facts fs/perms.c looks up, so
+# the decision is Rust and the hash-table access stays in the C file that owns
+# the table. Consumed by perms_may_remove() in fs/perms.c, which is reached by
+# sys_unlink, sys_rmdir, both ends of sys_rename and the DOS INT 21h gate.
+sticky_is_set_rs
+sticky_decide_rs
+sticky_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/renamevol.rs - [renamevol] #246: the ROUTING decision for a
+# filesystem operation whose path(s) may be on a hot-plugged removable volume.
+# Consumed by sys_rename / sys_mkdir / sys_rmdir / sys_unlink (proc/syscall.c)
+# and by hotplug_fs_or_root() (drivers/hotplug.c), which is the one place the
+# root-or-volume choice is made. The fat_fs_t pointers stay in C; only the
+# answers cross the FFI, so this function cannot be handed a pointer.
+renamevol_selftest_rs
+rename_route_rs
+path_route_rs
+# ---------------------------------------------------------------------------
+# rustkern/volperm.rs - [openperm] #246: the two permission POLICY decisions
+# for a path that may be on a hot-plugged removable volume.
+#
+# openperm_gate_rs: is this path exempt from the local POSIX permission table?
+# SMB and NFS are (the server decides, via NTLM/RPC auth and the share ACLs);
+# a removable volume is NOT, which is the change. Consumed by sys_open_k()
+# (proc/fdlayer.c), which previously skipped its whole permission block for a
+# removable path.
+#
+# volperm_mount_mode_rs / _uid_rs / _gid_rs: what ownership and mode a mounted
+# removable volume's mount point gets, so that enforcing the gate does not make
+# a stick read-only to the person who plugged it in. Consumed by
+# hotplug_mount_device() (drivers/hotplug.c), the one place it is set.
+#
+# No pointers cross this FFI except the self-test's out-parameter; every
+# decision crosses as an integer.
+openperm_gate_rs
+volperm_mount_mode_rs
+volperm_mount_uid_rs
+volperm_mount_gid_rs
+volperm_selftest_rs
+
+# rustkern/volblind.rs - [volaudit] #246: the RUNTIME DETECTOR for the same
+# fault class renamevol.rs above routes around: the ROOT filesystem being
+# asked about a path that lives on a mounted removable volume. Holds the
+# verdict, the per-call-site de-duplication table and the boot self-test.
+# Consumed by fs/volblind.c, whose hook sits in the public wrappers of
+# fs/fat.c so every caller in the tree is covered in one place. Nothing here
+# takes a pointer it could dereference; only integers cross.
+volblind_verdict_rs
+volblind_count_rs
+volblind_total_rs
+volblind_site_is_new_rs
+volblind_sites_rs
+volblind_selftest_rs
+
 # ---------------------------------------------------------------------------
 # rustkern/selftestreg.rs - #PERMSKIP: the register of self-test groups that
 # DECLINED TO RUN, so a boot summary can say so on a durable sink instead of
@@ -1973,6 +2451,40 @@ usbport_retires_rs
 usbport_parse_cfg_rs
 usbport_abi_check_rs
 usbport_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/escrowmark.rs - #246: the escrow actor MARK policy. Who inherits the
+# mark on SPAWN (the escape that was open until 2026-10-03), who may take it
+# off, and what a marked actor's DELETE becomes. Consumed by fs/escrow_guard.c
+# (self-exit + disposition) and proc/process.c init_proc (inheritance).
+# ---------------------------------------------------------------------------
+escmark_inherit_rs
+escmark_inherits_rs
+escmark_may_self_exit_rs
+escmark_write_scoped_rs
+escmark_is_ai_program_rs
+escmark_delete_disposition_rs
+escmark_replace_disposition_rs
+escmark_overwrite_disposition_rs
+escmark_victim_disposition_rs
+escmark_policy_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/recycle.rs - the Recycle Bin policy: retention (default 30 days,
+# never = 0, and every parse failure lands on KEEP), the index-row format
+# (extended from 2 fields to 4 without breaking either direction), the
+# collision-safe trash name, and the stable OBJECT identity of a path.
+# Consumed by fs/recycle_fs.c.
+# ---------------------------------------------------------------------------
+rcy_is_expired_rs
+rcy_parse_retention_rs
+rcy_format_retention_rs
+rcy_row_build_rs
+rcy_row_deleted_at_rs
+rcy_row_name_rs
+rcy_trash_name_rs
+rcy_object_local_rs
+rcy_policy_selftest_rs
 
 # ---------------------------------------------------------------------------
 # rustkern/imgra.rs, rustkern/isomemo.rs, rustkern/blkhist.rs - [no-ticket]:
@@ -2078,3 +2590,32 @@ blkmgr_aux_resolve_c
 blkmgr_aux_fat_read_c
 blkmgr_aux_fat_write_c
 blkmgr_aux_fat_readdir_c
+
+# --- rustkern/secstore.rs (#secretuse) -------------------------------------
+# The on-disk container for a password-encrypted secret store: header ||
+# ciphertext || Poly1305 tag, with the WHOLE header fed to the AEAD as AAD so
+# the file is tamper-evident and its KDF cost cannot be downgraded in place.
+# Proven by crypto/secstore_kat.sh (GREEN all 15 cases; RED catches a header
+# excluded from the AAD) and by secstore_selftest_rs() on every boot.
+secstore_seal_rs
+secstore_open_rs
+secstore_overhead_rs
+secstore_max_plaintext_rs
+secstore_selftest_rs
+
+# #secretuse: rustkern/totp.rs - RFC 4648 base32, RFC 4226/6238 TOTP, the secret
+# store's RECORD PARSER, and the SECRET TIER TABLE that says which key source
+# opens which class of secret. NEW code, no C twin, no strangler flag: the kernel
+# had none of this. It is the whole algorithmic surface of SYS_SECRET_USE; the C
+# in proc/secretuse.c holds no arithmetic at all. Callers: proc/secretuse.c and
+# proc/main.c (the boot self-test). Proven by crypto/secretuse_kat.sh (GREEN over
+# RFC 6238 Appendix B, both arms, all six times each, plus four proven REDs).
+totp_base32_decode_rs
+totp_parse_store_rs
+totp_format_store_rs
+totp_make_rec_rs
+totp_code_rs
+totp_wipe_rec_rs
+totp_selftest_rs
+secret_keysrc_for_class_rs
+secret_keysrc_is_implemented_rs

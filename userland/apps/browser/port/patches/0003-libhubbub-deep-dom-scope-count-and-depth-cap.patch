@@ -1,0 +1,176 @@
+--- a/src/treebuilder/treebuilder.c
++++ b/src/treebuilder/treebuilder.c
+@@ -12,6 +12,12 @@
+ #include <stdio.h>
+ 
+ #include "treebuilder/modes.h"
++
++/* MAYTERAOS LOCAL PATCH (#245 depth-cap) */
++#include <maytera-dom-limits.h>
++#ifdef HUBBUB_SCOPE_COUNT_VERIFY
++#include <stdlib.h>		/* abort() for the opt-in invariant check */
++#endif
+ #include "treebuilder/internal.h"
+ #include "treebuilder/treebuilder.h"
+ #include "utils/utils.h"
+@@ -213,7 +219,8 @@
+ 	assert((signed) treebuilder->context.current_node >= 0);
+ 
+ /* A slightly nasty debugging hook, but very useful */
+-/* MAYTERAOS LOCAL PATCH (#245) - the ONLY change in this vendored file.
++/* MAYTERAOS LOCAL PATCH (#245 mode-printf) - one of several changes in this
++ * vendored file; browser-port-drift.sh checks for each marker by name.
+  * Upstream leaves this printf ENABLED whenever NDEBUG is undefined, and no
+  * MayteraOS build script defines NDEBUG. It runs once per parsed token, and on
+  * this platform one printf character costs a SYS_PUTCHAR syscall, a busy-wait
+@@ -454,6 +461,41 @@
+ 
+ 	assert((signed) treebuilder->context.current_node >= 0);
+ 
++	/* MAYTERAOS LOCAL PATCH (#245 scope-count): the loop below walks down
++	 * the stack of open elements until it finds `type` or hits a scoping
++	 * element. Most element types are not scoping, so on a page of deeply
++	 * nested div elements the walk runs the whole stack EVERY TIME, which
++	 * makes parsing O(n^2) in the nesting depth: MEASURED 512,048,001
++	 * iterations at depth 32000, all of them failing. If the type is not on
++	 * the stack anywhere then it certainly is not in scope, and that is the
++	 * expensive case, so check the occupancy count first. */
++#ifdef HUBBUB_SCOPE_COUNT_VERIFY
++	/* Rebuild the count the slow way and refuse to run on a mismatch. The
++	 * fast path above is only sound while type_count is an UPPER bound on
++	 * the real occupancy of slots 1..current_node, so there is a cheap way
++	 * to prove that invariant instead of asserting it in prose: build the
++	 * engine with -DHUBBUB_SCOPE_COUNT_VERIFY and run a corpus through it.
++	 * Not on by default because it restores the O(stack) scan it exists to
++	 * remove. */
++	{
++		uint32_t vn, vreal = 0;
++		for (vn = 1; vn <= treebuilder->context.current_node; vn++) {
++			if (treebuilder->context.element_stack[vn].type == type)
++				vreal++;
++		}
++		if (type <= UNKNOWN &&
++				treebuilder->context.type_count[type] < vreal) {
++			fprintf(stderr, "HUBBUB_SCOPE_COUNT_VERIFY: type %d "
++					"count %u < real %u\n", (int) type,
++					treebuilder->context.type_count[type],
++					vreal);
++			abort();
++		}
++	}
++#endif
++	if (type <= UNKNOWN && treebuilder->context.type_count[type] == 0)
++		return 0;
++
+ 	for (node = treebuilder->context.current_node; node > 0; node--) {
+ 		hubbub_ns node_ns =
+ 				treebuilder->context.element_stack[node].ns;
+@@ -703,6 +745,34 @@
+ 	hubbub_error error;
+ 	void *node, *appended;
+ 
++	/* MAYTERAOS LOCAL PATCH (#245 depth-cap): upstream has NO nesting cap.
++	 * The stack of open elements just reallocs in 128-entry chunks, so N
++	 * nested start tags build an N-deep DOM and every per-insertion walk in
++	 * libhubbub and libdom costs O(N). The algorithmic fixes elsewhere in
++	 * this change remove the O(n^2) terms, but several remaining walks are
++	 * inherently O(depth) (element_in_scope for a type that IS on the stack,
++	 * current_table, reset_insertion_mode, the adoption agency, and libdom's
++	 * recursive node destruction, which at tens of thousands deep overflows
++	 * the 2 MB Ring 3 stack outright). Bounding the depth bounds all of them
++	 * at once, which is why this is here as well as, not instead of, the
++	 * algorithmic fixes.
++	 *
++	 * This is the single chokepoint: every element that goes on the stack of
++	 * open elements is created here. Over the cap the start tag is a parse
++	 * error and is ignored, so nothing is allocated, nothing is appended and
++	 * the stack does not grow; content inside the ignored tags is still
++	 * inserted, at the deepest node the cap allows. See
++	 * shim-include/maytera-dom-limits.h for the number and the reasoning.
++	 *
++	 * Deliberately NOT done in element_stack_push: by then the element has
++	 * been created and appended to the DOM, so refusing there would either
++	 * leak it or need an unwind, and push's other two callers (the active
++	 * formatting list reconstruction and the head-element re-push) are
++	 * bounded by the formatting list rather than by document nesting. */
++	if (push && treebuilder->context.current_node + 1 >=
++			MAYTERA_DOM_MAX_DEPTH)
++		return HUBBUB_OK;
++
+ 	error = treebuilder->tree_handler->create_element(
+ 			treebuilder->tree_handler->ctx, tag, &node);
+ 	if (error != HUBBUB_OK)
+@@ -1009,6 +1079,10 @@
+ 		treebuilder->context.stack_alloc += ELEMENT_STACK_CHUNK;
+ 	}
+ 
++	/* MAYTERAOS LOCAL PATCH (#245 scope-count) */
++	if (type <= UNKNOWN)
++		treebuilder->context.type_count[type]++;
++
+ 	treebuilder->context.element_stack[slot].ns = ns;
+ 	treebuilder->context.element_stack[slot].type = type;
+ 	treebuilder->context.element_stack[slot].name = NULL;
+@@ -1065,6 +1139,14 @@
+ 	*type = stack[slot].type;
+ 	*node = stack[slot].node;
+ 
++	/* MAYTERAOS LOCAL PATCH (#245 scope-count). The saturating guard is for
++	 * slot 0, whose sentinel type is written directly rather than pushed:
++	 * refusing to go below zero keeps the count an UPPER bound on the real
++	 * occupancy, and only an under-count could ever give a wrong answer. */
++	if (stack[slot].type <= UNKNOWN &&
++			treebuilder->context.type_count[stack[slot].type] > 0)
++		treebuilder->context.type_count[stack[slot].type]--;
++
+ 	/** \todo reduce allocated stack size once there's enough free */
+ 
+ 	treebuilder->context.current_node = slot - 1;
+@@ -1140,6 +1222,11 @@
+ 	*type = stack[index].type;
+ 	*removed = stack[index].node;
+ 
++	/* MAYTERAOS LOCAL PATCH (#245 scope-count) */
++	if (stack[index].type <= UNKNOWN &&
++			treebuilder->context.type_count[stack[index].type] > 0)
++		treebuilder->context.type_count[stack[index].type]--;
++
+ 	/* Now, shuffle the stack up one, removing node in the process */
+ 	if (index < treebuilder->context.current_node) {
+ 		memmove(&stack[index], &stack[index + 1],
+--- a/src/treebuilder/internal.h
++++ b/src/treebuilder/internal.h
+@@ -55,6 +55,14 @@
+ 	uint32_t stack_alloc;		/**< Number of stack slots allocated */
+ 	uint32_t current_node;		/**< Index of current node in stack */
+ 
++	/* MAYTERAOS LOCAL PATCH (#245 scope-count): how many entries of each
++	 * element type are on the stack of open elements. element_in_scope()
++	 * uses it to answer "not on the stack at all" in O(1) instead of
++	 * scanning the whole stack; see the comment there. Counts are indices
++	 * into a fixed array and hold no stack positions, which is why
++	 * element_stack_remove()'s memmove cannot invalidate them. */
++	uint32_t type_count[UNKNOWN + 1];
++
+ 	formatting_list_entry *formatting_list;	/**< List of active formatting 
+ 						 * elements */
+ 	formatting_list_entry *formatting_list_end;	/**< End of active 
+--- a/src/treebuilder/before_html.c
++++ b/src/treebuilder/before_html.c
+@@ -111,6 +111,16 @@
+ 		treebuilder->context.element_stack[0].node = appended;
+ 		treebuilder->context.current_node = 0;
+ 
++		/* MAYTERAOS LOCAL PATCH (#245 scope-count): this is the one
++		 * place an entry reaches the stack of open elements without
++		 * going through element_stack_push, so the occupancy count it
++		 * maintains is updated by hand here. element_in_scope never
++		 * examines slot 0, so on its own this cannot change an answer;
++		 * it is here so the invariant stays the simple "count is an
++		 * upper bound on the whole stack" rather than the weaker and
++		 * more easily forgotten "upper bound on slots 1 and above". */
++		treebuilder->context.type_count[HTML]++;
++
+ 		/** \todo cache selection algorithm */
+ 
+ 		treebuilder->context.mode = BEFORE_HEAD;

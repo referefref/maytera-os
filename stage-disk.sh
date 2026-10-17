@@ -185,7 +185,12 @@ else
     echo "   See disk/WALLPAPERS/README.md for the expected filenames.)"
 fi
 
-sync
+# No bare `sync` here. It was a WHOLE-SYSTEM writeback wait, and on a machine with
+# a slow network mount it can block for hours in uninterruptible state where no
+# signal can reach it (MEASURED 2026-10-07: 3.14 hours for one such call). It was
+# also redundant: the `umount` on the next line flushes this filesystem, which is
+# the only one whose contents this script cares about. `parted` itself calls no
+# whole-system sync (checked with `objdump -R`), so removing this line leaves none.
 umount "$MNT"
 losetup -d "$LOOP"
 rmdir "$MNT"

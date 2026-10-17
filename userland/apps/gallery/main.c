@@ -22,6 +22,8 @@
 #include "../../libc/gui_theme.h"
 #include "../../libc/gui_style.h"
 #include "../../libc/dirent.h"
+#include "../../libc/userconf.h"   // [filesui] named-places accessors
+#include "../../libc/places.h"     // [filesui] places_have_home()
 
 // ---------------------------------------------------------------------------
 // Layout tokens
@@ -73,7 +75,17 @@ typedef struct { int x, y, w, h; } rect_t;
 static int win = -1;
 static int g_win_w = WIN_W, g_win_h = WIN_H;
 
+// [filesui] WAS "/", the filesystem root: an image gallery that opens beside
+// BOOT.BMP and eighty wallpapers instead of in the user's Pictures folder.
+// Resolved in main() through the shared model.
 static char    g_path[256] = "/";
+static void gallery_start_path(void) {
+    char b[256];
+    if (places_have_home() && userhome_pictures_dir(b, sizeof(b)) == 0)
+        snprintf(g_path, sizeof(g_path), "%s", b);
+    else if (userscratch_dir(b, sizeof(b)) == 0)
+        snprintf(g_path, sizeof(g_path), "%s", b);
+}
 static entry_t g_ent[MAX_ENT];
 static int     g_count = 0;
 static int     g_ndirs = 0;       // directories sort first
@@ -761,7 +773,10 @@ static int handle_toolbar_click(int x, int y) {
 // main
 // ---------------------------------------------------------------------------
 int main(int argc, char **argv) {
+    // [filesui] the session's Pictures folder, but ONLY when argv did not name a
+    // path: an "Open With" handoff from Files must still win.
     if (argc > 1 && argv[1][0] == '/') strlcpy(g_path, argv[1], sizeof(g_path));
+    else gallery_start_path();
 
     win = win_create("Maytera Gallery", 60, 30, WIN_W, WIN_H);
     if (win < 0) {

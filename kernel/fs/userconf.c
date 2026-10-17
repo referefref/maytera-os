@@ -17,22 +17,67 @@
 #include "perms.h"
 #include "../mm/heap.h"
 #include "../serial.h"
+#include "../string.h"
 
 extern fat_fs_t g_fat_fs;
 
 extern int userconf_join_rs(const char *home, const char *name,
                             char *out, uint32_t cap);
+// [noaccount] THE DECISION lives in rustkern/userconf.rs, so this side and the
+// userland side cannot answer it differently. See that file for the rule and
+// for the measurement that produced it.
+extern int userconf_state_root_rs(int has_entry, const char *home,
+                                  char *out, uint32_t cap);
 
-int userconf_kpath(const char *name, char *out, uint32_t cap) {
+// [noaccount] THE ONE ANSWER to "where does this session's per-account state
+// live", kernel side. Exported (userconf.h) because SYS_SESSION_HOME has to
+// hand the SAME answer to a privileged userland service: a service that
+// resolved the requester's path from the raw home would look in /CONFIG while
+// the requester wrote to /TMP, which is the split-brain this file's header
+// warns about, in the one session type where nobody would notice until a
+// feature quietly did nothing.
+int userconf_kstate_root(char *out, uint32_t cap) {
     uint32_t uid = desktop_get_session_uid();
     user_entry_t *u = user_lookup_uid(uid);
-    const char *home = (u && u->home[0]) ? u->home : "/";
-    return userconf_kpath_home(home, name, out, cap);
+    return userconf_state_root_rs(u ? 1 : 0, (u && u->home[0]) ? u->home : "",
+                                  out, cap) < 0 ? -1 : 0;
+}
+
+int userconf_kpath(const char *name, char *out, uint32_t cap) {
+    // [noaccount] WAS: `(u && u->home[0]) ? u->home : "/"`. That "/" is the
+    // whole defect. Ring 0 could always write /CONFIG so nothing here ever
+    // failed, and the Ring-3 half of every file this resolves was refused.
+    // fs/recycle_fs.c is the measured case: it created /CONFIG/RECYCLE on a
+    // machine whose recycler daemon could not read it.
+    char root[256];
+    if (userconf_kstate_root(root, sizeof(root)) != 0) return -1;
+    return userconf_kpath_home(root, name, out, cap);
 }
 
 int userconf_kpath_home(const char *home, const char *name, char *out, uint32_t cap) {
     if (!home || !home[0]) return -1;
     return userconf_join_rs(home, name, out, cap) < 0 ? -1 : 0;
+}
+
+// [noaccount] THIS IS NOW userconf_kpath(), and that is the point.
+//
+// It used to be the only accessor that knew about the no-account session, and
+// it knew in a DIFFERENT SHAPE: "/TMP/<name>", flat, with the CONFIG component
+// dropped, plus an explicit uid-0 early-out to undo a "home != /" test that
+// answers wrongly for root. Both of those were workarounds for asking the
+// question in the wrong place. Now that userconf_kpath() resolves the state
+// root, "<root>/CONFIG/<name>" is right for every session and this is one
+// name for one behaviour.
+//
+// THE NOTIFICATION SPOOL MOVES, on a no-account machine only, from
+// /TMP/NOTIFY.TXT to /TMP/CONFIG/NOTIFY.TXT. All five parties to that file
+// (this Ring-0 poster, libc/notify.c's writer and reader, and the
+// compositor's reader and its stale-spool unlink) resolve through one joiner
+// on each side and both joiners now make the same decision, so they move
+// together or not at all. Keeping the name for one release means the three
+// call sites do not have to be edited in the same change that moves the file.
+int userconf_kpath_scratch(const char *name, char *out, uint32_t cap) {
+    return userconf_kpath(name, out, cap);
 }
 
 // Moved here from kernel/main.c (was static provision_ai_key(login_result_t*))

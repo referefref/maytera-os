@@ -46,9 +46,15 @@ build() {
     objcopy --prefix-symbols=ad_ "$WORK/aiclient_raw.o" "$WORK/aiclient.o" || return 2
     objcopy --prefix-symbols=ad_ "$WORK/aidev_raw.o"   "$WORK/aidev.o"   || return 2
     objcopy --prefix-symbols=ad_ "$WORK/aicap_raw.o"   "$WORK/aicap.o"   || return 2
+    # #aiaudit: aitools.c is the shipping tool table aiclient.c emits from.
+    # Link the REAL one rather than stubbing it, so the rig exercises the tool
+    # surface the OS ships instead of one invented for the test.
+    gcc $UUT_FLAGS -x c -c "$LIBC/aitools.c" -o "$WORK/aitools_raw.o" 2>"$WORK/cc_at.log" || {
+        echo "  compile of aitools.c FAILED:"; sed -n 1,25p "$WORK/cc_at.log"; return 2; }
+    objcopy --prefix-symbols=ad_ "$WORK/aitools_raw.o" "$WORK/aitools.o" || return 2
     gcc -m64 -O1 -g -c aieject_test.c -o "$WORK/t.o" 2>"$WORK/cc4.log" || {
         echo "  compile of harness FAILED:"; sed -n 1,25p "$WORK/cc4.log"; return 2; }
-    gcc -m64 "$WORK/t.o" "$WORK/aiclient.o" "$WORK/aidev.o" "$WORK/aicap.o" -o "$2" 2>"$WORK/ld.log" || {
+    gcc -m64 "$WORK/t.o" "$WORK/aiclient.o" "$WORK/aidev.o" "$WORK/aicap.o" "$WORK/aitools.o" -o "$2" 2>"$WORK/ld.log" || {
         echo "  link FAILED:"; sed -n 1,25p "$WORK/ld.log"; return 2; }
     return 0
 }
