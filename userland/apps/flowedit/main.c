@@ -29,12 +29,25 @@
 // REAL vs PLACEHOLDER (kept honest, per the milestone brief):
 //   - REAL: the whole graph model, the YAML load AND save (round-trips through
 //     flow.c's parser), node/port typing, add/move/wire/delete, Save, Run.
-//   - PLACEHOLDER: the App-node inspector's app+feature catalog is a small
-//     representative table (see g_app_catalog[]), NOT a live enumeration of
-//     every installed app's contract. Live enumeration would drive each app's
-//     ct_contract_t through contract_invoke() / a describe verb (contract.h);
-//     that is an M2 concern. The catalog rows are typed with the REAL contract.h
-//     risk/access vocabulary so the model is not faked, only the data is seeded.
+//   - REAL since #<config-ref>: the App-node inspector's app and feature lists are a
+//     LIVE enumeration of the installed contracts. The app list comes from
+//     contract_declared_list() over the generated /AITOOLS/CONTRACTS.YML, the
+//     feature list from the chosen app's own `list` verb, and a feature's
+//     type/access/risk from its own `brief` row, all through contract_invoke()
+//     (libc/ctinvoke.c), which is the SAME call flowrun uses to gate the node it
+//     is about to run. Before this the inspector offered a FIXED five-app enum
+//     ("files|editor|terminal|settings|notes", one of which, notes, declares no
+//     contract at all) and a FREE-TEXT feature box, so a user wiring an App node
+//     typed an action name blind and found out it was wrong at run time.
+//
+//     WHERE THE RESOLUTION HAPPENS, AND WHY NOT IN THE DRAW PATH. contract_invoke()
+//     SPAWNS the target app and waits for it. get_ports() runs for every node on
+//     every frame, so resolving there would spawn a process per app node per
+//     frame. Resolution is therefore INSPECTOR-DRIVEN (selection and field
+//     commit, both one-shot user events) and lands in a small memo table; the
+//     draw path only READS that table and falls back to a neutral port type on a
+//     miss. This is the same rule as the compositor's "the draw thread must
+//     never block": async-resolve-then-cache, never fetch-in-paint.
 
 #include "stdio.h"
 #include "stdlib.h"
@@ -51,10 +64,58 @@
 #include "pkgsig.h"       // #153: App Store / updater trust anchor (SAME verify)
 
 // ===========================================================================
-// Layout constants (window is fixed for M1; content coords match draw coords).
+// Layout (content coords match draw coords).
+//
+// WIN_W/WIN_H are the window's CONTENT size and are VARIABLES, not constants.
+// Every panel rect, button rect and hit-test below is expressed in terms of
+// them, so updating them when EVENT_RESIZE arrives reflows the entire UI with
+// no other change. This is the idiom apps/files/main.c already uses
+// (`#define WIN_W g_win_w`), reused here rather than invented again.
+//
+// THEY USED TO BE `#define WIN_W 960`, under the comment "window is fixed for
+// M1". MEASURED on golden 2585: a real corner-grip drag resized the window
+// FRAME correctly (the kernel WM path is fine; Files, driven by the identical
+// injected drag on the same boot, reflowed perfectly) while Flow kept drawing
+// its UI at 960x620 in the top-left corner. The rest of the enlarged window
+// stayed the 0xFFF5F5F5 background that user_window_handle_resize() fills a
+// freshly-reallocated content buffer with, which reads on screen as "resizing
+// the Flow app does not work".
+//
+// WIN_*_MIN is a floor on the LAYOUT arithmetic only, not a refusal to resize:
+// the window manager stays authoritative over geometry (its own floor,
+// WINDOW_MIN_WIDTH/HEIGHT, is 100x50, far below anything this UI can draw
+// into). Below the floor the layout is simply clipped by the kernel's own
+// bounds check in sys_win_draw_rect(); g_raw_w/g_raw_h below make sure the
+// filler never shows through in that case either.
 // ===========================================================================
-#define WIN_W       960
-#define WIN_H       620
+#define WIN_W_DEFAULT 960
+#define WIN_H_DEFAULT 620
+#define WIN_W_MIN     520
+#define WIN_H_MIN     240
+static int g_win_w = WIN_W_DEFAULT;   // layout size: clamped to the floor
+static int g_win_h = WIN_H_DEFAULT;
+static int g_raw_w = WIN_W_DEFAULT;   // the size the kernel actually gave us
+static int g_raw_h = WIN_H_DEFAULT;
+#define WIN_W       g_win_w
+#define WIN_H       g_win_h
+
+// Adopt a new content size, from EVENT_RESIZE or from win_get_size() just
+// after win_create(). Keeps BOTH sizes: the clamped one the layout uses, and
+// the real one, because the background fill has to cover every pixel the
+// kernel allocated or the leftover filler is visible exactly where this bug
+// was visible before.
+static void set_win_size(int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    g_raw_w = w;
+    g_raw_h = h;
+    g_win_w = (w < WIN_W_MIN) ? WIN_W_MIN : w;
+    g_win_h = (h < WIN_H_MIN) ? WIN_H_MIN : h;
+}
+
+// Every pixel of the content buffer, whichever of the two sizes is larger, so
+// no run of the kernel's post-resize filler can survive a repaint.
+static int bg_w(void) { return (g_raw_w > g_win_w) ? g_raw_w : g_win_w; }
+static int bg_h(void) { return (g_raw_h > g_win_h) ? g_raw_h : g_win_h; }
 #define TOOLBAR_H   36
 #define PALETTE_W   150
 #define INSPECTOR_W 250
@@ -246,15 +307,45 @@ typedef struct {
     int access;           // CT_READ / CT_WRITE
     int risk;             // CT_SAFE / CT_GUARDED
 } appcat_t;
-static const appcat_t g_app_catalog[] = {
-    { "files",    "files.write_text", PT_STRING, PT_INT,    CT_WRITE, CT_GUARDED },
-    { "files",    "files.list_dir",   PT_STRING, PT_LIST,   CT_READ,  CT_SAFE    },
-    { "editor",   "editor.open",      PT_STRING, PT_ACTION, CT_WRITE, CT_SAFE    },
-    { "terminal", "terminal.run",     PT_STRING, PT_STRING, CT_WRITE, CT_GUARDED },
-    { "settings", "settings.get",     PT_STRING, PT_STRING, CT_READ,  CT_SAFE    },
-    { "notes",    "notes.append",     PT_STRING, PT_ACTION, CT_WRITE, CT_GUARDED },
-};
-#define NAPPCAT ((int)(sizeof(g_app_catalog)/sizeof(g_app_catalog[0])))
+// The memo. One row per (app, feature) the user has actually selected, filled
+// only from the inspector path. 24 is generous: a workflow with more than two
+// dozen DISTINCT app actions open in one editing session is not a shape this
+// table needs to be fast for, and an overflow simply reuses slot 0 rather than
+// growing, because a wrong port TYPE is cosmetic while an unbounded table is not.
+typedef struct {
+    char app[40];
+    char feature[FLOW_PORT_MAX];
+    int  in_type, out_type, access, risk;
+    int  valid;                 // 0 until the app itself answered
+} appmemo_t;
+#define NAPPMEMO 24
+static appmemo_t g_appmemo[NAPPMEMO];
+static int g_nappmemo = 0;
+
+// Forward declarations: node creation (new_node) runs above the definitions.
+static const char *ct_app_options(void);
+static const char *ct_feature_options(const char *app);
+static void        ct_memo_resolve(const char *app, const char *feature);
+static void        ct_first_feature(const char *app, char *out, int ocap);
+
+// The neutral row a miss falls back to. NOT a guess dressed up as data: an
+// unresolved action gets PT_ANY on both sides, which draws a port that will wire
+// to anything, instead of asserting a string input the contract may not have.
+static const appcat_t g_app_unknown = { "", "", PT_ANY, PT_ANY, CT_READ, CT_SAFE };
+
+// contract type/access -> flow port type. The only mapping, used by the one
+// resolver below; contract.h's CT_* vocabulary is the input, flow.h's PT_* the
+// output, and nothing else in this file converts between them.
+static int ct_to_port(int cttype) {
+    switch (cttype) {
+        case CT_BOOL:   return PT_BOOL;
+        case CT_INT:    return PT_INT;
+        case CT_ENUM:   return PT_STRING;
+        case CT_ACTION: return PT_ACTION;
+        case CT_STR:    return PT_STRING;
+    }
+    return PT_ANY;
+}
 
 // ===========================================================================
 // Small helpers.
@@ -417,7 +508,17 @@ static int add_node(const char *type, int wx, int wy) {
     else if (strcmp(type, "transform") == 0){ param_set(n, "op", "constant"); param_set(n, "text", ""); }
     else if (strcmp(type, "file") == 0)    { param_set(n, "op", "write"); param_set(n, "path", "/HOME/OUT.TXT"); }
     else if (strcmp(type, "llm") == 0)     { param_set(n, "system", ""); param_set(n, "prompt", ""); param_set(n, "model", "kimi"); param_set(n, "schema", ""); }
-    else if (strcmp(type, "app") == 0)     { param_set(n, "app", g_app_catalog[0].app); param_set(n, "feature", g_app_catalog[0].feature); }
+    else if (strcmp(type, "app") == 0)     {
+        // The first CONTRACTED app and its first declared item, asked for rather
+        // than hardcoded, so a new App node starts on something that exists.
+        char a0[40]; a0[0] = 0;
+        const char *opts = ct_app_options();
+        int k = 0; while (opts[k] && opts[k] != '|' && k < (int)sizeof(a0) - 1) { a0[k] = opts[k]; k++; }
+        a0[k] = 0;
+        char f0[FLOW_PORT_MAX]; ct_first_feature(a0, f0, (int)sizeof(f0));
+        param_set(n, "app", a0); param_set(n, "feature", f0);
+        ct_memo_resolve(a0, f0);
+    }
     else if (strcmp(type, "service") == 0) { param_set(n, "service", "http"); param_set(n, "url", ""); }
     else if (strcmp(type, "device") == 0)  { param_set(n, "device", ""); param_set(n, "attr", ""); }
     // #469 AI-VISION. Seeded with the params the runner actually reads, and
@@ -508,13 +609,158 @@ static void add_edge(const char *fn, const char *fp, const char *tn, const char 
 typedef struct { char name[FLOW_PORT_MAX]; int type; } port_t;
 #define MAXP 8
 
+// READ ONLY. The draw path's view of the memo: never spawns, never blocks.
 static const appcat_t *app_lookup(const flow_node_t *n) {
+    static appcat_t row;
     const char *app = param_get(n, "app");
     const char *feat = param_get(n, "feature");
-    for (int i = 0; i < NAPPCAT; i++)
-        if (app && feat && strcmp(g_app_catalog[i].app, app) == 0 &&
-            strcmp(g_app_catalog[i].feature, feat) == 0) return &g_app_catalog[i];
-    return &g_app_catalog[0];
+    if (app && feat) {
+        for (int i = 0; i < g_nappmemo; i++) {
+            if (g_appmemo[i].valid &&
+                strcmp(g_appmemo[i].app, app) == 0 &&
+                strcmp(g_appmemo[i].feature, feat) == 0) {
+                row.app      = g_appmemo[i].app;
+                row.feature  = g_appmemo[i].feature;
+                row.in_type  = g_appmemo[i].in_type;
+                row.out_type = g_appmemo[i].out_type;
+                row.access   = g_appmemo[i].access;
+                row.risk     = g_appmemo[i].risk;
+                return &row;
+            }
+        }
+    }
+    return &g_app_unknown;
+}
+
+// ---------------------------------------------------------------------------
+// LIVE CONTRACT ENUMERATION. Three readers, all through contract_invoke(), all
+// called ONLY from the inspector (selection / field commit), never from draw.
+//
+// Each caches, because each one spawns the target app. The app LIST is cached
+// for the life of the process (the set of installed contracts does not change
+// under a running editor); the feature list is cached per app and refetched when
+// the user picks a different app; a typed row is memoised per (app, feature).
+// ---------------------------------------------------------------------------
+
+// comma-separated -> pipe-separated, which is what add_enum_field() expects.
+static void commas_to_pipes(char *b) {
+    int o = 0;
+    for (int i = 0; b[i]; i++) {
+        if (b[i] == ',') {
+            b[o++] = '|';
+            while (b[i + 1] == ' ') i++;   // "a, b" -> "a|b", not "a| b"
+        } else {
+            b[o++] = b[i];
+        }
+    }
+    b[o] = 0;
+}
+
+// "files|editor|..." - every app that DECLARES a contract on this machine.
+static const char *ct_app_options(void) {
+    static char buf[384];
+    static int done = 0;
+    if (!done) {
+        done = 1;
+        if (contract_declared_list(buf, (int)sizeof(buf)) > 0) commas_to_pipes(buf);
+        else buf[0] = 0;
+    }
+    // A machine with no index at all still gets a usable editor rather than an
+    // empty dropdown, and the fallback is honest about being one.
+    return buf[0] ? buf : "files|editor|terminal|settings";
+}
+
+// The chosen app's own item names, from its `list` verb: one name per line.
+static const char *ct_feature_options(const char *app) {
+    static char cached_app[40];
+    static char buf[2048];
+    if (!app || !app[0]) return "";
+    if (strcmp(cached_app, app) == 0) return buf;
+    buf[0] = 0;
+    char *lv[1] = { (char *)"list" };
+    // CACHE ONLY A SUCCESS. Marking the app as cached before the call would
+    // make one transient failure permanent for the life of the process: the
+    // dropdown would stay empty and every later selection of that app would
+    // take the fast path and never ask again. An app that failed once is asked
+    // again next time it is selected.
+    if (contract_invoke(app, 1, lv, buf, (int)sizeof(buf)) != CT_OK) { buf[0] = 0; return buf; }
+    scpy(cached_app, app, sizeof(cached_app));
+    // newlines -> pipes, dropping the trailing one so there is no empty option.
+    int o = 0;
+    for (int i = 0; buf[i]; i++) {
+        if (buf[i] == '\n' || buf[i] == '\r') { if (o && buf[o - 1] != '|') buf[o++] = '|'; }
+        else buf[o++] = buf[i];
+    }
+    while (o > 0 && buf[o - 1] == '|') o--;
+    buf[o] = 0;
+    return buf;
+}
+
+// Resolve ONE (app, feature) into the memo, from the app's own `brief` row.
+// Idempotent and cheap on a hit; one spawn on a miss.
+static void ct_memo_resolve(const char *app, const char *feature) {
+    if (!app || !app[0] || !feature || !feature[0]) return;
+    for (int i = 0; i < g_nappmemo; i++)
+        if (strcmp(g_appmemo[i].app, app) == 0 &&
+            strcmp(g_appmemo[i].feature, feature) == 0) return;
+
+    static char reply[1024];
+    reply[0] = 0;
+    char *bv[2]; bv[0] = (char *)"brief"; bv[1] = (char *)feature;
+    if (contract_invoke(app, 2, bv, reply, (int)sizeof(reply)) != CT_OK) return;
+    const char *row = strstr(reply, "  - {name: ");
+    if (!row) return;
+
+    appmemo_t m;
+    memset(&m, 0, sizeof(m));
+    scpy(m.app, app, sizeof(m.app));
+    scpy(m.feature, feature, sizeof(m.feature));
+    m.in_type = m.out_type = PT_ANY;
+    m.access = CT_READ;
+    m.risk = CT_SAFE;
+
+    const char *tp = strstr(row, "type: ");
+    int cttype = -1;
+    if (tp) {
+        tp += 6;
+        if      (!strncmp(tp, "bool", 4))   cttype = CT_BOOL;
+        else if (!strncmp(tp, "int", 3))    cttype = CT_INT;
+        else if (!strncmp(tp, "enum", 4))   cttype = CT_ENUM;
+        else if (!strncmp(tp, "action", 6)) cttype = CT_ACTION;
+        else if (!strncmp(tp, "string", 6)) cttype = CT_STR;
+    }
+    const char *ac = strstr(row, "access: ");
+    if (ac) {
+        ac += 8;
+        if (!strncmp(ac, "rw", 2))      m.access = CT_RW;
+        else if (!strncmp(ac, "w", 1))  m.access = CT_WRITE;
+        else                            m.access = CT_READ;
+    }
+    const char *rk = strstr(row, "risk: ");
+    if (rk) {
+        rk += 6;
+        if      (!strncmp(rk, "guarded", 7)) m.risk = CT_GUARDED;
+        else if (!strncmp(rk, "denied", 6))  m.risk = CT_DENIED;
+        else                                 m.risk = CT_SAFE;
+    }
+    // An ACTION is triggered and reports a result; a VALUE is read or written.
+    // The port shape follows the declared type, not a convention invented here.
+    if (cttype == CT_ACTION) { m.in_type = PT_ACTION; m.out_type = PT_STRING; }
+    else                     { m.in_type = ct_to_port(cttype); m.out_type = ct_to_port(cttype); }
+    m.valid = 1;
+
+    int slot = (g_nappmemo < NAPPMEMO) ? g_nappmemo++ : 0;
+    g_appmemo[slot] = m;
+}
+
+// The first item the app declares, used when a node is created or its app is
+// changed. Comes from the app, so there is no default action name in this file.
+static void ct_first_feature(const char *app, char *out, int ocap) {
+    if (ocap > 0) out[0] = 0;
+    const char *opts = ct_feature_options(app);
+    int i = 0;
+    while (opts[i] && opts[i] != '|' && i < ocap - 1) { out[i] = opts[i]; i++; }
+    out[i] = 0;
 }
 
 // Parse "{name}" placeholders from a prompt template into input ports.
@@ -759,9 +1005,15 @@ static void build_inspector(void) {
         add_enum_field("model", param_ref(n, "model"), FLOW_VAL_MAX, "kimi|gpt|claude|local");
         add_text_field("schema", param_ref(n, "schema"), FLOW_VAL_MAX);
     } else if (strcmp(t, "app") == 0) {
-        add_enum_field("app", param_ref(n, "app"), FLOW_VAL_MAX,
-                       "files|editor|terminal|settings|notes");
-        add_text_field("feature", param_ref(n, "feature"), FLOW_VAL_MAX);
+        // Both lists LIVE. The feature field is an ENUM now, not free text: the
+        // app has told us exactly which names it answers to, so offering a box
+        // the user can type a non-existent action into would be choosing to keep
+        // a failure mode we no longer have to have. Resolve this node's row so
+        // the ports draw with the contract's own types on the next frame.
+        add_enum_field("app", param_ref(n, "app"), FLOW_VAL_MAX, ct_app_options());
+        add_enum_field("feature", param_ref(n, "feature"), FLOW_VAL_MAX,
+                       ct_feature_options(param_get(n, "app")));
+        ct_memo_resolve(param_get(n, "app"), param_get(n, "feature"));
     } else if (strcmp(t, "service") == 0) {
         add_enum_field("service", param_ref(n, "service"), FLOW_VAL_MAX, "http|smb|nfs|notify");
         add_text_field("url", param_ref(n, "url"), FLOW_VAL_MAX);
@@ -823,13 +1075,18 @@ static void enum_next(field_t *f) {
         memcpy(nv, first, l); nv[l] = 0;
     }
     scpy(f->buf, nv, f->cap);
-    // App node: reset feature to the first catalog row for the newly-picked app
-    if (g_sel >= 0 && strcmp(g_g.nodes[g_sel].type, "app") == 0 && strcmp(f->label, "app") == 0) {
-        for (int i = 0; i < NAPPCAT; i++)
-            if (strcmp(g_app_catalog[i].app, nv) == 0) {
-                param_set(&g_g.nodes[g_sel], "feature", g_app_catalog[i].feature);
-                break;
-            }
+    // App node: a new app means a new feature list, so move the feature onto the
+    // first item THAT app declares rather than leaving a name belonging to the
+    // previous app, which would be a node that cannot run. Both sides come from
+    // the apps themselves.
+    if (g_sel >= 0 && strcmp(g_g.nodes[g_sel].type, "app") == 0) {
+        if (strcmp(f->label, "app") == 0) {
+            char f0[FLOW_PORT_MAX]; ct_first_feature(nv, f0, (int)sizeof(f0));
+            if (f0[0]) param_set(&g_g.nodes[g_sel], "feature", f0);
+            ct_memo_resolve(nv, f0);
+        } else if (strcmp(f->label, "feature") == 0) {
+            ct_memo_resolve(param_get(&g_g.nodes[g_sel], "app"), nv);
+        }
     }
 }
 
@@ -1481,7 +1738,7 @@ static void library_do_saveas(void) {
     for (int i = 0; i < g_lib_n; i++) if (!g_lib[i].is_example && strcmp(g_lib[i].name, nm) == 0) { g_lib_sel = i; break; }
 }
 static void draw_library(void) {
-    win_draw_rect(g_win, 0, 0, WIN_W, WIN_H, C_SURFACE);
+    win_draw_rect(g_win, 0, 0, bg_w(), bg_h(), C_SURFACE);
     win_draw_rect(g_win, 0, 0, WIN_W, 46, C_PANEL);
     win_draw_rect(g_win, 0, 46, WIN_W, 1, C_EDGE);
     ttf(16, 12, "Flow Library", 18, C_INK);
@@ -1831,7 +2088,7 @@ static void feed_open(void) {
 }
 
 static void draw_feed(void) {
-    win_draw_rect(g_win, 0, 0, WIN_W, WIN_H, C_SURFACE);
+    win_draw_rect(g_win, 0, 0, bg_w(), bg_h(), C_SURFACE);
     win_draw_rect(g_win, 0, 0, WIN_W, 46, C_PANEL);
     win_draw_rect(g_win, 0, 46, WIN_W, 1, C_EDGE);
     ttf(16, 12, "Get More Flows", 18, C_INK);
@@ -1900,7 +2157,7 @@ static void on_feed_key(gui_event_t *ev) {
 static void render(void) {
     if (g_feed_open) { draw_feed(); return; }
     if (g_lib_open) { draw_library(); return; }
-    win_draw_rect(g_win, 0, 0, WIN_W, WIN_H, C_SURFACE);
+    win_draw_rect(g_win, 0, 0, bg_w(), bg_h(), C_SURFACE);
     draw_canvas();
     draw_toolbar();
     draw_palette();
@@ -2128,6 +2385,28 @@ static void on_key(gui_event_t *ev) {
         tf_handle_key(&g_fields[g_focus].tf, ev);
         return;
     }
+    // TAB: cycle the node selection, the keyboard equivalent of clicking a node.
+    // Forward only, because gui_event_t carries no modifier field (gui.h:56-65),
+    // so there is no Shift+Tab to read; on a graph this size wrapping round is
+    // the same journey. The SAME argument the `l` key carries a few lines below:
+    // selecting a node was mouse-only, QEMU pointer injection does not reliably
+    // land clicks on this project's VMs (#334, reconfirmed 2026-10-28 with two
+    // identical screendumps after clicking the palette and the + Node button),
+    // so the Inspector - which is where every node's configuration lives - could
+    // not be reached by any automated check at all. That is how the App node's
+    // placeholder catalog survived a milestone: nothing could open the panel it
+    // was wrong in. One key, no new concept, and it calls the same
+    // build_inspector() every click site already calls.
+    if (ev->keycode == GUI_KEY_TAB) {
+        if (g_g.nnodes > 0) {
+            g_sel = (g_sel < 0) ? 0 : (g_sel + 1) % g_g.nnodes;
+            g_focus = -1;
+            build_inspector();
+            snprintf(g_status, sizeof(g_status), "Selected %s (%s)",
+                     g_g.nodes[g_sel].id, g_g.nodes[g_sel].type);
+        }
+        return;
+    }
     if (ev->keycode == GUI_KEY_DEL || ev->key_char == 0x7F) {
         if (g_sel >= 0) { delete_node(g_sel); build_inspector(); scpy(g_status, "Deleted node", sizeof(g_status)); }
     } else if (ev->key_char == 's' || ev->key_char == 'S') {
@@ -2232,8 +2511,14 @@ int main(int argc, char **argv) {
 
     seed_workflows();
 
-    g_win = win_create("Maytera Flow", 60, 40, WIN_W + 4, WIN_H + 24);
+    g_win = win_create("Maytera Flow", 60, 40,
+                       WIN_W_DEFAULT + 4, WIN_H_DEFAULT + 24);
     if (g_win < 0) return 1;
+    // win_create() takes the OUTER size; everything below works in CONTENT
+    // coordinates, so ask the kernel what the content size actually came out
+    // as rather than re-deriving it from the chrome constants here.
+    { int cw = 0, chh = 0;
+      if (win_get_size(g_win, &cw, &chh) == 0) set_win_size(cw, chh); }
 
     load_theme();
     load_workflow(g_name);
@@ -2269,8 +2554,12 @@ int main(int argc, char **argv) {
             case EVENT_KEY_DOWN:
                 on_key(&ev);
                 g_dirty = 1; break;
-            case EVENT_REDRAW:
             case EVENT_RESIZE:
+                // gui.h: EVENT_RESIZE carries the new CONTENT size in
+                // mouse_x/mouse_y. Adopt it, then fall into the repaint.
+                set_win_size(ev.mouse_x, ev.mouse_y);
+                g_dirty = 1; break;
+            case EVENT_REDRAW:
             case EVENT_WINDOW_FOCUS:
                 g_dirty = 1; break;
             default:

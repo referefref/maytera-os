@@ -1,0 +1,44 @@
+# upstream-pins.tsv - the browser engine's out-of-repo third-party dependencies.
+#
+# THE SINGLE SOURCE OF TRUTH for what the browser links, where it came from,
+# and what bytes are acceptable. Read by:
+#   userland/apps/browser/port/fetch-upstream.sh   (fetch + verify + extract)
+#   userland/apps/browser/port/deps-publish.sh     (rebuild the bundles from upstream)
+#   build/browser-deps-gate.sh                     (the table is well-formed and self-consistent)
+#
+# WHY A HASH AND NOT A VERSION OR A BRANCH. Before this file existed the browser
+# built only because ONE machine happened to hold 59 MB that nothing tracked
+# (the build container:<workspace>{duktape,netsurf-port}). Replacing that with a fetch is
+# only an improvement if the fetch cannot silently return something different:
+# a mutable URL would be WORSE than the old state, because the old state failed
+# loudly. So every row carries the sha256 of the exact bundle, it is verified
+# after download and BEFORE extraction, and a mismatch is fatal, never a warning.
+#
+# COLUMNS (TAB separated, in this order):
+#   1 name          directory the extracted source becomes (netsurf libs), or 'duktape'
+#   2 tree          netsurf-port | duktape   - which of the two trees it belongs to
+#   3 kind          git     - bundle is 'git archive <pin>' of the upstream repo
+#                   tarball - bundle is the upstream release tarball, byte-identical
+#   4 upstream_url  where it came from originally (NOT where we fetch it from now)
+#   5 pin           git commit (kind=git) or upstream version (kind=tarball)
+#   6 bundle        filename under the deps base URL. Carries the pin, so moving
+#                   the pin cannot reuse a URL that a cache may still hold.
+#   7 sha256        sha256 of that bundle file. Maintained by deps-publish.sh.
+#   8 licence       SPDX-ish identifier, and see licence-notes below
+#
+# LICENCE POSITION, in short. Every row below is MIT. The five NetSurf CORE
+# LIBRARIES are MIT (each carries its own COPYING, reproduced in its bundle);
+# this is NOT the GPLv2 NetSurf browser application, which MayteraOS does not
+# use any part of. Duktape is MIT and its bundle is the unmodified upstream
+# distribution, so LICENSE.txt and AUTHORS.rst travel with it. We redistribute
+# COMPLETE AND UNMODIFIED UPSTREAM SOURCE, so there is no source-offer gap to
+# fill: the bundle IS the source. MayteraOS changes to these trees are never
+# made in the bundles; they are committed patches in patches/ applied on top.
+#
+#name	tree	kind	upstream_url	pin	bundle	sha256	licence
+libwapcaplet	netsurf-port	git	https://github.com/netsurf-browser/libwapcaplet.git	c7c128d3eb3223b216c974471f82e9337fbcf4ba	netsurf-libwapcaplet-c7c128d3eb32-src.tar.gz	bfbb30e105a46dfece7f7225b963236a42703d7922f1d81ff363075772a152f8	MIT
+libparserutils	netsurf-port	git	https://github.com/netsurf-browser/libparserutils.git	6b0cbf086ca8eb8fe74b69f0c9ecf274eb2397ca	netsurf-libparserutils-6b0cbf086ca8-src.tar.gz	7de2702fe9c84c08f4896f63bef22cf110a38d50fc5e807c365a85f5f166198e	MIT
+libhubbub	netsurf-port	git	https://github.com/netsurf-browser/libhubbub.git	6651b8cf87a4aa87bcdb2ff024a02659cd3f9402	netsurf-libhubbub-6651b8cf87a4-src.tar.gz	5a7fdd21cc4206e120859dd95e81a1906cf65e72011ceba9bf47483925238298	MIT
+libcss	netsurf-port	git	https://github.com/netsurf-browser/libcss.git	104d87fde48b9e022cd3cdad28aeb4d8cc0a0c5a	netsurf-libcss-104d87fde48b-src.tar.gz	7e844186430de9c893a6a667694f4961e6516f65c1ee6b0a69f35cbc3a6d9423	MIT
+libdom	netsurf-port	git	https://github.com/netsurf-browser/libdom.git	f69781e1f062444b5af3f62d431d7d94018da53b	netsurf-libdom-f69781e1f062-src.tar.gz	5ae360dfdd4f0ec4e6ca7b4c64f6dc997af33dd22f2f7bd6f172be4e46926525	MIT
+duktape	duktape	tarball	https://duktape.org/duktape-2.7.0.tar.xz	2.7.0	duktape-2.7.0.tar.xz	90f8d2fa8b5567c6899830ddef2c03f3c27960b11aca222fa17aa7ac613c2890	MIT

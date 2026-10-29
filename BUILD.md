@@ -44,6 +44,13 @@ Verified against the toolchain actually used to build this tree:
   -C panic=abort` are required (verified in `kernel/Makefile`'s `RUSTFLAGS`).
 - **python3** for the link-time gates described in section 3 (they live under
   `kernel/tools/*/` and are invoked by the Makefile with `python3`).
+- **perl, gperf, a host `cc` and `curl`**, only if you are building the WEB
+  BROWSER. The browser's third-party engine libraries generate several of their
+  own source files at build time (charset alias tables, the HTML entity table, an
+  element-type perfect hash, and the per-property CSS parsers), and `gperf` in
+  particular is easy to be missing. `userland/apps/browser/port/fetch-upstream.sh
+  --check-tools` reports exactly which of these are absent, by binary and by
+  package name, before anything is downloaded or compiled. See section 4a.
 - Standard Linux disk/filesystem tools for assembling and verifying the golden
   image: `losetup`, `sgdisk`, `mkfs.vfat` (or equivalent FAT tooling), `mke2fs`,
   `debugfs`, `e2fsck`, `fsck.fat`, `blkid`, `blockdev`, `mount`. These are only
@@ -284,6 +291,73 @@ explicit, named exception rather than a silent one: see the `KNOWN_FAIL` list ne
 the top of `build/build-golden.sh`'s userland stage. Any *other* app failing to
 build is treated as fatal by that script, precisely so a new breakage cannot slip
 in silently under cover of the existing known ones.
+
+## 4a. Building the web browser: its two dependencies are not in this repository
+
+The browser is the one app whose third-party source is **not** in this
+repository. It links five NetSurf core libraries (libwapcaplet, libparserutils,
+libhubbub, libcss, libdom) and the Duktape JavaScript engine. Only MayteraOS's
+own glue is tracked here, under `userland/apps/browser/port/`.
+
+Until 2026-10-20 that meant the browser could be built on exactly one machine in
+the world and nowhere else: the source sat in a directory outside version
+control, and a `git ls-files` of this repository matched neither `duktape.c` nor
+`duk_config.h`. It is now fetched from the MayteraOS update server.
+
+### Fetch and build it
+
+```
+userland/apps/browser/port/fetch-upstream.sh --check-tools     # what is missing
+userland/apps/browser/port/fetch-upstream.sh <workspace>     # stage the source
+MAYTERA_NS_ROOT=<workspace> \
+  <workspace>                      # compile the 5 libs
+cd userland/apps/browser && make                               # build the browser
+```
+
+`build/build-golden.sh` does all of this automatically when the trees are absent,
+so a golden build on a fresh host needs no manual step. Point it elsewhere with
+`BROWSER_DEPS_ROOT=<dir>`; the app Makefile and the library build take
+`MAYTERA_NS_ROOT` / `MAYTERA_DUK_ROOT`.
+
+### Everything is pinned by content hash, and a mismatch is fatal
+
+`userland/apps/browser/port/upstream-pins.tsv` records, for each of the six
+components, the upstream URL, the pinned commit or release, the bundle filename
+and its **sha256**. `fetch-upstream.sh` verifies the hash after download and
+**before** extraction and aborts on a mismatch. It never warns and carries on: a
+fetch that can silently return different bytes would be worse than the hard
+refusal this replaced, which at least failed loudly. Downloads are cached under
+`<workspace>` (override with `MAYTERA_DEPS_CACHE`) and re-hashed on
+every use, including a cache hit, so the cache cannot poison a build.
+
+`build/browser-deps-gate.sh` checks that the table stays well formed. Its most
+useful rule is that a bundle's filename must contain its own pin, so moving a pin
+cannot reuse a URL that some host's cache still holds. Run
+`build/browser-deps-gate.sh --self-test` to see it go red on each fault it
+catches; it also runs as a pre-land gate.
+
+### Mirror, provenance and licence
+
+The bundles are served from the update server (`http://192.0.2.1/deps/browser`
+on the LAN, `https://updates.maytera.net/deps/browser` externally; the LAN URL
+first, so a build host with no internet works). Plain HTTP is adequate because
+the sha256 pin, not the transport, is what establishes integrity.
+
+The upstream URLs stay in the pin table and are not merely historical:
+`userland/apps/browser/port/deps-publish.sh` rebuilds every bundle from the real
+upstreams (needs internet) and its `verify-live` mode re-derives each tree from
+upstream at the pin, applies the committed patches from
+`userland/apps/browser/port/patches/`, and diffs the result against a local tree.
+That is how the claim "what we ship is pristine upstream plus three committed
+patches" is checked rather than asserted.
+
+All six components are MIT. The NetSurf bundles carry each library's `COPYING`,
+and the fetch FAILS if an extracted tree has none. The Duktape bundle is the
+upstream release tarball byte for byte, so `LICENSE.txt`, `AUTHORS.rst` and
+`licenses/` travel with it. The NetSurf bundles are **source only**: the upstream
+`test/`, `examples/` and `perf/` trees are deliberately not redistributed because
+they contain third-party fixtures under terms the libraries' own MIT licence does
+not cover. The full reasoning, file by file, is in `ATTRIBUTION.md`.
 
 ## 5. Producing the two-partition golden image
 

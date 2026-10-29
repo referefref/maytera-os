@@ -139,6 +139,18 @@ static const aicap_ent_t g_caps[] = {
     // app.launch dispatches only from a fixed curated allowlist table (not an
     // arbitrary path), so it is treated as a low-risk launch.
     { "app.launch",          "process.launch",        AICAP_RISK_LOW  },
+    // #<config-ref>: READING an app's contract is enumeration, not effect.
+    // ct_describe() emits names, types, access flags, risk classes, ranges and
+    // descriptions and NO VALUES. Reading a value is the "get" verb, which the
+    // target app gates separately through its own contract_authorize(). Named
+    // here rather than left to the unknown-tool default (HIGH, fail closed) for
+    // two reasons. Correctness: a consent dialog on the DISCOVERY step teaches a
+    // model to skip discovery and guess, which is the behaviour this tool exists
+    // to end. Honesty about the gate: an unnamed tool is given a capability
+    // named after itself, so a refusal would read "app.describe denied" instead
+    // of naming a capability a person could reason about. Still audited, like
+    // every other LOW tool.
+    { "app.describe",        "app.contract.read",     AICAP_RISK_LOW  },
     // ---- HIGH: write / execute / destructive ----
     { "settings.set",        "system.settings.write", AICAP_RISK_HIGH },
     { "fs.write",            "fs.write",              AICAP_RISK_HIGH },

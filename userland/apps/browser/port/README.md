@@ -4,8 +4,8 @@ The MayteraOS browser is not a hand-written renderer. It links:
 
 | Component | Origin | In this repo? |
 |---|---|---|
-| libwapcaplet, libparserutils, libhubbub, libcss, libdom | NetSurf, pristine upstream | No, fetched at pinned commits |
-| duktape.c / duktape.h / duk_config.h | Duktape 2.7.0, pristine upstream | No, fetched by release |
+| libwapcaplet, libparserutils, libhubbub, libcss, libdom | NetSurf core libs, pristine upstream | No. Fetched from the update server, pinned by sha256 |
+| duktape.c / duktape.h / duk_config.h | Duktape 2.7.0, pristine upstream | No. Fetched from the update server, pinned by sha256 |
 | `dom_hubbub_bind.c`, `css_select_bind.c`, `layout.c` | MayteraOS, original | **Yes** |
 | `duk_dom.c`, `duk_support.c` | MayteraOS, original | **Yes** |
 | `shim-include/`, `shim/` | MayteraOS, original | **Yes** |
@@ -25,12 +25,45 @@ revisions the shipping browser was built against, then copies this glue over
 them. The pins matter: the shim headers and the bindings track these APIs, and
 upstream HEAD may not compile.
 
+## Where the third-party source comes from (changed 2026-10-20)
+
+That paragraph above was true and not sufficient. "Both are re-fetchable" was an
+assumption about six third-party hosts staying up and serving the same bytes
+forever, and in the meantime the trees existed on exactly ONE machine, outside
+version control. A `git ls-files` of this repository matched neither `duktape.c`
+nor `duk_config.h`, so nobody, including us, could build the browser from a clean
+checkout, and the day that machine was rebuilt the browser would have become
+unbuildable with no warning of any kind.
+
+The source is now mirrored on the MayteraOS update server and fetched from there
+by default, which also means a build host with no internet works:
+
+- `upstream-pins.tsv` is the single source of truth: upstream URL, pinned commit
+  or release, bundle filename, **sha256**, licence, for each of the six
+  components. Read by `fetch-upstream.sh`, `deps-publish.sh` and
+  `build/browser-deps-gate.sh`.
+- The hash is verified after download and **before** extraction. A mismatch
+  aborts; it is never a warning. A fetch that can silently change what it
+  returns would be worse than the previous state, which at least failed loudly.
+- `deps-publish.sh build` rebuilds every bundle from the real upstreams and
+  records the hashes. `deps-publish.sh verify-live` re-derives each tree from
+  upstream at the pin, applies the committed `patches/`, and diffs the result
+  against a local tree: that is how "pristine upstream plus three committed
+  patches" is a measurement and not a claim.
+- The NetSurf bundles are SOURCE ONLY (`src/`, `include/`, `build/`, `COPYING`,
+  the makefiles). The upstream `test/`, `examples/` and `perf/` trees are not
+  redistributable: see `ATTRIBUTION.md` for the file-by-file reasoning.
+
 ## Build
 
 ```
-./fetch-upstream.sh [dest]        # default dest: <workspace>
-<workspace>
+./fetch-upstream.sh --check-tools  # report missing host prerequisites first
+./fetch-upstream.sh [dest]         # default dest: <workspace>
+MAYTERA_NS_ROOT=<dest>/netsurf-port <dest>/netsurf-port/build-all.sh
 ```
+
+`build/build-golden.sh` runs both of those automatically when the trees are
+absent, so a golden build on a fresh host needs no manual step.
 
 `build-all.sh` needs host `perl`, `python3`, `gperf` and a host `cc`: NetSurf
 generates several sources (charset aliases, HTML entity tables, an element-type

@@ -553,30 +553,75 @@ static void ct_audit(const ct_contract_t *c, const ct_item_t *it,
 // header at column 0 and one flow map per line. Deliberately the SAME grammar
 // traymenu.c already parses, rather than a fifth config dialect.
 // ---------------------------------------------------------------------------
-static void ct_describe(const ct_contract_t *c) {
+// BRIEF vs FULL, and why BOTH come out of THIS function rather than out of a
+// post-processor in the caller (#<config-ref>).
+//
+// The AI tool layer needs an app's action list BEFORE it calls the app, and a
+// full describe is too big to put in front of a model: MEASURED on golden 2588,
+// the fifteen contracted apps' full describes total 235,096 bytes over 786
+// rows: Maytera Studio alone is 62,994 (197 rows), Files 29,668, Terminal
+// 30,028, Settings 18,441. aiclient.c's observation buffer (OBS_MAX) is 8,192
+// bytes, so not one of the four largest fits in a SINGLE observation, let alone
+// fifteen contracts in a prompt. Method: each app's own `--contract describe`
+// run inside the OS and redirected to a file, then read off the image; not
+// estimated from row counts.
+//
+// What costs those bytes is NOT what a caller needs in order to CHOOSE an
+// action. It is `needs: [...]` (the kernel capability binding), `cap:` (the
+// aicap id), `key:` (the config-file letter) and the whole `ct_terms_fields()`
+// block (timing / success / depth / promise), all of which exist for the GATE
+// and the ESCROW, not for the chooser. Strip those four and a row is name,
+// type, access, risk, its valid values and its description: everything needed
+// to pick a row and nothing else.
+//
+// THE REASON THE FILTER LIVES HERE. aiclient.c could have run a full describe
+// and deleted fields from the text. That is a SECOND description of the
+// contract, maintained apart from the first, which is precisely the defect
+// contract.h's header records four previous instances of. One emitter, two
+// widths: a field that is added to a row appears in `describe` and is absent
+// from `brief` by one decision taken in one place, and the two cannot disagree
+// about what a row IS.
+//
+// `only` is NULL for the whole surface, or one item name for a single row.
+// A single FULL row is how a caller goes from "this action looks right" to
+// "here is its timing, its postcondition and the capability it needs" without
+// paying for the other sixty rows.
+// width: CT_W_FULL / CT_W_BRIEF / CT_W_TERSE (see contract.h).
+static int ct_describe(const ct_contract_t *c, int width, const char *only) {
+    int brief = (width >= CT_W_BRIEF);
+    int matched = 0;
     ct_line("contract: %s\n", c->app);
     ct_line("  title: %s\n", c->title ? c->title : c->app);
     ct_line("  source: %s\n", c->project ? "projected" : "static");
-    if (c->note) ct_line("  note: %s\n", c->note);
+    if (c->note && !brief) ct_line("  note: %s\n", c->note);
     ct_line("items:\n");
     ct_item_t it;
     for (int i = 0; contract_at(c, i, &it); i++) {
+        // PREFIX, not equality. An exact name still selects exactly its own row
+        // (a name is a prefix of itself), and a namespace selects its family:
+        // `brief fx.colors` on Maytera Studio is 27 rows of 197, 4,247 bytes
+        // because the whole point is to fit an answer in a caller's buffer, and
+        // the apps that do not fit are precisely the ones whose items are
+        // namespaced. One comparison, two uses, no second selector syntax.
+        if (only && strncmp(it.name, only, strlen(only)) != 0) continue;
+        matched++;
         char extra[CT_OPTS_MAX + 64]; extra[0] = 0;
         if (it.type == CT_ENUM && it.options)
             snprintf(extra, sizeof(extra), ", options: %s", it.options);
         else if (it.type == CT_INT)
             snprintf(extra, sizeof(extra), ", min: %d, max: %d", it.lo, it.hi);
         char keybuf[24]; keybuf[0] = 0;
-        if (it.cfgkey) snprintf(keybuf, sizeof(keybuf), ", key: %c", it.cfgkey);
+        if (it.cfgkey && !brief) snprintf(keybuf, sizeof(keybuf), ", key: %c", it.cfgkey);
         char capbuf[80]; capbuf[0] = 0;
-        if (it.cap) snprintf(capbuf, sizeof(capbuf), ", cap: %s", it.cap);
+        if (it.cap && !brief) snprintf(capbuf, sizeof(capbuf), ", cap: %s", it.cap);
         // tier 2: the KERNEL capabilities the action reaches, as a flow list.
         // Emitted even when empty ("needs: []") so a consumer can tell a
         // cooperative action (no system capability) from one whose `needs`
         // were simply never declared.
         char needsbuf[192]; int nb = 0;
-        nb = (int)snprintf(needsbuf, sizeof(needsbuf), ", needs: [");
-        if (it.needs) {
+        needsbuf[0] = 0;
+        if (!brief) nb = (int)snprintf(needsbuf, sizeof(needsbuf), ", needs: [");
+        if (it.needs && !brief) {
             for (const ct_cap_need_t *nd = it.needs; nd->cap; nd++) {
                 nb += snprintf(needsbuf + nb, sizeof(needsbuf) - nb, "%s%d:%s",
                                nd == it.needs ? "" : "|",
@@ -584,17 +629,43 @@ static void ct_describe(const ct_contract_t *c) {
                 if (nb > (int)sizeof(needsbuf) - 24) break;
             }
         }
-        snprintf(needsbuf + nb, sizeof(needsbuf) - nb, "]");
+        if (!brief) snprintf(needsbuf + nb, sizeof(needsbuf) - nb, "]");
         // #<config-ref>: the TERMS, on every row. A consumer must be able to read
         // timing/success/depth without knowing whether the row declared them or
         // the engine derived them, so they are always emitted.
         char termsbuf[512];
-        ct_terms_fields(&it, termsbuf, (int)sizeof(termsbuf));
-        ct_line("  - {name: %s, type: %s, access: %s, risk: %s%s%s%s%s%s, desc: %s}\n",
-                it.name, ct_typename(it.type), ct_access_str(it.access),
-                ct_riskname(it.risk), extra, keybuf, capbuf, needsbuf, termsbuf,
-                it.desc ? it.desc : "");
+        termsbuf[0] = 0;
+        if (!brief) ct_terms_fields(&it, termsbuf, (int)sizeof(termsbuf));
+        // TERSE drops the description, which is just over HALF of a BRIEF row
+        // and the only field left that is prose rather than shape. (MEASURED,
+        // because "60 to 70 per cent" stood here first and was a guess: across
+        // the five apps dumped at both widths on golden 2588 it is 77,525 bytes
+        // of brief against 36,775 of terse, so the descriptions are 52.6 per
+        // cent of a brief row.) It exists
+        // because of one measured number: Settings' brief is 9,511 bytes against
+        // an 8,192-byte observation, so the app the assistant is asked about most
+        // missed a single-call answer by 1.3 KB. Terse puts it at about 5 KB.
+        // This is the LAST field that can go; below terse there is only `list`.
+        if (width >= CT_W_TERSE)
+            ct_line("  - {name: %s, type: %s, access: %s, risk: %s%s}\n",
+                    it.name, ct_typename(it.type), ct_access_str(it.access),
+                    ct_riskname(it.risk), extra);
+        else
+            ct_line("  - {name: %s, type: %s, access: %s, risk: %s%s%s%s%s%s, desc: %s}\n",
+                    it.name, ct_typename(it.type), ct_access_str(it.access),
+                    ct_riskname(it.risk), extra, keybuf, capbuf, needsbuf, termsbuf,
+                    it.desc ? it.desc : "");
     }
+    if (only && !matched) {
+        // An unknown name must FAIL, not return an empty but well-formed
+        // "items:" block. An empty list reads as "this app has no such thing
+        // and that is fine"; the caller asked about ONE row and there isn't
+        // one, which is the same answer get/set/call already give.
+        ct_line("err code=%s name=%s detail=no-item-with-this-name-or-prefix\n",
+                ct_codename(CT_ERR_UNKNOWN), only);
+        return CT_ERR_UNKNOWN;
+    }
+    return CT_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -857,7 +928,19 @@ int contract_run_verb(const ct_contract_t *c, const char *verb,
         for (int i = 0; contract_at(c, i, &it); i++) ct_line("%s\n", it.name);
         return CT_OK;
     }
-    if (!strcmp(verb, "describe")) { ct_describe(c); return CT_OK; }
+    // describe          the WHOLE surface, every field (unchanged, and flowrun's
+    //                    flow_app_risk() parses exactly this).
+    // describe <prefix> the matching rows, every field. A full name matches one.
+    // brief [<prefix>]  the same selection without the gate/escrow fields.
+    // terse [<prefix>]  brief without the descriptions: shape only.
+    // All three are ONE emitter at three widths, so a field added to a row
+    // appears or is suppressed by one decision in one place.
+    if (!strcmp(verb, "describe"))
+        return ct_describe(c, CT_W_FULL,  nargs >= 1 ? args[0] : 0);
+    if (!strcmp(verb, "brief"))
+        return ct_describe(c, CT_W_BRIEF, nargs >= 1 ? args[0] : 0);
+    if (!strcmp(verb, "terse"))
+        return ct_describe(c, CT_W_TERSE, nargs >= 1 ? args[0] : 0);
     if (!strcmp(verb, "get")) {
         if (nargs < 1) { ct_line("err code=usage detail=get-needs-a-name\n"); return CT_ERR_USAGE; }
         return ct_do_get(c, args[0]);

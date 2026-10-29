@@ -61,7 +61,11 @@ static void usage(void) {
     printf("usage:\n");
     printf("  ctl apps                      list apps that declare a contract\n");
     printf("  ctl list     <app>            list the app's contract item names\n");
-    printf("  ctl describe <app>            the app's full declaration\n");
+    printf("  ctl describe <app> [name]     the app's full declaration, or one row\n");
+    printf("  ctl brief    <app> [name]     the same WITHOUT the gate/escrow fields\n");
+    printf("  ctl terse    <app> [name]     brief without the descriptions\n");
+    printf("                                (what a chooser needs; this is what the\n");
+    printf("                                 AI's app.describe tool reads)\n");
     printf("  ctl get      <app> <name>     read one item\n");
     printf("  ctl set      <app> <name> <v> write one item\n");
     printf("  ctl call     <app> <name> ... invoke one action\n");
@@ -238,9 +242,19 @@ int main(int argc, char **argv) {
         printf("%s\n", p);
         return CT_OK;
     }
-    if (!strcmp(verb, "list") || !strcmp(verb, "describe") || !strcmp(verb, "probe")) {
+    if (!strcmp(verb, "list") || !strcmp(verb, "probe")) {
         char *rest[1]; rest[0] = (char *)verb;
         return run_contract(app, 1, rest);
+    }
+    // describe/brief take an OPTIONAL item name, so the extra argv is passed
+    // through rather than dropped. Dropping it silently would answer a
+    // different question from the one asked, which on a debug client is the
+    // worst kind of wrong.
+    if (!strcmp(verb, "describe") || !strcmp(verb, "brief") || !strcmp(verb, "terse")) {
+        char *rest[2]; int rc = 0;
+        rest[rc++] = (char *)verb;
+        if (argc > 3) rest[rc++] = argv[3];
+        return run_contract(app, rc, rest);
     }
     if (!strcmp(verb, "get") || !strcmp(verb, "set") || !strcmp(verb, "call")) {
         char *rest[24];

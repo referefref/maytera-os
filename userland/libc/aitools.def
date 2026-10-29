@@ -119,8 +119,13 @@ AI_TOOL("app.launch",
   AI_ARG("rom", AI_T_STR, 0)
   AI_ARG("arg", AI_T_STR, 0)
 
+AI_TOOL("app.describe",
+        "READ an app's own capability contract BEFORE calling it: the actions, settings and live state it offers, each with type, read/write access, risk and valid values. Call this first whenever you intend app.action on an app and do not already know the exact item name. args {app:string, name:string (one item name, OR a dotted prefix such as fx.colors, to get those rows in full detail with timing, capability and promise)}. A very large app answers with NAMES ONLY and tells you to come back with a prefix. Read-only, cap app.contract.read, low risk, no consent prompt.")
+  AI_ARG("app", AI_T_STR, 1)
+  AI_ARG("name", AI_T_STR, 0)
+
 AI_TOOL("app.action",
-        "Run a NAMED contract action against an ALREADY RUNNING app, on its live document. Prefer this over synthetic input when the app has the action you need. args {app:string, name:string, args:string, verb:'get'|'set', value:string}. Gated by the app, low risk.")
+        "Run a NAMED contract action against an ALREADY RUNNING app, on its live document. Prefer this over synthetic input when the app has the action you need. Get the item NAME from app.describe; do not guess it. args {app:string, name:string, args:string, verb:'get'|'set', value:string}. Gated by the app, low risk.")
   AI_ARG("app", AI_T_STR, 1)
   AI_ARG("name", AI_T_STR, 1)
   AI_ARG("args", AI_T_STR, 0)

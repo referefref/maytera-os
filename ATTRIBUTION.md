@@ -480,8 +480,8 @@ mechanically; see "How this table is kept honest" below.
 | TinyGL | `userland/libgl` | zlib-style, **mandatory in-product acknowledgment** (see note below) | `src/LICENSE` |
 | CPython 3.11.9 (the shipping Python interpreter, `/APPS/PYTHON.ELF`) | `userland/apps/python/port` holds MayteraOS port glue only (MIT); CPython 3.11.9 itself is fetched at build time, not vendored in this repo | Python Software Foundation License (PSF), upstream python.org | upstream (python.org); the port-glue files carry MIT SPDX headers |
 | MicroPython MayteraOS port glue (legacy tree, not the shipping interpreter) | `userland/python/micropython/ports/maytera` | MIT (port glue only; upstream MicroPython is MIT) | per-file SPDX headers |
-| Duktape (JS engine core) | `userland/apps/browser/port/duktape` holds MayteraOS glue only; the engine is fetched, not tracked (see note below) | MIT (upstream) | not tracked |
-| NetSurf core libs (libwapcaplet, libparserutils, libhubbub, libcss, libdom) | `userland/apps/browser/port/netsurf` holds MayteraOS glue only; the libraries are fetched at pinned revisions, not tracked (see note below) | MIT (upstream NetSurf core libs) | not tracked |
+| Duktape (JS engine core) | `userland/apps/browser/port/duktape` holds MayteraOS glue only; the engine is the unmodified upstream 2.7.0 distribution, fetched from the MayteraOS update server by sha256 pin (`userland/apps/browser/port/upstream-pins.tsv`) | MIT (upstream) | not tracked in git; redistributed as complete upstream source from `updates.maytera.net/deps/browser` |
+| NetSurf core libs (libwapcaplet, libparserutils, libhubbub, libcss, libdom) | `userland/apps/browser/port/netsurf` holds MayteraOS glue only; the library source is fetched at pinned commits by sha256 pin (`userland/apps/browser/port/upstream-pins.tsv`) | MIT (upstream NetSurf CORE libs; NOT the GPLv2 NetSurf browser application, no part of which is used) | not tracked in git; redistributed as upstream source from `updates.maytera.net/deps/browser` |
 | DOOM (id Software) | `userland/apps/doom` | id Software DOOM Source Code License (NOT the GPL) | per-file headers only; **no licence document is in the tree, see the DOOM note below** |
 | Rogue 5.4.4 (Michael Toy, Ken Arnold, Glenn Wichman) | `userland/apps/rogue` | BSD 3-clause | `LICENSE.TXT` |
 | GNU grep (installs as `/APPS/GREP`, the only grep on the image since #745 local 98) | `userland/apps/grep-gnu/src` | GPLv3-or-later | none tracked |
@@ -541,19 +541,71 @@ fixed by this task: the natural home for it is a Settings "About" panel, and
 Flagged here as an open compliance item for a follow-up ticket, not silently
 closed.
 
-**Duktape's core engine (`duktape.c`/`duk_config.h`) is not tracked in this
-git repository at all.** `duktape/build.sh` reads it from a host-local path
-(`<workspace>`) at build time; only the MayteraOS-authored glue
-(`userland/apps/browser/port/duktape/duk_dom.c`, `duk_support.c`) is tracked
-in-tree. Duktape itself is MIT-licensed upstream
-(https://duktape.org, Sami Vaarala and contributors) and MIT permits
-binary-only redistribution without republishing source, so this is a
-**source-completeness gap, not by itself a license violation**, as long as
-this attribution entry (which does ship in the public repo) travels with any
-distributed binary that links the compiled engine. Found 2026-08-12 (#745,
-local queue item 57) while building the per-component license table; not fixed here,
-since moving ~750KB of vendored upstream source into git is a build-topology
-change outside this task's docs/license scope.
+**The browser's two out-of-repo dependencies are now REDISTRIBUTED BY US, and
+that changed the licence question from a notice question into a distribution
+one (2026-10-20).**
+
+Neither the Duktape engine (`duktape.c`, `duktape.h`, `duk_config.h`) nor the
+five NetSurf core libraries is tracked in this git repository. Until 2026-10-20
+they existed on exactly one machine, outside version control, which meant the
+browser could not be built from a clean checkout by anyone, including us. The
+source is now mirrored on the MayteraOS update server, pinned by content hash in
+`userland/apps/browser/port/upstream-pins.tsv`, and fetched by
+`userland/apps/browser/port/fetch-upstream.sh`. The previous entry here called
+that a "source-completeness gap, not by itself a license violation" on the
+grounds that MIT permits binary-only redistribution. That reasoning was correct
+and is now moot: we ship the corresponding source ourselves.
+
+**What we redistribute, and why it is clean.** All six components are MIT. The
+NetSurf libraries are the NetSurf project's CORE LIBRARIES, which are MIT; they
+are not the NetSurf browser application, which is GPLv2 and no part of which
+MayteraOS uses. Each bundle carries its own `COPYING`, and `fetch-upstream.sh`
+FAILS if an extracted tree has none. The Duktape bundle is the upstream release
+tarball byte for byte, so `LICENSE.txt`, `AUTHORS.rst` and the upstream
+`licenses/` directory travel with it; the staging step places all three next to
+the code, which closes a real gap found by the same audit, namely that the
+engine had been compiled for months from a tree holding NEITHER `LICENSE.txt`
+nor `AUTHORS.rst`, while `duktape.c`'s own header told the reader to see them.
+
+**What we deliberately do NOT redistribute, measured 2026-10-20.** The NetSurf
+bundles are source only: `src/`, `include/`, `build/` (the code generators),
+`COPYING`, the makefiles and the pkg-config template. The upstream `test/`,
+`examples/` and `perf/` trees are excluded because they are not ours to pass on,
+and this was a file-by-file finding rather than an assumption:
+
+- `libcss/test/data/css/allzengarden.css` carries 139 blocks under Creative
+  Commons Attribution-**NonCommercial**-ShareAlike 1.0 across roughly 211
+  individual designers, plus an express "You may not reproduce it elsewhere
+  without the designer's written permission". A NonCommercial term cannot be
+  cured by adding a notice file.
+- `libhubbub/test/data/html/` holds nine real third-party web pages saved as
+  crash regression fixtures (Coriell Institute, Direct Line, UBC and six more),
+  under their owners' all-rights-reserved notices with no grant of any kind.
+- `libdom/test/testcases/` is 13 MB of the W3C DOM Test Suite under the W3C
+  Software Licence, including 38 Oracle and 34 X-Hive files, and the five
+  `libdom/test/dom*-interface*.xml` files are under the stricter W3C **Document**
+  Licence, which does not permit derivatives. No W3C licence text exists anywhere
+  in those trees.
+- The `.dat`/`.test` corpora in `libhubbub/test/data/{tree-construction,
+  tokeniser2,csdetect}` are html5lib tests, attributed only in prose in `INDEX`
+  files with no licence text present.
+
+MayteraOS compiles, links and ships none of that. Excluding the test trees
+removes every non-MIT item in one step and takes the redistributed payload from
+52 MB to 536 KB, which is a better outcome than shipping four more licence texts
+for fixtures we never use. Anyone who wants the test suites should clone the
+upstream repositories at the pinned commits, where they are covered by the
+upstream projects' own distribution.
+
+Duktape also embeds several third-party ALGORITHMS credited by URL rather than
+by name: MurmurHash2 (Austin Appleby, public domain), xoroshiro128+ and
+SplitMix64 (Blackman and Vigna, CC0), a Lua-derived string hash, and a V8-derived
+equivalent-year table that Duktape generated with its own script from a published
+algorithm. A full-text search of all 3.68 MB of `duktape.c` finds exactly two
+`Copyright` lines and both are Duktape's own, and zero public-domain
+dedications, so there is no bundled third-party component with an attribution
+obligation. The upstream `licenses/` directory records each of them anyway and
+now ships alongside the code.
 
 **The `VI` binary no longer has to be offered as GPLv3 (#745 local 97), and
 `GREP` still carries LGPLv3 for a DIFFERENT reason. Both halves stated, because

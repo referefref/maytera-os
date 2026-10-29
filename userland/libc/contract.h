@@ -133,6 +133,27 @@ enum {
     CT_LIVE_TIMEOUT = 8   // a live instance exists but did not answer in time
 };
 
+// ---- describe widths --------------------------------------------------
+//
+// ONE emitter, three widths, chosen by the CALLER'S BUDGET rather than by the
+// app. A caller asks for the widest it can carry and steps down when the reply
+// does not fit; contract_invoke() FAILS a reply that did not fit rather than
+// returning a prefix, so "does not fit" is a fact the caller is told, not one it
+// has to guess at from a length.
+//
+// FULL   everything: the gate fields (cap, key, needs) and the escrow terms
+//        (timing, budget, tflags, success, success_ref, depth, failures).
+//        What flowrun's risk gate and the escrow layer read.
+// BRIEF  what a CHOOSER needs: name, type, access, risk, valid values, desc.
+// TERSE  BRIEF without the descriptions: shape only, for an app whose surface
+//        is too large to describe in one reply at any wider setting.
+//
+// MEASURED on golden 2588, fifteen contracted apps: FULL 235,096 bytes over 786
+// rows, BRIEF 114,008, and the AI observation buffer is 8,192.
+#define CT_W_FULL   0
+#define CT_W_BRIEF  1
+#define CT_W_TERSE  2
+
 #define CT_NAME_MAX  64
 #define CT_DESC_MAX  128
 #define CT_OPTS_MAX  192

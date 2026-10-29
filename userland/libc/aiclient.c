@@ -1119,6 +1119,17 @@ static void load_tools(void) {
     "function call. Use at most %d tools per question. If no tool is needed, " \
     "answer the user in plain language and call nothing.\n"
 
+// The apps that declare a contract on THIS machine, for the system prompt.
+// Derived at runtime from the generated index via contract_declared_list(), NOT
+// a list written here: a hardcoded one would be a sixteenth description of the
+// app set and would be wrong the first time an app gained or lost a contract.
+static const char *ct_applist(void) {
+    static char buf[320];
+    if (!buf[0] && contract_declared_list(buf, (int)sizeof(buf)) <= 0)
+        strlcpy(buf, "(none declared on this image)", sizeof(buf));
+    return buf;
+}
+
 static const char *system_prompt(void) {
     static char sp[AITOOLS_PROSE_MAX + APPGEN_MAX + APPLIST_MAX + 8192];
     char proto[1024];
@@ -1267,7 +1278,14 @@ static const char *system_prompt(void) {
         "the target window or file, and you stop on CAPABILITY_DENIED as above.\n"
         "When an app COOPERATES (declares a contract) you can drive it by a NAMED "
         "action on its LIVE document instead of guessing pixels, which is more "
-        "reliable. app.action {\"app\":\"paint\",\"name\":\"invert\"} runs a "
+        "reliable. FIRST READ THE APP'S CONTRACT: app.describe {\"app\":\"paint\"} "
+        "returns that app's own list of actions, settings and readable state, each "
+        "with its type, read/write access, risk and valid values; add "
+        "{\"name\":\"<item>\"} for one item's full detail. It is read-only, not "
+        "consent-gated, and it is the app itself answering, so it is never out of "
+        "date. Do not guess an item name: call app.describe, then use the name it "
+        "gives you. The apps that declare a contract on THIS machine are: %s. "
+        "app.action {\"app\":\"paint\",\"name\":\"invert\"} runs a "
         "contract action against the running app (add \"args\":\"...\" for a call "
         "with arguments, or \"verb\":\"get\"/\"set\" with \"name\" and \"value\" to "
         "read or write live state). These actions are permission-gated by the app "
@@ -1294,6 +1312,24 @@ static const char *system_prompt(void) {
         "Installed apps you can launch with app.launch (id: name):\n%s"
         "%s",
         proto,
+        // ORDER MATTERS AND IT WAS WRONG ONCE. These arguments are consumed in
+        // the order the %s appear in the format string above, and the CONTRACTED
+        // apps line ("The apps that declare a contract on THIS machine are")
+        // sits ABOVE the INSTALLED apps line ("Installed apps you can launch
+        // with app.launch"). Added at the end of the argument list, as felt
+        // natural, this printed the installed-app manifest where the contracted
+        // list belonged and vice versa - and NOTHING WOULD HAVE CAUGHT IT: both
+        // are plausible lists of app ids, the compiler cannot tell two char*
+        // apart, and the proof run passed because the model answered through
+        // app.describe, which does not read either line. Caught by reading the
+        // format string's %s in order against the argument list, after the
+        // behaviour had already been demonstrated working.
+        //
+        // #<config-ref>: the CONTRACTED apps, read from /AITOOLS/CONTRACTS.YML by
+        // the SAME contract_declared_list() the app.action/app.describe refusals
+        // use, so what the prompt advertises and what the gate accepts are one
+        // list. Naming them costs ~130 bytes and removes the model's first guess.
+        ct_applist(),
         g_have_applist ? g_applist : "  (app manifest unavailable)\n",
         // #469m: from aitools.def, NOT from /AITOOLS/INDEX.yaml. The shipped
         // index advertised 18 of the 29 tools dispatch_tool() runs, so the
@@ -2879,6 +2915,24 @@ static void exec_app_action(const char *args, char *obs, int ocap) {
 
     int denied = (strstr(reply, "capability-denied") != 0);
     int err = (strncmp(reply, "err", 3) == 0);
+
+    // A GUESSED NAME MUST COME BACK WITH THE REAL ONES, not just "no".
+    //
+    // The same move the settings.get path already makes ("if a key is unknown
+    // the OBSERVATION lists every key that exists"), applied to the generic
+    // app wire. Without it the model's only recovery from a wrong item name is
+    // another guess, and on this tool a wrong guess can spawn a process. The
+    // list comes from the app's own `list` verb, so it cannot disagree with the
+    // thing that just refused, and it is fetched ONLY on this failure path, so
+    // the happy path pays nothing.
+    static char names[1024];
+    names[0] = 0;
+    if (err && strstr(reply, "code=unknown-item")) {
+        char *lv[1] = { (char *)"list" };
+        if (contract_invoke(app, 1, lv, names, (int)sizeof(names)) != CT_OK)
+            names[0] = 0;
+        for (int i = 0; names[i]; i++) if (names[i] == '\n') names[i] = ' ';
+    }
     int o = 0;
     o = str_append(obs, o, ocap, "{\"app\":\"");
     o = obs_escape(obs, o, ocap, app);
@@ -2890,6 +2944,223 @@ static void exec_app_action(const char *args, char *obs, int ocap) {
     else if (err)
         o = str_append(obs, o, ocap, "\"error\":\"CONTRACT_ERROR\",");
     o = str_append(obs, o, ocap, "\"reply\":\"");
+    o = obs_escape(obs, o, ocap, reply);
+    if (names[0]) {
+        o = str_append(obs, o, ocap, "\",\"items_this_app_has\":\"");
+        o = obs_escape(obs, o, ocap, names);
+        o = str_append(obs, o, ocap,
+            "\",\"next\":\"pick one of those names, or call app.describe for their types and risks\"");
+        str_append(obs, o, ocap, "}");
+        return;
+    }
+    str_append(obs, o, ocap, "\"}");
+}
+
+// --- app.describe: THE APP'S OWN CAPABILITY CONTRACT, ON DEMAND (#<config-ref>).
+//
+// THE GAP THIS CLOSES, measured on golden 2588 rather than argued. The model
+// was told app.action exists and told, in one line, that it takes {"app","name"}.
+// It was never told what NAMES any app offers. /AITOOLS/INDEX.YAML carries id +
+// summary for the 29 OS tools and nothing per-app; /AITOOLS/CONTRACTS.YML is a
+// thin app -> binary index with no items in it at all. The detail - every
+// action, setting and readable state, with type, access, risk and valid values -
+// is compiled into each app and emitted only when something ASKS, and before
+// this nothing in the AI path ever asked. So a model that wanted to drive an app
+// had to guess the item name, and a wrong guess is not free: #469m records
+// app.action {"app":"sprite"} launching /APPS/SPRITE and hanging the ReAct loop.
+//
+// WHY A TOOL THE MODEL CALLS, AND NOT CONTEXT WE INJECT. Three options were on
+// the table and the choice is a token-cost one, so it was priced, not asserted:
+//
+//   (c) inject every contract up front. MEASURED on golden 2588 by running each
+//       app's own `--contract describe` inside the OS and reading the files back
+//       off the image: the fifteen contracted apps total 235,096 bytes over 786
+//       rows, Maytera Studio alone 62,994 and Settings 18,441. OBS_MAX here is
+//       8192 and the whole system prompt is a single sp[] buffer. It does not
+//       fit by a factor of nearly thirty, and even if it did, a user asking
+//       about the weather would pay for Slides, Sheets and Snapshot.
+//   (b) fetch-on-first-use, injected the first time an app is targeted. Cheaper,
+//       but it still spends tokens the model did not ask for, it cannot know
+//       WHICH of the fifteen a turn needs until the turn has gone wrong once,
+//       and it puts a second copy of "what an app can do" in the conversation
+//       where the first one can go stale.
+//   (a) THIS: an on-demand read, costing one line of prompt when unused and one
+//       observation when used, answered BY THE APP so it cannot drift.
+//
+// Cheap because of `brief` (contract.c): the gate/escrow fields that make a full
+// describe large are exactly the ones a chooser does not need.
+//
+// NOT CONSENT-GATED, and that is a deliberate classification, not an oversight
+// (aicap.c, cap app.contract.read, LOW). ct_describe() emits names, types,
+// access flags, risk classes, valid ranges and descriptions. It emits NO VALUES:
+// reading one is the `get` verb, which the app gates separately through its own
+// contract_authorize(). Enumerating a surface is not touching it, and a
+// discovery step that pops a consent dialog is a discovery step a model learns
+// to skip.
+// Ask the app one contract verb: the RUNNING instance if one is listening, a
+// stateless spawn otherwise. Factored out because the width step-down below asks
+// up to three times and all three must take the same route; the first version
+// asked live-first only for the first attempt, so a truncated LIVE brief fell
+// back to a SPAWNED terse and the two answers came from different instances of
+// the app. Same question, same place to ask it.
+static int ctd_ask(const char *app, int ac, char **av,
+                   char *buf, int cap, const char **delivery) {
+    int rc = contract_invoke_live(app, ac, av, buf, cap);
+    *delivery = "live";
+    if (rc == CT_LIVE_NONE || rc == CT_LIVE_TIMEOUT) {
+        *delivery = "spawn";
+        rc = contract_invoke(app, ac, av, buf, cap);
+    }
+    return rc;
+}
+
+static void exec_app_describe(const char *args, char *obs, int ocap) {
+    char app[40], name[80];
+    if (!json_get_str(args, "app", app, sizeof(app)) || !app[0]) {
+        strlcpy(obs, "{\"error\":\"missing 'app'\"}", ocap); return;
+    }
+    if (!json_get_str(args, "name", name, sizeof(name))) name[0] = 0;
+
+    // Same guard as app.action, same reason: the app id came from the model, and
+    // contract_invoke()'s /APPS/<UPPERCASE> fallback would spawn a GUI app that
+    // ignores --contract and never exits, on an UNBOUNDED sys_waitpid().
+    if (!contract_declared(app)) {
+        char known[256];
+        contract_declared_list(known, sizeof(known));
+        int o = 0;
+        o = str_append(obs, o, ocap, "{\"error\":\"no-such-app\",\"app\":\"");
+        o = obs_escape(obs, o, ocap, app);
+        o = str_append(obs, o, ocap,
+                       "\",\"detail\":\"that app declares no contract\",\"apps_with_actions\":\"");
+        o = obs_escape(obs, o, ocap, known);
+        str_append(obs, o, ocap, "\"}");
+        return;
+    }
+
+    // brief for the whole surface, FULL for a named row or namespace: a caller
+    // that has chosen a row wants its timing, its promise and the capability it
+    // needs, and one row of that is small.
+    char *av[2]; int ac = 0;
+    av[ac++] = name[0] ? (char *)"describe" : (char *)"brief";
+    if (name[0]) av[ac++] = name;
+
+    // SIZED TO THE OBSERVATION, NOT TO THE LARGEST CONTRACT, and the overflow is
+    // handled rather than enlarged away.
+    //
+    // OBS_MAX is 8192, so a reply buffer bigger than that would only produce
+    // answers the observation cannot carry. The largest app, Maytera Studio, has
+    // 197 rows and will not fit here whatever this number is. So the size IS the
+    // test: contract_invoke() FAILS a reply that did not fit rather than handing
+    // back a prefix (ctinvoke.c's own truncation guard), and that documented
+    // failure is what selects the narrower answer below. No second length
+    // calculation, and no 64 KB static in libc, which every app linking aiclient
+    // would carry in .bss for the sake of one tool.
+    // 7680, NOT 8192, and not a round 7168 either. OBS_MAX is 8192 and the reply
+    // is wrapped in JSON and escaped on the way out (each newline becomes two
+    // characters), so a reply that exactly filled the observation would be cut
+    // by the wrapper rather than by the fit test below, and cut SILENTLY.
+    //
+    // The margin is sized from the measurement, not guessed. The worst case that
+    // still fits is Files at TERSE: 7,172 bytes over 106 rows, so 110 newlines
+    // escape to 7,282, and the JSON wrapper with its longest note is about 300,
+    // giving 7,582 against 8,192. A 7,168 buffer, which is what a round number
+    // would have produced, would have missed Files by FOUR BYTES and sent the
+    // model a names-only answer for a 106-row app that fits comfortably.
+    static char reply[7680];
+    reply[0] = 0;
+
+    // LIVE instance first, then a stateless spawn, exactly as app.action does.
+    // A projected contract is built from the app's own live tables, so asking
+    // the RUNNING instance is what makes the answer describe the app the next
+    // app.action will actually reach.
+    const char *delivery = "live";
+    int rc = ctd_ask(app, ac, av, reply, (int)sizeof(reply), &delivery);
+    // TOO BIG TO SEND: STEP DOWN A WIDTH, do not fail and do not truncate.
+    //
+    // A model told "the answer did not fit" has learned nothing and will give up
+    // or guess, which is the state before this tool existed. So the budget is
+    // satisfied by asking the app a NARROWER question, three times if need be,
+    // and the observation says which width it got so the model knows what it is
+    // missing rather than believing it has the whole thing.
+    //
+    // MEASURED on golden 2588, and this is why there are three steps and not
+    // one. At BRIEF, eleven of the fifteen contracted apps fit; Settings (9,511),
+    // Files (14,629) and Terminal (16,328) miss, and Maytera Studio (30,197)
+    // misses by a factor of four. At TERSE, Settings is 4,936, Terminal 6,547
+    // and Files 7,172, so all three come back inside the budget in a SINGLE
+    // call - which matters most for Settings, the app an assistant is asked
+    // about more than any other. Maytera Studio is 14,647 even at terse and
+    // ends at names-only, which is the honest answer for a 197-row surface; the
+    // note tells the model to come back with a dotted prefix, a request the
+    // describe/brief/terse verbs now accept (contract.c), so it is an
+    // instruction the model can actually act on.
+    //
+    // A NAMED request STEPS DOWN TOO, and the first version of this did not.
+    // It carried the claim that "the caller asked about one row or one
+    // namespace, and that selection is small by construction" - which is true
+    // of a full name and FALSE of a short prefix, and was written without being
+    // measured. `app.describe {"app":"paint","name":"fx"}` selects most of
+    // Maytera Studio's 197 rows, so at FULL width it is tens of kilobytes and
+    // came back as a bare truncation error with no suggestion of what to do
+    // next. It steps FULL -> BRIEF -> TERSE, always keeping the name, because
+    // the caller asked about THAT selection; it never falls through to `list`,
+    // which ignores the prefix and would answer a different question.
+    const char *detail = name[0] ? "full" : "brief";
+    const char *steps[2] = { "brief", "terse" };
+    const char *labels[2] = { "brief", "terse-no-descriptions" };
+    for (int k = 0; k < 2; k++) {
+        if (rc == CT_OK || !strstr(reply, "reply-truncated")) break;
+        if (!name[0] && k == 0) continue;        // the unnamed path starts AT brief
+        char *sv[2]; int sc = 0;
+        sv[sc++] = (char *)steps[k];
+        if (name[0]) sv[sc++] = name;
+        reply[0] = 0;
+        rc = ctd_ask(app, sc, sv, reply, (int)sizeof(reply), &delivery);
+        detail = labels[k];
+    }
+    // Only an UNNAMED request may end at names-only: `list` has no prefix, so
+    // using it for a named request would silently widen what was asked.
+    if (!name[0] && rc != CT_OK && strstr(reply, "reply-truncated")) {
+        char *lv[1] = { (char *)"list" };
+        reply[0] = 0;
+        rc = ctd_ask(app, 1, lv, reply, (int)sizeof(reply), &delivery);
+        detail = "names-only";
+        for (int i = 0; reply[i]; i++) if (reply[i] == '\n') reply[i] = ' ';
+    }
+    // A NAMED selection that does not fit even at terse: say what to do, rather
+    // than hand back a truncation error the model can only guess its way out of.
+    int prefix_too_broad = (name[0] && rc != CT_OK && strstr(reply, "reply-truncated"));
+
+    int rl = (int)strlen(reply);
+    while (rl > 0 && (reply[rl - 1] == '\n' || reply[rl - 1] == '\r')) reply[--rl] = 0;
+
+    int err = (strncmp(reply, "err", 3) == 0) || rc != CT_OK;
+    int o = 0;
+    o = str_append(obs, o, ocap, "{\"app\":\"");
+    o = obs_escape(obs, o, ocap, app);
+    o = str_append(obs, o, ocap, "\",\"delivery\":\"");
+    o = str_append(obs, o, ocap, delivery);
+    o = str_append(obs, o, ocap, "\",\"detail\":\"");
+    o = str_append(obs, o, ocap, detail);
+    o = str_append(obs, o, ocap, "\",");
+    if (!strcmp(detail, "names-only"))
+        o = str_append(obs, o, ocap,
+            "\"note\":\"this app has too many items to describe in one reply, so these "
+            "are the NAMES only; call app.describe again with name set to a name or a "
+            "dotted prefix (e.g. fx.colors) to get those rows in full\",");
+    else if (prefix_too_broad)
+        o = str_append(obs, o, ocap,
+            "\"note\":\"that name matched too many items to describe in one reply; "
+            "use a LONGER dotted prefix (fx.colors rather than fx), or call "
+            "app.describe with no name to see what the app offers\",");
+    else if (!strcmp(detail, "terse-no-descriptions"))
+        o = str_append(obs, o, ocap,
+            "\"note\":\"this app's full descriptions did not fit, so each row carries "
+            "its name, type, access, risk and valid values but no description; call "
+            "app.describe again with name set to a name or a dotted prefix for the "
+            "full rows\",");
+    if (err) o = str_append(obs, o, ocap, "\"error\":\"CONTRACT_ERROR\",");
+    o = str_append(obs, o, ocap, "\"contract\":\"");
     o = obs_escape(obs, o, ocap, reply);
     str_append(obs, o, ocap, "\"}");
 }
@@ -2906,6 +3177,7 @@ static int dispatch_tool(const char *id, const char *args, char *obs, int ocap) 
     else if (!strcmp(id, "calc.open"))         exec_calc_open(args, obs, ocap);
     else if (!strcmp(id, "calc.eval"))         exec_calc_eval(args, obs, ocap);
     else if (!strcmp(id, "app.launch"))        exec_app_launch(args, obs, ocap);
+    else if (!strcmp(id, "app.describe"))      exec_app_describe(args, obs, ocap);
     else if (!strcmp(id, "app.action"))        exec_app_action(args, obs, ocap);
     else if (!strcmp(id, "storage.free") ||
              !strcmp(id, "system.storage.info")) exec_storage_info(args, obs, ocap);
